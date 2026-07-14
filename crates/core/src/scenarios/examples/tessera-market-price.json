@@ -1,0 +1,18 @@
+{
+  "id": "tessera-market-price-example",
+  "name": "Tessera WSOL/USDC price override",
+  "description": "Prices the Tessera WSOL/USDC prop-AMM market at $80 using the raw-layout override kind (Tessera is non-Anchor, so it can't use the IDL template path). The live market is forked (fetchBeforeUse), then only the fair-value anchor, its reciprocal, and the publish slot are overwritten - the real orderbook ladder is preserved. A strategy can then trade against the forged price, e.g. arbitrage it against a Raydium SOL/USDC pool priced differently.",
+  "tags": ["pmm", "tessera", "price", "arbitrage"],
+  "overrides": [
+    {
+      "id": "tessera-price-80",
+      "templateId": "tessera-market-price",
+      "label": "Set Tessera WSOL/USDC to $80",
+      "scenarioRelativeSlot": 0,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "account": { "pubkey": "FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n" },
+      "values": { "price": 80 }
+    }
+  ]
+}

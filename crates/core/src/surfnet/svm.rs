@@ -2691,6 +2691,57 @@ impl SurfnetSvm {
                 }
             }
 
+            if let Some(tmpl) = crate::scenarios::protocols::pmm::builtin_raw_templates()
+                .into_iter()
+                .find(|t| t.id == override_instance.template_id)
+            {
+                let Some(existing) = self.inner.get_account(&account_pubkey)? else {
+                    warn!(
+                        "Account {} not found for raw-layout override {} (enable fetchBeforeUse to fork it)",
+                        account_pubkey, override_instance.id
+                    );
+                    continue;
+                };
+                let base = tmpl
+                    .base_account
+                    .clone()
+                    .unwrap_or_else(|| existing.data().to_vec());
+                let new_data =
+                    match tmpl.materialize(&base, &override_instance.values, target_slot) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!("Raw-layout override {} failed: {}", override_instance.id, e);
+                            continue;
+                        }
+                    };
+                let modified = Account {
+                    lamports: existing.lamports(),
+                    data: new_data,
+                    owner: *existing.owner(),
+                    executable: existing.executable(),
+                    rent_epoch: existing.rent_epoch(),
+                };
+                if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                    warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                    continue;
+                }
+                debug!(
+                    "Raw-layout override {} applied to {} via template {}",
+                    override_instance.id, account_pubkey, tmpl.id
+                );
+
+                let next_slot = target_slot + 1;
+                let mut next = self
+                    .scheduled_overrides
+                    .get(&next_slot)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                next.push(override_instance.clone());
+                let _ = self.scheduled_overrides.store(next_slot, next);
+                continue;
+            }
+
             // Apply the override values to the account data
             if !override_instance.values.is_empty() {
                 // Filter out values that are only used for PDA derivation (not account data)

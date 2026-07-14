@@ -1,0 +1,28 @@
+{
+  "id": "tessera-raydium-sol-usdc-arbitrage",
+  "name": "Tessera vs Raydium SOL/USDC arbitrage",
+  "description": "Creates a cross-venue SOL/USDC price gap for an arbitrage strategy to realize. Tessera (a non-Anchor prop-AMM) is priced at $80 via the raw-layout override kind; the Raydium CLMM SOL/USDC pool (config index 8) is priced at $75 via the existing IDL-based raydium-clmm-custom template. A strategy buys SOL cheap on Raydium (~$75) and sells it dear on Tessera ($80) for ~$5/SOL. Demonstrates both override kinds - raw byte-offset and IDL/borsh - in a single scenario.",
+  "tags": ["arbitrage", "pmm", "tessera", "raydium", "clmm", "sol-usdc"],
+  "overrides": [
+    {
+      "id": "tessera-sol-usdc-80",
+      "templateId": "tessera-market-price",
+      "label": "Tessera WSOL/USDC = $80 (sell venue)",
+      "scenarioRelativeSlot": 0,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "account": { "pubkey": "FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n" },
+      "values": { "price": 80 }
+    },
+    {
+      "id": "raydium-clmm-sol-usdc-75",
+      "templateId": "raydium-clmm-custom",
+      "label": "Raydium CLMM SOL/USDC = $75 (buy venue)",
+      "scenarioRelativeSlot": 0,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "account": { "pubkey": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv" },
+      "values": { "sqrt_price_x64": 5051848920847730954, "tick_current": -25904 }
+    }
+  ]
+}

@@ -607,6 +607,155 @@ impl Default for ScenarioConfig {
 }
 
 // ========================================
+// Raw-layout Override Types
+// ========================================
+//
+/// How a single field's little-endian u64 bytes are computed from an override's `values`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum RawEncoding {
+    U64FixedPoint { from_value: String, scale: f64 },
+    U64Reciprocal { from_value: String, scale: f64 },
+    U64 { from_value: String },
+    Slot { lead: i64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawLayoutField {
+    /// Byte offset of the (8-byte, little-endian u64) field within the account data.
+    pub offset: usize,
+    /// How the field's value is derived.
+    pub encoding: RawEncoding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawLayoutTemplate {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_account: Option<Vec<u8>>,
+    pub fields: Vec<RawLayoutField>,
+}
+
+fn raw_value_as_f64(
+    values: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<f64, String> {
+    let v = values
+        .get(key)
+        .ok_or_else(|| format!("raw-layout: missing value '{key}'"))?;
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        .ok_or_else(|| format!("raw-layout: value '{key}' is not a number"))
+}
+
+impl RawLayoutTemplate {
+    /// Produce the new account data bytes by writing each field into a copy of `base`.
+    /// `target_slot` is the materialization slot, used by [`RawEncoding::Slot`] fields.
+    pub fn materialize(
+        &self,
+        base: &[u8],
+        values: &HashMap<String, serde_json::Value>,
+        target_slot: u64,
+    ) -> Result<Vec<u8>, String> {
+        let mut data = base.to_vec();
+        for field in &self.fields {
+            let raw: u64 = match &field.encoding {
+                RawEncoding::U64FixedPoint { from_value, scale } => {
+                    (raw_value_as_f64(values, from_value)? * scale) as u64
+                }
+                RawEncoding::U64Reciprocal { from_value, scale } => {
+                    let v = raw_value_as_f64(values, from_value)?;
+                    if v == 0.0 {
+                        return Err(format!("raw-layout: reciprocal of zero for '{from_value}'"));
+                    }
+                    (scale / v) as u64
+                }
+                RawEncoding::U64 { from_value } => raw_value_as_f64(values, from_value)? as u64,
+                RawEncoding::Slot { lead } => (target_slot as i64 + lead).max(0) as u64,
+            };
+            let end = field
+                .offset
+                .checked_add(8)
+                .ok_or_else(|| "raw-layout: field offset overflow".to_string())?;
+            if end > data.len() {
+                return Err(format!(
+                    "raw-layout: field at offset {} exceeds account size {}",
+                    field.offset,
+                    data.len()
+                ));
+            }
+            data[field.offset..end].copy_from_slice(&raw.to_le_bytes());
+        }
+        Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod raw_layout_tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::{RawEncoding, RawLayoutField, RawLayoutTemplate};
+
+    #[test]
+    fn materialize_writes_price_reciprocal_and_slot() {
+        let tmpl = RawLayoutTemplate {
+            id: "tessera-market-price".to_string(),
+            name: "Tessera market price".to_string(),
+            protocol: "Tessera".to_string(),
+            base_account: None,
+            fields: vec![
+                RawLayoutField {
+                    offset: 128,
+                    encoding: RawEncoding::U64FixedPoint {
+                        from_value: "price".to_string(),
+                        scale: 1e12,
+                    },
+                },
+                RawLayoutField {
+                    offset: 144,
+                    encoding: RawEncoding::U64Reciprocal {
+                        from_value: "price".to_string(),
+                        scale: 1e18,
+                    },
+                },
+                RawLayoutField {
+                    offset: 120,
+                    encoding: RawEncoding::Slot { lead: 30 },
+                },
+            ],
+        };
+        let values = HashMap::from([("price".to_string(), json!(80.0))]);
+        let data = tmpl.materialize(&[0u8; 1264], &values, 1000).unwrap();
+
+        let read = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        assert_eq!(read(128), (80.0f64 * 1e12) as u64);
+        assert_eq!(read(144), (1e18f64 / 80.0) as u64);
+        assert_eq!(read(120), 1030);
+    }
+
+    #[test]
+    fn materialize_rejects_out_of_bounds_offset() {
+        let tmpl = RawLayoutTemplate {
+            id: "x".to_string(),
+            name: "x".to_string(),
+            protocol: "x".to_string(),
+            base_account: None,
+            fields: vec![RawLayoutField {
+                offset: 4,
+                encoding: RawEncoding::Slot { lead: 0 },
+            }],
+        };
+        assert!(tmpl.materialize(&[0u8; 8], &HashMap::new(), 1).is_err());
+    }
+}
+
+// ========================================
 // YAML Template File Types
 // ========================================
 
