@@ -646,7 +646,7 @@
         },
         {
           "method": "surfnet_setTokenAccount",
-          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. This is designed to help developers quickly modify token account properties like amounts, delegates, and authorities.",
+          "description": "A 'cheat code' method for developers to set or update a token account in Surfpool. It allows for updating properties like amount, delegate, state, delegated amount, and close authority. It can also configure (and optionally fund) a Token-2022 confidential-transfer account via the `update.confidential` field, letting tests skip the real multi-transaction Configure/Deposit/ApplyPendingBalance flow. This is designed to help developers quickly modify token account properties.",
           "params": [
             {
               "name": "owner",
@@ -667,7 +667,8 @@
                 "delegate": "Option<SetSomeAccount>",
                 "state": "Option<string> ('uninitialized', 'frozen', 'initialized')",
                 "delegated_amount": "Option<u64>",
-                "close_authority": "Option<SetSomeAccount>"
+                "close_authority": "Option<SetSomeAccount>",
+                "confidential": "Option<ConfidentialTransferAccountUpdate> (Token-2022 only; configures the confidential-transfer extension. Fields: elgamalPubkey (string, 32 bytes base58/base64, required), aesKey (string, 16 bytes base58/base64, required — produces the owner-decryptable balance, encrypt(0) for a zero balance), amount (Option<u64>, default 0), approved (Option<bool>, default true), allowConfidentialCredits (Option<bool>, default true), allowNonConfidentialCredits (Option<bool>, default true), maximumPendingBalanceCreditCounter (Option<u64>, default 65536))"
               }
             },
             {
@@ -688,6 +689,24 @@
                 "amount": 1000,
                 "state": "initialized"
               }
+            ]
+          },
+          "confidentialExample": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setTokenAccount",
+            "params": [
+              "owner_pubkey",
+              "mint_pubkey",
+              {
+                "confidential": {
+                  "elgamalPubkey": "<base58, 32 bytes>",
+                  "aesKey": "<base58, 16 bytes>",
+                  "amount": 100000000,
+                  "approved": true
+                }
+              },
+              "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
             ]
           }
         },

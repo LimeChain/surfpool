@@ -907,6 +907,43 @@ pub struct TokenAccountUpdate {
     pub delegated_amount: Option<u64>,
     /// providing this value sets the close authority of the token account
     pub close_authority: Option<SetSomeAccount>,
+    /// providing this value configures the Token-2022 confidential-transfer
+    /// extension on the account (Token-2022 only)
+    pub confidential: Option<ConfidentialTransferAccountUpdate>,
+}
+
+/// Configures the Token-2022 `ConfidentialTransferAccount` extension on a token
+/// account created via `surfnet_setTokenAccount`.
+///
+/// This is a test-only cheatcode: it fabricates a configured (and optionally
+/// funded) confidential account directly, bypassing the real on-chain
+/// configure / deposit / apply-pending-balance instruction flow.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfidentialTransferAccountUpdate {
+    /// The owner's ElGamal public key (base58 or base64, 32 bytes). Required —
+    /// the confidential balance is encrypted to this key, and confidential
+    /// payment clients read it off the account to encrypt transfers.
+    pub elgamal_pubkey: String,
+    /// The owner's AES (authenticated-encryption) secret key (base58 or base64,
+    /// 16 bytes). Required. Produces the `decryptable_available_balance` the
+    /// owner reads to learn its balance — even a zero-balance receive-only
+    /// account needs a valid `encrypt(0)` here (a placeholder would fail
+    /// owner-side balance reads), so this is mandatory for every confidential
+    /// account. Modeled as `Option` only so the field can be validated with a
+    /// clear error message when omitted.
+    pub aes_key: Option<String>,
+    /// The confidential available balance to set (default 0).
+    pub amount: Option<u64>,
+    /// Whether the account is approved for confidential transfers (default true).
+    pub approved: Option<bool>,
+    /// Whether the account accepts incoming confidential credits (default true).
+    pub allow_confidential_credits: Option<bool>,
+    /// Whether the base account accepts incoming non-confidential credits
+    /// (default true).
+    pub allow_non_confidential_credits: Option<bool>,
+    /// The maximum pending-balance credit counter (default 65536).
+    pub maximum_pending_balance_credit_counter: Option<u64>,
 }
 
 // token supply update for set supply method in SVM tricks
