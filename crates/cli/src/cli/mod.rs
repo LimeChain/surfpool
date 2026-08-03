@@ -12,8 +12,6 @@ use chrono::Local;
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Generator, Shell};
 use fern::colors::{Color, ColoredLevelConfig};
-#[cfg(not(target_os = "windows"))]
-use fork::{Fork, daemon};
 use hiro_system_kit::{self, Logger};
 use log::info;
 use solana_keypair::Keypair;
@@ -898,6 +896,11 @@ pub async fn handle_mcp_command(_ctx: &Context) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn daemon(nochdir: i32, noclose: i32) -> i32;
+}
+
 fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
     match opts.command {
         Command::Simnet(mut cmd) => {
@@ -933,19 +936,15 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
             }
 
             if cmd.runtime.daemon {
-                #[cfg(not(target_os = "windows"))]
-                match daemon(false, false) {
-                    Ok(Fork::Child) => {
-                        info!("Starting surfpool in daemon mode");
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    if daemon(0, 0) != 0 {
+                        return Err(format!(
+                            "Failed to start surfpool in daemon mode: {}",
+                            std::io::Error::last_os_error()
+                        ));
                     }
-                    Ok(Fork::Parent(pid)) => {
-                        info!("Parent exiting {pid}");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        info!("Failed to start surfpool in daemon mode: {}", e);
-                        return Ok(());
-                    }
+                    info!("Starting surfpool in daemon mode");
                 };
             }
             hiro_system_kit::nestable_block_on(simnet::handle_start_local_surfnet_command(cmd, ctx))

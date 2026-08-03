@@ -60,7 +60,6 @@ diesel_derives = { version = "2.2.6", default-features = false }
 dirs = "6.0.0"
 dotenvy = "0.15.7"
 fern = { version = "0.7.1", default-features = false }
-fork = "0.2.0"
 futures = { version = "0.3.22", default-features = false }
 hex = { version = "0.4.3", default-features = false }
 hiro-system-kit = { version = "0.3.4", default-features = false, features = [
