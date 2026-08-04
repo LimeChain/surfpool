@@ -12081,6 +12081,7 @@ dependencies = [
  "spl-token-interface 2.0.0",
  "surfpool-core",
  "surfpool-types",
+ "tokio",
  "tracing",
 ]
 
