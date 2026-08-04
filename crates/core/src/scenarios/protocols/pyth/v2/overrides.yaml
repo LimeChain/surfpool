@@ -196,13 +196,34 @@ templates:
     description: Override any Pyth price feed with custom price data
     idl_account_name: PriceUpdateV2
     properties:
-      - path: price_message.price
-        label: Price
-        description: The price value
       - path: feed_id
         type: constant_ref
         label: Price Feed
         constant: price_feed
+      - path: price_message.price
+        label: Price
+        description: Price as a scaled integer - multiply the USD value by 10^decimals
+      - path: price_message.conf
+        label: Confidence
+        description: Uncertainty band around the price, in the same scale as price
+      - path: price_message.exponent
+        label: Exponent
+        description: Decimal exponent, normally -8 and -10 on some feeds. Rescales every price field
+      - path: price_message.publish_time
+        label: Publish Time
+        description: Unix seconds of this update, interpreted against the Surfnet clock
+      - path: price_message.prev_publish_time
+        label: Previous Publish Time
+        description: Unix seconds of the preceding update
+      - path: price_message.ema_price
+        label: EMA Price
+        description: Exponential moving average price, in the same scale as price
+      - path: price_message.ema_conf
+        label: EMA Confidence
+        description: Exponential moving average confidence, in the same scale as conf
+      - path: posted_slot
+        label: Posted Slot
+        description: Slot the update was posted at, for consumers that measure freshness in slots
     llm_context: |
       CRITICAL: Always set fetchBeforeUse: true for Pyth price feeds!
       This fetches the current account data from mainnet before applying your price override.
@@ -224,6 +245,34 @@ templates:
       EXAMPLE SCENARIO - "SOL crashes from $145 to $85":
       Override 1 (slot 0): feed_id=SOL/USD, price_message.price=14500000000
       Override 2 (slot 1): feed_id=SOL/USD, price_message.price=8500000000
+
+      FIELDS OTHER THAN PRICE:
+      - price_message.conf is the uncertainty band, in the SAME scale as price. Consumers reject a
+        quote when confidence is too wide relative to the price. On an 8 decimal feed, $2 of
+        uncertainty is 200000000.
+      - price_message.exponent rescales price, conf, ema_price and ema_conf together. Leave it alone
+        unless the scenario is specifically about an exponent error. If you do change it, restate
+        every scaled field to match.
+      - price_message.ema_price and price_message.ema_conf use the same scales as price and conf.
+      - posted_slot is a slot number, not a timestamp. Some consumers measure freshness in slots
+        rather than in seconds.
+
+      TIME FIELDS - READ BEFORE SETTING publish_time:
+      publish_time and prev_publish_time are unix seconds interpreted against the SURFNET clock, not
+      the real-world clock. The two can differ by an arbitrary amount, so a timestamp taken from the
+      real current time will look far in the future inside the simulation and will NOT produce a
+      stale price.
+
+      Do not try to backdate the timestamp either - the Surfnet clock only moves forward. To build a
+      stale-price scenario, make the price fresh and then advance time past the consumer's limit:
+      1. surfnet_pauseClock so the elapsed time is exact rather than dependent on slot production
+      2. read the current Surfnet clock and set publish_time to it, which is a fresh price
+      3. surfnet_timeTravel forward by more than the consumer's staleness limit
+      4. send the transaction - the consumer now sees an aged price and should reject it
+
+      UNITS WARNING for step 3: surfnet_timeTravel's absoluteTimestamp is in MILLISECONDS, while
+      publish_time and the Clock sysvar are in SECONDS. Multiply by 1000 when passing a value read
+      from the clock, or the call fails with a "past timestamp" error.
     address:
       type: pda
       program_id: pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT

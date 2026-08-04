@@ -4071,6 +4071,23 @@ mod tests {
         surfnet::{BlockHeader, SurfnetSvm, svm::apply_override_to_decoded_account},
     };
 
+    /// A real `PriceUpdateV2` account. Its `VerificationLevel` is the one-byte `Full` variant and
+    /// it ends in a padding byte, which is what fixes the offsets the tests below assert on.
+    fn pyth_price_update_v2_fixture() -> Vec<u8> {
+        vec![
+            0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd, // Discriminator
+            0x35, 0xa7, 0x0c, 0x11, 0x16, 0x2f, 0xbf, 0x5a, 0x0e, 0x7f, 0x7d, 0x2f, 0x96, 0xe1,
+            0x9f, 0x97, 0xb0, 0x22, 0x46, 0xa1, 0x56, 0x87, 0xee, 0x67, 0x27, 0x94, 0x89, 0x74,
+            0x48, 0xe6, 0x58, 0xde, 0x01, 0xe6, 0x2d, 0xf6, 0xc8, 0xb4, 0xa8, 0x5f, 0xe1, 0xa6,
+            0x7d, 0xb4, 0x4d, 0xc1, 0x2d, 0xe5, 0xdb, 0x33, 0x0f, 0x7a, 0xc6, 0x6b, 0x72, 0xdc,
+            0x65, 0x8a, 0xfe, 0xdf, 0x0f, 0x4a, 0x41, 0x5b, 0x43, 0xd7, 0x1f, 0x18, 0x64, 0x5f,
+            0x0a, 0x00, 0x00, 0x96, 0x67, 0xea, 0xc5, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xff, 0xff,
+            0xff, 0x5f, 0x2b, 0x00, 0x69, 0x00, 0x00, 0x00, 0x00, 0x5e, 0x2b, 0x00, 0x69, 0x00,
+            0x00, 0x00, 0x00, 0xa0, 0x7c, 0x1a, 0x38, 0x63, 0x0a, 0x00, 0x00, 0x94, 0xa6, 0xb9,
+            0xb5, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x5e, 0x6d, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
     #[test]
     fn test_get_forged_account_data_with_pyth_fixture() {
         use borsh::{BorshDeserialize, BorshSerialize};
@@ -4103,18 +4120,7 @@ mod tests {
         }
 
         // Pyth price feed account data fixture
-        let account_data_hex = vec![
-            0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd, // Discriminator
-            0x35, 0xa7, 0x0c, 0x11, 0x16, 0x2f, 0xbf, 0x5a, 0x0e, 0x7f, 0x7d, 0x2f, 0x96, 0xe1,
-            0x9f, 0x97, 0xb0, 0x22, 0x46, 0xa1, 0x56, 0x87, 0xee, 0x67, 0x27, 0x94, 0x89, 0x74,
-            0x48, 0xe6, 0x58, 0xde, 0x01, 0xe6, 0x2d, 0xf6, 0xc8, 0xb4, 0xa8, 0x5f, 0xe1, 0xa6,
-            0x7d, 0xb4, 0x4d, 0xc1, 0x2d, 0xe5, 0xdb, 0x33, 0x0f, 0x7a, 0xc6, 0x6b, 0x72, 0xdc,
-            0x65, 0x8a, 0xfe, 0xdf, 0x0f, 0x4a, 0x41, 0x5b, 0x43, 0xd7, 0x1f, 0x18, 0x64, 0x5f,
-            0x0a, 0x00, 0x00, 0x96, 0x67, 0xea, 0xc5, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xff, 0xff,
-            0xff, 0x5f, 0x2b, 0x00, 0x69, 0x00, 0x00, 0x00, 0x00, 0x5e, 0x2b, 0x00, 0x69, 0x00,
-            0x00, 0x00, 0x00, 0xa0, 0x7c, 0x1a, 0x38, 0x63, 0x0a, 0x00, 0x00, 0x94, 0xa6, 0xb9,
-            0xb5, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x5e, 0x6d, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
+        let account_data_hex = pyth_price_update_v2_fixture();
 
         // Create a minimal Pyth IDL for testing
         let idl: Idl = serde_json::from_str(PYTH_V2_IDL_CONTENT).expect("Failed to load IDL");
@@ -4549,6 +4555,133 @@ mod tests {
                 );
             }
             _ => panic!("Expected JSON parsed data"),
+        }
+    }
+
+    /// Mirrors the `pyth-price-feed-v2` template: a property added there needs a case here.
+    #[test]
+    fn test_get_forged_account_data_overrides_all_pyth_price_feed_fields() {
+        use solana_account_decoder::UiAccountData;
+
+        let account_data = pyth_price_update_v2_fixture();
+        let idl: Idl = serde_json::from_str(PYTH_V2_IDL_CONTENT).expect("Failed to load IDL");
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let account_pubkey = Pubkey::from_str_const("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
+        svm_locker.register_idl(idl.clone(), None).unwrap();
+
+        // feed_id is omitted because it is a PDA seed reference, which the override path strips
+        // before writing. Every value differs from the fixture's so a no-op write cannot pass.
+        let new_price = 9_100_000_000_000i64;
+        let new_conf = 500_000_000u64;
+        let new_exponent = -10i32;
+        let new_publish_time = 1_800_000_000i64;
+        let new_prev_publish_time = 1_799_999_940i64;
+        let new_ema_price = 9_050_000_000_000i64;
+        let new_ema_conf = 450_000_000u64;
+        let new_posted_slot = 500_000_000u64;
+
+        let mut overrides: HashMap<String, serde_json::Value> = HashMap::new();
+        overrides.insert("price_message.price".into(), json!(new_price));
+        overrides.insert("price_message.conf".into(), json!(new_conf));
+        overrides.insert("price_message.exponent".into(), json!(new_exponent));
+        overrides.insert("price_message.publish_time".into(), json!(new_publish_time));
+        overrides.insert(
+            "price_message.prev_publish_time".into(),
+            json!(new_prev_publish_time),
+        );
+        overrides.insert("price_message.ema_price".into(), json!(new_ema_price));
+        overrides.insert("price_message.ema_conf".into(), json!(new_ema_conf));
+        overrides.insert("posted_slot".into(), json!(new_posted_slot));
+
+        let forged = svm_locker
+            .get_forged_account_data(&account_pubkey, &account_data, &idl, &overrides)
+            .expect("forging should succeed for every field the template exposes");
+
+        // price starts at byte 73, so nothing before it is named by the overrides.
+        assert_eq!(
+            forged.len(),
+            account_data.len(),
+            "forged account should keep its original length"
+        );
+        assert_eq!(
+            &forged[..73],
+            &account_data[..73],
+            "bytes ahead of the price field should be untouched"
+        );
+
+        let forged_account = Account {
+            lamports: 1_000_000,
+            data: forged,
+            owner: account_pubkey,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let ui_account = svm_locker.encode_ui_account(
+            &account_pubkey,
+            &forged_account,
+            UiAccountEncoding::JsonParsed,
+            None,
+            None,
+        );
+
+        match &ui_account.data {
+            UiAccountData::Json(parsed_account) => {
+                let parsed = &parsed_account.parsed;
+                let price_message = parsed
+                    .get("price_message")
+                    .expect("Should have price_message field")
+                    .as_object()
+                    .expect("price_message should be an object");
+
+                let field = |name: &str| -> i64 {
+                    price_message
+                        .get(name)
+                        .unwrap_or_else(|| panic!("Should have {name} field"))
+                        .as_i64()
+                        .unwrap_or_else(|| panic!("{name} should be a number"))
+                };
+
+                assert_eq!(field("price"), new_price, "price should be overridden");
+                assert_eq!(field("conf"), new_conf as i64, "conf should be overridden");
+                assert_eq!(
+                    field("exponent"),
+                    new_exponent as i64,
+                    "exponent should be overridden"
+                );
+                assert_eq!(
+                    field("publish_time"),
+                    new_publish_time,
+                    "publish_time should be overridden"
+                );
+                assert_eq!(
+                    field("prev_publish_time"),
+                    new_prev_publish_time,
+                    "prev_publish_time should be overridden"
+                );
+                assert_eq!(
+                    field("ema_price"),
+                    new_ema_price,
+                    "ema_price should be overridden"
+                );
+                assert_eq!(
+                    field("ema_conf"),
+                    new_ema_conf as i64,
+                    "ema_conf should be overridden"
+                );
+
+                let posted_slot = parsed
+                    .get("posted_slot")
+                    .expect("Should have posted_slot field")
+                    .as_u64()
+                    .expect("posted_slot should be a number");
+                assert_eq!(
+                    posted_slot, new_posted_slot,
+                    "posted_slot should be overridden"
+                );
+            }
+            _ => panic!("Expected JSON parsed account data"),
         }
     }
 
