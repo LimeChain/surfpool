@@ -41,6 +41,19 @@ use crate::cli::Context;
 #[folder = "../../../explorer/.next/server/app"]
 pub struct Asset;
 
+/// Registers the studio API routes. Shared between the server and its tests
+fn configure_api(cfg: &mut web::ServiceConfig) {
+    cfg.service(get_config)
+        .service(get_scenario_templates)
+        .service(post_scenarios)
+        .service(get_scenarios)
+        .service(delete_scenario)
+        .service(patch_scenario)
+        // Unknown /v1/* paths must fail loudly here: otherwise the studio
+        // SPA fallback answers them with index.html and a misleading 200
+        .service(web::scope("/v1").default_service(web::route().to(api_not_found)));
+}
+
 pub async fn start_studio_and_scenario_server(
     network_binding: String,
     config: SanitizedConfig,
@@ -78,12 +91,7 @@ pub async fn start_studio_and_scenario_server(
             )
             .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::default())
-            .service(get_config)
-            .service(get_scenario_templates)
-            .service(post_scenarios)
-            .service(get_scenarios)
-            .service(delete_scenario)
-            .service(patch_scenario)
+            .configure(configure_api)
             .service(web::scope("/mcp").service(mcp_service.clone().scope()));
 
         if enable_studio {
@@ -265,4 +273,48 @@ async fn dist(path: web::Path<String>) -> impl Responder {
         other => other,
     };
     handle_embedded_file(path_str)
+}
+
+async fn api_not_found() -> HttpResponse {
+    HttpResponse::NotFound()
+        .content_type("application/json")
+        .body(r#"{"error":"not found"}"#)
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{App, test};
+
+    use super::*;
+
+    #[actix_web::test]
+    async fn unknown_v1_paths_return_json_404_instead_of_spa_fallback() {
+        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(loaded_scenarios)
+                .configure(configure_api)
+                .service(surfpool_studio_ui::serve_studio_static_files),
+        )
+        .await;
+
+        for path in ["/v1/scenarios/some-id", "/v1/nonexistent"] {
+            let request = test::TestRequest::get().uri(path).to_request();
+            let response = test::call_service(&app, request).await;
+            assert_eq!(response.status(), 404, "expected 404 for {path}");
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "application/json",
+                "expected JSON body for {path}"
+            );
+        }
+
+        let request = test::TestRequest::get().uri("/v1/scenarios").to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "registered endpoints must keep working"
+        );
+    }
 }
