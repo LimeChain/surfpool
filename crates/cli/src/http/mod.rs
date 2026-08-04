@@ -309,6 +309,20 @@ mod tests {
             );
         }
 
+        let request = test::TestRequest::post()
+            .uri("/v1/nonexistent")
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            404,
+            "the guard must catch non-GET methods too"
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json",
+        );
+
         let request = test::TestRequest::get().uri("/v1/scenarios").to_request();
         let response = test::call_service(&app, request).await;
         assert_eq!(
