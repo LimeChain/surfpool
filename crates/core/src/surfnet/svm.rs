@@ -2407,7 +2407,7 @@ impl SurfnetSvm {
                     previous_blockhash: previous_chain_tip.hash.clone(),
                     block_time: self.updated_at as i64 / 1_000,
                     block_height: self.chain_tip.index,
-                    parent_slot: slot,
+                    parent_slot: slot.saturating_sub(1),
                     signatures: confirmed_signatures,
                 },
             )?;
@@ -3177,7 +3177,7 @@ impl SurfnetSvm {
             signatures,
             rewards: if show_rewards { Some(vec![]) } else { None },
             num_reward_partitions: None,
-            block_time: Some(block.block_time / 1000),
+            block_time: Some(block.block_time),
             block_height: Some(block.block_height),
         };
         Ok(Some(block))

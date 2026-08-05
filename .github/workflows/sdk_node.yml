@@ -8,8 +8,11 @@ on:
       - ".github/workflows/sdk_node.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/core/src/rpc/surfnet_cheatcodes.rs"
+      - "crates/core/src/types.rs"
       - "crates/sdk/**"
       - "crates/sdk-node/**"
+      - "crates/types/**"
   pull_request:
     branches:
       - main
@@ -17,14 +20,41 @@ on:
       - ".github/workflows/sdk_node.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/core/src/rpc/surfnet_cheatcodes.rs"
+      - "crates/core/src/types.rs"
       - "crates/sdk/**"
       - "crates/sdk-node/**"
+      - "crates/types/**"
 
 env:
   CARGO_TERM_COLOR: always
   SURFPOOL_WEB_UI_VERSION: 0.2.0-alpha.0
 
 jobs:
+  kit_types_fresh:
+    name: Generated kit RPC types are up to date
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-types
+          cache-bin: false
+          workspaces: |
+            . -> target
+
+      - name: Regenerate kit type bindings
+        run: node crates/sdk-node/scripts/generate-kit-types.js
+
+      - name: Verify committed bindings are up to date
+        run: git diff --exit-code -- crates/sdk-node/surfpool-sdk/kit/generated
+
   validate:
     name: Validate (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -147,4 +177,41 @@ jobs:
           assert.match(surfnet.wsUrl, /^ws:\/\//);
           assert.ok(surfnet.instanceId.length > 0);
           assert.ok(Array.isArray(surfnet.drainEvents()));
+          EOF
+
+      - name: Smoke test packed kit entry
+        working-directory: crates/sdk-node
+        shell: bash
+        run: |
+          TMP_DIR=$(mktemp -d)
+          cp "${{ steps.pack.outputs.root_pack }}" "${TMP_DIR}/"
+          cp "${{ steps.pack.outputs.platform_pack }}" "${TMP_DIR}/"
+          cd "${TMP_DIR}"
+          npm init -y
+          npm install "./$(basename "${{ steps.pack.outputs.platform_pack }}")"
+          npm install "./$(basename "${{ steps.pack.outputs.root_pack }}")"
+          # The kit peers are optional and not auto-installed; installing them
+          # here validates the documented opt-in flow.
+          npm install "@solana/kit@^7.0.0" "@solana/kit-plugin-rpc@^0.15.0" "@solana/kit-plugin-signer@^0.13.0"
+          node - <<'EOF'
+          const assert = require("node:assert/strict");
+          const { createClient } = require("@solana/kit");
+          const { surfpool } = require("@solana/surfpool/kit");
+
+          async function main() {
+            const client = await createClient().use(surfpool({ surfnet: { offline: true } }));
+            assert.equal(client.payer.address, client.surfnet.payer);
+            const info = await client.cheatcodes.getSurfnetInfo().send();
+            assert.ok(Array.isArray(info.runbookExecutions));
+            const slot = await client.rpc.getSlot().send();
+            assert.equal(typeof slot, "bigint");
+            client.surfnet.stop();
+          }
+          main();
+          EOF
+          node --input-type=module - <<'EOF'
+          import assert from "node:assert/strict";
+          import { surfpool, createSurfnetCheatcodesRpc } from "@solana/surfpool/kit";
+          assert.equal(typeof surfpool, "function");
+          assert.equal(typeof createSurfnetCheatcodesRpc, "function");
           EOF
