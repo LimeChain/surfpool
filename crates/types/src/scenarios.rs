@@ -131,16 +131,13 @@ impl PdaSeed {
                 })
             }
             PdaSeed::U16Be(n) => Some(n.to_be_bytes().to_vec()),
-            PdaSeed::U16BeRef(prop) => {
-                values?.get(prop).and_then(|v| {
-                    // Handle numeric values - convert to u16 big-endian
-                    if let Some(n) = v.as_u64() {
-                        let n16 = u16::try_from(n).ok()?;
-                        return Some(n16.to_be_bytes().to_vec());
-                    }
-                    None
-                })
-            }
+            PdaSeed::U16BeRef(prop) => values?.get(prop).and_then(|v| {
+                let index = match v {
+                    serde_json::Value::String(s) => s.parse::<u16>().ok()?,
+                    _ => u16::try_from(v.as_u64()?).ok()?,
+                };
+                Some(index.to_be_bytes().to_vec())
+            }),
             PdaSeed::U16Le(n) => Some(n.to_le_bytes().to_vec()),
             PdaSeed::Bytes32Ref(prop) => {
                 values?.get(prop).and_then(|v| {
@@ -1121,5 +1118,33 @@ mod tests {
         let values = HashMap::from([("index".to_string(), json!(513))]);
 
         assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn u16_be_ref_encodes_decimal_strings() {
+        let seed = PdaSeed::U16BeRef("index".to_string());
+        let values = HashMap::from([("index".to_string(), json!("513"))]);
+
+        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn u16_be_ref_rejects_strings_that_are_not_a_u16() {
+        let seed = PdaSeed::U16BeRef("index".to_string());
+
+        for value in [json!("65536"), json!("abc"), json!("-1"), json!("")] {
+            let values = HashMap::from([("index".to_string(), value.clone())]);
+            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+        }
+    }
+
+    #[test]
+    fn u16_be_ref_rejects_values_that_are_not_an_integer() {
+        let seed = PdaSeed::U16BeRef("index".to_string());
+
+        for value in [json!(1.5), json!(true), json!(null), json!([1]), json!({})] {
+            let values = HashMap::from([("index".to_string(), value.clone())]);
+            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+        }
     }
 }
