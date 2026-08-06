@@ -265,9 +265,15 @@ templates:
 
       Do not try to backdate the timestamp either - the Surfnet clock only moves forward. To build a
       stale-price scenario, make the price fresh and then advance time past the consumer's limit:
-      1. surfnet_pauseClock so the elapsed time is exact rather than dependent on slot production
-      2. read the current Surfnet clock and set publish_time to it, which is a fresh price
-      3. surfnet_timeTravel forward by more than the consumer's staleness limit
+      1. surfnet_pauseClock so the elapsed time is exact rather than dependent on slot production.
+         It returns an EpochInfo, which carries no timestamp - step 2 is how you read the time.
+      2. read the Surfnet clock with getAccountInfo on
+         SysvarC1ock11111111111111111111111111111111 using the jsonParsed encoding, and take
+         result.value.data.parsed.info.unixTimestamp, which is in SECONDS. Set publish_time to
+         that value, which makes the price fresh.
+      3. surfnet_timeTravel forward by more than the consumer's staleness limit. Its
+         absoluteTimestamp is in MILLISECONDS, so multiply the value from step 2 by 1000 before
+         adding your offset.
       4. send the transaction - the consumer now sees an aged price and should reject it
 
       UNITS WARNING for step 3: surfnet_timeTravel's absoluteTimestamp is in MILLISECONDS, while

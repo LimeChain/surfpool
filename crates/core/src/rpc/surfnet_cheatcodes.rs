@@ -766,11 +766,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
@@ -803,11 +803,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
@@ -839,11 +839,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
