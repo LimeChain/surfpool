@@ -88,6 +88,7 @@ fn compact_template_json(template: &surfpool_types::OverrideTemplate) -> serde_j
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchConstantOptionsParams {
     #[schemars(
         description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
@@ -1110,6 +1111,23 @@ impl ServerHandler for Surfpool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_takes_its_template_id_the_way_the_response_names_it() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchConstantOptionsParams))
+            .expect("schema serializes");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(properties.contains_key("templateId"), "{properties:?}");
+        assert!(!properties.contains_key("template_id"), "{properties:?}");
+
+        let parsed: SearchConstantOptionsParams = serde_json::from_value(
+            serde_json::json!({"templateId": "pyth-price-feed-v2", "query": ""}),
+        )
+        .expect("the deserializer accepts what the schema advertises");
+        assert_eq!(parsed.template_id, "pyth-price-feed-v2");
+    }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {
         let text = &result.content[0].as_text().expect("text content").text;
