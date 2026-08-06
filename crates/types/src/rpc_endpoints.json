@@ -651,7 +651,7 @@
                 "lamports": "Option<u64>",
                 "owner": "Option<string> (base-58 encoded pubkey)",
                 "executable": "Option<bool>",
-                "rent_epoch": "Option<u64>",
+                "rentEpoch": "Option<u64>",
                 "data": "Option<string> (hex encoded)"
               }
             }
@@ -693,8 +693,8 @@
                 "amount": "Option<u64>",
                 "delegate": "Option<SetSomeAccount>",
                 "state": "Option<string> ('uninitialized', 'frozen', 'initialized')",
-                "delegated_amount": "Option<u64>",
-                "close_authority": "Option<SetSomeAccount>",
+                "delegatedAmount": "Option<u64>",
+                "closeAuthority": "Option<SetSomeAccount>",
                 "confidential": "Option<ConfidentialTransferAccountUpdate> (Token-2022 only; configures the confidential-transfer extension. Fields: elgamalPubkey (string, 32 bytes base58/base64, required), aesKey (string, 16 bytes base58/base64, required — produces the owner-decryptable balance, encrypt(0) for a zero balance), amount (Option<u64>, default 0), approved (Option<bool>, default true), allowConfidentialCredits (Option<bool>, default true), allowNonConfidentialCredits (Option<bool>, default true), maximumPendingBalanceCreditCounter (Option<u64>, default 65536))"
               }
             },
@@ -830,12 +830,12 @@
                     "description": "An OverrideInstance object.",
                     "schema": {
                       "id": "String (A unique identifier for this override instance)",
-                      "template_id": "String (The identifier of the template this instance is based on)",
+                      "templateId": "String (The identifier of the template this instance is based on)",
                       "values": "HashMap<String, serde_json::Value> (A hash map of field paths to override values. The field paths are a flat map to the account key being updated, from the IDL, using dot-notation to provide the path to the key. For example, to override a field 'amount' in an account 'myAccount', the path would be 'myAccount.amount'.)",
-                      "scenario_relative_slot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
+                      "scenarioRelativeSlot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
-                      "fetch_before_use": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
+                      "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
                       "account": "String (The account this override instance is applied to)"
                     }
                   }
