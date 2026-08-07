@@ -317,8 +317,24 @@ mod tests {
 
     use super::*;
 
+    fn scenario_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "s1",
+            "name": "first",
+            "description": "",
+            "overrides": [],
+            "tags": [],
+        })
+    }
+
+    fn post_scenario(body: serde_json::Value) -> test::TestRequest {
+        test::TestRequest::post()
+            .uri("/v1/scenarios")
+            .set_json(body)
+    }
+
     #[actix_web::test]
-    async fn creating_the_same_scenario_twice_is_a_no_op_and_a_reused_id_conflicts() {
+    async fn creating_the_same_scenario_twice_is_a_no_op() {
         let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
         let app = test::init_service(
             App::new()
@@ -327,34 +343,36 @@ mod tests {
         )
         .await;
 
-        let scenario = serde_json::json!({
-            "id": "s1",
-            "name": "first",
-            "description": "",
-            "overrides": [],
-            "tags": [],
-        });
-
-        let post = |body: serde_json::Value| {
-            test::TestRequest::post()
-                .uri("/v1/scenarios")
-                .set_json(body)
-                .to_request()
-        };
-
-        let created = test::call_service(&app, post(scenario.clone())).await;
+        let created = test::call_service(&app, post_scenario(scenario_body()).to_request()).await;
         assert_eq!(created.status(), 200, "first create must succeed");
 
-        let retried = test::call_service(&app, post(scenario.clone())).await;
+        let retried = test::call_service(&app, post_scenario(scenario_body()).to_request()).await;
         assert_eq!(
             retried.status(),
             200,
             "an identical retry must be accepted as a no-op"
         );
 
-        let mut conflicting = scenario.clone();
+        let stored = &loaded_scenarios.read().unwrap().scenarios;
+        assert_eq!(stored.len(), 1, "no duplicate may be stored");
+    }
+
+    #[actix_web::test]
+    async fn reusing_a_scenario_id_for_different_content_conflicts() {
+        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(loaded_scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let created = test::call_service(&app, post_scenario(scenario_body()).to_request()).await;
+        assert_eq!(created.status(), 200, "first create must succeed");
+
+        let mut conflicting = scenario_body();
         conflicting["name"] = serde_json::json!("second");
-        let rejected = test::call_service(&app, post(conflicting)).await;
+        let rejected = test::call_service(&app, post_scenario(conflicting).to_request()).await;
         assert_eq!(
             rejected.status(),
             409,
@@ -362,7 +380,11 @@ mod tests {
         );
 
         let stored = &loaded_scenarios.read().unwrap().scenarios;
-        assert_eq!(stored.len(), 1, "no duplicate may be stored");
+        assert_eq!(
+            stored.len(),
+            1,
+            "the conflicting scenario must not be stored"
+        );
         assert_eq!(stored[0].name, "first", "the stored scenario is untouched");
     }
 
