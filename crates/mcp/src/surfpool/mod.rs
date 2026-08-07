@@ -42,6 +42,68 @@ pub struct SetTokenAccountsParams {
     pub token_params_with_owner: Vec<CreateTokenAccountForOwnerParams>,
 }
 
+/// Page size of search_constant_options results. The exact value is a
+/// judgment call: big enough that an ambiguous query ("USD") still returns a
+/// useful choice, small enough that a response stays cheap in LLM context.
+/// `totalMatches`/`truncated` tell the model to refine the query when more
+/// options exist.
+const MAX_SEARCH_RESULTS: usize = 20;
+
+/// Compact template JSON shared by the get_override_templates tool and the
+/// str:///override_templates resource. Constant options are summarized to a
+/// count: inlined option lists run to hundreds of entries and are duplicated
+/// across templates, pushing LLM clients past context and rate limits. Models
+/// resolve concrete values through search_constant_options instead.
+fn compact_template_json(template: &surfpool_types::OverrideTemplate) -> serde_json::Value {
+    let constants: serde_json::Map<String, serde_json::Value> = template
+        .constants
+        .iter()
+        .map(|(name, def)| {
+            (
+                name.clone(),
+                serde_json::json!({
+                    "label": def.label,
+                    "description": def.description,
+                    "optionsCount": def.options.len(),
+                }),
+            )
+        })
+        .collect();
+
+    let mut obj = serde_json::json!({
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "protocol": template.protocol,
+        "accountType": template.account_type,
+        "properties": template.properties,
+        "address": template.address,
+        "constants": constants,
+        "tags": template.tags
+    });
+    if let Some(ref ctx) = template.llm_context {
+        obj["llmContext"] = serde_json::Value::String(ctx.clone());
+    }
+    obj
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchConstantOptionsParams {
+    #[schemars(
+        description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
+    )]
+    pub template_id: String,
+    #[schemars(
+        description = "Name of the constant to search in (e.g., \"price_feed\", \"openbook_market\"). Omit to search every constant on the template."
+    )]
+    pub constant: Option<String>,
+    #[schemars(
+        description = "Case-insensitive text matched against option id, label, description and value (e.g., \"SOL/USD\"). An empty string returns the first options."
+    )]
+    pub query: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StartSurfnetWithTokenAccountsParams {
     #[schemars(
@@ -546,7 +608,7 @@ impl Surfpool {
         1. `templateId` MUST exactly match a template's `id` field (e.g., "raydium-clmm-custom", NOT "raydium_clmm_v1")
         2. `values` keys MUST be from the template's `properties` array
         3. For PDA addresses, DO NOT provide `account` - it will be generated from template + values
-        4. For constant_ref properties (like feed_id), the value MUST be from the template's constants options
+        4. For constant_ref properties (like feed_id), the value MUST come from search_constant_options results
 
         CORRECT JSON STRUCTURE FOR PYTH PRICE FEED:
         {
@@ -571,7 +633,7 @@ impl Surfpool {
         }
 
         NOTE: The `account` field will be auto-generated from the template's PDA configuration.
-        For Pyth feeds, use feed_id values from get_override_templates constants.
+        For Pyth feeds, resolve the feed_id value via search_constant_options (e.g., query "SOL/USD").
         "#)]
     async fn create_scenario(
         &self,
@@ -798,7 +860,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values, property names, and account addresses."
+        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -810,31 +872,97 @@ impl Surfpool {
             }
         })?;
 
-        // Return compact version without full IDL to avoid token limits
         let templates: Vec<serde_json::Value> = registry
             .all()
             .iter()
-            .map(|t| {
-                let mut obj = serde_json::json!({
-                    "id": t.id,
-                    "name": t.name,
-                    "description": t.description,
-                    "protocol": t.protocol,
-                    "accountType": t.account_type,
-                    "properties": t.properties,
-                    "address": t.address,
-                    "constants": t.constants,
-                    "tags": t.tags
-                });
-                // Include llm_context if present
-                if let Some(ref ctx) = t.llm_context {
-                    obj["llmContext"] = serde_json::Value::String(ctx.clone());
-                }
-                obj
-            })
+            .map(|t| compact_template_json(t))
             .collect();
 
         let json_str = serde_json::to_string(&templates).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+
+    #[tool(
+        description = "Searches the options of a template's constants (price feeds, markets, token mints). Use after get_override_templates to resolve a constant_ref value: pass the templateId, optionally the constant name, and a query like \"SOL/USD\". Returns matching options whose `value` field is what create_scenario expects."
+    )]
+    async fn search_constant_options(
+        &self,
+        Parameters(params): Parameters<SearchConstantOptionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let registry = self.template_registry.read().map_err(|_| {
+            use std::borrow::Cow;
+            McpError {
+                code: ErrorCode(-32603),
+                message: Cow::from("Failed to read template registry"),
+                data: None,
+            }
+        })?;
+
+        let all_templates = registry.all();
+        let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
+            let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Unknown templateId {:?}. Valid IDs are: {:?}",
+                params.template_id, valid_ids
+            ))]));
+        };
+
+        if let Some(ref wanted) = params.constant {
+            if !template.constants.contains_key(wanted) {
+                let available: Vec<&String> = template.constants.keys().collect();
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Template {:?} has no constant {:?}. Available constants: {:?}",
+                    params.template_id, wanted, available
+                ))]));
+            }
+        }
+
+        let query = params.query.to_lowercase();
+        let mut results = Vec::new();
+        let mut total_matches = 0usize;
+
+        // HashMap iteration order is random per process; sort so paged results
+        // are stable across calls for templates with several constants
+        let mut constants: Vec<_> = template.constants.iter().collect();
+        constants.sort_by(|a, b| a.0.cmp(b.0));
+        for (constant_name, def) in constants {
+            if let Some(ref wanted) = params.constant {
+                if constant_name != wanted {
+                    continue;
+                }
+            }
+            for opt in &def.options {
+                let matches = query.is_empty()
+                    || opt.id.to_lowercase().contains(&query)
+                    || opt.label.to_lowercase().contains(&query)
+                    || opt.value.to_lowercase().contains(&query)
+                    || opt
+                        .description
+                        .as_deref()
+                        .is_some_and(|d| d.to_lowercase().contains(&query));
+                if matches {
+                    total_matches += 1;
+                    if results.len() < MAX_SEARCH_RESULTS {
+                        results.push(serde_json::json!({
+                            "constant": constant_name,
+                            "id": opt.id,
+                            "label": opt.label,
+                            "description": opt.description,
+                            "value": opt.value,
+                            "metadata": opt.metadata,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let response = serde_json::json!({
+            "templateId": params.template_id,
+            "results": results,
+            "totalMatches": total_matches,
+            "truncated": total_matches > results.len(),
+        });
+        let json_str = serde_json::to_string(&response).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 
@@ -935,28 +1063,10 @@ impl ServerHandler for Surfpool {
                     }
                 })?;
 
-                // Return compact version without full IDL to avoid token limits
                 let templates: Vec<serde_json::Value> = registry
                     .all()
                     .iter()
-                    .map(|t| {
-                        let mut obj = serde_json::json!({
-                            "id": t.id,
-                            "name": t.name,
-                            "description": t.description,
-                            "protocol": t.protocol,
-                            "accountType": t.account_type,
-                            "properties": t.properties,
-                            "address": t.address,
-                            "constants": t.constants,
-                            "tags": t.tags
-                        });
-                        // Include llm_context if present
-                        if let Some(ref ctx) = t.llm_context {
-                            obj["llmContext"] = serde_json::Value::String(ctx.clone());
-                        }
-                        obj
-                    })
+                    .map(|t| compact_template_json(t))
                     .collect();
 
                 let templates_json = serde_json::to_string(&templates).map_err(|_| {
@@ -995,5 +1105,148 @@ impl ServerHandler for Surfpool {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_takes_its_template_id_the_way_the_response_names_it() {
+        let schema = serde_json::to_value(schemars::schema_for!(SearchConstantOptionsParams))
+            .expect("schema serializes");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(properties.contains_key("templateId"), "{properties:?}");
+        assert!(!properties.contains_key("template_id"), "{properties:?}");
+
+        let parsed: SearchConstantOptionsParams = serde_json::from_value(
+            serde_json::json!({"templateId": "pyth-price-feed-v2", "query": ""}),
+        )
+        .expect("the deserializer accepts what the schema advertises");
+        assert_eq!(parsed.template_id, "pyth-price-feed-v2");
+    }
+
+    fn json_of(result: &CallToolResult) -> serde_json::Value {
+        let text = &result.content[0].as_text().expect("text content").text;
+        serde_json::from_str(text).expect("valid JSON payload")
+    }
+
+    fn search(
+        template_id: &str,
+        constant: Option<&str>,
+        query: &str,
+    ) -> Parameters<SearchConstantOptionsParams> {
+        Parameters(SearchConstantOptionsParams {
+            template_id: template_id.to_string(),
+            constant: constant.map(str::to_string),
+            query: query.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn get_override_templates_summarizes_constants_instead_of_inlining_options() {
+        let surfpool = Surfpool::new();
+        let result = surfpool.get_override_templates().await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let templates = json_of(&result);
+        let pyth = templates
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "pyth-price-feed-v2")
+            .expect("pyth template present");
+
+        let price_feed = &pyth["constants"]["price_feed"];
+        assert!(
+            price_feed["optionsCount"].as_u64().unwrap() > 0,
+            "summary must report how many options exist"
+        );
+        assert!(
+            price_feed.get("options").is_none(),
+            "options must not be inlined; they blow past LLM token limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_finds_a_feed_case_insensitively_and_returns_usable_values() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .search_constant_options(search("pyth-price-feed-v2", None, "sOl/UsD"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let payload = json_of(&result);
+        let results = payload["results"].as_array().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r["label"].as_str().unwrap().eq_ignore_ascii_case("sol/usd")),
+            "SOL/USD must match a case-insensitive query"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| !r["value"].as_str().unwrap().is_empty()),
+            "every result must carry the value create_scenario expects"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_truncates_at_max_results_and_reports_the_full_total() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .search_constant_options(search("pyth-price-feed-v2", Some("price_feed"), ""))
+            .await
+            .unwrap();
+
+        let payload = json_of(&result);
+        let returned = payload["results"].as_array().unwrap().len();
+        let total = payload["totalMatches"].as_u64().unwrap() as usize;
+        assert!(returned <= MAX_SEARCH_RESULTS);
+        assert_eq!(payload["truncated"].as_bool().unwrap(), total > returned);
+        assert!(
+            total > MAX_SEARCH_RESULTS,
+            "the pyth feed list is expected to exceed one page; if this fails the \
+             truncation branch is no longer covered"
+        );
+        assert_eq!(returned, MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
+    fn compact_template_json_never_inlines_constant_options() {
+        let registry = TemplateRegistry::new();
+        for template in registry.all() {
+            let json = compact_template_json(template);
+            for (name, constant) in json["constants"].as_object().unwrap() {
+                assert!(
+                    constant.get("options").is_none(),
+                    "constant {name} of template {} leaks inlined options",
+                    template.id
+                );
+                assert!(constant.get("optionsCount").is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_rejects_unknown_template_and_unknown_constant() {
+        let surfpool = Surfpool::new();
+
+        let unknown_template = surfpool
+            .search_constant_options(search("no-such-template", None, "x"))
+            .await
+            .unwrap();
+        assert_eq!(unknown_template.is_error, Some(true));
+
+        let unknown_constant = surfpool
+            .search_constant_options(search("pyth-price-feed-v2", Some("no-such-constant"), "x"))
+            .await
+            .unwrap();
+        assert_eq!(unknown_constant.is_error, Some(true));
     }
 }
