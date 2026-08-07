@@ -811,6 +811,30 @@
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
         },
         {
+          "method": "surfnet_timeTravel",
+          "description": "A cheat code to move the Surfnet clock forward. The clock only moves forward: a target in the past is rejected. Returns the epoch state after the jump.",
+          "params": [
+            {
+              "name": "config",
+              "type": "Option<TimeTravelConfig>",
+              "description": "One of {\"absoluteTimestamp\": <unix milliseconds>}, {\"absoluteSlot\": <slot>} or {\"absoluteEpoch\": <epoch>}. Note that absoluteTimestamp is in MILLISECONDS, while the Clock sysvar reports seconds. If omitted, jumps one hour ahead."
+            }
+          ],
+          "returns": "An `EpochInfo` object describing the clock after the jump."
+        },
+        {
+          "method": "surfnet_pauseClock",
+          "description": "A cheat code to freeze the Surfnet clock. Slot production and time progression halt until resumed. The paused state is not reported by any other method.",
+          "params": [],
+          "returns": "An `EpochInfo` object describing the clock at the moment of the pause. It carries no timestamp: read the Clock sysvar with getAccountInfo on SysvarC1ock11111111111111111111111111111111 (jsonParsed) for the simulated unix time."
+        },
+        {
+          "method": "surfnet_resumeClock",
+          "description": "A cheat code to resume Surfnet clock progression after a pause.",
+          "params": [],
+          "returns": "An `EpochInfo` object describing the clock after resuming."
+        },
+        {
           "method": "surfnet_registerScenario",
           "description": "A cheat code to register a scenario with account overrides.",
           "params": [
@@ -822,6 +846,7 @@
                 "id": "String (A unique identifier for the scenario)",
                 "name": "String (A Human-readable name for the scenario)",
                 "description": "String (A description of the scenario)",
+                "tags": "Vec<String> (Required. Tags for categorization; pass an empty array when unused)",
                 "overrides": {
                   "type": "array",
                   "description": "Array of OverrideInstance objects, each containing account overrides.",
@@ -836,7 +861,7 @@
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
-                      "account": "String (The account this override instance is applied to)"
+                      "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }
                 }
