@@ -412,7 +412,8 @@ impl Surfpool {
                     token_amount,
                     token_program_id,
                     token_symbol.clone(),
-                );
+                )
+                .await;
                 results.push(set_token_result);
             }
         }
@@ -489,7 +490,8 @@ impl Surfpool {
                     token_amount,
                     token_program_id,
                     token_symbol.clone(),
-                );
+                )
+                .await;
                 results.push(set_token_result);
             }
         }
@@ -533,13 +535,15 @@ impl Surfpool {
             "params": rpc_params
         });
 
-        // Make the RPC request to the surfnet RPC endpoint
-        let client = reqwest::blocking::Client::new();
+        // Async client: a blocking one inside this async tool can fail after the
+        // request has already reached the surfnet
+        let client = reqwest::Client::new();
         let http_response = match client
             .post(&surfnet_endpoint)
             .header("Content-Type", "application/json")
             .json(&rpc_request)
             .send()
+            .await
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -552,7 +556,7 @@ impl Surfpool {
             }
         };
 
-        let response_text = match http_response.text() {
+        let response_text = match http_response.text().await {
             Ok(text) => text,
             Err(e) => {
                 let response =
@@ -640,101 +644,107 @@ impl Surfpool {
         Parameters(mut scenario): Parameters<Scenario>,
     ) -> Result<CallToolResult, McpError> {
         // Validate all templateIds exist in the registry
-        let registry = self.template_registry.read().map_err(|_| {
-            use std::borrow::Cow;
-            McpError {
-                code: ErrorCode(-32603),
-                message: Cow::from("Failed to read template registry"),
-                data: None,
-            }
-        })?;
+        // The registry lock must not be held across the HTTP await below, so the
+        // validation runs in its own scope and only its outcome escapes
+        let validation_error: Option<String> = {
+            let registry = self.template_registry.read().map_err(|_| {
+                use std::borrow::Cow;
+                McpError {
+                    code: ErrorCode(-32603),
+                    message: Cow::from("Failed to read template registry"),
+                    data: None,
+                }
+            })?;
 
-        let mut invalid_templates: Vec<String> = Vec::new();
-        let mut validation_errors: Vec<String> = Vec::new();
+            let mut invalid_templates: Vec<String> = Vec::new();
+            let mut validation_errors: Vec<String> = Vec::new();
 
-        for override_instance in &mut scenario.overrides {
-            // Check if template exists
-            if !registry.contains(&override_instance.template_id) {
-                invalid_templates.push(override_instance.template_id.clone());
-                continue;
-            }
+            for override_instance in &mut scenario.overrides {
+                // Check if template exists
+                if !registry.contains(&override_instance.template_id) {
+                    invalid_templates.push(override_instance.template_id.clone());
+                    continue;
+                }
 
-            // Get the template for validation and normalization
-            if let Some(template) = registry.get(&override_instance.template_id) {
-                // Normalize: Extract values from malformed PDA seeds
-                // LLMs sometimes put values directly in seeds instead of in values map
-                if let surfpool_types::AccountAddress::Pda { seeds, .. } =
-                    &override_instance.account
-                {
-                    for seed in seeds {
-                        match seed {
-                            // If bytes32Ref contains a hex value (starts with 0x), extract it
-                            surfpool_types::PdaSeed::Bytes32Ref(value)
-                                if value.starts_with("0x") =>
-                            {
-                                // Find the corresponding property reference from template
-                                if let surfpool_types::AccountAddress::Pda {
-                                    seeds: template_seeds,
-                                    ..
-                                } = &template.address
+                // Get the template for validation and normalization
+                if let Some(template) = registry.get(&override_instance.template_id) {
+                    // Normalize: Extract values from malformed PDA seeds
+                    // LLMs sometimes put values directly in seeds instead of in values map
+                    if let surfpool_types::AccountAddress::Pda { seeds, .. } =
+                        &override_instance.account
+                    {
+                        for seed in seeds {
+                            match seed {
+                                // If bytes32Ref contains a hex value (starts with 0x), extract it
+                                surfpool_types::PdaSeed::Bytes32Ref(value)
+                                    if value.starts_with("0x") =>
                                 {
-                                    for template_seed in template_seeds.iter() {
-                                        if let surfpool_types::PdaSeed::Bytes32Ref(prop_name) =
-                                            template_seed
-                                        {
-                                            // The template has a property reference, but LLM put the value directly
-                                            // Add the value to the values map using the property name
-                                            if !override_instance.values.contains_key(prop_name) {
-                                                override_instance.values.insert(
-                                                    prop_name.clone(),
-                                                    serde_json::Value::String(value.clone()),
-                                                );
+                                    // Find the corresponding property reference from template
+                                    if let surfpool_types::AccountAddress::Pda {
+                                        seeds: template_seeds,
+                                        ..
+                                    } = &template.address
+                                    {
+                                        for template_seed in template_seeds.iter() {
+                                            if let surfpool_types::PdaSeed::Bytes32Ref(prop_name) =
+                                                template_seed
+                                            {
+                                                // The template has a property reference, but LLM put the value directly
+                                                // Add the value to the values map using the property name
+                                                if !override_instance.values.contains_key(prop_name)
+                                                {
+                                                    override_instance.values.insert(
+                                                        prop_name.clone(),
+                                                        serde_json::Value::String(value.clone()),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-                }
 
-                // PDA templates derive their account from template seeds plus values.
-                // Fixed-address templates may intentionally receive a caller-provided pubkey.
-                if matches!(
-                    &template.address,
-                    surfpool_types::AccountAddress::Pda { .. }
-                ) {
-                    override_instance.account = template.address.clone();
-                }
+                    // PDA templates derive their account from template seeds plus values.
+                    // Fixed-address templates may intentionally receive a caller-provided pubkey.
+                    if matches!(
+                        &template.address,
+                        surfpool_types::AccountAddress::Pda { .. }
+                    ) {
+                        override_instance.account = template.address.clone();
+                    }
 
-                // Validate constant_ref values against template constants
-                for prop in &template.properties {
-                    if prop.is_constant_ref() {
-                        if let Some(constant_name) = prop.constant_name() {
-                            if let Some(constant_def) = template.constants.get(constant_name) {
-                                // Check if the value exists in values map
-                                if let Some(value) = override_instance.values.get(&prop.path) {
-                                    if let Some(value_str) = value.as_str() {
-                                        // Validate the value is one of the valid options
-                                        let is_valid = constant_def.options.iter().any(|opt| {
-                                            opt.value.to_lowercase() == value_str.to_lowercase()
-                                        });
-                                        if !is_valid {
-                                            // Show only first 10 options to avoid overwhelming error messages
-                                            let sample_options: Vec<String> = constant_def
-                                                .options
-                                                .iter()
-                                                .take(10)
-                                                .map(|opt| format!("{}: {}", opt.label, opt.value))
-                                                .collect();
-                                            let total = constant_def.options.len();
-                                            let more_msg = if total > 10 {
-                                                format!(" (showing 10 of {} options)", total)
-                                            } else {
-                                                String::new()
-                                            };
-                                            validation_errors.push(format!(
+                    // Validate constant_ref values against template constants
+                    for prop in &template.properties {
+                        if prop.is_constant_ref() {
+                            if let Some(constant_name) = prop.constant_name() {
+                                if let Some(constant_def) = template.constants.get(constant_name) {
+                                    // Check if the value exists in values map
+                                    if let Some(value) = override_instance.values.get(&prop.path) {
+                                        if let Some(value_str) = value.as_str() {
+                                            // Validate the value is one of the valid options
+                                            let is_valid = constant_def.options.iter().any(|opt| {
+                                                opt.value.to_lowercase() == value_str.to_lowercase()
+                                            });
+                                            if !is_valid {
+                                                // Show only first 10 options to avoid overwhelming error messages
+                                                let sample_options: Vec<String> = constant_def
+                                                    .options
+                                                    .iter()
+                                                    .take(10)
+                                                    .map(|opt| {
+                                                        format!("{}: {}", opt.label, opt.value)
+                                                    })
+                                                    .collect();
+                                                let total = constant_def.options.len();
+                                                let more_msg = if total > 10 {
+                                                    format!(" (showing 10 of {} options)", total)
+                                                } else {
+                                                    String::new()
+                                                };
+                                                validation_errors.push(format!(
                                                 "Override '{}' (template '{}'): Invalid value '{}' for '{}' (constant: '{}'). Valid options{}:\n  {}",
                                                 override_instance.id,
                                                 override_instance.template_id,
@@ -744,17 +754,17 @@ impl Surfpool {
                                                 more_msg,
                                                 sample_options.join("\n  ")
                                             ));
+                                            }
                                         }
-                                    }
-                                } else {
-                                    // Value is missing - required for PDA derivation
-                                    let valid_options: Vec<String> = constant_def
-                                        .options
-                                        .iter()
-                                        .take(5) // Show first 5 options
-                                        .map(|opt| format!("{}: {}", opt.label, opt.value))
-                                        .collect();
-                                    validation_errors.push(format!(
+                                    } else {
+                                        // Value is missing - required for PDA derivation
+                                        let valid_options: Vec<String> = constant_def
+                                            .options
+                                            .iter()
+                                            .take(5) // Show first 5 options
+                                            .map(|opt| format!("{}: {}", opt.label, opt.value))
+                                            .collect();
+                                        validation_errors.push(format!(
                                         "Override '{}' (template '{}'): Missing required value for '{}' (constant: '{}', used in PDA derivation). Add it to values. Example options:\n  {}",
                                         override_instance.id,
                                         override_instance.template_id,
@@ -762,34 +772,35 @@ impl Surfpool {
                                         constant_name,
                                         valid_options.join("\n  ")
                                     ));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        if !invalid_templates.is_empty() {
-            let valid_ids: Vec<String> = registry.list_ids();
-            let response = RegisterScenarioResponse::error(format!(
-                "Invalid templateId(s): {:?}. You MUST use templateIds from get_override_templates. Valid IDs are: {:?}",
-                invalid_templates, valid_ids
-            ));
+            if !invalid_templates.is_empty() {
+                let valid_ids: Vec<String> = registry.list_ids();
+                Some(format!(
+                    "Invalid templateId(s): {:?}. You MUST use templateIds from get_override_templates. Valid IDs are: {:?}",
+                    invalid_templates, valid_ids
+                ))
+            } else if !validation_errors.is_empty() {
+                Some(format!(
+                    "Validation errors:\n{}",
+                    validation_errors.join("\n")
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some(message) = validation_error {
+            let response = RegisterScenarioResponse::error(message);
             let json_str = serde_json::to_string(&response).unwrap_or_default();
             return Ok(CallToolResult::success(vec![Content::text(json_str)]));
         }
-
-        if !validation_errors.is_empty() {
-            let response = RegisterScenarioResponse::error(format!(
-                "Validation errors:\n{}",
-                validation_errors.join("\n")
-            ));
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-        }
-
-        drop(registry);
 
         let load_scenarios_endpoint = format!(
             "http://127.0.0.1:{}/v1/scenarios",
@@ -797,13 +808,13 @@ impl Surfpool {
         );
         let payload = serde_json::json!(scenario);
 
-        // Make the RPC request to the surfnet RPC endpoint
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let http_response = match client
             .post(&load_scenarios_endpoint)
             .header("Content-Type", "application/json")
             .json(&payload)
             .send()
+            .await
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -816,7 +827,9 @@ impl Surfpool {
             }
         };
 
-        let response_text = match http_response.text() {
+        let status = http_response.status();
+
+        let response_text = match http_response.text().await {
             Ok(text) => text,
             Err(e) => {
                 let response =
@@ -837,6 +850,17 @@ impl Surfpool {
                 return Ok(CallToolResult::success(vec![Content::text(json_str)]));
             }
         };
+
+        // A different scenario already occupies this id: say so instead of
+        // reporting a success the model would trust
+        if status == reqwest::StatusCode::CONFLICT {
+            let response = RegisterScenarioResponse::error(format!(
+                "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
+                scenario.id
+            ));
+            let json_str = serde_json::to_string(&response).unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+        }
 
         if let Some(error) = rpc_response.get("error") {
             let response = RegisterScenarioResponse::error(format!("RPC error: {}", error));
