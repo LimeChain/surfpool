@@ -182,7 +182,148 @@ impl TemplateRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, str::FromStr};
+
+    use solana_pubkey::Pubkey;
+    use surfpool_types::{AccountAddress, PdaSeed};
+
     use super::*;
+
+    #[test]
+    fn raydium_config_index_options_derive_their_documented_address() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("raydium-clmm-custom").expect("template");
+
+        let AccountAddress::Pda { seeds, .. } = &template.address else {
+            panic!("the pool address is a PDA");
+        };
+        let derived_pda_seed = seeds
+            .iter()
+            .find(|seed| matches!(seed, PdaSeed::DerivedPda { .. }))
+            .expect("the pool PDA derives the amm config PDA");
+
+        let options = &template
+            .constants
+            .get("amm_config_index")
+            .expect("amm_config_index constant")
+            .options;
+        assert!(!options.is_empty(), "the fee tiers are the fixture here");
+
+        for option in options {
+            let expected = option
+                .metadata
+                .get("derived_address")
+                .and_then(|address| address.as_str())
+                .map(|address| Pubkey::from_str(address).expect("a valid address"))
+                .unwrap_or_else(|| panic!("option {} documents no derived_address", option.id));
+
+            let values = HashMap::from([(
+                "config_index".to_string(),
+                serde_json::Value::String(option.value.clone()),
+            )]);
+            let bytes = derived_pda_seed
+                .to_bytes(Some(&values))
+                .unwrap_or_else(|| panic!("option {} did not resolve", option.id));
+
+            assert_eq!(
+                Pubkey::try_from(bytes.as_slice()).expect("32 bytes"),
+                expected,
+                "option {}",
+                option.id
+            );
+        }
+    }
+
+    /// The expected address is not ours: SOL/USDC at fee tier 1 holds a live CLMM
+    /// PoolState on mainnet (owner CAMMCzo5…, discriminator 247 237 227 245 215 195 222 70),
+    /// so this pins the whole chain — catalogue value, config PDA, pool PDA — against
+    /// something outside the fixtures. Mint order is part of the recipe: Raydium expects
+    /// the lower mint first, and the reversed order derives an address that holds nothing.
+    #[test]
+    fn raydium_template_derives_the_live_sol_usdc_pool() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("raydium-clmm-custom").expect("template");
+        let sol = "So11111111111111111111111111111111111111112";
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+        let values = |mint_0: &str, mint_1: &str| {
+            HashMap::from([
+                (
+                    "config_index".to_string(),
+                    serde_json::Value::String("1".to_string()),
+                ),
+                (
+                    "token_mint_0".to_string(),
+                    serde_json::Value::String(mint_0.to_string()),
+                ),
+                (
+                    "token_mint_1".to_string(),
+                    serde_json::Value::String(mint_1.to_string()),
+                ),
+            ])
+        };
+
+        assert_eq!(
+            template
+                .address
+                .resolve(Some(&values(sol, usdc)))
+                .expect("resolves"),
+            Pubkey::from_str("3tD34VtprDSkYCnATtQLCiVgTkECU3d12KtjupeR6N2X").expect("address"),
+        );
+
+        assert_ne!(
+            template
+                .address
+                .resolve(Some(&values(usdc, sol)))
+                .expect("resolves"),
+            Pubkey::from_str("3tD34VtprDSkYCnATtQLCiVgTkECU3d12KtjupeR6N2X").expect("address"),
+            "swapping the mints must not land on the same pool"
+        );
+    }
+
+    #[test]
+    fn raydium_pool_address_needs_every_seed_to_resolve() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("raydium-clmm-custom").expect("template");
+
+        let mints: Vec<String> = template
+            .constants
+            .get("token_mint")
+            .expect("token_mint constant")
+            .options
+            .iter()
+            .take(2)
+            .map(|option| option.value.clone())
+            .collect();
+        assert_eq!(mints.len(), 2, "the pool address needs two mints");
+
+        let mut values = HashMap::from([
+            (
+                "config_index".to_string(),
+                serde_json::Value::String("1".to_string()),
+            ),
+            (
+                "token_mint_0".to_string(),
+                serde_json::Value::String(mints[0].clone()),
+            ),
+            (
+                "token_mint_1".to_string(),
+                serde_json::Value::String(mints[1].clone()),
+            ),
+        ]);
+
+        assert!(
+            template.address.resolve(Some(&values)).is_some(),
+            "every seed resolves, so the pool address does too"
+        );
+
+        values.remove("config_index");
+        assert_eq!(
+            template.address.resolve(Some(&values)),
+            None,
+            "a seed that cannot resolve must not derive a shorter address"
+        );
+    }
 
     #[test]
     fn test_registry_loads_all_protocols() {

@@ -735,12 +735,15 @@ pub trait SurfnetCheatcodes {
         limit: Option<u64>,
     ) -> BoxFuture<Result<RpcResponse<Vec<RpcLogsResponse>>>>;
 
-    /// A cheat code to jump forward or backward in time on the local network.
+    /// A cheat code to jump forward in time on the local network. The clock only moves
+    /// forward: a target in the past is rejected.
     /// Useful for testing epoch-based or time-sensitive logic.
     ///
     /// ## Parameters
     /// - `config` (optional): A `TimeTravelConfig` specifying how to modify the clock:
-    ///   - `absoluteTimestamp(u64)`: Moves time to the specified UNIX timestamp.
+    ///   - `absoluteTimestamp(u64)`: Moves time to the specified UNIX timestamp in
+    ///     **milliseconds** (like JavaScript `Date.now()`). Note that the `Clock` sysvar
+    ///     programs read is in seconds, so a value taken from it must be multiplied by 1000.
     ///   - `absoluteSlot(u64)`: Moves to the specified absolute slot.
     ///   - `absoluteEpoch(u64)`: Advances time to the specified epoch (each epoch = 432,000 slots).
     ///
@@ -763,11 +766,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
@@ -800,11 +803,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
@@ -836,11 +839,11 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "result": {
     ///     "epoch": 512,
-    ///     "slot_index": 0,
-    ///     "slots_in_epoch": 432000,
-    ///     "absolute_slot": 221184000,
-    ///     "block_height": 650000000,
-    ///     "transaction_count": 923472834
+    ///     "slotIndex": 0,
+    ///     "slotsInEpoch": 432000,
+    ///     "absoluteSlot": 221184000,
+    ///     "blockHeight": 650000000,
+    ///     "transactionCount": 923472834
     ///   },
     ///   "id": 1
     /// }
