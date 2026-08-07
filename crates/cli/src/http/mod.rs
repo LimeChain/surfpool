@@ -183,6 +183,36 @@ async fn post_scenarios(
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
     let scenario_data = scenario.into_inner();
     let scenario_id = scenario_data.id.clone();
+
+    if let Some(existing) = loaded_scenarios
+        .scenarios
+        .iter()
+        .find(|s| s.id == scenario_id)
+    {
+        let identical = match (
+            serde_json::to_value(existing),
+            serde_json::to_value(&scenario_data),
+        ) {
+            (Ok(stored), Ok(incoming)) => stored == incoming,
+            _ => false,
+        };
+
+        if identical {
+            let response = serde_json::json!({"id": scenario_id});
+            return Ok(HttpResponse::Ok()
+                .content_type("application/json")
+                .body(response.to_string()));
+        }
+
+        let response = serde_json::json!({
+            "error": "a different scenario is already stored under this id",
+            "id": scenario_id,
+        });
+        return Ok(HttpResponse::Conflict()
+            .content_type("application/json")
+            .body(response.to_string()));
+    }
+
     loaded_scenarios.scenarios.push(scenario_data);
     let response = serde_json::json!({"id": scenario_id});
     Ok(HttpResponse::Ok()
@@ -286,6 +316,55 @@ mod tests {
     use actix_web::{App, test};
 
     use super::*;
+
+    #[actix_web::test]
+    async fn creating_the_same_scenario_twice_is_a_no_op_and_a_reused_id_conflicts() {
+        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(loaded_scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let scenario = serde_json::json!({
+            "id": "s1",
+            "name": "first",
+            "description": "",
+            "overrides": [],
+            "tags": [],
+        });
+
+        let post = |body: serde_json::Value| {
+            test::TestRequest::post()
+                .uri("/v1/scenarios")
+                .set_json(body)
+                .to_request()
+        };
+
+        let created = test::call_service(&app, post(scenario.clone())).await;
+        assert_eq!(created.status(), 200, "first create must succeed");
+
+        let retried = test::call_service(&app, post(scenario.clone())).await;
+        assert_eq!(
+            retried.status(),
+            200,
+            "an identical retry must be accepted as a no-op"
+        );
+
+        let mut conflicting = scenario.clone();
+        conflicting["name"] = serde_json::json!("second");
+        let rejected = test::call_service(&app, post(conflicting)).await;
+        assert_eq!(
+            rejected.status(),
+            409,
+            "different content under a taken id must conflict"
+        );
+
+        let stored = &loaded_scenarios.read().unwrap().scenarios;
+        assert_eq!(stored.len(), 1, "no duplicate may be stored");
+        assert_eq!(stored[0].name, "first", "the stored scenario is untouched");
+    }
 
     #[actix_web::test]
     async fn unknown_v1_paths_return_json_404_instead_of_spa_fallback() {
