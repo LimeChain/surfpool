@@ -1,0 +1,139 @@
+protocol: PumpSwap
+version: v1
+account_type: Pool
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - constant-product
+  - defi
+
+constants:
+  # Token mints loaded from verified tokens registry
+  token_mint:
+    label: Token
+    description: Select the base token mint (the pump.fun coin) from verified tokens
+    source: verified_tokens
+    address_suffix: pump
+
+templates:
+  - id: pump-amm-pool-state
+    name: Override Pool State
+    description: Override any PumpSwap pool by specifying its address directly
+    idl_account_name: Pool
+    properties: ["lp_supply", "coin_creator", "virtual_quote_reserves"]
+    address:
+      type: pubkey
+
+  - id: pump-amm-canonical-pool
+    name: Override Canonical Pool (Custom)
+    description: |
+      Override the canonical PumpSwap pool of a migrated pump.fun coin by specifying its mint.
+      Covers WSOL-quoted canonical migrations only; for any other pool pass its address to
+      pump-amm-pool-state. Two PDAs are derived:
+      - Pool authority (Pump program): ["pool-authority", base_mint]
+      - Pool (PumpSwap): ["pool", index 0 as u16 LE, pool_authority, base_mint, WSOL]
+    idl_account_name: Pool
+    properties:
+      - path: lp_supply
+        label: LP Supply
+        description: Total LP token supply before user burns and lock-ups
+      - path: coin_creator
+        label: Coin Creator
+        description: Pubkey accruing the coin-creator fee for this pool
+      - path: virtual_quote_reserves
+        label: Virtual Quote Reserves
+        description: Appended quote reserves added to the quote vault balance when quoting (0 on all pools today)
+      - path: base_mint
+        type: constant_ref
+        label: Base Token Mint
+        constant: token_mint
+    llm_context: |
+      Set fetchBeforeUse: true so the fields you don't override keep their live values.
+      Use false only for a later override that builds on state an earlier one prepared in
+      the same scenario.
+
+      WORKS ONLY FOR MIGRATED PUMP.FUN COINS. Coins that completed before PumpSwap
+      launched (March 2025) migrated to Raydium and have no canonical pool. The
+      canonical pool (index 0) is created by the Pump program's migrate instruction: its creator seed is the Pump program's
+      pool-authority PDA ["pool-authority", base_mint] and its quote mint is always
+      wrapped SOL — this template cannot derive pools quoted in any other mint. Pools
+      created directly by users carry the creator's own pubkey and possibly a different
+      index — override those (and any non-WSOL pool) with the pump-amm-pool-state
+      template by passing the pool address directly.
+
+      PRICING: PumpSwap is a constant-product AMM whose reserves live in the pool's token
+      accounts, NOT in the Pool account:
+      - price = effective_quote_reserves / base_vault_balance (coin has 6 decimals, SOL 9)
+      - effective_quote_reserves = pool_quote_token_account balance + Pool.virtual_quote_reserves
+
+      TO SIMULATE PRICE CHANGES either:
+      1. modify the vault token balances with the spl-token template — the vault addresses
+         are stored in the Pool account's pool_base_token_account and
+         pool_quote_token_account fields, or
+      2. set virtual_quote_reserves on this Pool account — it shifts the effective quote
+         reserves without touching any token balance.
+
+      EXAMPLE - "make a migrated coin ~10x more expensive to buy": read the pool's quote
+      vault balance Q (getTokenAccountBalance on pool_quote_token_account), then one
+      override at slot 0, fetchBeforeUse: true, values =
+        base_mint: <the migrated pump.fun mint>
+        virtual_quote_reserves: <9 * Q>
+      Effective quote reserves become Q + 9*Q = 10*Q, so the same buy costs about 10x
+      what it did before, and a buy sized to the old price fails with ExceededSlippage
+      (0x1774). Use spl-token on the vaults instead when you want the balances, not just
+      the quote, to move.
+
+      FEES per swap: trades read the fee program's FeeConfig market-cap fee tiers — a
+      required account of every buy and sell; GlobalConfig's flat lp_fee_basis_points +
+      protocol_fee_basis_points + coin_creator_fee_basis_points are legacy fields from
+      before the external fee program.
+    address:
+      type: pda
+      program_id: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+      seeds:
+        - type: string
+          value: pool
+        - type: u16_le
+          value: 0
+        - type: derived_pda
+          program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+          seeds:
+            - type: string
+              value: pool-authority
+            - type: property_ref
+              value: base_mint
+        - type: property_ref
+          value: base_mint
+        - type: pubkey
+          value: So11111111111111111111111111111111111111112
+
+  - id: pump-amm-global-config
+    name: Override Global Config
+    description: |
+      Override the PumpSwap program's single GlobalConfig account
+      (PDA derived from ["global_config"], resolving to ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw).
+    idl_account_name: GlobalConfig
+    properties:
+      [
+        "lp_fee_basis_points",
+        "protocol_fee_basis_points",
+        "coin_creator_fee_basis_points",
+        "disable_flags",
+      ]
+    llm_context: |
+      Set fetchBeforeUse: true so GlobalConfig's admin and protocol fee recipient list keep
+      their live values; false only to build on an earlier override's prepared state.
+
+      lp_fee_basis_points, protocol_fee_basis_points and coin_creator_fee_basis_points
+      are legacy fields from before the external fee program (deposits and withdrawals
+      are free); trades read fees from the fee program's FeeConfig market-cap fee tiers
+      — a required account of every buy and sell. coin_creator_fee_basis_points accrues
+      to each pool's coin_creator. disable_flags is a bitmask disabling individual
+      instructions (0 = everything enabled).
+    address:
+      type: pda
+      program_id: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+      seeds:
+        - type: string
+          value: global_config
