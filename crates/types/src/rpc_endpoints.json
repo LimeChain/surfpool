@@ -651,7 +651,7 @@
                 "lamports": "Option<u64>",
                 "owner": "Option<string> (base-58 encoded pubkey)",
                 "executable": "Option<bool>",
-                "rent_epoch": "Option<u64>",
+                "rentEpoch": "Option<u64>",
                 "data": "Option<string> (hex encoded)"
               }
             }
@@ -693,8 +693,8 @@
                 "amount": "Option<u64>",
                 "delegate": "Option<SetSomeAccount>",
                 "state": "Option<string> ('uninitialized', 'frozen', 'initialized')",
-                "delegated_amount": "Option<u64>",
-                "close_authority": "Option<SetSomeAccount>",
+                "delegatedAmount": "Option<u64>",
+                "closeAuthority": "Option<SetSomeAccount>",
                 "confidential": "Option<ConfidentialTransferAccountUpdate> (Token-2022 only; configures the confidential-transfer extension. Fields: elgamalPubkey (string, 32 bytes base58/base64, required), aesKey (string, 16 bytes base58/base64, required — produces the owner-decryptable balance, encrypt(0) for a zero balance), amount (Option<u64>, default 0), approved (Option<bool>, default true), allowConfidentialCredits (Option<bool>, default true), allowNonConfidentialCredits (Option<bool>, default true), maximumPendingBalanceCreditCounter (Option<u64>, default 65536))"
               }
             },
@@ -811,6 +811,30 @@
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
         },
         {
+          "method": "surfnet_timeTravel",
+          "description": "A cheat code to move the Surfnet clock forward. The clock only moves forward: a target in the past is rejected. Returns the epoch state after the jump.",
+          "params": [
+            {
+              "name": "config",
+              "type": "Option<TimeTravelConfig>",
+              "description": "One of {\"absoluteTimestamp\": <unix milliseconds>}, {\"absoluteSlot\": <slot>} or {\"absoluteEpoch\": <epoch>}. Note that absoluteTimestamp is in MILLISECONDS, while the Clock sysvar reports seconds. If omitted, jumps one hour ahead."
+            }
+          ],
+          "returns": "An `EpochInfo` object describing the clock after the jump."
+        },
+        {
+          "method": "surfnet_pauseClock",
+          "description": "A cheat code to freeze the Surfnet clock. Slot production and time progression halt until resumed. The paused state is not reported by any other method.",
+          "params": [],
+          "returns": "An `EpochInfo` object describing the clock at the moment of the pause. It carries no timestamp: read the Clock sysvar with getAccountInfo on SysvarC1ock11111111111111111111111111111111 (jsonParsed) for the simulated unix time."
+        },
+        {
+          "method": "surfnet_resumeClock",
+          "description": "A cheat code to resume Surfnet clock progression after a pause.",
+          "params": [],
+          "returns": "An `EpochInfo` object describing the clock after resuming."
+        },
+        {
           "method": "surfnet_registerScenario",
           "description": "A cheat code to register a scenario with account overrides.",
           "params": [
@@ -822,6 +846,7 @@
                 "id": "String (A unique identifier for the scenario)",
                 "name": "String (A Human-readable name for the scenario)",
                 "description": "String (A description of the scenario)",
+                "tags": "Vec<String> (Required. Tags for categorization; pass an empty array when unused)",
                 "overrides": {
                   "type": "array",
                   "description": "Array of OverrideInstance objects, each containing account overrides.",
@@ -830,13 +855,13 @@
                     "description": "An OverrideInstance object.",
                     "schema": {
                       "id": "String (A unique identifier for this override instance)",
-                      "template_id": "String (The identifier of the template this instance is based on)",
+                      "templateId": "String (The identifier of the template this instance is based on)",
                       "values": "HashMap<String, serde_json::Value> (A hash map of field paths to override values. The field paths are a flat map to the account key being updated, from the IDL, using dot-notation to provide the path to the key. For example, to override a field 'amount' in an account 'myAccount', the path would be 'myAccount.amount'.)",
-                      "scenario_relative_slot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
+                      "scenarioRelativeSlot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
-                      "fetch_before_use": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
-                      "account": "String (The account this override instance is applied to)"
+                      "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
+                      "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }
                 }
