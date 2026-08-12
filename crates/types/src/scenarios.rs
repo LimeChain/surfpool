@@ -390,6 +390,8 @@ pub struct OverrideTemplate {
     /// Account type name from the IDL (e.g., "PriceAccount")
     /// This specifies which account struct in the IDL to use
     pub account_type: String,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     /// List of editable properties with full metadata
     pub properties: Vec<Property>,
     /// Protocol-specific constants (e.g., AMM configs, well-known tokens)
@@ -422,6 +424,7 @@ impl OverrideTemplate {
             idl,
             address,
             account_type,
+            write_mode: OverrideWriteMode::default(),
             properties,
             constants: HashMap::new(),
             tags: Vec::new(),
@@ -459,6 +462,15 @@ impl OverrideTemplate {
     pub fn property_paths(&self) -> Vec<&str> {
         self.properties.iter().map(|p| p.path.as_str()).collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideWriteMode {
+    #[default]
+    Idl,
+    #[serde(rename = "token_2022_account_amount")]
+    Token2022AccountAmount,
 }
 
 /// A concrete instance of an override template with specific values
@@ -626,6 +638,8 @@ pub struct YamlOverrideTemplateFile {
     pub version: String,
     pub account_type: String,
     #[serde(default)]
+    pub write_mode: OverrideWriteMode,
+    #[serde(default)]
     pub properties: Vec<YamlProperty>,
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
@@ -649,6 +663,7 @@ impl YamlOverrideTemplateFile {
             idl,
             address: self.address.into(),
             account_type: self.account_type,
+            write_mode: self.write_mode,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
                 .constants
@@ -932,6 +947,8 @@ pub struct YamlOverrideTemplateEntry {
     /// Account type name from the IDL (overrides collection-level account_type)
     #[serde(default)]
     pub idl_account_name: Option<String>,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     /// Properties with full metadata
     #[serde(default)]
     pub properties: Vec<YamlProperty>,
@@ -965,6 +982,7 @@ impl YamlOverrideTemplateCollection {
                 account_type: entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone()),
+                write_mode: entry.write_mode,
                 properties: entry.properties.into_iter().map(Into::into).collect(),
                 constants: constants.clone(),
                 tags: self.tags.clone(),
@@ -984,6 +1002,8 @@ pub struct YamlOverrideTemplate {
     pub protocol: String,
     pub version: String,
     pub account_type: String,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     pub idl: Idl,
     pub address: YamlAccountAddress,
     #[serde(default)]
@@ -1008,6 +1028,7 @@ impl YamlOverrideTemplate {
             idl: self.idl,
             address: self.address.into(),
             account_type: self.account_type,
+            write_mode: self.write_mode,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
                 .constants
