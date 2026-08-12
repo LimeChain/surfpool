@@ -8,6 +8,13 @@ tags:
   - vault
   - balance
 
+constants:
+  pump_token_mint:
+    label: Pump Token
+    description: Select a pump.fun token or enter a validated Token-2022 mint
+    source: verified_tokens
+    address_suffix: pump
+
 templates:
   - id: spl-token-account-balance
     name: Override Token Account Balance
@@ -40,3 +47,37 @@ templates:
     properties: ["supply"]
     address:
       type: pubkey
+
+  - id: pump-token-2022-curve-balance
+    name: Override Pump Token-2022 Curve Balance
+    description: Override the Token-2022 base-token vault belonging to a pump.fun bonding curve.
+    idl_account_name: TokenAccount
+    write_mode: token_2022_account_amount
+    properties:
+      - path: amount
+        label: Curve Vault Amount
+        description: Base tokens held by the curve, including the reserve retained for migration
+      - path: token_mint
+        type: constant_ref
+        label: Pump Token Mint
+        constant: pump_token_mint
+    llm_context: |
+      Use this together with pump-bonding-curve-custom when preparing a Token-2022
+      pump.fun coin near graduation. The amount must equal the new real_token_reserves
+      plus the coin's existing migration reserve. Never set it to real_token_reserves alone.
+      Set fetchBeforeUse: true so Token-2022 extensions remain intact.
+    address:
+      type: pda
+      program_id: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+      seeds:
+        - type: derived_pda
+          program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+          seeds:
+            - type: string
+              value: bonding-curve
+            - type: property_ref
+              value: token_mint
+        - type: pubkey
+          value: TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+        - type: property_ref
+          value: token_mint

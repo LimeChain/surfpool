@@ -238,6 +238,15 @@ pub enum GetAccountResult {
 }
 
 impl GetAccountResult {
+    pub fn account(&self) -> Option<&Account> {
+        match self {
+            Self::None(_) => None,
+            Self::FoundAccount(_, account, _)
+            | Self::FoundProgramAccount((_, account), _)
+            | Self::FoundTokenAccount((_, account), _) => Some(account),
+        }
+    }
+
     pub fn expected_data(&self) -> &Vec<u8> {
         match &self {
             Self::None(_) => unreachable!(),

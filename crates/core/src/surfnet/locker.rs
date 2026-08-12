@@ -4426,7 +4426,7 @@ mod tests {
     use std::collections::HashMap;
 
     use solana_account::Account;
-    use solana_account_decoder::UiAccountEncoding;
+    use solana_account_decoder::{UiAccountEncoding, encode_ui_account};
     use solana_epoch_schedule::EpochSchedule;
     use solana_transaction_status::TransactionStatusMeta;
 
@@ -4489,6 +4489,138 @@ mod tests {
         instance.fetch_before_use = true;
         scenario.add_override(instance);
         (scenario, pda)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_patches_only_the_pump_token_2022_vault_amount() {
+        let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
+            serde_json::from_str(include_str!(
+                "../tests/assets/pump_token2022_graduation.snapshot.json"
+            ))
+            .unwrap();
+        let expected_vault = Pubkey::from_str_const("9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh");
+        let base = snapshot[&expected_vault.to_string()]
+            .as_ref()
+            .unwrap()
+            .to_account()
+            .unwrap();
+        let values = HashMap::from([
+            (
+                "token_mint".to_string(),
+                serde_json::json!("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump"),
+            ),
+            ("amount".to_string(), serde_json::json!(216_645_197_009u64)),
+        ]);
+        let (scenario, derived_vault) =
+            pump_override_scenario("pump-token-2022-curve-balance", &values);
+        assert_eq!(derived_vault, expected_vault);
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        locker.with_svm_writer(|svm_writer| {
+            svm_writer
+                .set_account(&derived_vault, base.clone())
+                .unwrap();
+        });
+        locker.register_scenario(scenario, Some(100)).unwrap();
+        locker
+            .materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let after = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&derived_vault))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.data.len(), 170);
+        assert_eq!(&after.data[64..72], &216_645_197_009u64.to_le_bytes());
+        assert_eq!(&after.data[..64], &base.data[..64]);
+        assert_eq!(&after.data[72..], &base.data[72..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_before_use_materializes_a_remote_token_2022_vault() {
+        let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
+            serde_json::from_str(include_str!(
+                "../tests/assets/pump_token2022_graduation.snapshot.json"
+            ))
+            .unwrap();
+        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
+        let vault = Pubkey::from_str_const("9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh");
+        let mint_account = snapshot[&mint.to_string()]
+            .as_ref()
+            .unwrap()
+            .to_account()
+            .unwrap();
+        let vault_account = snapshot[&vault.to_string()]
+            .as_ref()
+            .unwrap()
+            .to_account()
+            .unwrap();
+        let accounts = Arc::new(HashMap::from([
+            (mint.to_string(), (mint, mint_account)),
+            (vault.to_string(), (vault, vault_account.clone())),
+        ]));
+        let mut io = jsonrpc_core::IoHandler::new();
+        io.add_sync_method("getAccountInfo", move |params: jsonrpc_core::Params| {
+            let params: Vec<serde_json::Value> = params.parse()?;
+            let address = params.first().and_then(serde_json::Value::as_str).unwrap();
+            let value = accounts.get(address).map(|(pubkey, account)| {
+                encode_ui_account(pubkey, account, UiAccountEncoding::Base64, None, None)
+            });
+            Ok(serde_json::json!({
+                "context": { "slot": 1 },
+                "value": value,
+            }))
+        });
+        let server = tokio::task::spawn_blocking(move || {
+            jsonrpc_http_server::ServerBuilder::new(io)
+                .start_http(&"127.0.0.1:0".parse().unwrap())
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let remote_client = SurfnetRemoteClient::new(format!("http://{}", server.address()));
+        let remote_result = remote_client
+            .get_account(&vault, CommitmentConfig::confirmed())
+            .await
+            .unwrap();
+        assert!(matches!(
+            remote_result,
+            GetAccountResult::FoundTokenAccount(..)
+        ));
+
+        let values = HashMap::from([
+            (
+                "token_mint".to_string(),
+                serde_json::json!(mint.to_string()),
+            ),
+            ("amount".to_string(), serde_json::json!(216_645_197_009u64)),
+        ]);
+        let (scenario, derived_vault) =
+            pump_override_scenario("pump-token-2022-curve-balance", &values);
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        locker.register_scenario(scenario, Some(100)).unwrap();
+        locker
+            .materialize_overrides_for_slot(
+                &Some((remote_client, CommitmentConfig::confirmed())),
+                100,
+            )
+            .await
+            .unwrap();
+
+        let after = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&derived_vault))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.data.len(), 170);
+        assert_eq!(&after.data[64..72], &216_645_197_009u64.to_le_bytes());
+        assert_eq!(&after.data[..64], &vault_account.data[..64]);
+        assert_eq!(&after.data[72..], &vault_account.data[72..]);
+        tokio::task::spawn_blocking(move || server.close())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5607,6 +5739,71 @@ mod tests {
         assert_eq!(account.owner, owner);
         assert_eq!(account.data, data);
         assert!(!account.executable);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_pump_token2022_graduation_snapshot_loads_with_absent_accounts_offline() {
+        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
+            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
+        )
+        .expect("graduation snapshot should deserialize (camelCase fields)");
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        locker
+            .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
+            .await
+            .unwrap();
+
+        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
+        let curve = Pubkey::from_str_const("GBpTHrtF8dGwxC7thRD7T6VfGtbVYEabKkQ7k6g3u7QF");
+        let vault = Pubkey::from_str_const("9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh");
+        let pump_global = Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+        let amm_global_config =
+            Pubkey::from_str_const("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw");
+
+        for (label, pk) in [
+            ("mint", mint),
+            ("curve", curve),
+            ("vault", vault),
+            ("pump_global", pump_global),
+            ("amm_global_config", amm_global_config),
+        ] {
+            let account = locker
+                .with_svm_reader(|svm| svm.get_account(&pk))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{label} should load from the snapshot"));
+            assert!(
+                !account.data.is_empty(),
+                "{label} should carry its real data"
+            );
+        }
+
+        // pinned-empty: read as absent AND offline, so the fork never fetches them from mainnet
+        let pool = Pubkey::from_str_const("FFgT2bSo5xrGs5uHyRY7xztL8hntvwuswGM8iYLrdBgx");
+        let quote_vault = Pubkey::from_str_const("CyugdSkzUoF1srFgCJGuMaAGjCUQ8ys4ca8cqLkWPXFJ");
+        let sharing_config = Pubkey::from_str_const("3NFHbr82N29vRbNHewWuuBHcNzdNuSU6zUBJBaRBPqj8");
+        let assoc_creator_vault =
+            Pubkey::from_str_const("C7jfrHkdirzU8F5r1Z1BKacwmwEMgKmLn9Ct3nKpLzmA");
+
+        for (label, pk) in [
+            ("pool", pool),
+            ("quote_vault", quote_vault),
+            ("pump_sharing_config", sharing_config),
+            ("pump_assoc_creator_vault", assoc_creator_vault),
+        ] {
+            assert!(
+                locker
+                    .with_svm_reader(|svm| svm.get_account(&pk))
+                    .unwrap()
+                    .is_none(),
+                "the pinned-empty {label} should read as absent"
+            );
+            assert!(
+                locker.is_account_offline(&pk),
+                "the pinned-empty {label} must be recorded offline so it is never fetched from mainnet"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
