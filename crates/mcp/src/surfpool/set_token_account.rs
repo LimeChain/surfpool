@@ -1,4 +1,4 @@
-use reqwest::blocking::Client;
+use reqwest::Client;
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -163,7 +163,7 @@ impl SetTokenAccountsResponse {
 ///
 /// # Returns
 /// * `SetTokenAccountResponse`: Contains either details of the successful account update (including new wallet details if generated) or an error message.                             
-pub fn run(
+pub async fn run(
     surfnet_address: String,
     owner_seeded_account: SeededAccount,
     token_mint: Option<String>,
@@ -279,10 +279,10 @@ pub fn run(
         }
     };
 
-    match client.post(&rpc_url).json(&request_payload).send() {
+    match client.post(&rpc_url).json(&request_payload).send().await {
         Ok(response) => {
             if response.status().is_success() {
-                match response.json::<JsonRpcResponse<serde_json::Value>>() {
+                match response.json::<JsonRpcResponse<serde_json::Value>>().await {
                     Ok(rpc_response) => {
                         if let Some(err) = rpc_response.error {
                             return SetTokenAccountsResponse::error(format!(
@@ -347,11 +347,13 @@ pub fn run(
                     )),
                 }
             } else {
+                let status = response.status();
                 SetTokenAccountsResponse::error(format!(
                     "HTTP Error: {} - {}",
-                    response.status(),
+                    status,
                     response
                         .text()
+                        .await
                         .unwrap_or_else(|_| "<failed to read body>".to_string())
                 ))
             }
