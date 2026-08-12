@@ -28,6 +28,7 @@ use txtx_addon_kit::indexmap::IndexMap;
 use uuid::Uuid;
 
 use crate::DEFAULT_MAINNET_RPC_URL;
+pub use crate::startup::*;
 
 pub const DEFAULT_RPC_PORT: u16 = 8899;
 pub const DEFAULT_WS_PORT: u16 = 8900;
@@ -432,8 +433,24 @@ pub mod pubkey_option_account_map {
 
 #[derive(Debug)]
 pub enum SimnetEvent {
-    /// Surfnet is ready, with the initial count of processed transactions from storage
-    Ready(u64),
+    /// RPC servers are bound and stored transactions have been replayed
+    /// (the payload is their count).
+    ///
+    /// Public readiness is [`SurfnetStartupPhase::Ready`], observable via
+    /// `surfnet_getSurfnetInfo` or the startup watch channel. An external
+    /// planner (the CLI) leaves a whole clone-and-run window between the
+    /// two; [`StartupPlanner::Runloop`] seals the empty plan immediately
+    /// before this event, so they coincide.
+    CoreStarted(u64),
+    /// The startup machine accepted a transition, carrying the status it
+    /// produced. One event per accepted transition, in the order they were
+    /// applied, so readiness can be observed as a position in a sequence.
+    /// Rejections are not events: nothing
+    /// changed, and the caller already holds the [`StartupError`].
+    ///
+    /// The startup watch channel carries the same status but coalesces, so a
+    /// reader that wants every step reads it here.
+    StartupStatusChanged(SurfnetStartupStatus),
     Connected(String),
     Aborted(String),
     Shutdown,
@@ -568,6 +585,12 @@ pub enum SimnetCommand {
     UpdateInternalClock(Option<(Hash, String)>, Clock),
     UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
     UpdateBlockProductionMode(BlockProductionMode),
+    /// Executes a transaction. `sendTransaction` enqueues this on the same
+    /// channel as the startup commands below, so channel order decides which
+    /// accounts the transaction sees: enqueued before
+    /// `CompleteStartupTask(RemoteAccounts, ..)`, it runs against unhydrated
+    /// state. The readiness gate exists so clients wait for `Ready` rather
+    /// than race that window.
     ProcessTransaction(
         Option<(Hash, String)>,
         VersionedTransaction,
@@ -576,6 +599,25 @@ pub enum SimnetCommand {
         Option<bool>,
     ),
     Terminate(Option<(Hash, String)>),
+    /// Seals the startup plan. Once sealed, `Ready` is unreachable until
+    /// every declared task completes successfully; an unsealed plan can
+    /// never reach `Ready`.
+    ///
+    /// Carries a reply channel because the planner must not dispatch tasks
+    /// until the seal has been accepted. The remaining startup commands are
+    /// fire-and-forget because no caller decision depends on their outcome;
+    /// state-machine rejections are reported asynchronously as error events.
+    SealStartupPlan(Vec<SurfnetStartupTask>, Sender<Result<(), StartupError>>),
+    /// Reports a failure discovered while the plan was still unsealed
+    /// (project inspection failed); drives the phase to `Failed`.
+    FailStartupPlanning(String),
+    /// Marks a sealed task `Running`. The submitter sends this before
+    /// dispatching the task's work, on the same channel, so the transition
+    /// is applied first.
+    StartStartupTask(SurfnetStartupTask),
+    /// Reports a task's outcome, mapping `Ok`/`Err` onto
+    /// `Succeeded`/`Failed`.
+    CompleteStartupTask(SurfnetStartupTask, Result<(), String>),
     StartRunbookExecution(String),
     CompleteRunbookExecution(String, Option<Vec<String>>),
     FetchRemoteAccounts(Vec<Pubkey>, String),
@@ -614,6 +656,28 @@ pub struct SurfpoolConfig {
     pub subgraph: SubgraphConfig,
     pub studio: StudioConfig,
     pub plugin_config_path: Vec<PathBuf>,
+    #[serde(default)]
+    pub startup_planner: StartupPlanner,
+}
+
+/// Who seals the startup plan for this surfnet.
+///
+/// Sealing fixes the task list, and `Ready` is unreachable without it, so
+/// every surfnet needs exactly one sealer. The default hands that obligation
+/// to the runloop, so embedders with no startup tasks need not set it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StartupPlanner {
+    /// The runloop is the planner: it seals an empty plan itself, right
+    /// before announcing core start, so the surfnet becomes publicly ready
+    /// as soon as core startup completes.
+    #[default]
+    Runloop,
+    /// An external planner (the CLI) inspects the project and seals the plan
+    /// via [`SimnetCommand::SealStartupPlan`]; the runloop must not seal. If
+    /// the planner dies before sealing, the surfnet stays un-ready forever,
+    /// which is the safe direction.
+    External,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1372,12 +1436,17 @@ pub struct StreamedAccountInfo {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct GetSurfnetInfoResponse {
-    runbook_executions: Vec<RunbookExecutionStatusReport>,
-}
-impl GetSurfnetInfoResponse {
-    pub fn new(runbook_executions: Vec<RunbookExecutionStatusReport>) -> Self {
-        Self { runbook_executions }
-    }
+    pub runbook_executions: Vec<RunbookExecutionStatusReport>,
+    /// Kept out of the generated TypeScript bindings. `SurfnetStartupStatus`
+    /// serializes through a hand-written impl that flattens the sum type onto
+    /// `{ phase, planSealed, tasks, error }`, and ts-rs derives from the Rust
+    /// shape rather than from that impl, so exporting it would need a
+    /// hand-maintained `ts(type = ...)` mirroring the wire format in a second
+    /// place. TypeScript clients read readiness from `runbookExecutions`,
+    /// which is the compatibility path this field exists to make safe.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub startup: SurfnetStartupStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1427,6 +1496,7 @@ impl RunbookExecutionStatusReport {
         self.errors = error;
     }
 }
+
 /// WebSocket subscription counts
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct WsSubscriptions {
@@ -2064,5 +2134,20 @@ mod tests {
 
         let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
         assert!(!config.skip_blockhash_check);
+    }
+
+    // Configs written before the startup planner existed must keep working;
+    // the runloop-seals default is also the correct reading of them, since
+    // none of their writers seal a plan.
+    #[test]
+    fn test_surfpool_config_startup_planner_defaults_on_deserialize() {
+        let mut config_json = serde_json::to_value(SurfpoolConfig::default()).unwrap();
+        config_json
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_planner");
+
+        let config: SurfpoolConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.startup_planner, StartupPlanner::Runloop);
     }
 }

@@ -1190,7 +1190,19 @@ pub trait SurfnetCheatcodes {
     ///           "completedAt": 1758747828,
     ///           "runbookId": "deployment"
     ///         }
-    ///       ]
+    ///       ],
+    ///       "startup": {
+    ///         "phase": "ready",
+    ///         "planSealed": true,
+    ///         "tasks": [
+    ///           {
+    ///             "task": "remoteAccounts",
+    ///             "state": "succeeded",
+    ///             "error": null
+    ///           }
+    ///         ],
+    ///         "error": null
+    ///       }
     ///     }
     ///   },
     ///   "id": 1
@@ -2205,9 +2217,22 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     ) -> Result<RpcResponse<GetSurfnetInfoResponse>> {
         let svm_locker = meta.get_svm_locker()?;
         let runbook_executions = svm_locker.runbook_executions();
+        // Status and start time under one guard: the compat entry projected
+        // from them must be self-consistent within a response.
+        let (startup_status, started_at) = svm_locker.with_svm_reader(|svm_reader| {
+            let started_at = svm_reader
+                .start_time
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as u32)
+                .unwrap_or_default();
+            (svm_reader.startup_status().clone(), started_at)
+        });
+        let value =
+            GetSurfnetInfoResponse::with_startup(runbook_executions, startup_status, started_at);
+
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: GetSurfnetInfoResponse::new(runbook_executions),
+            value,
         })
     }
 
@@ -2400,6 +2425,50 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(&config).unwrap(), expected);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_readiness_answer_flips_when_the_plan_seals() {
+        let setup = TestSetup::new(SurfnetCheatcodesRpc::empty());
+
+        let before = setup
+            .rpc
+            .get_surfnet_info(Some(setup.context.clone()))
+            .expect("the surfnet should answer")
+            .value;
+        assert_eq!(
+            before.runbook_executions.len(),
+            1,
+            "an unsealed plan answers with exactly the synthetic entry"
+        );
+        let entry = &before.runbook_executions[0];
+        assert_eq!(
+            entry.runbook_id,
+            GetSurfnetInfoResponse::STARTUP_COMPAT_RUNBOOK_ID,
+            "the outstanding work a poller sees is the startup entry"
+        );
+        assert!(
+            entry.completed_at.is_none(),
+            "an unsealed plan must read as outstanding work"
+        );
+
+        setup
+            .context
+            .svm_locker
+            .seal_startup_plan(vec![])
+            .expect("sealing an unsealed plan should be accepted");
+
+        let after = setup
+            .rpc
+            .get_surfnet_info(Some(setup.context.clone()))
+            .expect("the surfnet should answer")
+            .value;
+        assert!(
+            after.runbook_executions.is_empty(),
+            "sealing an empty plan is immediate readiness, which withdraws the \
+             synthetic entry: {:?}",
+            after.runbook_executions
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

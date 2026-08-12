@@ -261,7 +261,7 @@ struct App {
     events: Vec<(EventType, DateTime<Local>, String)>,
     transactions: Vec<(bool, DateTime<Local>, String)>, // (success, time, signature)
     include_debug_logs: bool,
-    deploy_progress_rx: Vec<Receiver<BlockEvent>>,
+    runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     status_bar_message: Option<String>,
     displayed_url: DisplayedUrl,
     breaker: Option<Keypair>,
@@ -276,7 +276,7 @@ impl App {
         simnet_events_rx: Receiver<SimnetEvent>,
         simnet_commands_tx: Sender<SimnetCommand>,
         include_debug_logs: bool,
-        deploy_progress_rx: Vec<Receiver<BlockEvent>>,
+        runbook_progress_rx: Vec<Receiver<BlockEvent>>,
         displayed_url: DisplayedUrl,
         breaker: Option<Keypair>,
         initial_transactions: u64,
@@ -327,7 +327,7 @@ impl App {
             events,
             transactions: vec![],
             include_debug_logs,
-            deploy_progress_rx,
+            runbook_progress_rx,
             status_bar_message: None,
             displayed_url,
             breaker,
@@ -396,7 +396,7 @@ pub fn start_app(
     simnet_events_rx: Receiver<SimnetEvent>,
     simnet_commands_tx: Sender<SimnetCommand>,
     include_debug_logs: bool,
-    deploy_progress_rx: Vec<Receiver<BlockEvent>>,
+    runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     displayed_url: DisplayedUrl,
     breaker: Option<Keypair>,
     initial_transactions: u64,
@@ -413,7 +413,7 @@ pub fn start_app(
         simnet_events_rx,
         simnet_commands_tx,
         include_debug_logs,
-        deploy_progress_rx,
+        runbook_progress_rx,
         displayed_url,
         breaker,
         initial_transactions,
@@ -462,7 +462,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
     })
     .expect("Error setting Ctrl-C handler");
 
-    let mut deployment_completed = false;
+    let mut runbooks_completed = false;
     loop {
         if should_exit_read.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
@@ -474,8 +474,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 
         {
             selector.recv(&app.simnet_events_rx);
-            if !deployment_completed {
-                for rx in app.deploy_progress_rx.iter() {
+            if !runbooks_completed {
+                for rx in app.runbook_progress_rx.iter() {
                     handles.push(selector.recv(rx));
                 }
             }
@@ -487,6 +487,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 match oper.index() {
                     0 => match oper.recv(&app.simnet_events_rx) {
                         Ok(event) => match &event {
+                            // The startup sequence matters to other listeners
+                            // (the headless watchdog, the SDK's event stream),
+                            // not to the TUI.
+                            SimnetEvent::StartupStatusChanged(_) => {}
                             SimnetEvent::AccountUpdate(dt, _account) => {
                                 new_events.push((
                                     EventType::Success,
@@ -549,7 +553,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                                         format!("Failed processing tx {}: {}", meta.signature, err),
                                     ));
                                 } else {
-                                    if deployment_completed {
+                                    if runbooks_completed {
                                         new_events.push((
                                             EventType::Success,
                                             *dt,
@@ -571,7 +575,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             SimnetEvent::Aborted(_error) => {
                                 break;
                             }
-                            SimnetEvent::Ready(_) => {}
+                            SimnetEvent::CoreStarted(_) => {}
                             SimnetEvent::Connected(_) => {}
                             SimnetEvent::Shutdown => {
                                 return Ok(());
@@ -588,7 +592,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                                 new_events.push((EventType::Info, *timestamp, msg));
                             }
                             SimnetEvent::RunbookStarted(runbook_id) => {
-                                deployment_completed = false;
+                                runbooks_completed = false;
                                 new_events.push((
                                     EventType::Success,
                                     Local::now(),
@@ -599,7 +603,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                                     .send(SimnetCommand::StartRunbookExecution(runbook_id.clone()));
                             }
                             SimnetEvent::RunbookCompleted(runbook_id, errors) => {
-                                deployment_completed = true;
+                                runbooks_completed = true;
                                 new_events.push((
                                     EventType::Success,
                                     Local::now(),
@@ -616,7 +620,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         },
                         Err(_) => break,
                     },
-                    i => match oper.recv(&app.deploy_progress_rx[i - 1]) {
+                    i => match oper.recv(&app.runbook_progress_rx[i - 1]) {
                         Ok(event) => match event {
                             BlockEvent::LogEvent(event) => {
                                 let summary = event.summary();
@@ -705,7 +709,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             _ => break,
                         },
                         Err(_) => {
-                            deployment_completed = true;
+                            runbooks_completed = true;
                             break;
                         }
                     },

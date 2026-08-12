@@ -25,11 +25,12 @@ use libloading::{Library, Symbol};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
 use solana_message::SimpleAddressLoader;
+use solana_pubkey::Pubkey;
 use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
-    SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
+    SimnetCommand, SimnetConfig, SimnetEvent, StartupPlanner, SurfnetStartupTask, SurfpoolConfig,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -42,8 +43,29 @@ use crate::{
         admin::AdminRpc, bank_data::BankData, full::Full, jito::Jito, minimal::Minimal,
         surfnet_cheatcodes::SurfnetCheatcodes, ws::Rpc,
     },
-    surfnet::{GeyserEvent, PluginCommand, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient},
+    surfnet::{
+        GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
+        remote::SurfnetRemoteClient,
+    },
 };
+
+/// The accounts a hydration batch could not produce: requested, not found
+/// remotely, and not deliberately kept offline. Offline accounts are absent by
+/// configuration rather than by accident, so they are not reported.
+fn absent_after_hydration(
+    svm_locker: &SurfnetSvmLocker,
+    results: &[GetAccountResult],
+) -> Vec<Pubkey> {
+    results
+        .iter()
+        .filter_map(|result| match result {
+            GetAccountResult::None(pubkey) if !svm_locker.is_account_offline(pubkey) => {
+                Some(*pubkey)
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// A loaded geyser plugin with all metadata needed for lifecycle management.
 /// Field order matters: `plugin` must be declared before `_library` so it drops first,
@@ -158,6 +180,7 @@ pub async fn start_local_surfnet_runloop(
     let Some(simnet) = config.simnets.first() else {
         return Ok(());
     };
+    let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 
     let remote_rpc_client = match simnet.offline_mode {
@@ -299,7 +322,18 @@ pub async fn start_local_surfnet_runloop(
 
         count
     });
-    let _ = simnet_events_tx_cc.send(SimnetEvent::Ready(initial_transaction_count));
+    // `Runloop` means nobody declares startup work, so the plan is empty.
+    // Seal it before CoreStarted, and an embedder waiting on that event
+    // observes a publicly ready surfnet. An external planner instead
+    // inspects the project after this point and seals its own plan.
+    if startup_planner == StartupPlanner::Runloop {
+        if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
+            let _ = simnet_events_tx_cc.try_send(SimnetEvent::error(format!(
+                "Failed to seal startup plan: {error}"
+            )));
+        }
+    }
+    let _ = simnet_events_tx_cc.send(SimnetEvent::CoreStarted(initial_transaction_count));
 
     // Notify geyser plugins that startup is complete
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
@@ -493,6 +527,41 @@ pub async fn start_block_production_runloop(
                         }
                         break;
                     }
+                    SimnetCommand::SealStartupPlan(tasks, response_tx) => {
+                        let result = svm_locker.seal_startup_plan(tasks);
+                        if let Err(error) = &result {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to seal startup plan: {error}"),
+                            ));
+                        }
+                        let _ = response_tx.send(result);
+                    }
+                    SimnetCommand::FailStartupPlanning(error) => {
+                        if let Err(transition_error) =
+                            svm_locker.fail_startup_planning(error.clone())
+                        {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to transition startup to Failed: {transition_error}"),
+                            ));
+                        }
+                        let _ = svm_locker
+                            .simnet_events_tx()
+                            .try_send(SimnetEvent::error(format!("Surfpool startup failed: {error}")));
+                    }
+                    SimnetCommand::StartStartupTask(task) => {
+                        if let Err(error) = svm_locker.start_startup_task(task) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to start startup task {task:?}: {error}"),
+                            ));
+                        }
+                    }
+                    SimnetCommand::CompleteStartupTask(task, result) => {
+                        if let Err(error) = svm_locker.complete_startup_task(task, result) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to complete startup task {task:?}: {error}"),
+                            ));
+                        }
+                    }
                     SimnetCommand::StartRunbookExecution(runbook_id) => {
                         svm_locker.start_runbook_execution(runbook_id);
                     }
@@ -501,16 +570,59 @@ pub async fn start_block_production_runloop(
                         svm_locker.complete_runbook_execution(runbook_id, error, ix_profiling_initially_enabled);
                     }
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
-                        let remote_client = SurfnetRemoteClient::new_unsafe(&remote_url);
-                        if let Some(remote_client) = remote_client {
-                              match svm_locker.get_multiple_accounts_with_remote_fallback(&remote_client, &pubkeys, CommitmentConfig::confirmed()).await {
-                                 Ok(account_updates) => {
-                                     svm_locker.write_multiple_account_updates(&account_updates.inner);
-                                 }
-                                 Err(e) => {
-                                     svm_locker.simnet_events_tx().try_send(SimnetEvent::error(format!("Failed to fetch remote accounts {:?}: {}", pubkeys, e))).ok();
-                                 }
-                             };
+                        // The submitter already marked RemoteAccounts as started;
+                        // StartStartupTask precedes this command on the same channel.
+                        let fetch_result = match SurfnetRemoteClient::new_unsafe(&remote_url) {
+                            Some(remote_client) => match svm_locker
+                                .get_multiple_accounts_with_remote_fallback(
+                                    &remote_client,
+                                    &pubkeys,
+                                    CommitmentConfig::confirmed(),
+                                )
+                                .await
+                            {
+                                Ok(account_updates) => {
+                                    // The locker holds one write guard while applying the complete
+                                    // batch, so Ready cannot expose a partially installed clone set.
+                                    svm_locker
+                                        .write_multiple_account_updates(&account_updates.inner);
+
+                                    // A cloned account the datasource does not have is not a
+                                    // failure: hydration did complete, and some workflows clone
+                                    // addresses that do not exist yet. Warn, though, because the
+                                    // surfnet reaches Ready with the account absent.
+                                    let absent =
+                                        absent_after_hydration(&svm_locker, &account_updates.inner);
+                                    if !absent.is_empty() {
+                                        let _ = svm_locker.simnet_events_tx().try_send(
+                                            SimnetEvent::warn(format!(
+                                                "Cloned accounts not found on the datasource, and \
+                                                 absent locally: {}",
+                                                absent.iter().map(|key| key.to_string()).join(", ")
+                                            )),
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(format!(
+                                    "Failed to fetch remote accounts {pubkeys:?}: {error}"
+                                )),
+                            },
+                            None => Err(format!("Invalid remote RPC URL: {remote_url}")),
+                        };
+
+                        if let Err(error) = &fetch_result {
+                            let _ = svm_locker
+                                .simnet_events_tx()
+                                .try_send(SimnetEvent::error(error.clone()));
+                        }
+                        if let Err(error) = svm_locker.complete_startup_task(
+                            SurfnetStartupTask::RemoteAccounts,
+                            fetch_result,
+                        ) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to finish remote account hydration: {error}"),
+                            ));
                         }
                     }
                     SimnetCommand::AirdropProcessed => {
@@ -1041,4 +1153,43 @@ async fn start_ws_rpc_server_runloop(
         .map_err(|_| "Failed to receive WebSocket RPC server startup result".to_string())??;
 
     Ok((_ws_handle, close_handle))
+}
+
+#[cfg(test)]
+mod absent_after_hydration_tests {
+    use solana_account::Account;
+
+    use super::*;
+    use crate::surfnet::svm::SurfnetSvm;
+
+    /// A hydration batch reports absence two ways that must not be conflated:
+    /// the datasource did not have the account, or the account was marked
+    /// offline and never asked for. Only the first is worth a warning.
+    // Multi-threaded flavor: the locker reads through a blocking guard, which
+    // panics on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_unexpectedly_absent_accounts_are_reported() {
+        let (surfnet_svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(surfnet_svm);
+
+        let missing = Pubkey::new_unique();
+        let offline = Pubkey::new_unique();
+        let found = Pubkey::new_unique();
+        locker
+            .insert_offline_account(offline, false)
+            .await
+            .expect("marking an account offline should succeed");
+
+        let results = vec![
+            GetAccountResult::None(missing),
+            GetAccountResult::None(offline),
+            GetAccountResult::FoundAccount(found, Account::default(), true),
+        ];
+
+        assert_eq!(
+            absent_after_hydration(&locker, &results),
+            vec![missing],
+            "an account kept offline on purpose is not a surprise; a missing one is"
+        );
+    }
 }

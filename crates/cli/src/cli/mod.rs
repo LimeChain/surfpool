@@ -13,6 +13,8 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Generator, Shell};
 use fern::colors::{Color, ColoredLevelConfig};
 use hiro_system_kit::{self, Logger};
+// The only caller is the daemon fork, which exists on Linux alone.
+#[cfg(target_os = "linux")]
 use log::info;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
@@ -23,8 +25,8 @@ use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
     DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL, DEFAULT_NETWORK_HOST,
     DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL, DEFAULT_TPU_PORT,
-    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StudioConfig,
-    SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
+    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StartupPlanner,
+    StudioConfig, SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
 };
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
@@ -313,7 +315,7 @@ pub struct StartProjectOptions {
     /// Skip runbook generation prompts.
     #[clap(long = "yes", short = 'y', action=ArgAction::SetTrue,  default_value = "false")]
     pub skip_runbook_generation_prompts: bool,
-    /// Watch programs in your artifacts folder (default: `target/deploy`), and automatically re-execute the deployment runbook when the `.so` files change. (eg. surfpool start --watch)
+    /// Watch programs in your artifacts folder (default: `target/deploy`), and automatically re-execute the startup runbooks when the `.so` files change. (eg. surfpool start --watch)
     #[clap(long = "watch", action=ArgAction::SetTrue, default_value = "false")]
     pub watch: bool,
     /// Directory containing .so program artifacts.
@@ -725,6 +727,11 @@ impl StartSimnet {
             subgraph: self.subgraph_config(),
             studio: self.studio_config(),
             plugin_config_path,
+            // `External` makes the runloop wait for someone else to seal the
+            // startup plan instead of sealing an empty one at boot. Here that
+            // someone is the CLI: it inspects the project (clones, startup
+            // runbooks) after the runloop starts and seals the plan itself.
+            startup_planner: StartupPlanner::External,
         }
     }
 }

@@ -648,7 +648,7 @@ impl SimnetEventValue {
 impl From<SimnetEvent> for SimnetEventValue {
     fn from(event: SimnetEvent) -> Self {
         match event {
-            SimnetEvent::Ready(count) => {
+            SimnetEvent::CoreStarted(count) => {
                 let mut value = Self::new("ready");
                 value.initial_transaction_count = Some(count as f64);
                 value
@@ -664,6 +664,7 @@ impl From<SimnetEvent> for SimnetEventValue {
                 value
             }
             SimnetEvent::Shutdown => Self::new("shutdown"),
+            SimnetEvent::StartupStatusChanged(_) => Self::new("startupStatusChanged"),
             SimnetEvent::SystemClockUpdated(clock) => {
                 let mut value = Self::new("systemClockUpdated");
                 value.clock = Some(ClockValue {
