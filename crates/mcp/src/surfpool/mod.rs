@@ -105,6 +105,15 @@ pub struct SearchConstantOptionsParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePumpGraduationScenarioParams {
+    #[schemars(
+        description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
+    )]
+    pub token_mint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StartSurfnetWithTokenAccountsParams {
     #[schemars(
         description = "A list of accounts to create or fund. For each account, an optional owner can be specified; if omitted, a new wallet is generated. Token parameters include the mint, program ID, and amount."
@@ -895,6 +904,63 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Creates an editable Pump Graduation state-preparation scenario for the required tokenMint. If validation fails, report that error and do not retry. The backend validates the mint, incomplete bonding curve, curve vault, and absent canonical PumpSwap pool."
+    )]
+    async fn create_pump_graduation_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePumpGraduationScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/scenarios/pump-graduation",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .json(&serde_json::json!({ "tokenMint": params.token_mint }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let result = RegisterScenarioResponse::error(format!(
+                    "Failed to reach the Pump graduation endpoint: {error}"
+                ));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&result).unwrap_or_default(),
+                )]));
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let result = RegisterScenarioResponse::error(if body.is_empty() {
+                format!("Pump graduation validation failed with HTTP {status}")
+            } else {
+                body
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&result).unwrap_or_default(),
+            )]));
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            McpError::internal_error(format!("Invalid Pump graduation response: {error}"), None)
+        })?;
+        let scenario_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::internal_error("Pump graduation response has no id", None))?;
+        let url = format!(
+            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
+        );
+        let result = RegisterScenarioResponse::success(url);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
@@ -1162,6 +1228,14 @@ mod tests {
         )
         .expect("the deserializer accepts what the schema advertises");
         assert_eq!(parsed.template_id, "pyth-price-feed-v2");
+    }
+
+    #[test]
+    fn pump_graduation_mint_is_required() {
+        assert!(
+            serde_json::from_value::<CreatePumpGraduationScenarioParams>(serde_json::json!({}))
+                .is_err()
+        );
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {

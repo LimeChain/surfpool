@@ -59,7 +59,7 @@ use spl_token_2022_interface::extension::{
 use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
-    OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
+    OverrideInstance, OverrideWriteMode, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
@@ -152,6 +152,51 @@ impl AccountUpdatePolicy {
             AccountSource::Svm | AccountSource::Generated => None,
         }
     }
+}
+
+fn forge_token_2022_amount(
+    account_pubkey: &Pubkey,
+    account: &Account,
+    values: &HashMap<String, serde_json::Value>,
+    account_values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<Vec<u8>> {
+    if account.owner != spl_token_2022_interface::id() {
+        return Err(SurfpoolError::invalid_account_data(
+            account_pubkey,
+            "Expected a Token-2022 account",
+            Some("owner is not the Token-2022 program"),
+        ));
+    }
+    if account_values.len() != 1 || !account_values.contains_key("amount") {
+        return Err(SurfpoolError::internal(
+            "Token-2022 amount overrides accept only the amount field",
+        ));
+    }
+
+    let expected_mint = values
+        .get("token_mint")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|mint| Pubkey::from_str(mint).ok())
+        .ok_or_else(|| SurfpoolError::internal("token_mint must be a valid pubkey"))?;
+    let amount = account_values["amount"]
+        .as_u64()
+        .or_else(|| {
+            account_values["amount"]
+                .as_str()
+                .and_then(|amount| amount.parse().ok())
+        })
+        .ok_or_else(|| SurfpoolError::internal("amount must be an unsigned 64-bit integer"))?;
+
+    let mut token_account = TokenAccount::unpack_for_program(&account.data, &account.owner)?;
+    if token_account.mint() != expected_mint {
+        return Err(SurfpoolError::invalid_account_data(
+            account_pubkey,
+            "Token account mint does not match token_mint",
+            Some("derived vault contains a different mint"),
+        ));
+    }
+    token_account.set_amount(amount);
+    token_account.patch_amount_preserving_extensions(&account.data)
 }
 
 /// Helper function to apply an override to a decoded account value using dot notation
@@ -2655,6 +2700,8 @@ impl SurfnetSvm {
             target_slot
         );
 
+        let template_registry = TemplateRegistry::new();
+
         for override_instance in overrides {
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
@@ -2704,28 +2751,29 @@ impl SurfnetSvm {
                         .get_account(&account_pubkey, CommitmentConfig::confirmed())
                         .await
                     {
-                        Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
-                            debug!(
-                                "Fetched account {} from remote: {} lamports, {} bytes",
-                                account_pubkey,
-                                remote_account.lamports(),
-                                remote_account.data().len()
-                            );
-
-                            // Set the fresh account data in the SVM
-                            if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
-                                warn!(
-                                    "Failed to set account {} from remote: {}",
-                                    account_pubkey, e
+                        Ok(result) => match result.account().cloned() {
+                            Some(remote_account) => {
+                                debug!(
+                                    "Fetched account {} from remote: {} lamports, {} bytes",
+                                    account_pubkey,
+                                    remote_account.lamports(),
+                                    remote_account.data().len()
                                 );
+
+                                // Set the fresh account data in the SVM
+                                if let Err(e) =
+                                    self.inner.set_account(account_pubkey, remote_account)
+                                {
+                                    warn!(
+                                        "Failed to set account {} from remote: {}",
+                                        account_pubkey, e
+                                    );
+                                }
                             }
-                        }
-                        Ok(GetAccountResult::None(_)) => {
-                            debug!("Account {} not found on remote", account_pubkey);
-                        }
-                        Ok(_) => {
-                            debug!("Account {} fetched (other variant)", account_pubkey);
-                        }
+                            None => {
+                                debug!("Account {} not found on remote", account_pubkey);
+                            }
+                        },
                         Err(e) => {
                             warn!(
                                 "Failed to fetch account {} from remote: {}",
@@ -2776,6 +2824,29 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
+
+                let write_mode = template_registry
+                    .get(&override_instance.template_id)
+                    .map(|template| template.write_mode)
+                    .unwrap_or_default();
+
+                if write_mode == OverrideWriteMode::Token2022AccountAmount {
+                    let new_account_data = forge_token_2022_amount(
+                        &account_pubkey,
+                        &account,
+                        &override_instance.values,
+                        &account_values,
+                    )?;
+                    let modified_account = Account {
+                        lamports: account.lamports(),
+                        data: new_account_data,
+                        owner: *account.owner(),
+                        executable: account.executable(),
+                        rent_epoch: account.rent_epoch(),
+                    };
+                    self.inner.set_account(account_pubkey, modified_account)?;
+                    continue;
+                }
 
                 // Get the account owner (program ID)
                 let owner_program_id = account.owner();
@@ -4236,6 +4307,45 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    fn pump_token_2022_vault_fixture() -> (Pubkey, Account) {
+        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
+            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
+        )
+        .unwrap();
+        let vault = Pubkey::from_str_const("9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh");
+        let account = snapshot[&vault.to_string()]
+            .as_ref()
+            .unwrap()
+            .to_account()
+            .unwrap();
+        (vault, account)
+    }
+
+    #[test]
+    fn token_2022_amount_override_rejects_the_wrong_owner() {
+        let (vault, mut account) = pump_token_2022_vault_fixture();
+        account.owner = spl_token_interface::id();
+        let values = HashMap::from([(
+            "token_mint".to_string(),
+            serde_json::json!("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump"),
+        )]);
+        let account_values = HashMap::from([("amount".to_string(), serde_json::json!(1u64))]);
+
+        assert!(forge_token_2022_amount(&vault, &account, &values, &account_values).is_err());
+    }
+
+    #[test]
+    fn token_2022_amount_override_rejects_a_different_mint() {
+        let (vault, account) = pump_token_2022_vault_fixture();
+        let values = HashMap::from([(
+            "token_mint".to_string(),
+            serde_json::json!(Pubkey::new_unique().to_string()),
+        )]);
+        let account_values = HashMap::from([("amount".to_string(), serde_json::json!(1u64))]);
+
+        assert!(forge_token_2022_amount(&vault, &account, &values, &account_values).is_err());
     }
 
     fn build_transfer_transaction(

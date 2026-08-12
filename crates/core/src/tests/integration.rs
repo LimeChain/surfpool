@@ -86,6 +86,9 @@ use surfpool_types::{
 use test_case::test_case;
 use tokio::{sync::RwLock, task};
 use uuid::Uuid;
+
+mod pump_token2022_graduation;
+
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 use crate::{
