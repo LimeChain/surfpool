@@ -505,6 +505,7 @@ pub struct OverrideInstance {
         description = "If true, re-applies this override every following slot. Use only for values no transaction writes: it reverts transaction writes to the same fields."
     )]
     #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub persist: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
@@ -943,12 +944,10 @@ pub struct YamlOverrideTemplateEntry {
     pub llm_context: Option<String>,
 }
 
-/// Walks a dot-notation property path the way overrides are applied: struct fields by name,
-/// array elements by index. The `Err` says where the path stopped.
+/// Walks a dot-notation path: struct fields by name, array elements by index.
 ///
-/// Returns the named field the path passed through last *and* the type at the path's end. Those
-/// differ when the path ends on an index: `price_info_accounts.0` is documented by the array
-/// field, but its value is one Pubkey element, so callers must pick the one they need.
+/// Returns the last named field and the type at the path's end. They differ on a trailing index:
+/// `price_info_accounts.0` is documented by the array but its value is one Pubkey.
 fn resolve_idl_path<'a>(
     idl: &'a Idl,
     account_type: &str,
