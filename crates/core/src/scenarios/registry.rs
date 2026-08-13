@@ -23,6 +23,27 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
+pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/scope/v1/overrides.yaml");
+
+pub const KAMINO_FARMS_IDL_CONTENT: &str = include_str!("./protocols/kamino/farms/v1/idl.json");
+pub const KAMINO_FARMS_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/farms/v1/overrides.yaml");
+
+pub const KAMINO_SWAP_IDL_CONTENT: &str = include_str!("./protocols/kamino/swap/v1/idl.json");
+pub const KAMINO_SWAP_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/swap/v1/overrides.yaml");
+
+pub const KAMINO_VAULT_IDL_CONTENT: &str = include_str!("./protocols/kamino/vault/v1/idl.json");
+pub const KAMINO_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/vault/v1/overrides.yaml");
+
+pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
+    include_str!("./protocols/kamino/liquidity/v1/idl.json");
+pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -89,6 +110,36 @@ impl TemplateRegistry {
 
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
+
+        self.load_protocol_overrides(
+            KAMINO_SCOPE_IDL_CONTENT,
+            KAMINO_SCOPE_OVERRIDES_CONTENT,
+            "kamino-scope",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_FARMS_IDL_CONTENT,
+            KAMINO_FARMS_OVERRIDES_CONTENT,
+            "kamino-farms",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_SWAP_IDL_CONTENT,
+            KAMINO_SWAP_OVERRIDES_CONTENT,
+            "kamino-swap",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_VAULT_IDL_CONTENT,
+            KAMINO_VAULT_OVERRIDES_CONTENT,
+            "kamino-vault",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_LIQUIDITY_IDL_CONTENT,
+            KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
+            "kamino-liquidity",
+        );
     }
 
     pub fn load_drift_overrides(&mut self) {
@@ -182,12 +233,34 @@ impl TemplateRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, str::FromStr};
+    use anchor_lang_idl::types::IdlType;
+    use std::{collections::HashMap, collections::BTreeSet, str::FromStr};
 
     use solana_pubkey::Pubkey;
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    /// A valid JSON value for a scalar IDL type, or `None` for composites.
+    fn sample_scalar_value(ty: &IdlType) -> Option<serde_json::Value> {
+        match ty {
+            IdlType::Bool => Some(serde_json::json!(true)),
+            IdlType::U8
+            | IdlType::U16
+            | IdlType::U32
+            | IdlType::U64
+            | IdlType::U128
+            | IdlType::I8
+            | IdlType::I16
+            | IdlType::I32
+            | IdlType::I64
+            | IdlType::I128 => Some(serde_json::json!(1)),
+            IdlType::Pubkey => Some(serde_json::json!(
+                "11111111111111111111111111111111".to_string()
+            )),
+            _ => None,
+        }
+    }
 
     #[test]
     fn raydium_config_index_options_derive_their_documented_address() {
@@ -329,11 +402,11 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) = 24 total
+        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) + Whirlpool(6) + SPL Token (2) = 57 total
         assert_eq!(
             registry.count(),
-            24,
-            "Registry should load 24 templates total"
+            57,
+            "Registry should load 57 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -352,7 +425,36 @@ mod tests {
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
+        assert!(registry.contains("kamino-reserve-status"));
+        assert!(registry.contains("kamino-reserve-limits"));
+        assert!(registry.contains("kamino-reserve-fees"));
+        assert!(registry.contains("kamino-reserve-interest-rate"));
+        assert!(registry.contains("kamino-reserve-oracle"));
         assert!(registry.contains("kamino-obligation-health"));
+        assert!(registry.contains("kamino-obligation-positions"));
+        assert!(registry.contains("kamino-obligation-orders"));
+        assert!(registry.contains("kamino-lending-market-risk"));
+        assert!(registry.contains("kamino-lending-market-elevation-groups"));
+        assert!(registry.contains("kamino-reserve-rewards"));
+        assert!(registry.contains("kamino-reserve-debt-term"));
+        assert!(registry.contains("kamino-withdraw-ticket"));
+        assert!(registry.contains("kamino-scope-price"));
+        assert!(registry.contains("kamino-scope-price-source"));
+        assert!(registry.contains("kamino-scope-twap"));
+        assert!(registry.contains("kamino-farms-reward-emissions"));
+        assert!(registry.contains("kamino-farms-reward-accumulator"));
+        assert!(registry.contains("kamino-farms-user-rewards"));
+        assert!(registry.contains("kamino-farms-farm-config"));
+        assert!(registry.contains("kamino-farms-global-config"));
+        assert!(registry.contains("kamino-swap-order"));
+        assert!(registry.contains("kamino-swap-global-config"));
+        assert!(registry.contains("kamino-vault-state"));
+        assert!(registry.contains("kamino-vault-allocation"));
+        assert!(registry.contains("kamino-vault-rewards"));
+        assert!(registry.contains("kamino-vault-reserve-whitelist"));
+        assert!(registry.contains("kamino-liquidity-strategy-balances"));
+        assert!(registry.contains("kamino-liquidity-strategy-rewards"));
+        assert!(registry.contains("kamino-liquidity-strategy-guards"));
 
         assert!(registry.contains("drift-perp-market"));
         assert!(registry.contains("drift-spot-market"));
@@ -409,8 +511,70 @@ mod tests {
             "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
         );
 
-        let kamino_templates = registry.by_protocol("Kamino");
-        assert_eq!(kamino_templates.len(), 3, "Should have 3 Kamino templates");
+        let kamino_templates = registry.by_protocol("kamino");
+        assert_eq!(
+            kamino_templates.len(),
+            17,
+            "Should have 17 Kamino Lend templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-scope").len(),
+            3,
+            "Should have 3 Kamino Scope templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-farms").len(),
+            5,
+            "Should have 5 Kamino Farms templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-swap").len(),
+            2,
+            "Should have 2 Kamino Swap templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-vault").len(),
+            5,
+            "Should have 5 Kamino Earn vault templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-liquidity").len(),
+            4,
+            "Should have 4 Kamino Liquidity templates"
+        );
+
+        // Each Kamino-family protocol must cover the accounts worth overriding
+        for (protocol, expected_accounts) in [
+            (
+                "kamino",
+                vec!["Reserve", "Obligation", "LendingMarket", "WithdrawTicket"],
+            ),
+            (
+                "kamino-scope",
+                vec!["OraclePrices", "OracleMappings", "OracleTwaps"],
+            ),
+            (
+                "kamino-farms",
+                vec!["FarmState", "UserState", "GlobalConfig"],
+            ),
+            ("kamino-swap", vec!["Order", "GlobalConfig"]),
+            ("kamino-vault", vec!["VaultState", "ReserveWhitelistEntry"]),
+            ("kamino-liquidity", vec!["WhirlpoolStrategy"]),
+        ] {
+            let account_types: BTreeSet<&str> = registry
+                .by_protocol(protocol)
+                .iter()
+                .map(|t| t.account_type.as_str())
+                .collect();
+            for expected in expected_accounts {
+                assert!(
+                    account_types.contains(expected),
+                    "{} should have at least one template for the {} account",
+                    protocol,
+                    expected
+                );
+            }
+        }
 
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
@@ -427,8 +591,15 @@ mod tests {
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            1,
-            "Should find 1 oracle template (Pyth)"
+            4,
+            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+        );
+
+        let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
+        assert_eq!(
+            rewards_templates.len(),
+            5,
+            "Should find 5 rewards templates (Kamino Farms)"
         );
 
         let dex_templates = registry.by_tags(&[vec!["dex".to_string()]].concat());
@@ -473,6 +644,11 @@ mod tests {
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
         assert!(ids.contains(&"kamino-obligation-health".to_string()));
+        assert!(ids.contains(&"kamino-obligation-positions".to_string()));
+        assert!(ids.contains(&"kamino-reserve-oracle".to_string()));
+        assert!(ids.contains(&"kamino-lending-market-risk".to_string()));
+        assert!(ids.contains(&"kamino-scope-price".to_string()));
+        assert!(ids.contains(&"kamino-farms-user-rewards".to_string()));
         assert!(ids.contains(&"drift-perp-market".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdc".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdt".to_string()));
@@ -875,6 +1051,1091 @@ mod tests {
             resolved_address, expected_address,
             "PDA from JSON should match expected SOL/USD address.\nGot: {}\nExpected: {}",
             resolved_address, expected_address
+        );
+    }
+
+    /// A property that does not exist in the IDL is dropped at materialization time with only
+    /// a warning, so the scenario appears to run while changing nothing.
+    #[test]
+    fn test_all_template_property_paths_exist_in_idl() {
+        let registry = TemplateRegistry::new();
+        let mut errors = Vec::new();
+
+        for template in registry.all() {
+            for property in &template.properties {
+                // constant_ref properties are UI dropdowns (e.g. token pickers), not
+                // account fields, so they are not expected to resolve against the IDL.
+                if property.is_constant_ref() {
+                    continue;
+                }
+                if let Err(e) = surfpool_types::resolve_idl_type(
+                    &template.idl,
+                    &template.account_type,
+                    &property.path,
+                ) {
+                    errors.push(format!("[{}] {}: {}", template.id, property.path, e));
+                }
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "{} template propert(ies) do not exist in their IDL:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn test_kamino_templates_round_trip_through_forge() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        // Live mainnet sizes. Keyed by (protocol, account) because `GlobalConfig` is a
+        // different struct in four of these programs.
+        const ACCOUNT_SIZES: &[(&str, &str, usize)] = &[
+            // Kamino Lend (KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD)
+            ("kamino", "Reserve", 8624),
+            ("kamino", "Obligation", 3344),
+            ("kamino", "LendingMarket", 4664),
+            // No WithdrawTicket existed on mainnet when this was written (the feature is new
+            // in klend 1.23.0), so this size is derived from the IDL rather than observed.
+            ("kamino", "WithdrawTicket", 520),
+            // Scope (HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ)
+            ("kamino-scope", "OraclePrices", 28712),
+            ("kamino-scope", "OracleMappings", 29704),
+            ("kamino-scope", "OracleTwaps", 344136),
+            // Kamino Farms (FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr)
+            ("kamino-farms", "FarmState", 8336),
+            ("kamino-farms", "UserState", 920),
+            ("kamino-farms", "GlobalConfig", 2136),
+            // LIMO / Kamino Swap (LiMoM9rMhrdYrfzUCxQppvxCSG1FcrUK9G8uLq4A1GF)
+            ("kamino-swap", "Order", 424),
+            ("kamino-swap", "GlobalConfig", 2168),
+            // Kamino Vaults / Earn (KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd)
+            ("kamino-vault", "VaultState", 62552),
+            ("kamino-vault", "ReserveWhitelistEntry", 136),
+            // Kamino Liquidity / yvaults (6LtLpnUFNByNXLyCoK9wA2MykKAmQNZKBdY8s47dehDc)
+            ("kamino-liquidity", "WhirlpoolStrategy", 4064),
+        ];
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+        let mut checked = 0;
+
+        for protocol in [
+            "kamino",
+            "kamino-scope",
+            "kamino-farms",
+            "kamino-swap",
+            "kamino-vault",
+            "kamino-liquidity",
+        ] {
+            let templates = registry.by_protocol(protocol);
+            assert!(
+                !templates.is_empty(),
+                "expected templates for protocol {}",
+                protocol
+            );
+
+            for template in templates {
+                let (_, _, size) = ACCOUNT_SIZES
+                    .iter()
+                    .find(|(proto, name, _)| *proto == protocol && *name == template.account_type)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "template {} targets {}/{} with no known size; add it to ACCOUNT_SIZES",
+                            template.id, protocol, template.account_type
+                        )
+                    });
+
+                let account_def = template
+                    .idl
+                    .accounts
+                    .iter()
+                    .find(|a| a.name == template.account_type)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "account '{}' not found in the {} IDL (template {})",
+                            template.account_type, protocol, template.id
+                        )
+                    });
+
+                let mut data = vec![0u8; *size];
+                data[..8].copy_from_slice(&account_def.discriminator);
+
+                // A zeroed account with no overrides must survive the decode/re-encode cycle
+                // byte-for-byte, otherwise the pipeline is silently rewriting account state.
+                let identity = surfnet_svm
+                    .get_forged_account_data(&pubkey, &data, &template.idl, &HashMap::new())
+                    .unwrap_or_else(|e| {
+                        panic!("identity round-trip failed for {}: {}", template.id, e)
+                    });
+                assert_eq!(
+                    identity, data,
+                    "identity round-trip changed bytes for {}",
+                    template.id
+                );
+
+                // Now write every scalar property the template advertises, in one pass.
+                let mut overrides: HashMap<String, serde_json::Value> = HashMap::new();
+                for property in &template.properties {
+                    let ty = surfpool_types::resolve_idl_type(
+                        &template.idl,
+                        &template.account_type,
+                        &property.path,
+                    )
+                    .unwrap_or_else(|e| panic!("[{}] {}: {}", template.id, property.path, e));
+                    if let Some(value) = sample_scalar_value(ty) {
+                        overrides.insert(property.path.clone(), value);
+                    }
+                }
+
+                if overrides.is_empty() {
+                    // Composite-only template (e.g. kamino-reserve-interest-rate exposes a
+                    // single struct); its llm_context documents the required full shape.
+                    continue;
+                }
+
+                let forged = surfnet_svm
+                    .get_forged_account_data(&pubkey, &data, &template.idl, &overrides)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "forge failed for {} with {} scalar override(s): {}",
+                            template.id,
+                            overrides.len(),
+                            e
+                        )
+                    });
+
+                assert_eq!(
+                    forged.len(),
+                    data.len(),
+                    "forged account size changed for {}",
+                    template.id
+                );
+                assert_ne!(
+                    forged, data,
+                    "overrides for {} did not change any bytes",
+                    template.id
+                );
+                checked += 1;
+            }
+        }
+
+        assert!(
+            checked >= 25,
+            "expected to exercise at least 25 Kamino-family templates, got {}",
+            checked
+        );
+    }
+
+    /// The default pubkey "1111...1111" is all hex characters, which the encoder used to
+    /// misread as hex bytes and panic on.
+    #[test]
+    fn test_kamino_obligation_array_index_and_pubkey_overrides() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        // Obligation offsets incl. discriminator: header is 88 bytes, then 136 per deposit.
+        const DEPOSIT_0_RESERVE: usize = 8 + 88;
+        const DEPOSIT_0_AMOUNT: usize = DEPOSIT_0_RESERVE + 32;
+        const DEPOSIT_1_RESERVE: usize = 8 + 88 + 136;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("kamino-obligation-positions")
+            .expect("kamino-obligation-positions template should exist");
+
+        let account_def = template
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "Obligation")
+            .expect("Obligation account in Kamino IDL");
+        let mut data = vec![0u8; 3344];
+        data[..8].copy_from_slice(&account_def.discriminator);
+
+        let wsol = "So11111111111111111111111111111111111111112";
+        let overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                "deposits.0.deposit_reserve".to_string(),
+                serde_json::json!("11111111111111111111111111111111"),
+            ),
+            (
+                "deposits.0.deposited_amount".to_string(),
+                serde_json::json!(4_200_000_000u64),
+            ),
+            (
+                "deposits.1.deposit_reserve".to_string(),
+                serde_json::json!(wsol),
+            ),
+            ("has_debt".to_string(), serde_json::json!(1)),
+        ]);
+
+        let forged = surfnet_svm
+            .get_forged_account_data(&Pubkey::new_unique(), &data, &template.idl, &overrides)
+            .expect("array-index and pubkey overrides should apply");
+
+        assert_eq!(forged.len(), data.len(), "account size must be preserved");
+
+        assert_eq!(
+            &forged[DEPOSIT_0_RESERVE..DEPOSIT_0_RESERVE + 32],
+            Pubkey::default().as_ref(),
+            "deposits[0].deposit_reserve should be the default pubkey"
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                forged[DEPOSIT_0_AMOUNT..DEPOSIT_0_AMOUNT + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            4_200_000_000u64,
+            "deposits[0].deposited_amount should be written at its array index"
+        );
+        assert_eq!(
+            &forged[DEPOSIT_1_RESERVE..DEPOSIT_1_RESERVE + 32],
+            Pubkey::from_str_const(wsol).as_ref(),
+            "deposits[1].deposit_reserve should be the wSOL mint"
+        );
+    }
+
+    #[test]
+    fn test_array_index_override_path_errors() {
+        use txtx_addon_kit::{indexmap::IndexMap, types::types::Value};
+
+        use crate::surfnet::svm::apply_override_to_decoded_account;
+
+        let mut decoded = Value::Object(IndexMap::from([(
+            "deposits".to_string(),
+            Value::Array(Box::new(vec![Value::Integer(1), Value::Integer(2)])),
+        )]));
+
+        assert!(
+            apply_override_to_decoded_account(&mut decoded, "deposits.1", &serde_json::json!(9))
+                .is_ok()
+        );
+        match &decoded {
+            Value::Object(map) => match map.get("deposits") {
+                Some(Value::Array(items)) => assert_eq!(items[1], Value::Integer(9)),
+                _ => panic!("expected deposits array"),
+            },
+            _ => panic!("expected object"),
+        }
+
+        // out-of-bounds index
+        let err =
+            apply_override_to_decoded_account(&mut decoded, "deposits.7", &serde_json::json!(1))
+                .expect_err("index 7 is out of bounds for a 2-element array");
+        assert!(
+            format!("{err}").contains("out of bounds"),
+            "unexpected error: {err}"
+        );
+
+        // non-numeric segment on an array
+        let err = apply_override_to_decoded_account(
+            &mut decoded,
+            "deposits.first",
+            &serde_json::json!(1),
+        )
+        .expect_err("'first' is not an array index");
+        assert!(
+            format!("{err}").contains("zero-based array index"),
+            "unexpected error: {err}"
+        );
+
+        // empty segment
+        assert!(
+            apply_override_to_decoded_account(&mut decoded, "deposits..0", &serde_json::json!(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_kamino_scope_price_override_writes_expected_bytes() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        // OraclePrices: discriminator + oracle_mappings pubkey, then 56 bytes per entry.
+        const PRICES_BASE: usize = 8 + 32;
+        const DATED_PRICE_SIZE: usize = 56;
+
+        // A mechanical target; real per-token indices differ per price account.
+        const SOL_INDEX: usize = 0;
+        // $125.50 with exp = 8
+        const SOL_VALUE: u64 = 12_550_000_000;
+        const SOL_EXP: u64 = 8;
+        const AT_SLOT: u64 = 370_000_000;
+        const AT_TS: u64 = 1_800_000_000;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("kamino-scope-price")
+            .expect("kamino-scope-price template should exist");
+
+        assert_eq!(
+            template.address,
+            surfpool_types::AccountAddress::Pubkey(
+                "3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH".to_string()
+            ),
+            "template should default to the Main Market's Scope prices account"
+        );
+
+        let account_def = template
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "OraclePrices")
+            .expect("OraclePrices in the Scope IDL");
+        let mut data = vec![0u8; 28712];
+        data[..8].copy_from_slice(&account_def.discriminator);
+
+        let overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                format!("prices.{SOL_INDEX}.price.value"),
+                serde_json::json!(SOL_VALUE),
+            ),
+            (
+                format!("prices.{SOL_INDEX}.price.exp"),
+                serde_json::json!(SOL_EXP),
+            ),
+            (
+                format!("prices.{SOL_INDEX}.last_updated_slot"),
+                serde_json::json!(AT_SLOT),
+            ),
+            (
+                format!("prices.{SOL_INDEX}.unix_timestamp"),
+                serde_json::json!(AT_TS),
+            ),
+        ]);
+
+        let forged = surfnet_svm
+            .get_forged_account_data(&Pubkey::new_unique(), &data, &template.idl, &overrides)
+            .expect("scope price override should apply");
+
+        assert_eq!(forged.len(), data.len(), "account size must be preserved");
+
+        let base = PRICES_BASE + SOL_INDEX * DATED_PRICE_SIZE;
+        let read = |off: usize| u64::from_le_bytes(forged[off..off + 8].try_into().unwrap());
+        assert_eq!(read(base), SOL_VALUE, "price.value");
+        assert_eq!(read(base + 8), SOL_EXP, "price.exp");
+        assert_eq!(read(base + 16), AT_SLOT, "last_updated_slot");
+        assert_eq!(read(base + 24), AT_TS, "unix_timestamp");
+
+        // price = value / 10^exp
+        assert_eq!(SOL_VALUE as f64 / 10f64.powi(SOL_EXP as i32), 125.50);
+
+        // Neighbouring entries must be untouched.
+        let next = PRICES_BASE + (SOL_INDEX + 1) * DATED_PRICE_SIZE;
+        assert!(
+            forged[next..next + DATED_PRICE_SIZE]
+                .iter()
+                .all(|b| *b == 0),
+            "writing one price index must not disturb the next entry"
+        );
+    }
+
+    /// A reward accrues from the gap between the farm accumulator and the user's tally, so
+    /// both halves must be writable.
+    #[test]
+    fn test_kamino_farms_reward_override_writes_both_halves() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+
+        let farm = registry
+            .get("kamino-farms-reward-accumulator")
+            .expect("kamino-farms-reward-accumulator template");
+        let farm_def = farm
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "FarmState")
+            .expect("FarmState in the Farms IDL");
+        let mut farm_data = vec![0u8; 8336];
+        farm_data[..8].copy_from_slice(&farm_def.discriminator);
+
+        let farm_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                "reward_infos.0.reward_per_share_scaled".to_string(),
+                serde_json::json!(5_000_000u64),
+            ),
+            (
+                "total_active_stake_scaled".to_string(),
+                serde_json::json!(1_000_000u64),
+            ),
+        ]);
+        let forged_farm = surfnet_svm
+            .get_forged_account_data(&pubkey, &farm_data, &farm.idl, &farm_overrides)
+            .expect("farm accumulator override should apply");
+        assert_eq!(forged_farm.len(), farm_data.len());
+        assert_ne!(forged_farm, farm_data);
+
+        let user = registry
+            .get("kamino-farms-user-rewards")
+            .expect("kamino-farms-user-rewards template");
+        let user_def = user
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "UserState")
+            .expect("UserState in the Farms IDL");
+        let mut user_data = vec![0u8; 920];
+        user_data[..8].copy_from_slice(&user_def.discriminator);
+
+        // UserState offsets incl. discriminator: 80-byte header, then the [u128; 10] tally.
+        const TALLY_0: usize = 88;
+        const UNCLAIMED_0: usize = TALLY_0 + 160;
+
+        let user_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                "rewards_issued_unclaimed.0".to_string(),
+                serde_json::json!(777_000u64),
+            ),
+            (
+                "rewards_tally_scaled.0".to_string(),
+                serde_json::json!(0u64),
+            ),
+            (
+                "active_stake_scaled".to_string(),
+                serde_json::json!(1_000u64),
+            ),
+        ]);
+        let forged_user = surfnet_svm
+            .get_forged_account_data(&pubkey, &user_data, &user.idl, &user_overrides)
+            .expect("user reward override should apply");
+
+        assert_eq!(forged_user.len(), user_data.len());
+        assert_eq!(
+            u64::from_le_bytes(
+                forged_user[UNCLAIMED_0..UNCLAIMED_0 + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            777_000u64,
+            "rewards_issued_unclaimed[0] should be written at its array index"
+        );
+    }
+
+    /// The two overrides that survive `refresh_obligation`: crash the Scope price, then
+    /// tighten the deposit reserve's liquidation threshold.
+    #[test]
+    fn test_kamino_liquidation_setup_writes_durable_inputs() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        const LTV_PCT: usize = 4872;
+        const LIQ_THRESHOLD_PCT: usize = 4873;
+        const SCOPE_PRICES_BASE: usize = 8 + 32;
+        const DATED_PRICE_SIZE: usize = 56;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+
+        // Crash the Scope price the reserve prices from.
+        let scope = registry.get("kamino-scope-price").expect("scope template");
+        let scope_disc = &scope
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "OraclePrices")
+            .expect("OraclePrices")
+            .discriminator;
+        let mut scope_data = vec![0u8; 28712];
+        scope_data[..8].copy_from_slice(scope_disc);
+
+        const IDX: usize = 45;
+        const CRASHED: u64 = 15_000_000;
+        let scope_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                format!("prices.{IDX}.price.value"),
+                serde_json::json!(CRASHED),
+            ),
+            (format!("prices.{IDX}.price.exp"), serde_json::json!(8u64)),
+        ]);
+        let forged_scope = surfnet_svm
+            .get_forged_account_data(&pubkey, &scope_data, &scope.idl, &scope_overrides)
+            .expect("scope crash should apply");
+
+        let off = SCOPE_PRICES_BASE + IDX * DATED_PRICE_SIZE;
+        assert_eq!(
+            u64::from_le_bytes(forged_scope[off..off + 8].try_into().unwrap()),
+            CRASHED,
+            "crashed price must land at the Scope entry the reserve names"
+        );
+        assert_eq!(
+            CRASHED as f64 / 10f64.powi(8),
+            0.15,
+            "value/exp must decode to $0.15"
+        );
+
+        // Tighten the deposit reserve's liquidation threshold.
+        let reserve = registry
+            .get("kamino-reserve-config")
+            .expect("reserve config template");
+        let reserve_disc = &reserve
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "Reserve")
+            .expect("Reserve")
+            .discriminator;
+        let mut reserve_data = vec![0u8; 8624];
+        reserve_data[..8].copy_from_slice(reserve_disc);
+        // A healthy 70/75 configuration.
+        reserve_data[LTV_PCT] = 70;
+        reserve_data[LIQ_THRESHOLD_PCT] = 75;
+
+        let reserve_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                "config.liquidation_threshold_pct".to_string(),
+                serde_json::json!(50u8),
+            ),
+            (
+                "config.max_liquidation_bonus_bps".to_string(),
+                serde_json::json!(1000u16),
+            ),
+        ]);
+        let forged_reserve = surfnet_svm
+            .get_forged_account_data(&pubkey, &reserve_data, &reserve.idl, &reserve_overrides)
+            .expect("reserve config override should apply");
+
+        assert_eq!(
+            forged_reserve[LIQ_THRESHOLD_PCT], 50,
+            "liquidation threshold must be lowered"
+        );
+        assert_eq!(
+            forged_reserve[LTV_PCT], 70,
+            "loan-to-value must be left untouched, so a position at 70% LTV is now above the \
+             50% liquidation threshold and therefore liquidatable"
+        );
+        assert_eq!(
+            forged_reserve.len(),
+            reserve_data.len(),
+            "reserve size must be preserved"
+        );
+    }
+
+    /// A ticket becomes redeemable once the reserve's queue cursor reaches its sequence number.
+    #[test]
+    fn test_kamino_withdraw_ticket_and_queue_cursor() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+
+        let ticket = registry
+            .get("kamino-withdraw-ticket")
+            .expect("withdraw ticket template");
+        let ticket_disc = &ticket
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "WithdrawTicket")
+            .expect("WithdrawTicket")
+            .discriminator;
+        let mut ticket_data = vec![0u8; 520];
+        ticket_data[..8].copy_from_slice(ticket_disc);
+
+        let ticket_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            ("sequence_number".to_string(), serde_json::json!(7u64)),
+            (
+                "queued_collateral_amount".to_string(),
+                serde_json::json!(500u64),
+            ),
+            ("invalid".to_string(), serde_json::json!(0u8)),
+        ]);
+        let forged_ticket = surfnet_svm
+            .get_forged_account_data(&pubkey, &ticket_data, &ticket.idl, &ticket_overrides)
+            .expect("withdraw ticket override should apply");
+        assert_eq!(
+            u64::from_le_bytes(forged_ticket[8..16].try_into().unwrap()),
+            7,
+            "ticket sequence number"
+        );
+
+        // Advance the reserve's cursor to 7, making ticket 7 serveable.
+        let limits = registry
+            .get("kamino-reserve-limits")
+            .expect("reserve limits template");
+        let reserve_disc = &limits
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "Reserve")
+            .expect("Reserve")
+            .discriminator;
+        let mut reserve_data = vec![0u8; 8624];
+        reserve_data[..8].copy_from_slice(reserve_disc);
+
+        let queue_overrides: HashMap<String, serde_json::Value> = HashMap::from([
+            (
+                "withdraw_queue.queued_collateral_amount".to_string(),
+                serde_json::json!(500u64),
+            ),
+            (
+                "withdraw_queue.next_withdrawable_ticket_sequence_number".to_string(),
+                serde_json::json!(7u64),
+            ),
+            (
+                "withdraw_queue.next_issued_ticket_sequence_number".to_string(),
+                serde_json::json!(8u64),
+            ),
+            (
+                "liquidity.total_available_amount".to_string(),
+                serde_json::json!(0u64),
+            ),
+        ]);
+        let forged_reserve = surfnet_svm
+            .get_forged_account_data(&pubkey, &reserve_data, &limits.idl, &queue_overrides)
+            .expect("withdraw queue override should apply");
+
+        assert_eq!(forged_reserve.len(), reserve_data.len());
+        assert_ne!(forged_reserve, reserve_data);
+    }
+
+    // Unmodified mainnet account data, captured 2026-08-06, with the source address of each so
+    // it can be re-captured. Zeroed accounts never exercise real enum discriminants or non-zero
+    // padding; these do. The reserve and Scope prices accounts are a matched pair -
+    // test_reserve_price_is_derived_from_scope depends on it.
+    // 14sqx2pLioXamoBFxE6CvHNth6uEAvJhXuJ2iwZMccAS
+    const FIXTURE_RESERVE: &[u8] = include_bytes!("./fixtures/kamino_reserve.bin");
+    // 3iprSGrEQdBxhmqV399tYQQPG8Z1Hh2aYFrBwgqFXjGS
+    const FIXTURE_OBLIGATION: &[u8] = include_bytes!("./fixtures/kamino_obligation.bin");
+    // 3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C
+    const FIXTURE_SCOPE_PRICES: &[u8] = include_bytes!("./fixtures/kamino_scope_oracle_prices.bin");
+    // 18DizwAbBuuNGwfav3v6yWMbunnye4RnMLwLp67jAtj
+    const FIXTURE_FARM_STATE: &[u8] = include_bytes!("./fixtures/kamino_farms_farm_state.bin");
+    // 14Buhfy7WBpiv2e6RMZNN5R7w3ua8MY1ZJ3WQyd29uJ
+    const FIXTURE_SWAP_ORDER: &[u8] = include_bytes!("./fixtures/kamino_swap_order.bin");
+    // 1EXN5b1z7wucGb2uZoQmqjHdPoK1PNfUNWuwq8AqLTV
+    const FIXTURE_STRATEGY: &[u8] = include_bytes!("./fixtures/kamino_liquidity_strategy.bin");
+
+    /// Byte indices at which two buffers differ.
+    fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+        a.iter()
+            .zip(b.iter())
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A failure here means a bundled IDL disagrees with the live on-chain layout.
+    #[test]
+    fn test_real_mainnet_accounts_round_trip_unchanged() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("kamino-reserve-config", "Reserve", FIXTURE_RESERVE),
+            ("kamino-obligation-health", "Obligation", FIXTURE_OBLIGATION),
+            ("kamino-scope-price", "OraclePrices", FIXTURE_SCOPE_PRICES),
+            (
+                "kamino-farms-reward-accumulator",
+                "FarmState",
+                FIXTURE_FARM_STATE,
+            ),
+            ("kamino-swap-order", "Order", FIXTURE_SWAP_ORDER),
+            (
+                "kamino-liquidity-strategy-balances",
+                "WhirlpoolStrategy",
+                FIXTURE_STRATEGY,
+            ),
+        ];
+
+        for (template_id, account_name, data) in cases {
+            let template = registry
+                .get(template_id)
+                .unwrap_or_else(|| panic!("template {} should exist", template_id));
+
+            let account_def = template
+                .idl
+                .accounts
+                .iter()
+                .find(|a| a.name == *account_name)
+                .unwrap_or_else(|| panic!("{} not in the IDL", account_name));
+            assert_eq!(
+                &data[..8],
+                account_def.discriminator.as_slice(),
+                "{} fixture discriminator does not match the IDL - wrong account type?",
+                account_name
+            );
+
+            let forged = surfnet_svm
+                .get_forged_account_data(&pubkey, data, &template.idl, &HashMap::new())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "real mainnet {} failed to decode/re-encode with the bundled IDL: {}",
+                        account_name, e
+                    )
+                });
+
+            assert_eq!(
+                forged.len(),
+                data.len(),
+                "{} changed size on round-trip",
+                account_name
+            );
+            let diffs = diff_indices(&forged, data);
+            assert!(
+                diffs.is_empty(),
+                "real mainnet {} was altered by a no-op round-trip at {} byte(s), first at {:?}",
+                account_name,
+                diffs.len(),
+                diffs.first()
+            );
+        }
+    }
+
+    /// Catches collateral damage from the Borsh re-encode that a zeroed fixture would hide.
+    #[test]
+    fn test_override_on_real_account_touches_only_target_bytes() {
+        use std::collections::HashMap;
+
+        use solana_pubkey::Pubkey;
+
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let registry = TemplateRegistry::new();
+        let pubkey = Pubkey::new_unique();
+
+        // Reserve: one u8 at a known offset.
+        const LIQ_THRESHOLD_PCT: usize = 4873;
+        let reserve = registry.get("kamino-reserve-config").unwrap();
+        let original_threshold = FIXTURE_RESERVE[LIQ_THRESHOLD_PCT];
+        assert!(
+            original_threshold > 50,
+            "fixture should start above the value we set, got {}",
+            original_threshold
+        );
+
+        let forged = surfnet_svm
+            .get_forged_account_data(
+                &pubkey,
+                FIXTURE_RESERVE,
+                &reserve.idl,
+                &HashMap::from([(
+                    "config.liquidation_threshold_pct".to_string(),
+                    serde_json::json!(50u8),
+                )]),
+            )
+            .expect("threshold override on real reserve");
+
+        assert_eq!(
+            diff_indices(&forged, FIXTURE_RESERVE),
+            vec![LIQ_THRESHOLD_PCT],
+            "exactly one byte should change, and only the liquidation threshold"
+        );
+        assert_eq!(forged[LIQ_THRESHOLD_PCT], 50);
+
+        // Scope: one u64 inside a 512-element array.
+        const PRICES_BASE: usize = 8 + 32;
+        const DATED_PRICE_SIZE: usize = 56;
+        const IDX: usize = 0;
+        let scope = registry.get("kamino-scope-price").unwrap();
+        let value_off = PRICES_BASE + IDX * DATED_PRICE_SIZE;
+
+        let original_value = u64::from_le_bytes(
+            FIXTURE_SCOPE_PRICES[value_off..value_off + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            original_value > 0,
+            "fixture SOL price should be non-zero, got {}",
+            original_value
+        );
+        let new_value = original_value / 2; // halve SOL
+
+        let forged = surfnet_svm
+            .get_forged_account_data(
+                &pubkey,
+                FIXTURE_SCOPE_PRICES,
+                &scope.idl,
+                &HashMap::from([(
+                    format!("prices.{IDX}.price.value"),
+                    serde_json::json!(new_value),
+                )]),
+            )
+            .expect("price override on real Scope account");
+
+        let diffs = diff_indices(&forged, FIXTURE_SCOPE_PRICES);
+        assert!(!diffs.is_empty(), "the price should have changed");
+        assert!(
+            diffs.iter().all(|i| (value_off..value_off + 8).contains(i)),
+            "only the 8 bytes of prices[{}].price.value should change, got {:?}",
+            IDX,
+            diffs
+        );
+        assert_eq!(
+            u64::from_le_bytes(forged[value_off..value_off + 8].try_into().unwrap()),
+            new_value
+        );
+
+        let next = PRICES_BASE + DATED_PRICE_SIZE;
+        assert_eq!(
+            &forged[next..next + DATED_PRICE_SIZE],
+            &FIXTURE_SCOPE_PRICES[next..next + DATED_PRICE_SIZE],
+            "neighbouring Scope entry must not move"
+        );
+    }
+
+    /// These addresses are hardcoded facts about mainnet, so guard their shape and uniqueness.
+    /// A liveness check would need network access.
+    #[test]
+    fn test_named_kamino_reserve_templates_have_baked_addresses() {
+        use std::{collections::BTreeSet, str::FromStr};
+
+        use solana_pubkey::Pubkey;
+
+        let registry = TemplateRegistry::new();
+
+        const NAMED: &[&str] = &["kamino-reserve-main-sol", "kamino-reserve-main-usdc"];
+
+        let mut addresses = BTreeSet::new();
+        for id in NAMED {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("named reserve template {} should exist", id));
+
+            assert_eq!(
+                template.account_type, "Reserve",
+                "{} should target a Reserve",
+                id
+            );
+
+            let surfpool_types::AccountAddress::Pubkey(address) = &template.address else {
+                panic!("{} should carry a plain pubkey address, not a PDA", id);
+            };
+            assert!(
+                Pubkey::from_str(address).is_ok(),
+                "{} has an unparseable address: {}",
+                id,
+                address
+            );
+            assert!(
+                addresses.insert(address.clone()),
+                "{} reuses an address already used by another named template",
+                id
+            );
+
+            let paths: Vec<&str> = template.property_paths();
+            for required in [
+                "config.liquidation_threshold_pct",
+                "liquidity.market_price_sf",
+            ] {
+                assert!(
+                    paths.contains(&required),
+                    "{} should expose {}",
+                    id,
+                    required
+                );
+            }
+
+            // Each must point at the template that moves its price, and name its Scope index -
+            // the lookup a user would otherwise do by hand.
+            let context = template.llm_context.as_deref().unwrap_or_default();
+            assert!(
+                context.contains("kamino-scope-price"),
+                "{} should point at kamino-scope-price for moving its price",
+                id
+            );
+            assert!(
+                context.contains("index"),
+                "{} should name the Scope index its price comes from",
+                id
+            );
+        }
+
+        assert_eq!(
+            addresses.len(),
+            NAMED.len(),
+            "all addresses must be distinct"
+        );
+    }
+
+    /// Evidence that a Reserve's cached price is derived from Scope, which is why
+    /// `kamino-scope-price` is the durable lever. The two fixtures are a matched pair: the
+    /// reserve names this Scope account, and its `price_chain` product reproduces the cache.
+    #[test]
+    fn test_reserve_price_is_derived_from_scope() {
+        use solana_pubkey::Pubkey;
+
+        // Reserve offsets incl. discriminator.
+        const MARKET_PRICE_SF: usize = 248; // u128 scaled fraction (value << 60)
+        const SCOPE_PRICE_FEED: usize = 5112;
+        const SCOPE_PRICE_CHAIN: usize = 5144; // [u16; 4], 65535 = unused
+        const PRICES_BASE: usize = 8 + 32;
+        const DATED_PRICE_SIZE: usize = 56;
+        const UNUSED_CHAIN_ENTRY: u16 = 65535;
+
+        let scope_account = Pubkey::from_str_const("3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C");
+
+        assert_eq!(
+            &FIXTURE_RESERVE[SCOPE_PRICE_FEED..SCOPE_PRICE_FEED + 32],
+            scope_account.as_ref(),
+            "the reserve fixture must price through the Scope account the other fixture holds"
+        );
+
+        let chain: Vec<u16> = (0..4)
+            .map(|i| {
+                let off = SCOPE_PRICE_CHAIN + i * 2;
+                u16::from_le_bytes(FIXTURE_RESERVE[off..off + 2].try_into().unwrap())
+            })
+            .take_while(|entry| *entry != UNUSED_CHAIN_ENTRY)
+            .collect();
+        assert!(
+            !chain.is_empty(),
+            "the reserve fixture should name at least one Scope index"
+        );
+
+        // A chained price is the product of its entries, each value / 10^exp.
+        let mut scope_price = 1.0f64;
+        for index in &chain {
+            let base = PRICES_BASE + (*index as usize) * DATED_PRICE_SIZE;
+            let value =
+                u64::from_le_bytes(FIXTURE_SCOPE_PRICES[base..base + 8].try_into().unwrap());
+            let exp = u64::from_le_bytes(
+                FIXTURE_SCOPE_PRICES[base + 8..base + 16]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert!(
+                value > 0 && exp < 30,
+                "Scope entry {} looks unpopulated (value {}, exp {})",
+                index,
+                value,
+                exp
+            );
+            scope_price *= value as f64 / 10f64.powi(exp as i32);
+        }
+
+        let cached_sf = u128::from_le_bytes(
+            FIXTURE_RESERVE[MARKET_PRICE_SF..MARKET_PRICE_SF + 16]
+                .try_into()
+                .unwrap(),
+        );
+        let cached_price = cached_sf as f64 / 2f64.powi(60);
+        assert!(cached_price > 0.0, "reserve fixture should have a price");
+
+        // Captured together, so this is exact rather than approximate.
+        let relative_error = (scope_price - cached_price).abs() / cached_price;
+        assert!(
+            relative_error < 1e-6,
+            "reserve cached price ${cached_price} should equal the Scope chain {chain:?} product \
+             ${scope_price} - if these have diverged, either the scaled-fraction interpretation \
+             (value << 60), the price_chain semantics (a product), or an offset is wrong. \
+             Relative error {relative_error}"
+        );
+    }
+
+    /// A path ending on an index must resolve to the array's ELEMENT type. Resolving it to the
+    /// array instead sends the value down the untyped conversion, where an all-hex base58 pubkey
+    /// such as the default one is mistaken for hex and panics the request.
+    #[test]
+    fn test_terminal_array_index_resolves_to_the_element_type() {
+        use anchor_lang_idl::types::IdlType;
+
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("kamino-scope-price-source")
+            .expect("kamino-scope-price-source should exist");
+
+        for (path, expected) in [
+            ("price_info_accounts.0", IdlType::Pubkey),
+            ("price_types.0", IdlType::U8),
+            ("ref_price.0", IdlType::U16),
+        ] {
+            let resolved =
+                surfpool_types::resolve_idl_type(&template.idl, &template.account_type, path)
+                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+            assert_eq!(
+                *resolved, expected,
+                "{path} should resolve to its element type, not the array"
+            );
+        }
+
+        // An index mid-path already worked; keep it that way.
+        let obligation = registry
+            .get("kamino-obligation-positions")
+            .expect("kamino-obligation-positions should exist");
+        let resolved = surfpool_types::resolve_idl_type(
+            &obligation.idl,
+            &obligation.account_type,
+            "deposits.0.deposit_reserve",
+        )
+        .expect("deposits.0.deposit_reserve should resolve");
+        assert_eq!(*resolved, IdlType::Pubkey);
+    }
+
+    /// Descriptions come from the IDL's own `docs`, or from an explicit `description` in the
+    /// YAML. Studio and any LLM reading a template rely on them.
+    #[test]
+    fn test_every_kamino_property_has_a_description() {
+        let registry = TemplateRegistry::new();
+        let mut missing = Vec::new();
+        let mut described = 0;
+
+        for protocol in [
+            "kamino",
+            "kamino-scope",
+            "kamino-farms",
+            "kamino-swap",
+            "kamino-vault",
+            "kamino-liquidity",
+        ] {
+            for template in registry.by_protocol(protocol) {
+                for property in &template.properties {
+                    match property.description.as_deref() {
+                        Some(text) if !text.trim().is_empty() => described += 1,
+                        _ => missing.push(format!("{}:{}", template.id, property.path)),
+                    }
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "{} Kamino propert(ies) have no description ({} do):\n  {}",
+            missing.len(),
+            described,
+            missing.join("\n  ")
         );
     }
 }
