@@ -7,6 +7,7 @@ use std::{
 };
 
 use agave_feature_set::FeatureSet;
+use anchor_lang_idl::types::{IdlDefinedFields, IdlGenericArg, IdlType, IdlTypeDef, IdlTypeDefTy};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
@@ -160,46 +161,144 @@ pub fn apply_override_to_decoded_account(
     path: &str,
     value: &serde_json::Value,
 ) -> SurfpoolResult<()> {
+    let txtx_value = json_to_txtx_value(value)?;
+    set_decoded_account_value(decoded_value, path, txtx_value)
+}
+
+/// Same as [`apply_override_to_decoded_account`], but takes an already-converted [`Value`].
+pub fn apply_typed_override_to_decoded_account(
+    decoded_value: &mut Value,
+    path: &str,
+    value: Value,
+) -> SurfpoolResult<()> {
+    set_decoded_account_value(decoded_value, path, value)
+}
+
+fn set_decoded_account_value(
+    decoded_value: &mut Value,
+    path: &str,
+    new_value: Value,
+) -> SurfpoolResult<()> {
     let parts: Vec<&str> = path.split('.').collect();
 
-    if parts.is_empty() {
-        return Err(SurfpoolError::internal("Empty path provided for override"));
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(SurfpoolError::internal(format!(
+            "Invalid path '{}' provided for override - contains an empty segment",
+            path
+        )));
     }
 
     // Navigate to the parent of the target field
     let mut current = decoded_value;
     for part in &parts[..parts.len() - 1] {
-        match current {
-            Value::Object(map) => {
-                current = map.get_mut(&part.to_string()).ok_or_else(|| {
+        current = match current {
+            Value::Object(map) => map.get_mut(&part.to_string()).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Path segment '{}' not found in decoded account",
+                    part
+                ))
+            })?,
+            Value::Array(items) => {
+                let index = parse_decoded_account_index(part, path)?;
+                let len = items.len();
+                items.get_mut(index).ok_or_else(|| {
                     SurfpoolError::internal(format!(
-                        "Path segment '{}' not found in decoded account",
-                        part
+                        "Index {} is out of bounds for array of length {} in path '{}'",
+                        index, len, path
                     ))
-                })?;
+                })?
             }
             _ => {
                 return Err(SurfpoolError::internal(format!(
-                    "Cannot navigate through field '{}' - not an object",
+                    "Cannot navigate through field '{}' - not an object or array",
                     part
                 )));
             }
-        }
+        };
     }
 
-    // Set the final field
     let final_key = parts[parts.len() - 1];
     match current {
         Value::Object(map) => {
-            // Convert serde_json::Value to txtx Value
-            let txtx_value = json_to_txtx_value(value)?;
-            map.insert(final_key.to_string(), txtx_value);
+            map.insert(final_key.to_string(), new_value);
+            Ok(())
+        }
+        Value::Array(items) => {
+            let index = parse_decoded_account_index(final_key, path)?;
+            let len = items.len();
+            let slot = items.get_mut(index).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Index {} is out of bounds for array of length {} in path '{}'",
+                    index, len, path
+                ))
+            })?;
+            *slot = new_value;
             Ok(())
         }
         _ => Err(SurfpoolError::internal(format!(
-            "Cannot set field '{}' - parent is not an object",
+            "Cannot set field '{}' - parent is not an object or array",
             final_key
         ))),
+    }
+}
+
+fn parse_decoded_account_index(segment: &str, path: &str) -> SurfpoolResult<usize> {
+    segment.parse::<usize>().map_err(|_| {
+        SurfpoolError::internal(format!(
+            "Path segment '{}' in '{}' must be a zero-based array index",
+            segment, path
+        ))
+    })
+}
+
+/// Converts JSON into a txtx [`Value`] using the expected IDL type
+fn json_to_txtx_value_for_idl_type(
+    json: &serde_json::Value,
+    idl_type: &IdlType,
+    idl_types: &[IdlTypeDef],
+) -> SurfpoolResult<Value> {
+    match (idl_type, json) {
+        (IdlType::Pubkey, serde_json::Value::String(address)) => {
+            let pubkey = Pubkey::from_str(address).map_err(|e| {
+                SurfpoolError::internal(format!(
+                    "Invalid pubkey '{}' in account override: {}",
+                    address, e
+                ))
+            })?;
+            Ok(txtx_addon_network_svm_types::SvmValue::pubkey(
+                pubkey.to_bytes().to_vec(),
+            ))
+        }
+        (IdlType::Option(inner), _) if !json.is_null() => {
+            json_to_txtx_value_for_idl_type(json, inner, idl_types)
+        }
+        (IdlType::Vec(inner), serde_json::Value::Array(items))
+        | (IdlType::Array(inner, _), serde_json::Value::Array(items)) => {
+            let converted = items
+                .iter()
+                .map(|item| json_to_txtx_value_for_idl_type(item, inner, idl_types))
+                .collect::<SurfpoolResult<Vec<_>>>()?;
+            Ok(Value::Array(Box::new(converted)))
+        }
+        (IdlType::Defined { name, .. }, serde_json::Value::Object(fields)) => {
+            let Some(IdlTypeDefTy::Struct {
+                fields: Some(IdlDefinedFields::Named(named_fields)),
+            }) = idl_types.iter().find(|t| &t.name == name).map(|t| &t.ty)
+            else {
+                return json_to_txtx_value(json);
+            };
+
+            let mut object = IndexMap::new();
+            for (key, value) in fields.iter() {
+                let converted = match named_fields.iter().find(|f| &f.name == key) {
+                    Some(field) => json_to_txtx_value_for_idl_type(value, &field.ty, idl_types)?,
+                    None => json_to_txtx_value(value)?,
+                };
+                object.insert(key.clone(), converted);
+            }
+            Ok(Value::Object(object))
+        }
+        _ => json_to_txtx_value(json),
     }
 }
 
@@ -2741,6 +2840,10 @@ impl SurfnetSvm {
                 }
             }
 
+            if override_instance.persist {
+                self.reschedule_override_for_next_slot(&override_instance, target_slot);
+            }
+
             // Apply the override values to the account data
             if !override_instance.values.is_empty() {
                 // Filter out values that are only used for PDA derivation (not account data)
@@ -2872,6 +2975,34 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Re-queues `instance` for the slot after `target_slot`. Idempotent, so an override
+    /// cannot be applied twice to one slot.
+    fn reschedule_override_for_next_slot(
+        &mut self,
+        instance: &OverrideInstance,
+        target_slot: Slot,
+    ) {
+        let next_slot = target_slot + 1;
+        let mut next = self
+            .scheduled_overrides
+            .get(&next_slot)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        if next.iter().any(|existing| existing.id == instance.id) {
+            return;
+        }
+
+        next.push(instance.clone());
+        if let Err(e) = self.scheduled_overrides.store(next_slot, next) {
+            warn!(
+                "Failed to reschedule override {} for slot {}: {}",
+                instance.id, next_slot, e
+            );
+        }
+    }
+
     /// Forges account data by applying overrides to existing account data
     ///
     /// This function:
@@ -2962,12 +3093,15 @@ impl SurfnetSvm {
 
         // Apply overrides to the decoded value
         for (path, value) in overrides {
-            apply_override_to_decoded_account(&mut parsed_value, path, value)?;
+            let converted = match surfpool_types::resolve_idl_type(idl, &account_type.name, path) {
+                Ok(idl_type) => json_to_txtx_value_for_idl_type(value, idl_type, &idl.types)?,
+                Err(_) => json_to_txtx_value(value)?,
+            };
+            apply_typed_override_to_decoded_account(&mut parsed_value, path, converted)?;
         }
 
         // Construct an IdlType::Defined that references the account type
         // This is needed because borsh_encode_value_to_idl_type expects IdlType, not IdlTypeDefTy
-        use anchor_lang_idl::types::{IdlGenericArg, IdlType};
         let defined_type = IdlType::Defined {
             name: account_type.name.clone(),
             generics: account_type
@@ -7069,5 +7203,199 @@ mod tests {
             .expect("get_account should not error")
             .expect("Valid account should be restored");
         assert_eq!(restored_account.lamports, 1_000_000);
+    }
+
+    /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
+    const UNHEALTHY_OFFSET: usize = 2256;
+
+    /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
+    /// the bundled template IDLs, so klend's is resolvable by owner program.
+    fn scheduled_persist_fixture(
+        persist: bool,
+    ) -> (SurfnetSvm, Pubkey, surfpool_types::OverrideInstance) {
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+        let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
+            .expect("kamino idl");
+        let obligation_disc = &idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "Obligation")
+            .expect("Obligation account")
+            .discriminator;
+
+        let mut data = vec![0u8; 3344];
+        data[..8].copy_from_slice(obligation_disc);
+
+        let account_pubkey = Pubkey::new_unique();
+        surfnet_svm
+            .inner
+            .set_account(
+                account_pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    data,
+                    owner: klend,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .expect("set obligation account");
+
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        instance.persist = persist;
+
+        (surfnet_svm, account_pubkey, instance)
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_is_rescheduled_for_the_next_slot() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        let instance_id = instance.id.clone();
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(unhealthy, 1_234, "override should have been applied");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(
+            next.len(),
+            1,
+            "exactly one override queued for the next slot"
+        );
+        assert_eq!(next[0].id, instance_id);
+        assert!(next[0].persist, "persist flag must survive rescheduling");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("storage read")
+                .is_none(),
+            "materialized slot should be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_persisted_override_is_not_rescheduled() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(false);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("storage read")
+                .is_none(),
+            "a one-shot override must not be rescheduled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_survives_a_run_of_slots() {
+        const FIRST_SLOT: u64 = 900;
+        const SLOTS: u64 = 5;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(FIRST_SLOT, vec![instance])
+            .expect("schedule override");
+
+        for slot in FIRST_SLOT..FIRST_SLOT + SLOTS {
+            // Clobber the field, the way `refresh_obligation` would.
+            let mut account = svm
+                .inner
+                .get_account(&account_pubkey)
+                .expect("get_account")
+                .expect("account present");
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .copy_from_slice(&0u128.to_le_bytes());
+            svm.inner
+                .set_account(account_pubkey, account)
+                .expect("clobber account");
+
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize");
+
+            let account = svm
+                .inner
+                .get_account(&account_pubkey)
+                .expect("get_account")
+                .expect("account present");
+            let unhealthy = u128::from_le_bytes(
+                account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                    .try_into()
+                    .expect("16 bytes"),
+            );
+            assert_eq!(
+                unhealthy, 1_234,
+                "persisted override should be re-applied on slot {slot} after being clobbered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_does_not_duplicate_itself() {
+        const SLOT: u64 = 700;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(SLOT + 1, vec![instance.clone()])
+            .expect("pre-queue next slot");
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot queue");
+        assert_eq!(
+            next.len(),
+            1,
+            "override must not be queued twice for one slot"
+        );
     }
 }
