@@ -2806,6 +2806,7 @@ impl SurfnetSvm {
                 }
             }
 
+            // Queued before the write so a failed apply is retried next slot, still fetching.
             if override_instance.persist {
                 self.reschedule_override_for_next_slot(&override_instance, target_slot);
             }
@@ -2934,6 +2935,14 @@ impl SurfnetSvm {
                         account_pubkey,
                         override_instance.id
                     );
+                    // The account is forked now. Re-fetching it every slot would cost one RPC
+                    // per slot and overwrite whatever local transactions wrote to the fields
+                    // this override leaves alone, so later slots re-pin without fetching.
+                    if override_instance.persist && override_instance.fetch_before_use {
+                        let mut requeued = override_instance.clone();
+                        requeued.fetch_before_use = false;
+                        self.reschedule_override_for_next_slot(&requeued, target_slot);
+                    }
                 }
             }
         }
@@ -2941,8 +2950,8 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Re-queues `instance` for the slot after `target_slot`. Idempotent, so an override
-    /// cannot be applied twice to one slot.
+    /// Re-queues `instance` for the slot after `target_slot`, replacing any copy of itself
+    /// already queued there. One entry per id, so an override cannot be applied twice to one slot.
     fn reschedule_override_for_next_slot(
         &mut self,
         instance: &OverrideInstance,
@@ -2956,11 +2965,11 @@ impl SurfnetSvm {
             .flatten()
             .unwrap_or_default();
 
-        if next.iter().any(|existing| existing.id == instance.id) {
-            return;
+        if let Some(existing) = next.iter_mut().find(|queued| queued.id == instance.id) {
+            *existing = instance.clone();
+        } else {
+            next.push(instance.clone());
         }
-
-        next.push(instance.clone());
         if let Err(e) = self.scheduled_overrides.store(next_slot, next) {
             warn!(
                 "Failed to reschedule override {} for slot {}: {}",
@@ -7102,6 +7111,33 @@ mod tests {
                 .expect("storage read")
                 .is_none(),
             "materialized slot should be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_stops_refetching_once_the_account_is_forked() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            !next[0].fetch_before_use,
+            "the account is forked, so later slots must not re-fetch it and discard local writes"
         );
     }
 

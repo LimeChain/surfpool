@@ -38,8 +38,9 @@ every following slot, which is needed when something else writes the account in 
 transaction, or another override fetching it fresh. Persist inputs nothing in the scenario writes
 (an oracle price, a disabled switch, a risk parameter), never state the transactions under test
 mutate: re-applying reverts their writes at the start of the next slot, so a pool would refill
-itself after every swap. Re-queuing is idempotent, so an override is never applied twice to one
-slot.
+itself after every swap. Only one entry is queued per override, so it is never applied twice to
+one slot, and `fetchBeforeUse` applies to the first slot only - once the account is forked, later
+slots re-pin the fields without re-fetching it.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
