@@ -124,4 +124,4 @@ templates:
          kamino-reserve-oracle instead
 
       EXAMPLE - move the 1h EMA of entry 3 to $45 (EMAs are scaled by 2^60):
-      twaps.3.current_ema1h: 51879434184388608000
+      twaps.3.current_ema1h: "51879434184388608000"

@@ -42,6 +42,18 @@ itself after every swap. Only one entry is queued per override, so it is never a
 one slot, and `fetchBeforeUse` applies to the first slot only - once the account is forked, later
 slots re-pin the fields without re-fetching it.
 
+### Kamino integration tests
+
+Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real
+accounts from mainnet, so they need a network connection and are compiled only behind a feature:
+
+```
+cargo test -p surfpool-core --features integration-tests kamino
+```
+
+Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
+run needs no network.
+
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
 This is a cumbersome process in most cases.
