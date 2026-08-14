@@ -114,6 +114,17 @@ pub struct CreatePumpGraduationScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePumpSwapPriceShockScenarioParams {
+    #[schemars(
+        description = "Mint of a migrated pump.fun coin with a canonical WSOL PumpSwap pool."
+    )]
+    pub token_mint: String,
+    #[schemars(description = "Positive virtual quote reserve amount, passed as a decimal string.")]
+    pub virtual_quote_reserves: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StartSurfnetWithTokenAccountsParams {
     #[schemars(
         description = "A list of accounts to create or fund. For each account, an optional owner can be specified; if omitted, a new wallet is generated. Token parameters include the mint, program ID, and amount."
@@ -961,6 +972,71 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Creates an editable PumpSwap price-shock scenario for a required migrated tokenMint and positive virtualQuoteReserves decimal string. The backend validates that the mint has a canonical WSOL PumpSwap pool. Prepare state only; do not build or execute swaps."
+    )]
+    async fn create_pump_swap_price_shock_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePumpSwapPriceShockScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/scenarios/pump-swap-price-shock",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "tokenMint": params.token_mint,
+                "virtualQuoteReserves": params.virtual_quote_reserves,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let result = RegisterScenarioResponse::error(format!(
+                    "Failed to reach the PumpSwap price shock endpoint: {error}"
+                ));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&result).unwrap_or_default(),
+                )]));
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let result = RegisterScenarioResponse::error(if body.is_empty() {
+                format!("PumpSwap price shock validation failed with HTTP {status}")
+            } else {
+                body
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&result).unwrap_or_default(),
+            )]));
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            McpError::internal_error(
+                format!("Invalid PumpSwap price shock response: {error}"),
+                None,
+            )
+        })?;
+        let scenario_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                McpError::internal_error("PumpSwap price shock response has no id", None)
+            })?;
+        let url = format!(
+            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
+        );
+        let result = RegisterScenarioResponse::success(url);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
@@ -1236,6 +1312,21 @@ mod tests {
             serde_json::from_value::<CreatePumpGraduationScenarioParams>(serde_json::json!({}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn pump_swap_price_shock_inputs_are_required() {
+        assert!(
+            serde_json::from_value::<CreatePumpSwapPriceShockScenarioParams>(serde_json::json!({}))
+                .is_err()
+        );
+        let parsed: CreatePumpSwapPriceShockScenarioParams =
+            serde_json::from_value(serde_json::json!({
+                "tokenMint": "mint",
+                "virtualQuoteReserves": "15000000000000",
+            }))
+            .unwrap();
+        assert_eq!(parsed.virtual_quote_reserves, "15000000000000");
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {
