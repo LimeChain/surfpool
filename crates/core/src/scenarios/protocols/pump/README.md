@@ -136,7 +136,9 @@ against live mainnet data).
   over real 151/300-byte mainnet snapshots.
 - MCP surface: `cargo test -p surfpool-mcp --lib` — compact template listing, catalog
   scoping, pre-HTTP validation errors.
-- Behavioral differential (planned, `#[ignore = "requires-network"]`): execute real
-  `buy` instructions against prepared state on a mainnet fork and assert exact
-  fee-inclusive costs and error codes (`TooMuchSolRequired`, `BondingCurveComplete`,
-  `ExceededSlippage`).
+- Behavioral regression: `cargo test -p surfpool-core
+  test_pump_token2022_graduation_lifecycle -- --ignored --nocapture` prepares the
+  frozen Token-2022 fixture through the production graduation scenario builder and
+  materializer, then executes real `buy_v2`, `migrate_v2`, and PumpSwap `sell`
+  instructions against live mainnet programs. It also compares baseline and
+  price-shocked sell simulations and requires the quote-token output to change.

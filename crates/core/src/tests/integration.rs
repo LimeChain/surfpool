@@ -33,7 +33,10 @@ use solana_address_lookup_table_interface::{
 };
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    rpc_config::{
+        RpcSendTransactionConfig, RpcSimulateTransactionAccountsConfig,
+        RpcSimulateTransactionConfig,
+    },
     rpc_response::RpcLogsResponse,
 };
 use solana_clock::{Clock, Slot};
