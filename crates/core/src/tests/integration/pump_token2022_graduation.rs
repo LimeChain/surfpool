@@ -1,4 +1,8 @@
 use super::*;
+use crate::scenarios::{
+    pump_graduation::build_pump_graduation_scenario,
+    pump_swap_price_shock::build_pump_swap_price_shock_scenario,
+};
 
 const PUMP: Pubkey = Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const PAMM: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -44,16 +48,9 @@ const BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
 const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
-const REAL_TOKEN_RESERVES: u64 = 216_645_197_009;
-const VIRTUAL_TOKEN_RESERVES: u64 = 280_116_645_197_009;
-const VIRTUAL_QUOTE_RESERVES: u64 = 58_138_841_819;
-const REAL_QUOTE_RESERVES: u64 = 1;
 const MAX_SOL_COST: u64 = 1_000_000_000;
 
-const CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET: usize = 8;
-const CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 16;
 const CURVE_REAL_TOKEN_RESERVES_OFFSET: usize = 24;
-const CURVE_REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const CURVE_COMPLETE_OFFSET: usize = 48;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 const AMM_RESERVED_FEE_RECIPIENT_OFFSET: usize = 385;
@@ -146,7 +143,7 @@ fn account_meta(pubkey: Pubkey, signer: bool, writable: bool) -> AccountMeta {
     }
 }
 
-fn start_snapshot_surfnet() -> (RpcClient, RunloopGuard) {
+fn start_snapshot_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
         serde_json::from_str(include_str!(
             "../assets/pump_token2022_graduation.snapshot.json"
@@ -170,8 +167,9 @@ fn start_snapshot_surfnet() -> (RpcClient, RunloopGuard) {
     };
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
     let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let locker = SurfnetSvmLocker::new(surfnet_svm);
     let runloop = spawn_runloop(
-        SurfnetSvmLocker::new(surfnet_svm),
+        locker.clone(),
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
@@ -184,7 +182,7 @@ fn start_snapshot_surfnet() -> (RpcClient, RunloopGuard) {
         CommitmentConfig::confirmed(),
     );
 
-    (rpc, runloop)
+    (rpc, locker, runloop)
 }
 
 async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Value) {
@@ -195,19 +193,6 @@ async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Va
         )
         .await
         .unwrap_or_else(|error| panic!("{method} cheatcode failed: {error:?}"));
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-async fn set_account_data(rpc: &RpcClient, pubkey: &Pubkey, data: &[u8]) {
-    cheatcode(
-        rpc,
-        "surfnet_setAccount",
-        serde_json::json!([pubkey.to_string(), { "data": bytes_to_hex(data) }]),
-    )
-    .await;
 }
 
 fn read_u64(data: &[u8], offset: usize) -> u64 {
@@ -228,60 +213,57 @@ async fn token_amount(rpc: &RpcClient, address: &Pubkey) -> u64 {
 }
 
 async fn send_transaction(rpc: &RpcClient, payer: &Keypair, instructions: Vec<Instruction>) {
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .expect("recent blockhash should be available");
-    let transaction = Transaction::new_signed_with_payer(
-        &instructions,
-        Some(&payer.pubkey()),
-        &[payer],
-        blockhash,
-    );
+    let transaction = signed_transaction(rpc, payer, instructions).await;
     rpc.send_and_confirm_transaction(&transaction)
         .await
         .unwrap_or_else(|error| panic!("transaction failed: {error:?}"));
 }
 
-async fn prepare_near_complete_curve(rpc: &RpcClient) -> u64 {
-    let curve_account = rpc
-        .get_account(&CURVE)
+async fn signed_transaction(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    instructions: Vec<Instruction>,
+) -> Transaction {
+    let blockhash = rpc
+        .get_latest_blockhash()
         .await
-        .expect("frozen curve should load");
-    let vault_account = rpc
-        .get_account(&BASE_VAULT)
+        .expect("recent blockhash should be available");
+    Transaction::new_signed_with_payer(&instructions, Some(&payer.pubkey()), &[payer], blockhash)
+}
+
+async fn simulate_token_amount_after_transaction(
+    rpc: &RpcClient,
+    payer: &Keypair,
+    instruction: Instruction,
+    token_account: Pubkey,
+) -> u64 {
+    let transaction = signed_transaction(rpc, payer, vec![instruction]).await;
+    let simulation = rpc
+        .simulate_transaction_with_config(
+            &transaction,
+            RpcSimulateTransactionConfig {
+                sig_verify: true,
+                commitment: Some(CommitmentConfig::confirmed()),
+                accounts: Some(RpcSimulateTransactionAccountsConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    addresses: vec![token_account.to_string()],
+                }),
+                ..RpcSimulateTransactionConfig::default()
+            },
+        )
         .await
-        .expect("frozen base vault should load");
-    let migration_reserve = read_u64(&vault_account.data, TOKEN_AMOUNT_OFFSET)
-        .checked_sub(read_u64(
-            &curve_account.data,
-            CURVE_REAL_TOKEN_RESERVES_OFFSET,
-        ))
-        .expect("base vault should cover the curve's real token reserves");
-
-    let mut curve_data = curve_account.data;
-    curve_data[CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET..CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET]
-        .copy_from_slice(&VIRTUAL_TOKEN_RESERVES.to_le_bytes());
-    curve_data[CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET..CURVE_REAL_TOKEN_RESERVES_OFFSET]
-        .copy_from_slice(&VIRTUAL_QUOTE_RESERVES.to_le_bytes());
-    curve_data[CURVE_REAL_TOKEN_RESERVES_OFFSET..CURVE_REAL_QUOTE_RESERVES_OFFSET]
-        .copy_from_slice(&REAL_TOKEN_RESERVES.to_le_bytes());
-    curve_data[CURVE_REAL_QUOTE_RESERVES_OFFSET..CURVE_REAL_QUOTE_RESERVES_OFFSET + 8]
-        .copy_from_slice(&REAL_QUOTE_RESERVES.to_le_bytes());
-    curve_data[CURVE_COMPLETE_OFFSET] = 0;
-    set_account_data(rpc, &CURVE, &curve_data).await;
-
-    let mut vault_data = vault_account.data;
-    assert_eq!(
-        vault_data.len(),
-        170,
-        "Token-2022 base vault must keep its extension tail"
-    );
-    vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8]
-        .copy_from_slice(&(REAL_TOKEN_RESERVES + migration_reserve).to_le_bytes());
-    set_account_data(rpc, &BASE_VAULT, &vault_data).await;
-
-    migration_reserve
+        .unwrap();
+    assert_eq!(simulation.value.err, None, "swap simulation should succeed");
+    let account_data = simulation
+        .value
+        .accounts
+        .unwrap()
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|account| account.data.decode())
+        .expect("simulation should return the requested token account");
+    read_u64(&account_data, TOKEN_AMOUNT_OFFSET)
 }
 
 async fn fund_user(rpc: &RpcClient, user: Pubkey) {
@@ -306,7 +288,7 @@ async fn fund_user(rpc: &RpcClient, user: Pubkey) {
     .await;
 }
 
-fn build_buy_v2(fixture: &GraduationFixture) -> Instruction {
+fn build_buy_v2(fixture: &GraduationFixture, completing_buy_amount: u64) -> Instruction {
     let accounts = vec![
         account_meta(PUMP_GLOBAL, false, false),           // 0 global
         account_meta(MINT, false, false),                  // 1 base_mint
@@ -337,7 +319,7 @@ fn build_buy_v2(fixture: &GraduationFixture) -> Instruction {
         account_meta(PUMP, false, false),                                 // 26 program
     ];
     let mut data = BUY_V2_DISCRIMINATOR.to_vec();
-    data.extend_from_slice(&REAL_TOKEN_RESERVES.to_le_bytes());
+    data.extend_from_slice(&completing_buy_amount.to_le_bytes());
     data.extend_from_slice(&MAX_SOL_COST.to_le_bytes());
 
     Instruction {
@@ -388,7 +370,11 @@ fn build_migrate_v2(fixture: &GraduationFixture) -> Vec<Instruction> {
     ]
 }
 
-async fn build_sell(rpc: &RpcClient, fixture: &GraduationFixture) -> (Instruction, u64) {
+async fn build_sell(
+    rpc: &RpcClient,
+    fixture: &GraduationFixture,
+    base_amount_in: u64,
+) -> Instruction {
     let global_config = rpc
         .get_account(&AMM_GLOBAL_CONFIG)
         .await
@@ -416,7 +402,6 @@ async fn build_sell(rpc: &RpcClient, fixture: &GraduationFixture) -> (Instructio
             .unwrap();
     let coin_creator_vault_authority =
         Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &PAMM).0;
-    let base_amount_in = REAL_TOKEN_RESERVES / 2;
     let accounts = vec![
         account_meta(fixture.pool, false, true),            // 0 pool
         account_meta(fixture.user, true, true),             // 1 user
@@ -460,27 +445,46 @@ async fn build_sell(rpc: &RpcClient, fixture: &GraduationFixture) -> (Instructio
     // Zero slippage protection is acceptable only in this regression test.
     data.extend_from_slice(&0u64.to_le_bytes());
 
-    (
-        Instruction {
-            program_id: PAMM,
-            accounts,
-            data,
-        },
-        base_amount_in,
-    )
+    Instruction {
+        program_id: PAMM,
+        accounts,
+        data,
+    }
 }
 
 /// The snapshot freezes account state while the live programs expose behavioral upgrades.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires network: forks mainnet for the live pump and pAMM programs"]
 async fn test_pump_token2022_graduation_lifecycle() {
-    let (rpc, _runloop) = start_snapshot_surfnet();
+    let (rpc, locker, _runloop) = start_snapshot_surfnet();
     let user = Keypair::new();
     let fixture = GraduationFixture::new(user.pubkey());
-    let migration_reserve = prepare_near_complete_curve(&rpc).await;
+    let preparation = build_pump_graduation_scenario(
+        MINT,
+        &rpc.get_account(&MINT).await.unwrap(),
+        &rpc.get_account(&CURVE).await.unwrap(),
+        &rpc.get_account(&BASE_VAULT).await.unwrap(),
+        None,
+        &rpc.get_account(&PUMP_GLOBAL).await.unwrap(),
+    )
+    .unwrap();
+    let completing_buy_amount = preparation.completing_buy_amount;
+    let migration_reserve = preparation.migration_reserve;
+    locker
+        .register_scenario(preparation.scenario, Some(0))
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, 1)
+        .await
+        .unwrap();
     fund_user(&rpc, fixture.user).await;
 
-    send_transaction(&rpc, &user, vec![build_buy_v2(&fixture)]).await;
+    send_transaction(
+        &rpc,
+        &user,
+        vec![build_buy_v2(&fixture, completing_buy_amount)],
+    )
+    .await;
 
     let curve_after = rpc.get_account(&CURVE).await.unwrap();
     assert_eq!(
@@ -494,7 +498,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
     );
     assert_eq!(
         token_amount(&rpc, &fixture.user_base).await,
-        REAL_TOKEN_RESERVES,
+        completing_buy_amount,
         "user should receive the purchased base tokens"
     );
     assert_eq!(
@@ -529,7 +533,32 @@ async fn test_pump_token2022_graduation_lifecycle() {
     let pre_user_quote = token_amount(&rpc, &fixture.user_quote).await;
     let pre_pool_base = token_amount(&rpc, &fixture.pool_base).await;
     let pre_pool_quote = token_amount(&rpc, &fixture.pool_quote).await;
-    let (sell, base_amount_in) = build_sell(&rpc, &fixture).await;
+    let base_amount_in = pre_user_base / 2;
+    let sell = build_sell(&rpc, &fixture, base_amount_in).await;
+    let baseline_user_quote =
+        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), fixture.user_quote)
+            .await;
+    let price_shock = build_pump_swap_price_shock_scenario(
+        MINT,
+        &rpc.get_account(&fixture.pool).await.unwrap(),
+        pre_pool_quote.checked_mul(9).unwrap(),
+    )
+    .unwrap();
+    locker
+        .register_scenario(price_shock.scenario, Some(0))
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, 1)
+        .await
+        .unwrap();
+    let shocked_user_quote =
+        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), fixture.user_quote)
+            .await;
+    assert_ne!(
+        shocked_user_quote - pre_user_quote,
+        baseline_user_quote - pre_user_quote,
+        "the price-shock scenario should change the real swap output"
+    );
     send_transaction(&rpc, &user, vec![sell]).await;
 
     assert_eq!(
