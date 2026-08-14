@@ -18,8 +18,8 @@ use spl_associated_token_account_interface::address::get_associated_token_addres
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
     GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, SimnetEvent,
-    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
+    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
+    StreamAccountsEntry, UiKeyedProfileResult,
     types::{AccountUpdate, SetSomeAccount, SupplyUpdate, TokenAccountUpdate, UuidOrSignature},
 };
 
@@ -1433,9 +1433,9 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 } = svm_locker.get_account(&remote_ctx, &pubkey, Some(Box::new(move |svm_locker| {
 
                             // if the account does not exist locally or in the remote, create a new account with default values
-                            let _ = svm_locker.simnet_events_tx().send(SimnetEvent::info(format!(
+                            svm_locker.simnet_events_tx().info(format!(
                                 "Account {pubkey} not found, creating a new account from default values"
-                            )));
+                            ));
                             GetAccountResult::FoundAccount(
                                 pubkey,
                                 solana_account::Account {

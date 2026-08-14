@@ -16,7 +16,7 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
-use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SubgraphEvent};
+use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SimnetEventsTx, SubgraphEvent};
 use txtx_core::kit::{channel::Receiver, helpers::fs::FileLocation, types::frontend::BlockEvent};
 use txtx_gql::kit::{indexmap::IndexMap, types::frontend::LogLevel, uuid::Uuid};
 
@@ -80,15 +80,15 @@ pub async fn handle_start_local_surfnet_command(
                 &cmd.observability.metrics_addr,
             ) {
                 Err(e) => {
-                    let _ = surfnet_svm
+                    surfnet_svm
                         .simnet_events_tx
-                        .send(SimnetEvent::warn(format!("Metrics init failed: {}", e)));
+                        .warn(format!("Metrics init failed: {}", e));
                 }
                 Ok(_) => {
-                    let _ = surfnet_svm.simnet_events_tx.send(SimnetEvent::info(format!(
+                    surfnet_svm.simnet_events_tx.info(format!(
                         "Metrics available at http://{}/metrics",
                         cmd.observability.metrics_addr
-                    )));
+                    ));
                 }
             }
         }
@@ -129,11 +129,11 @@ pub async fn handle_start_local_surfnet_command(
                 Option<surfpool_types::AccountSnapshot>,
             > = serde_json::from_str(&content)
                 .map_err(|e| format!("Failed to parse snapshot JSON '{}': {}", snapshot_path, e))?;
-            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+            simnet_events_tx.info(format!(
                 "Loaded {} accounts from snapshot file: {}",
                 snapshot_data.len(),
                 snapshot_path
-            )));
+            ));
 
             // Merge into the combined snapshot (later files override earlier ones)
             merged_snapshot.extend(snapshot_data);
@@ -197,11 +197,11 @@ pub async fn handle_start_local_surfnet_command(
         Ok(explorer_handle) => Some(explorer_handle),
         Err(e) => {
             error!("Failed to start subgraph and explorer server: {}", e);
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+            simnet_events_tx.warn(format!(
                 "Failed to start subgraph and explorer server: {}",
                 e
-            )));
-            let _ = simnet_events_tx.send(SimnetEvent::info("Continuing with simnet startup..."));
+            ));
+            simnet_events_tx.info("Continuing with simnet startup...");
             None
         }
     };
@@ -221,7 +221,7 @@ pub async fn handle_start_local_surfnet_command(
             );
             if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                 // Send the error through the event channel so the main thread can handle it
-                let _ = simnet_events_tx_for_thread.send(SimnetEvent::Aborted(e.to_string()));
+                simnet_events_tx_for_thread.aborted(e.to_string());
             }
             Ok::<(), String>(())
         })
@@ -243,13 +243,7 @@ pub async fn handle_start_local_surfnet_command(
     };
 
     // Re-send early events (like snapshot loading messages) so the TUI receives them
-    for event in early_events {
-        let _ = simnet_events_tx.send(event);
-    }
-
-    for event in airdrop_events {
-        let _ = simnet_events_tx.send(event);
-    }
+    replay_early_events(&simnet_events_tx, early_events, airdrop_events);
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut runbook_progress_rx = vec![];
@@ -262,8 +256,7 @@ pub async fn handle_start_local_surfnet_command(
             // the watchdog's decision.
             Err(StartupPlanFailure::Planning(e)) => {
                 let _ = simnet_commands_tx_copy.send(SimnetCommand::FailStartupPlanning(e.clone()));
-                let _ = simnet_events_tx
-                    .send(SimnetEvent::warn(format!("Startup planning failed: {e}")));
+                simnet_events_tx.warn(format!("Startup planning failed: {e}"));
             }
             // The command loop is dead or wedged, so the startup state machine
             // is unreachable and no session can ever become ready.
@@ -309,8 +302,7 @@ pub async fn handle_start_local_surfnet_command(
         if let Ok(response) = response {
             if let Ok(body) = response.json::<CheckVersionResponse>().await {
                 if let Some(deprecation_notice) = body.deprecation_notice {
-                    let _ =
-                        simnet_events_tx.send(SimnetEvent::warn(deprecation_notice.to_string()));
+                    let _ = simnet_events_tx.warn(deprecation_notice.to_string());
                 }
             }
         }
@@ -627,5 +619,82 @@ mod tests {
             public_service_url(None, None, "http", "0.0.0.0", 8899),
             "http://127.0.0.1:8899"
         );
+    }
+}
+
+/// Re-send events buffered before `CoreStarted` (and the airdrop
+/// announcements) so the frontend consumer receives them.
+pub(crate) fn replay_early_events(
+    simnet_events_tx: &SimnetEventsTx,
+    early_events: Vec<SimnetEvent>,
+    airdrop_events: Vec<SimnetEvent>,
+) {
+    // On a separate thread: the caller owns the only receiver and does not
+    // drain again until the frontend consumer starts, so a blocking emit on
+    // the caller's thread wedges startup once the buffer fills (a warm
+    // start can buffer a full channel of replayed transactions before
+    // CoreStarted). The replay thread blocks until the consumer drains,
+    // intentionally.
+    let tx = simnet_events_tx.clone();
+    let _ = hiro_system_kit::thread_named("early-event-replay").spawn(move || {
+        for event in early_events.into_iter().chain(airdrop_events) {
+            tx.forward(event);
+        }
+        Ok::<(), String>(())
+    });
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use std::{thread, time::Duration};
+
+    use surfpool_types::SimnetEventsTx;
+
+    use super::*;
+
+    /// Startup calls the replay on the thread that owns the only receiver,
+    /// and concurrent producers may already have refilled the buffer, so
+    /// the call must return without waiting on a drain. Buffered events
+    /// route by class: lifecycle events arrive once the consumer drains;
+    /// telemetry may drop, telemetry's standing contract. Small capacity
+    /// for speed; the mechanism is capacity-independent.
+    #[test]
+    fn replay_returns_before_the_consumer_drains() {
+        let (tx, rx) = SimnetEventsTx::channel(4);
+        for i in 0..4 {
+            tx.info(format!("producer {i}"));
+        }
+
+        let replay_tx = tx.clone();
+        let replayer = thread::spawn(move || {
+            replay_early_events(
+                &replay_tx,
+                vec![
+                    SimnetEvent::info("telemetry, droppable"),
+                    SimnetEvent::RunbookStarted("lifecycle, must arrive".to_string()),
+                ],
+                vec![],
+            );
+        });
+
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            replayer.is_finished(),
+            "replay must not block the receiver-owning thread on a full buffer"
+        );
+
+        // The consumer drains, as log_events/start_app do. The four producer
+        // events and the lifecycle event arrive; the telemetry line found
+        // the buffer full and dropped.
+        let received: Vec<SimnetEvent> = (0..5)
+            .map(|_| {
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("every surviving event arrives once the consumer drains")
+            })
+            .collect();
+        assert!(
+            matches!(&received[4], SimnetEvent::RunbookStarted(msg) if msg == "lifecycle, must arrive")
+        );
+        assert!(rx.try_recv().is_err(), "nothing else was queued");
     }
 }
