@@ -251,6 +251,22 @@ fn parse_decoded_account_index(segment: &str, path: &str) -> SurfpoolResult<usiz
     })
 }
 
+fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult<String> {
+    match json {
+        serde_json::Value::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => {
+            Err(SurfpoolError::internal(format!(
+                "{n} exceeds what a JSON number can hold exactly; pass this {target} as a decimal \
+                 string instead, e.g. \"1152921504606846976000\""
+            )))
+        }
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::String(s) => Ok(s.trim().to_string()),
+        other => Err(SurfpoolError::internal(format!(
+            "Expected a number or decimal string for {target}, found {other}"
+        ))),
+    }
+}
+
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
 fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
@@ -271,6 +287,20 @@ fn json_to_txtx_value_for_idl_type(
         }
         (IdlType::Option(inner), _) if !json.is_null() => {
             json_to_txtx_value_for_idl_type(json, inner, idl_types)
+        }
+        (IdlType::U128, _) => {
+            let digits = json_integer_digits(json, "u128")?;
+            let value = digits.parse::<u128>().map_err(|e| {
+                SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}"))
+            })?;
+            Ok(txtx_addon_network_svm_types::SvmValue::u128(value))
+        }
+        (IdlType::I128, _) => {
+            let digits = json_integer_digits(json, "i128")?;
+            let value = digits.parse::<i128>().map_err(|e| {
+                SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}"))
+            })?;
+            Ok(txtx_addon_network_svm_types::SvmValue::i128(value))
         }
         (IdlType::Vec(inner), serde_json::Value::Array(items))
         | (IdlType::Array(inner, _), serde_json::Value::Array(items)) => {
@@ -2754,6 +2784,8 @@ impl SurfnetSvm {
             target_slot
         );
 
+        let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
+
         for override_instance in overrides {
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
@@ -2792,7 +2824,7 @@ impl SurfnetSvm {
             );
 
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use {
+            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -2817,6 +2849,8 @@ impl SurfnetSvm {
                                     "Failed to set account {} from remote: {}",
                                     account_pubkey, e
                                 );
+                            } else {
+                                settled_this_slot.insert(account_pubkey);
                             }
                         }
                         Ok(GetAccountResult::None(_)) => {
@@ -2969,6 +3003,7 @@ impl SurfnetSvm {
                         account_pubkey,
                         override_instance.id
                     );
+                    settled_this_slot.insert(account_pubkey);
                     // The account is forked now. Re-fetching it every slot would cost one RPC
                     // per slot and overwrite whatever local transactions wrote to the fields
                     // this override leaves alone, so later slots re-pin without fetching.
@@ -7339,6 +7374,54 @@ mod tests {
             !next[0].fetch_before_use,
             "the account is forked, so later slots must not re-fetch it and discard local writes"
         );
+    }
+
+    /// Guards the ordering invariant only. The re-fetch that used to clobber the first override
+    /// needs a remote client, so `remote_ctx: &None` cannot reproduce it here - that path is
+    /// covered against a live fork.
+    #[tokio::test]
+    async fn test_two_fetching_overrides_on_one_account_both_apply() {
+        const SLOT: u64 = 500;
+        // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
+        const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
+
+        let (mut svm, account_pubkey, first) = scheduled_persist_fixture(false);
+        let mut first = first;
+        first.fetch_before_use = true;
+
+        let mut second = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "allowed_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        )]));
+        second.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![first, second])
+            .expect("schedule overrides");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let read = |off: usize| {
+            u128::from_le_bytes(account.data[off..off + 16].try_into().expect("16 bytes"))
+        };
+        assert_eq!(
+            read(UNHEALTHY_OFFSET),
+            1_234,
+            "the first override must survive the second override's fetch"
+        );
+        assert_eq!(read(ALLOWED_OFFSET), 5_678, "the second override must apply");
     }
 
     #[tokio::test]
