@@ -286,11 +286,22 @@ fn scenario_from_full_patch(patch: &serde_json::Value, path_id: &str) -> Result<
     let obj = scenario
         .as_object_mut()
         .ok_or_else(|| "PATCH body must be a JSON object".to_string())?;
+    let supplied_fields = obj.keys().cloned().collect::<Vec<_>>();
     obj.insert(
         "id".to_string(),
         serde_json::Value::String(path_id.to_string()),
     );
-    serde_json::from_value(scenario).map_err(|e| e.to_string())
+    let scenario: Scenario = serde_json::from_value(scenario).map_err(|e| e.to_string())?;
+    let serialized = serde_json::to_value(&scenario).map_err(|e| e.to_string())?;
+    let known_fields = serialized
+        .as_object()
+        .ok_or_else(|| "Failed to serialize the scenario".to_string())?;
+    for key in supplied_fields {
+        if !known_fields.contains_key(&key) {
+            return Err(format!("Unknown scenario field '{key}'"));
+        }
+    }
+    Ok(scenario)
 }
 
 fn json_error(status: actix_web::http::StatusCode, message: String) -> HttpResponse {
@@ -600,6 +611,28 @@ mod tests {
         let stored = &scenarios.read().unwrap().scenarios;
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id, "ghost", "the path id remains authoritative");
+    }
+
+    #[actix_web::test]
+    async fn a_full_document_upsert_rejects_unknown_fields_without_mutating() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+        let mut patch = scenario_json("body-id", "invalid upsert");
+        patch["unknown"] = serde_json::json!(true);
+
+        let request = test::TestRequest::patch()
+            .uri("/v1/scenarios/ghost")
+            .set_json(patch)
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), 400);
+        assert!(scenarios.read().unwrap().scenarios.is_empty());
     }
 
     #[actix_web::test]
