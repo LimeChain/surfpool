@@ -1662,6 +1662,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             } else {
                 (None, minimum_rent)
             };
+            let native_lamports = is_native_mint.then_some(initial_lamports);
 
             let SvmAccessContext {
                 slot,
@@ -1718,7 +1719,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                         .inner
                         .minimum_balance_for_rent_exemption(data.len())
                 });
-                (data, rent)
+                (data, Some(rent))
             } else if amount_only {
                 (
                     token_account_data
@@ -1729,7 +1730,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                                 e
                             ))
                         })?,
-                    initial_lamports,
+                    native_lamports,
                 )
             } else {
                 (
@@ -1741,13 +1742,15 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                                 e
                             ))
                         })?,
-                    initial_lamports,
+                    native_lamports,
                 )
             };
 
             token_account.apply_update(|account| {
-                // If this is a native mint, we need to adjust the lamports to match the wrapped SOL amount + rent
-                account.lamports = final_lamports;
+                // Native balances encode wrapped SOL in lamports, while confidential layouts may resize.
+                if let Some(final_lamports) = final_lamports {
+                    account.lamports = final_lamports;
+                }
                 account.data = final_account_bytes.clone();
                 Ok(())
             })?;
@@ -4907,6 +4910,108 @@ mod tests {
             result.is_err(),
             "stream_accounts with invalid pubkey should fail"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_amount_preserves_extension_account_lamports() {
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType,
+                StateWithExtensions, StateWithExtensionsMut, immutable_owner::ImmutableOwner,
+            },
+            state::{Account as Token2022Account, AccountState},
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let mint = Keypair::new();
+        let token_program = spl_token_2022_interface::id();
+        let associated_token_account = get_associated_token_address_with_program_id(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            &token_program,
+        );
+
+        let account_len = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+            ExtensionType::ImmutableOwner,
+        ])
+        .unwrap();
+        let mut data = vec![0; account_len];
+        {
+            let mut state =
+                StateWithExtensionsMut::<Token2022Account>::unpack_uninitialized(&mut data)
+                    .unwrap();
+            state.base = Token2022Account {
+                mint: mint.pubkey(),
+                owner: owner.pubkey(),
+                amount: 10,
+                delegate: COption::None,
+                state: AccountState::Initialized,
+                is_native: COption::None,
+                delegated_amount: 0,
+                close_authority: COption::None,
+            };
+            state.pack_base();
+            state.init_account_type().unwrap();
+            state.init_extension::<ImmutableOwner>(true).unwrap();
+        }
+
+        let original_lamports = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .minimum_balance_for_rent_exemption(data.len())
+                + 123
+        });
+        set_account(
+            &client,
+            &mint.pubkey(),
+            &Account {
+                lamports: 1,
+                data: vec![],
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        set_account(
+            &client,
+            &associated_token_account,
+            &Account {
+                lamports: original_lamports,
+                data,
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.pubkey().to_string(),
+                TokenAccountUpdate {
+                    amount: Some(42),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let updated = client.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .get_account(&associated_token_account)
+                .unwrap()
+                .unwrap()
+        });
+        let state = StateWithExtensions::<Token2022Account>::unpack(&updated.data).unwrap();
+
+        assert_eq!(updated.lamports, original_lamports);
+        assert_eq!(state.base.amount, 42);
+        assert!(state.get_extension::<ImmutableOwner>().is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]
