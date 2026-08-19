@@ -129,6 +129,54 @@ Variant — a semantically valid _completed_ curve (rejects buys/sells with
 curve-lifetime invariants (`virtual − real` = 279.9T tokens / 30 SOL of quote, verified
 against live mainnet data).
 
+## Recipe: prepare a graduation
+
+`POST /v1/scenarios/pump-graduation` builds the whole preparation from live state — no
+field math needed. Also available as the _Pump Graduation_ preset card in Studio and the
+`create_pump_graduation_scenario` MCP tool.
+
+```sh
+curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-graduation \
+  -H 'content-type: application/json' \
+  -d '{"tokenMint": "<SOL-quoted pump.fun mint still on its bonding curve>"}'
+```
+
+The coin must have a **Token-2022 mint**, a SOL-quoted incomplete curve, and no canonical
+PumpSwap pool yet. Eligibility failures return a 400 naming the failed check. The preset
+does not cover coins with a classic SPL-Token mint or a non-SOL quote mint — their curve
+can still be overridden field by field with `pump-bonding-curve-custom`, but the vault
+template and this graduation flow are Token-2022 and SOL-quote only. The response carries
+`completingBuyAmount`, `migrationReserve`, and the derived addresses, and the scenario
+appears in the Studio list with three overrides:
+
+1. the curve one buy away from completion (`real_token_reserves` = the finishing buy,
+   sized so the buy also clears the migration fee),
+2. the curve vault topped up to `migration reserve + finishing buy` — the reserve is
+   what `migrate_v2` moves into the pool, so draining the vault to match
+   `real_token_reserves` would make migration fail with `ZeroBaseAmount`,
+3. `Global.enable_migrate = true`.
+
+Press Play, then drive it like a user would: a real `buy_v2` of `completingBuyAmount`
+completes the curve, and a real `migrate_v2` creates the canonical WSOL pool with the
+reserve as its base liquidity.
+
+## Recipe: shock a migrated pool's price
+
+`POST /v1/scenarios/pump-swap-price-shock` targets the WSOL-quoted canonical pool of a
+migrated coin (also a Studio preset card and the
+`create_pump_swap_price_shock_scenario` MCP tool):
+
+```sh
+curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-swap-price-shock \
+  -H 'content-type: application/json' \
+  -d '{"tokenMint": "<WSOL-paired migrated pump.fun mint>", "virtualQuoteReserves": "15000000000000"}'
+```
+
+`virtualQuoteReserves` (lamports, as a string) is appended to the quote vault balance
+when the AMM quotes, so raising it makes the same sell return more quote without
+touching any token balance. After Play, the identical sell transaction simulates with a
+higher quote-token output than before.
+
 ## Verification
 
 - Address identity: `cargo test -p surfpool-core --lib pump` — template PDAs pinned to
@@ -142,3 +190,24 @@ against live mainnet data).
   materializer, then executes real `buy_v2`, `migrate_v2`, and PumpSwap `sell`
   instructions against live mainnet programs. It also compares baseline and
   price-shocked sell simulations and requires the quote-token output to change.
+
+### The test snapshot and how to retake it
+
+`crates/core/src/tests/assets/pump_token2022_graduation.snapshot.json` freezes the
+HRTz coin (`HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump`, Token-2022, incomplete
+SOL-quoted curve) plus everything a buy/migrate/sell reads: pump `Global`, both
+programs' fee-program `FeeConfig`s, the PumpSwap `GlobalConfig` (mayhem mode left on,
+exactly as on mainnet), the fee recipients and their WSOL ATAs, and the other accounts
+those instructions read along the way. Entries owned by the system program with 0
+lamports (the canonical pool and its accounts) deliberately pin those addresses
+**absent** — the surfnet then neither finds them locally nor fetches them remotely, so
+`migrate_v2` gets to create them. The two programs are *not* frozen on purpose: they load
+live from the mainnet fork, so an on-chain upgrade against the frozen config fails the
+test instead of passing silently.
+
+The file is the same account-map shape `surfpool start --snapshot` accepts. To retake
+it, fetch every pubkey already present in the file in one `getMultipleAccounts` request
+with base64 encoding, record the response context slot, and replace the frozen entries
+wholesale while keeping the zero-lamport pinned-absent entries as they are. Pick a coin
+state matching the checks above (Token-2022 mint, incomplete SOL-quoted curve, no
+canonical pool) if HRTz has since graduated.
