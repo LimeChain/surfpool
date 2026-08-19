@@ -724,10 +724,12 @@ impl Surfpool {
                                     // Check if the value exists in values map
                                     if let Some(value) = override_instance.values.get(&prop.path) {
                                         if let Some(value_str) = value.as_str() {
-                                            // Validate the value is one of the valid options
-                                            let is_valid = constant_def.options.iter().any(|opt| {
-                                                opt.value.to_lowercase() == value_str.to_lowercase()
-                                            });
+                                            // Base58 is case-sensitive: a case-folded match would
+                                            // accept a value that derives a different PDA.
+                                            let is_valid = constant_def
+                                                .options
+                                                .iter()
+                                                .any(|opt| opt.value == value_str);
                                             if !is_valid {
                                                 // Show only first 10 options to avoid overwhelming error messages
                                                 let sample_options: Vec<String> = constant_def
@@ -755,6 +757,15 @@ impl Surfpool {
                                                 sample_options.join("\n  ")
                                             ));
                                             }
+                                        } else {
+                                            validation_errors.push(format!(
+                                                "Override '{}' (template '{}'): Value for '{}' (constant: '{}') must be a base-58 mint address string, got: {}",
+                                                override_instance.id,
+                                                override_instance.template_id,
+                                                prop.path,
+                                                constant_name,
+                                                value
+                                            ));
                                         }
                                     } else {
                                         // Value is missing - required for PDA derivation
@@ -1272,5 +1283,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown_constant.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_override_templates_lists_the_pump_templates_compactly() {
+        let surfpool = Surfpool::new();
+        let result = surfpool.get_override_templates().await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let templates = json_of(&result);
+        let templates = templates.as_array().unwrap();
+        for id in [
+            "pump-bonding-curve-custom",
+            "pump-global",
+            "pump-amm-pool-state",
+            "pump-amm-canonical-pool",
+            "pump-amm-global-config",
+        ] {
+            let template = templates
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap_or_else(|| panic!("template {id} missing from the model's view"));
+            assert!(
+                template.get("idl").is_none(),
+                "{id} must not inline the ~160KB IDL into the LLM context"
+            );
+        }
+
+        let curve = templates
+            .iter()
+            .find(|t| t["id"] == "pump-bonding-curve-custom")
+            .unwrap();
+        let token_mint = &curve["constants"]["token_mint"];
+        assert!(
+            token_mint["optionsCount"].as_u64().unwrap() > 0,
+            "the verified-tokens catalog must be visible as a summary"
+        );
+        assert!(token_mint.get("options").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_resolves_pump_coin_mints_for_both_programs() {
+        let surfpool = Surfpool::new();
+
+        let result = surfpool
+            .search_constant_options(search("pump-bonding-curve-custom", None, "pump"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        let results = payload["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "a pump coin must be findable");
+        assert!(
+            results
+                .iter()
+                .all(|r| !r["value"].as_str().unwrap().is_empty()),
+            "every result must carry the mint create_scenario expects"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r["value"].as_str().unwrap().ends_with("pump")),
+            "pump.fun mints are recognizable by their suffix"
+        );
+
+        let result = surfpool
+            .search_constant_options(search("pump-amm-canonical-pool", Some("token_mint"), ""))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        assert!(
+            payload["totalMatches"].as_u64().unwrap() > 0,
+            "the canonical pool template must expose base mints to search"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_token_catalogs_offer_only_pump_mints() {
+        let registry = TemplateRegistry::new();
+        for template_id in ["pump-bonding-curve-custom", "pump-amm-canonical-pool"] {
+            let template = registry.get(template_id).expect("template");
+            let constant = template.constants.get("token_mint").expect("constant");
+            assert_eq!(
+                constant.options.len(),
+                976,
+                "{template_id} must offer every pump-suffixed catalog mint (976 in the CSV)"
+            );
+            assert!(
+                constant.options.iter().all(|o| o.value.ends_with("pump")),
+                "{template_id} must offer only pump.fun mints"
+            );
+        }
+
+        let surfpool = Surfpool::new();
+        for mint in [
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        ] {
+            let result = surfpool
+                .search_constant_options(search("pump-bonding-curve-custom", None, mint))
+                .await
+                .unwrap();
+            let payload = json_of(&result);
+            assert_eq!(
+                payload["totalMatches"].as_u64().unwrap(),
+                0,
+                "{mint} must not be offered for a bonding curve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_bad_pump_overrides_before_any_http_call() {
+        let surfpool = Surfpool::new();
+        let registry = TemplateRegistry::new();
+        let curve_address = registry
+            .get("pump-bonding-curve-custom")
+            .expect("template")
+            .address
+            .clone();
+
+        let mut unknown = surfpool_types::Scenario::new(
+            "bad template".to_string(),
+            "unknown templateId must be rejected".to_string(),
+        );
+        unknown.add_override(surfpool_types::OverrideInstance::new(
+            "pump-bonding-curve".to_string(),
+            0,
+            curve_address.clone(),
+        ));
+        let result = surfpool.create_scenario(Parameters(unknown)).await.unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid templateId"),
+            "a misremembered id must be named, got: {text}"
+        );
+
+        let mut incomplete = surfpool_types::Scenario::new(
+            "missing mint".to_string(),
+            "a PDA constant without a value must be rejected".to_string(),
+        );
+        incomplete.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                curve_address,
+            )
+            .with_values(HashMap::from([(
+                "complete".to_string(),
+                serde_json::json!(true),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(incomplete))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Missing required value") && text.contains("token_mint"),
+            "the missing PDA seed value must be named, got: {text}"
+        );
+
+        let mut wrong_type = surfpool_types::Scenario::new(
+            "numeric mint".to_string(),
+            "a non-string mint must be rejected, not silently skipped".to_string(),
+        );
+        wrong_type.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!(12345),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(wrong_type))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("must be a base-58 mint address string") && text.contains("token_mint"),
+            "the wrong-typed mint must be named, got: {text}"
+        );
+
+        let mut tampered = surfpool_types::Scenario::new(
+            "tampered mint".to_string(),
+            "base58 is case-sensitive; a case-folded match targets another PDA".to_string(),
+        );
+        tampered.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!("9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgPUMP"),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(tampered))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid value"),
+            "a case-flipped mint must be rejected, got: {text}"
+        );
     }
 }

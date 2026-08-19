@@ -45,9 +45,11 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::new(|| {
+/// Every catalog row in CSV order. Option lists must use this: the by-symbol
+/// map collapses tokens sharing a symbol and silently drops their mints.
+pub static VERIFIED_TOKENS: Lazy<Vec<TokenInfo>> = Lazy::new(|| {
     let csv = include_str!("verified_tokens.csv");
-    let mut map = HashMap::new();
+    let mut tokens = Vec::new();
 
     for (i, line) in csv.lines().enumerate() {
         if i == 0 {
@@ -69,18 +71,23 @@ pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::n
         let icon = fields[3].clone();
         let decimals: u8 = fields[4].parse().unwrap_or(0);
 
-        let token = TokenInfo {
+        tokens.push(TokenInfo {
             address,
             name,
-            symbol: symbol.clone(),
+            symbol,
             decimals,
             logo_uri: if icon.is_empty() { None } else { Some(icon) },
-        };
-
-        map.insert(symbol.to_uppercase(), token);
+        });
     }
 
-    map
+    tokens
+});
+
+pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::new(|| {
+    VERIFIED_TOKENS
+        .iter()
+        .map(|token| (token.symbol.to_uppercase(), token.clone()))
+        .collect()
 });
 
 #[cfg(test)]
