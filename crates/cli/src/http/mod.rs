@@ -256,10 +256,64 @@ async fn delete_scenario(
     Ok(HttpResponse::Ok().body(format!("Scenario '{}' deleted", scenario_id)))
 }
 
+fn merge_scenario_patch(
+    existing: &Scenario,
+    patch: &serde_json::Value,
+    path_id: &str,
+) -> Result<Scenario, String> {
+    let patch = patch
+        .as_object()
+        .ok_or_else(|| "PATCH body must be a JSON object".to_string())?;
+    let mut merged = serde_json::to_value(existing).map_err(|e| e.to_string())?;
+    let obj = merged
+        .as_object_mut()
+        .ok_or_else(|| "Failed to serialize the stored scenario".to_string())?;
+    for (key, value) in patch {
+        if key != "id" && !obj.contains_key(key) {
+            return Err(format!("Unknown scenario field '{key}'"));
+        }
+        obj.insert(key.clone(), value.clone());
+    }
+    obj.insert(
+        "id".to_string(),
+        serde_json::Value::String(path_id.to_string()),
+    );
+    serde_json::from_value(merged).map_err(|e| e.to_string())
+}
+
+fn scenario_from_full_patch(patch: &serde_json::Value, path_id: &str) -> Result<Scenario, String> {
+    let mut scenario = patch.clone();
+    let obj = scenario
+        .as_object_mut()
+        .ok_or_else(|| "PATCH body must be a JSON object".to_string())?;
+    let supplied_fields = obj.keys().cloned().collect::<Vec<_>>();
+    obj.insert(
+        "id".to_string(),
+        serde_json::Value::String(path_id.to_string()),
+    );
+    let scenario: Scenario = serde_json::from_value(scenario).map_err(|e| e.to_string())?;
+    let serialized = serde_json::to_value(&scenario).map_err(|e| e.to_string())?;
+    let known_fields = serialized
+        .as_object()
+        .ok_or_else(|| "Failed to serialize the scenario".to_string())?;
+    for key in supplied_fields {
+        if !known_fields.contains_key(&key) {
+            return Err(format!("Unknown scenario field '{key}'"));
+        }
+    }
+    Ok(scenario)
+}
+
+fn json_error(status: actix_web::http::StatusCode, message: String) -> HttpResponse {
+    HttpResponse::build(status)
+        .content_type("application/json")
+        .body(serde_json::json!({ "error": message }).to_string())
+}
+
 #[actix_web::patch("/v1/scenarios/{id}")]
 async fn patch_scenario(
     path: web::Path<String>,
-    scenario: web::Json<Scenario>,
+    patch: web::Json<serde_json::Value>,
     data: Data<RwLock<LoadedScenarios>>,
 ) -> Result<HttpResponse, Error> {
     let scenario_id = path.into_inner();
@@ -271,22 +325,28 @@ async fn patch_scenario(
         .scenarios
         .iter()
         .position(|s| s.id == scenario_id);
-
-    match scenario_index {
+    let updated = match scenario_index {
         Some(index) => {
-            loaded_scenarios.scenarios[index] = scenario.into_inner();
-            let response = serde_json::json!({"id": scenario_id});
+            merge_scenario_patch(&loaded_scenarios.scenarios[index], &patch, &scenario_id)
+        }
+        None => scenario_from_full_patch(&patch, &scenario_id),
+    };
+
+    match updated {
+        Ok(updated) => {
+            if let Some(index) = scenario_index {
+                loaded_scenarios.scenarios[index] = updated;
+            } else {
+                loaded_scenarios.scenarios.push(updated);
+            }
             Ok(HttpResponse::Ok()
                 .content_type("application/json")
-                .body(response.to_string()))
+                .body(serde_json::json!({ "id": scenario_id }).to_string()))
         }
-        None => {
-            loaded_scenarios.scenarios.push(scenario.into_inner());
-            let response = serde_json::json!({"id": scenario_id});
-            Ok(HttpResponse::Ok()
-                .content_type("application/json")
-                .body(response.to_string()))
-        }
+        Err(message) => Ok(json_error(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            message,
+        )),
     }
 }
 
@@ -431,5 +491,234 @@ mod tests {
             200,
             "registered endpoints must keep working"
         );
+    }
+
+    fn scenario_json(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "description": "original description",
+            "overrides": [{
+                "id": "o1",
+                "templateId": "pyth-price-feed-v2",
+                "values": {},
+                "scenarioRelativeSlot": 0,
+                "enabled": true,
+                "fetchBeforeUse": false,
+                "account": { "pubkey": "So11111111111111111111111111111111111111112" }
+            }],
+            "tags": ["repro"],
+        })
+    }
+
+    fn scenario_of(json: serde_json::Value) -> Scenario {
+        serde_json::from_value(json).expect("valid scenario")
+    }
+
+    #[actix_web::test]
+    async fn partial_patch_preserves_omitted_fields() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({ "name": "after" });
+
+        let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
+
+        assert_eq!(merged.name, "after", "the sent field changes");
+        assert_eq!(merged.overrides.len(), 1, "omitted overrides survive");
+        assert_eq!(merged.tags, vec!["repro"], "omitted tags survive");
+        assert_eq!(merged.description, "original description");
+    }
+
+    #[actix_web::test]
+    async fn full_document_patch_replaces_like_before() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({
+            "id": "s1", "name": "after", "description": "", "overrides": [], "tags": []
+        });
+
+        let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
+
+        assert_eq!(merged.name, "after");
+        assert!(merged.overrides.is_empty(), "a full doc still replaces");
+        assert!(merged.tags.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn explicit_empty_array_still_clears() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({ "overrides": [] });
+
+        let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
+
+        assert!(merged.overrides.is_empty(), "an explicit [] clears");
+        assert_eq!(merged.name, "before", "other fields untouched");
+    }
+
+    #[actix_web::test]
+    async fn path_id_wins_over_body_id() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({ "id": "s2", "name": "after" });
+
+        let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
+
+        assert_eq!(
+            merged.id, "s1",
+            "the path id is authoritative, not the body id"
+        );
+    }
+
+    #[actix_web::test]
+    async fn non_object_body_is_rejected() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        assert!(merge_scenario_patch(&existing, &serde_json::json!([1, 2, 3]), "s1").is_err());
+        assert!(merge_scenario_patch(&existing, &serde_json::json!("nope"), "s1").is_err());
+    }
+
+    #[actix_web::test]
+    async fn a_wrong_typed_field_is_rejected() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({ "name": 123 });
+        assert!(
+            merge_scenario_patch(&existing, &patch, "s1").is_err(),
+            "a merge that yields an invalid Scenario must fail, not store garbage"
+        );
+    }
+
+    #[actix_web::test]
+    async fn an_unknown_field_is_rejected() {
+        let existing = scenario_of(scenario_json("s1", "before"));
+        let patch = serde_json::json!({ "unknown": true });
+
+        assert!(merge_scenario_patch(&existing, &patch, "s1").is_err());
+    }
+
+    #[actix_web::test]
+    async fn a_full_document_patch_preserves_upsert_compatibility() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let request = test::TestRequest::patch()
+            .uri("/v1/scenarios/ghost")
+            .set_json(scenario_json("body-id", "created by patch"))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), 200);
+        let stored = &scenarios.read().unwrap().scenarios;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "ghost", "the path id remains authoritative");
+    }
+
+    #[actix_web::test]
+    async fn a_full_document_upsert_rejects_unknown_fields_without_mutating() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+        let mut patch = scenario_json("body-id", "invalid upsert");
+        patch["unknown"] = serde_json::json!(true);
+
+        let request = test::TestRequest::patch()
+            .uri("/v1/scenarios/ghost")
+            .set_json(patch)
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), 400);
+        assert!(scenarios.read().unwrap().scenarios.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn a_partial_patch_cannot_create_an_incomplete_scenario() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let request = test::TestRequest::patch()
+            .uri("/v1/scenarios/ghost")
+            .set_json(serde_json::json!({ "name": "incomplete" }))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), 400);
+        assert!(scenarios.read().unwrap().scenarios.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn consecutive_partial_patches_preserve_omitted_fields() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let create = test::TestRequest::post()
+            .uri("/v1/scenarios")
+            .set_json(scenario_json("s1", "before"))
+            .to_request();
+        assert_eq!(test::call_service(&app, create).await.status(), 200);
+
+        let rename = test::TestRequest::patch()
+            .uri("/v1/scenarios/s1")
+            .set_json(serde_json::json!({ "name": "renamed" }))
+            .to_request();
+        assert_eq!(test::call_service(&app, rename).await.status(), 200);
+
+        let describe = test::TestRequest::patch()
+            .uri("/v1/scenarios/s1")
+            .set_json(serde_json::json!({ "description": "updated description" }))
+            .to_request();
+        assert_eq!(test::call_service(&app, describe).await.status(), 200);
+
+        let stored = &scenarios.read().unwrap().scenarios;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].name, "renamed");
+        assert_eq!(stored[0].description, "updated description");
+        assert_eq!(
+            stored[0].overrides.len(),
+            1,
+            "a rename must not wipe overrides"
+        );
+        assert_eq!(stored[0].tags, vec!["repro"], "a rename must not wipe tags");
+    }
+
+    #[actix_web::test]
+    async fn patch_with_a_different_body_id_does_not_rename_the_record() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+
+        let create = test::TestRequest::post()
+            .uri("/v1/scenarios")
+            .set_json(scenario_json("s1", "before"))
+            .to_request();
+        assert_eq!(test::call_service(&app, create).await.status(), 200);
+
+        let patch = test::TestRequest::patch()
+            .uri("/v1/scenarios/s1")
+            .set_json(serde_json::json!({ "id": "s2", "name": "after" }))
+            .to_request();
+        assert_eq!(test::call_service(&app, patch).await.status(), 200);
+
+        let stored = &scenarios.read().unwrap().scenarios;
+        assert_eq!(stored.len(), 1, "no second record may appear");
+        assert_eq!(stored[0].id, "s1", "the id in the path is authoritative");
     }
 }
