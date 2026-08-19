@@ -21,7 +21,27 @@ templates:
     name: Override Pool State
     description: Override any PumpSwap pool by specifying its address directly
     idl_account_name: Pool
-    properties: ["lp_supply", "coin_creator", "virtual_quote_reserves"]
+    properties:
+      - path: lp_supply
+        label: LP Supply
+        description: Total LP token supply before user burns and lock-ups
+      - path: coin_creator
+        label: Coin Creator
+        description: Pubkey accruing the coin-creator fee for this pool
+      - path: virtual_quote_reserves
+        label: Virtual Quote Reserves
+        description: Appended quote reserves added to the quote vault balance when quoting (0 on all pools today)
+    llm_context: |
+      Pass the pool's own address; unlike pump-amm-canonical-pool this template derives
+      nothing. Use it for user-created or non-WSOL pools, or any pool whose address you
+      already have. Set fetchBeforeUse: true so the fields you don't override keep their
+      live values.
+
+      PumpSwap is a constant-product AMM whose reserves live in the pool's token accounts,
+      not in the Pool account: price = effective_quote_reserves / base_vault_balance, where
+      effective_quote_reserves = pool_quote_token_account balance + Pool.virtual_quote_reserves.
+      Move price by setting virtual_quote_reserves here, or by editing the vault balances with
+      the spl-token template.
     address:
       type: pubkey
 
@@ -115,12 +135,18 @@ templates:
       (PDA derived from ["global_config"], resolving to ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw).
     idl_account_name: GlobalConfig
     properties:
-      [
-        "lp_fee_basis_points",
-        "protocol_fee_basis_points",
-        "coin_creator_fee_basis_points",
-        "disable_flags",
-      ]
+      - path: lp_fee_basis_points
+        label: LP Fee Basis Points (legacy)
+        description: Legacy LP fee in basis points (deposits and withdrawals are free); live trades read fees from the fee program's FeeConfig
+      - path: protocol_fee_basis_points
+        label: Protocol Fee Basis Points (legacy)
+        description: Legacy protocol fee in basis points, superseded by the external fee program
+      - path: coin_creator_fee_basis_points
+        label: Coin Creator Fee Basis Points (legacy)
+        description: Legacy coin-creator fee in basis points; accrues to each pool's coin_creator
+      - path: disable_flags
+        label: Disable Flags
+        description: Bitmask disabling individual instructions (0 = everything enabled)
     llm_context: |
       Set fetchBeforeUse: true so GlobalConfig's admin and protocol fee recipient list keep
       their live values; false only to build on an earlier override's prepared state.
