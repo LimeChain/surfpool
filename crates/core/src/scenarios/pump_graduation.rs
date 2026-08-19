@@ -27,6 +27,7 @@ const VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 16;
 const REAL_TOKEN_RESERVES_OFFSET: usize = 24;
 const REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const COMPLETE_OFFSET: usize = 48;
+const QUOTE_MINT_OFFSET: usize = 83;
 const POOL_MIGRATION_FEE_OFFSET: usize = 146;
 const PREPARATION_SLOT: u64 = 1;
 const MIGRATION_FEE_BUFFER: u64 = 3;
@@ -233,7 +234,7 @@ pub fn build_pump_graduation_scenario(
 
     let mut scenario = Scenario::new(
         "Pump Graduation".to_string(),
-        "Prepare a Token-2022 pump.fun curve for one finishing buy and migration to PumpSwap."
+        "Prepare a SOL-quoted Token-2022 pump.fun curve for one finishing buy and migration to PumpSwap."
             .to_string(),
     );
     scenario.tags = vec!["pump".to_string(), "graduation".to_string()];
@@ -267,6 +268,11 @@ fn validate_accounts(
     if curve_account.data.get(COMPLETE_OFFSET) != Some(&0) {
         return Err(invalid_curve("bonding curve is already complete"));
     }
+    if read_pubkey(&curve_account.data, QUOTE_MINT_OFFSET, "quote_mint")? != Pubkey::default() {
+        return Err(invalid_curve(
+            "Pump graduation preset supports SOL-quoted bonding curves only",
+        ));
+    }
     if canonical_pool_account.is_some() {
         return Err(invalid_curve("canonical PumpSwap pool already exists"));
     }
@@ -289,6 +295,13 @@ fn read_u64(data: &[u8], offset: usize, field: &str) -> SurfpoolResult<u64> {
         .get(offset..offset + 8)
         .ok_or_else(|| invalid_curve(format!("missing {field}")))?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_pubkey(data: &[u8], offset: usize, field: &str) -> SurfpoolResult<Pubkey> {
+    let bytes = data
+        .get(offset..offset + 32)
+        .ok_or_else(|| invalid_curve(format!("missing {field}")))?;
+    Pubkey::try_from(bytes).map_err(|_| invalid_curve(format!("invalid {field}")))
 }
 
 fn div_ceil(numerator: u128, denominator: u128) -> SurfpoolResult<u128> {
@@ -396,6 +409,36 @@ mod tests {
                 &fixture_account(&snapshot, &addresses.global),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_sol_quoted_bonding_curve() {
+        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
+            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
+        )
+        .unwrap();
+        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
+        let addresses = pump_graduation_addresses(&mint);
+        let mut curve_account = fixture_account(&snapshot, &addresses.bonding_curve);
+        let usdc_mint = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        curve_account.data[QUOTE_MINT_OFFSET..QUOTE_MINT_OFFSET + 32]
+            .copy_from_slice(usdc_mint.as_ref());
+
+        let error = build_pump_graduation_scenario(
+            mint,
+            &fixture_account(&snapshot, &mint),
+            &curve_account,
+            &fixture_account(&snapshot, &addresses.curve_vault),
+            None,
+            &fixture_account(&snapshot, &addresses.global),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Pump graduation preset supports SOL-quoted bonding curves only")
         );
     }
 }
