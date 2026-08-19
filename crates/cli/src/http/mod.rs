@@ -278,7 +278,7 @@ fn merge_scenario_patch(
         "id".to_string(),
         serde_json::Value::String(path_id.to_string()),
     );
-    serde_json::from_value(merged).map_err(|e| e.to_string())
+    deserialize_scenario_strictly(merged)
 }
 
 fn scenario_from_full_patch(patch: &serde_json::Value, path_id: &str) -> Result<Scenario, String> {
@@ -286,22 +286,44 @@ fn scenario_from_full_patch(patch: &serde_json::Value, path_id: &str) -> Result<
     let obj = scenario
         .as_object_mut()
         .ok_or_else(|| "PATCH body must be a JSON object".to_string())?;
-    let supplied_fields = obj.keys().cloned().collect::<Vec<_>>();
     obj.insert(
         "id".to_string(),
         serde_json::Value::String(path_id.to_string()),
     );
-    let scenario: Scenario = serde_json::from_value(scenario).map_err(|e| e.to_string())?;
-    let serialized = serde_json::to_value(&scenario).map_err(|e| e.to_string())?;
-    let known_fields = serialized
-        .as_object()
-        .ok_or_else(|| "Failed to serialize the scenario".to_string())?;
-    for key in supplied_fields {
-        if !known_fields.contains_key(&key) {
-            return Err(format!("Unknown scenario field '{key}'"));
-        }
-    }
+    deserialize_scenario_strictly(scenario)
+}
+
+fn deserialize_scenario_strictly(value: serde_json::Value) -> Result<Scenario, String> {
+    let scenario: Scenario = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let normalized = serde_json::to_value(&scenario).map_err(|e| e.to_string())?;
+    validate_json_fields(&value, &normalized, "scenario")?;
     Ok(scenario)
+}
+
+fn validate_json_fields(
+    supplied: &serde_json::Value,
+    normalized: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    match (supplied, normalized) {
+        (serde_json::Value::Object(supplied), serde_json::Value::Object(normalized)) => {
+            for (key, value) in supplied {
+                let normalized_value = normalized
+                    .get(key)
+                    .ok_or_else(|| format!("Unknown field '{path}.{key}'"))?;
+                validate_json_fields(value, normalized_value, &format!("{path}.{key}"))?;
+            }
+        }
+        (serde_json::Value::Array(supplied), serde_json::Value::Array(normalized)) => {
+            for (index, (value, normalized_value)) in
+                supplied.iter().zip(normalized.iter()).enumerate()
+            {
+                validate_json_fields(value, normalized_value, &format!("{path}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn json_error(status: actix_web::http::StatusCode, message: String) -> HttpResponse {
@@ -589,6 +611,55 @@ mod tests {
         let patch = serde_json::json!({ "unknown": true });
 
         assert!(merge_scenario_patch(&existing, &patch, "s1").is_err());
+    }
+
+    #[actix_web::test]
+    async fn a_nested_unknown_override_field_is_rejected_without_mutating() {
+        let scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(scenarios.clone())
+                .configure(configure_api),
+        )
+        .await;
+        let original = scenario_json("s1", "before");
+        let create = test::TestRequest::post()
+            .uri("/v1/scenarios")
+            .set_json(&original)
+            .to_request();
+        assert_eq!(test::call_service(&app, create).await.status(), 200);
+
+        let mut invalid_override = original["overrides"][0].clone();
+        invalid_override["fetchBeforeUes"] = serde_json::json!(true);
+        let patch = test::TestRequest::patch()
+            .uri("/v1/scenarios/s1")
+            .set_json(serde_json::json!({ "overrides": [invalid_override] }))
+            .to_request();
+        let response = test::call_service(&app, patch).await;
+
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            scenarios.read().unwrap().scenarios,
+            vec![scenario_of(original)]
+        );
+    }
+
+    #[actix_web::test]
+    async fn arbitrary_nested_override_values_remain_valid() {
+        let mut patch = scenario_json("s1", "with arbitrary values");
+        patch["overrides"][0]["values"] = serde_json::json!({
+            "custom": {
+                "futureField": true,
+                "nested": [1, 2, 3]
+            }
+        });
+
+        let scenario = scenario_from_full_patch(&patch, "s1").unwrap();
+
+        assert_eq!(
+            scenario.overrides[0].values["custom"],
+            patch["overrides"][0]["values"]["custom"]
+        );
     }
 
     #[actix_web::test]
