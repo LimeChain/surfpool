@@ -100,6 +100,18 @@ fn compact_template_json(template: &surfpool_types::OverrideTemplate) -> serde_j
     obj
 }
 
+fn index_template_json(template: &surfpool_types::OverrideTemplate) -> serde_json::Value {
+    serde_json::json!({
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "protocol": template.protocol,
+        "accountType": template.account_type,
+        "tags": template.tags,
+        "hasLlmContext": template.llm_context.is_some(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchConstantOptionsParams {
@@ -128,6 +140,15 @@ pub struct CreatePumpGraduationScenarioParams {
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
     pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTemplateParams {
+    #[schemars(
+        description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
+    )]
+    pub template_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -644,7 +665,7 @@ impl Surfpool {
 
         IMPORTANT:
         - If a user asks to create a scenario, DO NOT USE this method. Instead, use the dedicated `create_scenario` tool.
-        - There is NO RPC method called `surfnet_getOverrideTemplates`. Override templates are ONLY available via the MCP resource str:///override_templates (use read_resource, not this RPC tool).
+        - There is NO RPC method called `surfnet_getOverrideTemplates`. The override templates index is available via the MCP resource str:///override_templates (use read_resource, not this RPC tool); one template's full detail comes from the get_override_template tool.
         "#)]
     async fn call_surfnet_rpc(
         &self,
@@ -729,7 +750,8 @@ impl Surfpool {
         - The `tags` field MUST be a JSON array [], NOT a JSON string
         - DO NOT stringify nested objects - pass them as native JSON
 
-        ⚠️ CRITICAL: You MUST call `get_override_templates` FIRST to get valid template data.
+        ⚠️ CRITICAL: You MUST call `get_override_templates` FIRST to pick a templateId, then
+        `get_override_template` on that id for its properties and account shape.
         DO NOT invent templateId values, property names, or account addresses - they MUST come from the templates.
 
         STRICT RULES - VIOLATIONS WILL CAUSE ERRORS:
@@ -1002,7 +1024,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
+        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -1017,10 +1039,39 @@ impl Surfpool {
         let templates: Vec<serde_json::Value> = registry
             .all()
             .iter()
-            .map(|t| compact_template_json(t))
+            .map(|t| index_template_json(t))
             .collect();
 
         let json_str = serde_json::to_string(&templates).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+
+    #[tool(
+        description = "Fetches one template's full detail (properties, address, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
+    )]
+    async fn get_override_template(
+        &self,
+        Parameters(params): Parameters<GetTemplateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let registry = self.template_registry.read().map_err(|_| {
+            use std::borrow::Cow;
+            McpError {
+                code: ErrorCode(-32603),
+                message: Cow::from("Failed to read template registry"),
+                data: None,
+            }
+        })?;
+
+        let all_templates = registry.all();
+        let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
+            let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Unknown templateId {:?}. Valid IDs are: {:?}",
+                params.template_id, valid_ids
+            ))]));
+        };
+
+        let json_str = serde_json::to_string(&compact_template_json(template)).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 
@@ -1208,7 +1259,7 @@ impl ServerHandler for Surfpool {
                 let templates: Vec<serde_json::Value> = registry
                     .all()
                     .iter()
-                    .map(|t| compact_template_json(t))
+                    .map(|t| index_template_json(t))
                     .collect();
 
                 let templates_json = serde_json::to_string(&templates).map_err(|_| {
@@ -1315,8 +1366,14 @@ mod tests {
         })
     }
 
+    fn template_id(id: &str) -> Parameters<GetTemplateParams> {
+        Parameters(GetTemplateParams {
+            template_id: id.to_string(),
+        })
+    }
+
     #[tokio::test]
-    async fn get_override_templates_summarizes_constants_instead_of_inlining_options() {
+    async fn the_template_index_is_light_and_omits_the_heavy_fields() {
         let surfpool = Surfpool::new();
         let result = surfpool.get_override_templates().await.unwrap();
         assert_ne!(result.is_error, Some(true));
@@ -1329,6 +1386,38 @@ mod tests {
             .find(|t| t["id"] == "pyth-price-feed-v2")
             .expect("pyth template present");
 
+        for heavy in ["llmContext", "properties", "address", "constants", "idl"] {
+            assert!(
+                pyth.get(heavy).is_none(),
+                "the index must not carry {heavy}"
+            );
+        }
+        assert_eq!(
+            pyth["hasLlmContext"], true,
+            "the index flags which templates have context to fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_override_template_returns_full_detail_and_summarizes_constants() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .get_override_template(template_id("pyth-price-feed-v2"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let pyth = json_of(&result);
+        assert!(
+            pyth.get("properties").is_some(),
+            "detail carries properties"
+        );
+        assert!(pyth.get("address").is_some(), "detail carries the address");
+        assert!(
+            pyth.get("llmContext").is_some(),
+            "detail carries llmContext"
+        );
+
         let price_feed = &pyth["constants"]["price_feed"];
         assert!(
             price_feed["optionsCount"].as_u64().unwrap() > 0,
@@ -1337,6 +1426,44 @@ mod tests {
         assert!(
             price_feed.get("options").is_none(),
             "options must not be inlined; they blow past LLM token limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_override_template_rejects_an_unknown_id_and_names_valid_ones() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .get_override_template(template_id("no-such-template"))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("pyth-price-feed-v2"),
+            "the error must name valid ids, got: {text}"
+        );
+    }
+
+    #[test]
+    fn the_index_is_lighter_than_the_full_detail_of_every_template() {
+        let registry = TemplateRegistry::new();
+        let index: Vec<_> = registry
+            .all()
+            .iter()
+            .map(|t| index_template_json(t))
+            .collect();
+        let full: Vec<_> = registry
+            .all()
+            .iter()
+            .map(|t| compact_template_json(t))
+            .collect();
+
+        let index_len = serde_json::to_string(&index).unwrap().len();
+        let full_len = serde_json::to_string(&full).unwrap().len();
+        assert!(
+            index_len * 3 < full_len,
+            "the index ({index_len} bytes) should be far lighter than the old full payload \
+             ({full_len} bytes)"
         );
     }
 
@@ -1402,6 +1529,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn index_template_json_omits_the_heavy_fields() {
+        let registry = TemplateRegistry::new();
+        for template in registry.all() {
+            let json = index_template_json(template);
+            for heavy in ["llmContext", "properties", "address", "constants", "idl"] {
+                assert!(
+                    json.get(heavy).is_none(),
+                    "index entry for {} leaks {heavy}",
+                    template.id
+                );
+            }
+            assert_eq!(json["hasLlmContext"], template.llm_context.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn search_rejects_unknown_template_and_unknown_constant() {
         let surfpool = Surfpool::new();
@@ -1420,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_override_templates_lists_the_pump_templates_compactly() {
+    async fn the_pump_templates_appear_in_the_index_and_detail_summarizes_the_catalog() {
         let surfpool = Surfpool::new();
         let result = surfpool.get_override_templates().await.unwrap();
         assert_ne!(result.is_error, Some(true));
@@ -1437,17 +1580,18 @@ mod tests {
             let template = templates
                 .iter()
                 .find(|t| t["id"] == id)
-                .unwrap_or_else(|| panic!("template {id} missing from the model's view"));
+                .unwrap_or_else(|| panic!("template {id} missing from the index"));
             assert!(
                 template.get("idl").is_none(),
-                "{id} must not inline the ~160KB IDL into the LLM context"
+                "{id} must not inline the ~160KB IDL into the index"
             );
         }
 
-        let curve = templates
-            .iter()
-            .find(|t| t["id"] == "pump-bonding-curve-custom")
+        let detail = surfpool
+            .get_override_template(template_id("pump-bonding-curve-custom"))
+            .await
             .unwrap();
+        let curve = json_of(&detail);
         let token_mint = &curve["constants"]["token_mint"];
         assert!(
             token_mint["optionsCount"].as_u64().unwrap() > 0,
