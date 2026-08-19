@@ -188,6 +188,7 @@ pub async fn handle_start_local_surfnet_command(
     let explorer_handle = match start_studio_and_scenario_server(
         studio_binding_address,
         sanitized_config.clone(),
+        config.simnets[0].remote_rpc_url.clone(),
         subgraph_events_tx.clone(),
         ctx,
         !cmd.runtime.no_studio,

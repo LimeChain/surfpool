@@ -21,7 +21,10 @@ use solana_address_lookup_table_interface::{
 };
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    rpc_config::{
+        RpcSendTransactionConfig, RpcSimulateTransactionAccountsConfig,
+        RpcSimulateTransactionConfig,
+    },
     rpc_response::RpcLogsResponse,
 };
 use solana_clock::{Clock, Slot};
@@ -69,6 +72,9 @@ use surfpool_types::{
 use test_case::test_case;
 use tokio::{sync::RwLock, task};
 use uuid::Uuid;
+
+mod pump_token2022_graduation;
+
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 use crate::{

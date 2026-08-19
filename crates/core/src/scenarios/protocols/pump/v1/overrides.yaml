@@ -1,0 +1,153 @@
+protocol: Pump
+version: v1
+account_type: BondingCurve
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - bonding-curve
+  - launchpad
+  - defi
+
+constants:
+  # Token mints loaded from verified tokens registry
+  token_mint:
+    label: Token
+    description: Select a pump.fun coin mint address from verified tokens
+    source: verified_tokens
+    address_suffix: pump
+
+templates:
+  - id: pump-bonding-curve-custom
+    name: Override Bonding Curve (Custom)
+    description: |
+      Override the bonding curve of any pump.fun coin by specifying its mint.
+      The bonding curve address is a PDA derived from ["bonding-curve", mint].
+    idl_account_name: BondingCurve
+    properties:
+      - path: virtual_token_reserves
+        label: Virtual Token Reserves
+        description: Synthetic token reserves driving the price formula (raw units, 6 decimals)
+      - path: virtual_quote_reserves
+        label: Virtual Quote Reserves
+        description: Synthetic quote reserves driving the price formula (lamports for SOL-quoted coins)
+      - path: real_token_reserves
+        label: Real Token Reserves
+        description: Tokens actually held by the curve; the curve completes when this reaches 0
+      - path: real_quote_reserves
+        label: Real Quote Reserves
+        description: Quote actually held by the curve (lamports for SOL-quoted coins)
+      - path: complete
+        label: Complete
+        description: True once the curve is bought out and ready to migrate to PumpSwap
+      - path: creator
+        label: Creator
+        description: Coin creator that accrues creator fees via the creator vault
+      - path: token_mint
+        type: constant_ref
+        label: Token Mint
+        constant: token_mint
+    llm_context: |
+      Set fetchBeforeUse: true so the fields you don't override keep their live values.
+      Use false only for a later override that builds on state an earlier one prepared in
+      the same scenario.
+
+      ONLY pump.fun coins have a bonding curve account. Their mint addresses usually end
+      with "pump". Selecting any other mint derives an address that holds no account, so
+      the override has nothing to apply to.
+
+      HOW THE CURVE PRICES (constant product over synthetic reserves, Uniswap V2 style):
+      - spot price in quote-per-token raw units = virtual_quote_reserves / virtual_token_reserves
+      - pump.fun coins have 6 decimals; the classic quote is SOL in lamports (9 decimals)
+
+      INVARIANTS THE PROGRAM MAINTAINS (keep them consistent when overriding):
+      - a buy increases virtual_quote_reserves and real_quote_reserves by the same amount
+        and decreases virtual_token_reserves and real_token_reserves by the same amount;
+        a sell does the exact reverse
+      - therefore virtual_token_reserves - real_token_reserves never changes over the life
+        of a curve (279,900,000,000,000 with today's mainnet Global defaults), and
+        virtual_quote_reserves - real_quote_reserves stays at the initial virtual quote
+        (30,000,000,000 lamports today)
+      - complete flips to true when real_token_reserves reaches 0; a completed curve
+        rejects buy and sell and can only be migrated to a PumpSwap pool
+
+      NEW CURVES START FROM Global's initial values: 1,073,000,000,000,000 virtual tokens,
+      30,000,000,000 virtual quote lamports, 793,100,000,000,000 real tokens, 0 real quote,
+      and a 1,000,000,000,000,000 total supply. Override a curve to exactly these (with
+      complete: false) to reopen an already-migrated coin for trading on its curve.
+
+      total_fee_bps = protocol fee + creator fee (0 when the curve has no creator).
+      Trades read both from the fee program's FeeConfig market-cap fee tiers — a
+      required account of every buy and sell. Global.fee_basis_points and
+      Global.creator_fee_basis_points are legacy fields from before the external fee
+      program. The creator share accrues to the curve's creator vault.
+
+      EXAMPLE - "prove a completed curve rejects trading": one override, values =
+        token_mint: <a pump.fun mint>
+        real_token_reserves: 0
+        complete: true
+      A buy against it now fails with BondingCurveComplete (0x1775).
+    address:
+      type: pda
+      program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+      seeds:
+        - type: string
+          value: bonding-curve
+        - type: property_ref
+          value: token_mint
+
+  - id: pump-global
+    name: Override Global Configuration
+    description: |
+      Override the Pump program's single Global configuration account
+      (PDA derived from ["global"], resolving to 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf).
+    idl_account_name: Global
+    properties:
+      - path: fee_basis_points
+        label: Fee Basis Points (legacy)
+        description: Legacy protocol fee in basis points, from before the external fee program; live trades read fees from the fee program's FeeConfig instead
+      - path: creator_fee_basis_points
+        label: Creator Fee Basis Points (legacy)
+        description: Legacy creator fee in basis points, likewise superseded by the external fee program
+      - path: initial_virtual_token_reserves
+        label: Initial Virtual Token Reserves
+        description: Virtual token reserves a newly created curve starts with; parameterizes new curves only, existing curves keep their creation values
+      - path: initial_virtual_sol_reserves
+        label: Initial Virtual SOL Reserves
+        description: Virtual SOL reserves seeding classic SOL-quoted curves at creation
+      - path: initial_virtual_quote_reserves
+        label: Initial Virtual Quote Reserves
+        description: Virtual quote reserves seeding newer non-SOL quote-mint curves at creation
+      - path: initial_real_token_reserves
+        label: Initial Real Token Reserves
+        description: Real token reserves a new curve starts with, the tokens available to buy before it completes
+      - path: token_total_supply
+        label: Token Total Supply
+        description: Total token supply minted for a new curve
+      - path: enable_migrate
+        label: Enable Migrate
+        description: Gates the migrate instruction that moves a completed curve's liquidity to PumpSwap
+      - path: pool_migration_fee
+        label: Pool Migration Fee
+        description: Fee taken when a completed curve migrates to its PumpSwap pool
+      - path: withdraw_authority
+        label: Withdraw Authority
+        description: Authority the migrate and withdraw paths check; override it to a key you control to drive a real migrate transaction on a fork
+    llm_context: |
+      Set fetchBeforeUse: true so Global's other fields (authorities, fee recipient lists)
+      keep their live values; false only to build on an earlier override's prepared state.
+
+      The initial_* values only parameterize bonding curves created AFTER the override;
+      existing curves keep the values they were created with. initial_virtual_sol_reserves
+      seeds classic SOL-quoted curves, initial_virtual_quote_reserves the newer non-SOL
+      quote-mint curves. fee_basis_points and creator_fee_basis_points are legacy
+      fields from before the external fee program; trades read fees from the fee
+      program's FeeConfig — a required account of every buy and sell. enable_migrate
+      gates the migrate instruction that moves a completed curve's liquidity to
+      PumpSwap.
+    address:
+      type: pda
+      program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+      seeds:
+        - type: string
+          value: global

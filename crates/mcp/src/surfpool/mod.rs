@@ -87,6 +87,18 @@ fn compact_template_json(template: &surfpool_types::OverrideTemplate) -> serde_j
     obj
 }
 
+fn index_template_json(template: &surfpool_types::OverrideTemplate) -> serde_json::Value {
+    serde_json::json!({
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "protocol": template.protocol,
+        "accountType": template.account_type,
+        "tags": template.tags,
+        "hasLlmContext": template.llm_context.is_some(),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchConstantOptionsParams {
@@ -102,6 +114,35 @@ pub struct SearchConstantOptionsParams {
         description = "Case-insensitive text matched against option id, label, description and value (e.g., \"SOL/USD\"). An empty string returns the first options."
     )]
     pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePumpGraduationScenarioParams {
+    #[schemars(
+        description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
+    )]
+    pub token_mint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePumpSwapPriceShockScenarioParams {
+    #[schemars(
+        description = "Mint of a migrated pump.fun coin with a canonical WSOL PumpSwap pool."
+    )]
+    pub token_mint: String,
+    #[schemars(description = "Positive virtual quote reserve amount, passed as a decimal string.")]
+    pub virtual_quote_reserves: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTemplateParams {
+    #[schemars(
+        description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
+    )]
+    pub template_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -520,7 +561,7 @@ impl Surfpool {
 
         IMPORTANT:
         - If a user asks to create a scenario, DO NOT USE this method. Instead, use the dedicated `create_scenario` tool.
-        - There is NO RPC method called `surfnet_getOverrideTemplates`. Override templates are ONLY available via the MCP resource str:///override_templates (use read_resource, not this RPC tool).
+        - There is NO RPC method called `surfnet_getOverrideTemplates`. The override templates index is available via the MCP resource str:///override_templates (use read_resource, not this RPC tool); one template's full detail comes from the get_override_template tool.
         "#)]
     async fn call_surfnet_rpc(
         &self,
@@ -605,7 +646,8 @@ impl Surfpool {
         - The `tags` field MUST be a JSON array [], NOT a JSON string
         - DO NOT stringify nested objects - pass them as native JSON
 
-        ⚠️ CRITICAL: You MUST call `get_override_templates` FIRST to get valid template data.
+        ⚠️ CRITICAL: You MUST call `get_override_templates` FIRST to pick a templateId, then
+        `get_override_template` on that id for its properties and account shape.
         DO NOT invent templateId values, property names, or account addresses - they MUST come from the templates.
 
         STRICT RULES - VIOLATIONS WILL CAUSE ERRORS:
@@ -724,10 +766,12 @@ impl Surfpool {
                                     // Check if the value exists in values map
                                     if let Some(value) = override_instance.values.get(&prop.path) {
                                         if let Some(value_str) = value.as_str() {
-                                            // Validate the value is one of the valid options
-                                            let is_valid = constant_def.options.iter().any(|opt| {
-                                                opt.value.to_lowercase() == value_str.to_lowercase()
-                                            });
+                                            // Base58 is case-sensitive: a case-folded match would
+                                            // accept a value that derives a different PDA.
+                                            let is_valid = constant_def
+                                                .options
+                                                .iter()
+                                                .any(|opt| opt.value == value_str);
                                             if !is_valid {
                                                 // Show only first 10 options to avoid overwhelming error messages
                                                 let sample_options: Vec<String> = constant_def
@@ -755,6 +799,15 @@ impl Surfpool {
                                                 sample_options.join("\n  ")
                                             ));
                                             }
+                                        } else {
+                                            validation_errors.push(format!(
+                                                "Override '{}' (template '{}'): Value for '{}' (constant: '{}') must be a base-58 mint address string, got: {}",
+                                                override_instance.id,
+                                                override_instance.template_id,
+                                                prop.path,
+                                                constant_name,
+                                                value
+                                            ));
                                         }
                                     } else {
                                         // Value is missing - required for PDA derivation
@@ -884,7 +937,129 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
+        description = "Creates an editable Pump Graduation state-preparation scenario for the required tokenMint. If validation fails, report that error and do not retry. The backend validates the mint, incomplete bonding curve, curve vault, and absent canonical PumpSwap pool."
+    )]
+    async fn create_pump_graduation_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePumpGraduationScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/scenarios/pump-graduation",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .json(&serde_json::json!({ "tokenMint": params.token_mint }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let result = RegisterScenarioResponse::error(format!(
+                    "Failed to reach the Pump graduation endpoint: {error}"
+                ));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&result).unwrap_or_default(),
+                )]));
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let result = RegisterScenarioResponse::error(if body.is_empty() {
+                format!("Pump graduation validation failed with HTTP {status}")
+            } else {
+                body
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&result).unwrap_or_default(),
+            )]));
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            McpError::internal_error(format!("Invalid Pump graduation response: {error}"), None)
+        })?;
+        let scenario_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::internal_error("Pump graduation response has no id", None))?;
+        let url = format!(
+            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
+        );
+        let result = RegisterScenarioResponse::success(url);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Creates an editable PumpSwap price-shock scenario for a required migrated tokenMint and positive virtualQuoteReserves decimal string. The backend validates that the mint has a canonical WSOL PumpSwap pool. Prepare state only; do not build or execute swaps."
+    )]
+    async fn create_pump_swap_price_shock_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePumpSwapPriceShockScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/scenarios/pump-swap-price-shock",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .json(&serde_json::json!({
+                "tokenMint": params.token_mint,
+                "virtualQuoteReserves": params.virtual_quote_reserves,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let result = RegisterScenarioResponse::error(format!(
+                    "Failed to reach the PumpSwap price shock endpoint: {error}"
+                ));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string(&result).unwrap_or_default(),
+                )]));
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let result = RegisterScenarioResponse::error(if body.is_empty() {
+                format!("PumpSwap price shock validation failed with HTTP {status}")
+            } else {
+                body
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&result).unwrap_or_default(),
+            )]));
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            McpError::internal_error(
+                format!("Invalid PumpSwap price shock response: {error}"),
+                None,
+            )
+        })?;
+        let scenario_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                McpError::internal_error("PumpSwap price shock response has no id", None)
+            })?;
+        let url = format!(
+            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
+        );
+        let result = RegisterScenarioResponse::success(url);
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -899,10 +1074,39 @@ impl Surfpool {
         let templates: Vec<serde_json::Value> = registry
             .all()
             .iter()
-            .map(|t| compact_template_json(t))
+            .map(|t| index_template_json(t))
             .collect();
 
         let json_str = serde_json::to_string(&templates).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+    }
+
+    #[tool(
+        description = "Fetches one template's full detail (properties, address, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
+    )]
+    async fn get_override_template(
+        &self,
+        Parameters(params): Parameters<GetTemplateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let registry = self.template_registry.read().map_err(|_| {
+            use std::borrow::Cow;
+            McpError {
+                code: ErrorCode(-32603),
+                message: Cow::from("Failed to read template registry"),
+                data: None,
+            }
+        })?;
+
+        let all_templates = registry.all();
+        let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
+            let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Unknown templateId {:?}. Valid IDs are: {:?}",
+                params.template_id, valid_ids
+            ))]));
+        };
+
+        let json_str = serde_json::to_string(&compact_template_json(template)).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
 
@@ -1090,7 +1294,7 @@ impl ServerHandler for Surfpool {
                 let templates: Vec<serde_json::Value> = registry
                     .all()
                     .iter()
-                    .map(|t| compact_template_json(t))
+                    .map(|t| index_template_json(t))
                     .collect();
 
                 let templates_json = serde_json::to_string(&templates).map_err(|_| {
@@ -1153,6 +1357,29 @@ mod tests {
         assert_eq!(parsed.template_id, "pyth-price-feed-v2");
     }
 
+    #[test]
+    fn pump_graduation_mint_is_required() {
+        assert!(
+            serde_json::from_value::<CreatePumpGraduationScenarioParams>(serde_json::json!({}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pump_swap_price_shock_inputs_are_required() {
+        assert!(
+            serde_json::from_value::<CreatePumpSwapPriceShockScenarioParams>(serde_json::json!({}))
+                .is_err()
+        );
+        let parsed: CreatePumpSwapPriceShockScenarioParams =
+            serde_json::from_value(serde_json::json!({
+                "tokenMint": "mint",
+                "virtualQuoteReserves": "15000000000000",
+            }))
+            .unwrap();
+        assert_eq!(parsed.virtual_quote_reserves, "15000000000000");
+    }
+
     fn json_of(result: &CallToolResult) -> serde_json::Value {
         let text = &result.content[0].as_text().expect("text content").text;
         serde_json::from_str(text).expect("valid JSON payload")
@@ -1170,8 +1397,14 @@ mod tests {
         })
     }
 
+    fn template_id(id: &str) -> Parameters<GetTemplateParams> {
+        Parameters(GetTemplateParams {
+            template_id: id.to_string(),
+        })
+    }
+
     #[tokio::test]
-    async fn get_override_templates_summarizes_constants_instead_of_inlining_options() {
+    async fn the_template_index_is_light_and_omits_the_heavy_fields() {
         let surfpool = Surfpool::new();
         let result = surfpool.get_override_templates().await.unwrap();
         assert_ne!(result.is_error, Some(true));
@@ -1184,6 +1417,38 @@ mod tests {
             .find(|t| t["id"] == "pyth-price-feed-v2")
             .expect("pyth template present");
 
+        for heavy in ["llmContext", "properties", "address", "constants", "idl"] {
+            assert!(
+                pyth.get(heavy).is_none(),
+                "the index must not carry {heavy}"
+            );
+        }
+        assert_eq!(
+            pyth["hasLlmContext"], true,
+            "the index flags which templates have context to fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_override_template_returns_full_detail_and_summarizes_constants() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .get_override_template(template_id("pyth-price-feed-v2"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let pyth = json_of(&result);
+        assert!(
+            pyth.get("properties").is_some(),
+            "detail carries properties"
+        );
+        assert!(pyth.get("address").is_some(), "detail carries the address");
+        assert!(
+            pyth.get("llmContext").is_some(),
+            "detail carries llmContext"
+        );
+
         let price_feed = &pyth["constants"]["price_feed"];
         assert!(
             price_feed["optionsCount"].as_u64().unwrap() > 0,
@@ -1192,6 +1457,44 @@ mod tests {
         assert!(
             price_feed.get("options").is_none(),
             "options must not be inlined; they blow past LLM token limits"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_override_template_rejects_an_unknown_id_and_names_valid_ones() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .get_override_template(template_id("no-such-template"))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("pyth-price-feed-v2"),
+            "the error must name valid ids, got: {text}"
+        );
+    }
+
+    #[test]
+    fn the_index_is_lighter_than_the_full_detail_of_every_template() {
+        let registry = TemplateRegistry::new();
+        let index: Vec<_> = registry
+            .all()
+            .iter()
+            .map(|t| index_template_json(t))
+            .collect();
+        let full: Vec<_> = registry
+            .all()
+            .iter()
+            .map(|t| compact_template_json(t))
+            .collect();
+
+        let index_len = serde_json::to_string(&index).unwrap().len();
+        let full_len = serde_json::to_string(&full).unwrap().len();
+        assert!(
+            index_len * 3 < full_len,
+            "the index ({index_len} bytes) should be far lighter than the old full payload \
+             ({full_len} bytes)"
         );
     }
 
@@ -1257,6 +1560,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn index_template_json_omits_the_heavy_fields() {
+        let registry = TemplateRegistry::new();
+        for template in registry.all() {
+            let json = index_template_json(template);
+            for heavy in ["llmContext", "properties", "address", "constants", "idl"] {
+                assert!(
+                    json.get(heavy).is_none(),
+                    "index entry for {} leaks {heavy}",
+                    template.id
+                );
+            }
+            assert_eq!(json["hasLlmContext"], template.llm_context.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn search_rejects_unknown_template_and_unknown_constant() {
         let surfpool = Surfpool::new();
@@ -1272,5 +1591,225 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown_constant.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn the_pump_templates_appear_in_the_index_and_detail_summarizes_the_catalog() {
+        let surfpool = Surfpool::new();
+        let result = surfpool.get_override_templates().await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let templates = json_of(&result);
+        let templates = templates.as_array().unwrap();
+        for id in [
+            "pump-bonding-curve-custom",
+            "pump-global",
+            "pump-amm-pool-state",
+            "pump-amm-canonical-pool",
+            "pump-amm-global-config",
+        ] {
+            let template = templates
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap_or_else(|| panic!("template {id} missing from the index"));
+            assert!(
+                template.get("idl").is_none(),
+                "{id} must not inline the ~160KB IDL into the index"
+            );
+        }
+
+        let detail = surfpool
+            .get_override_template(template_id("pump-bonding-curve-custom"))
+            .await
+            .unwrap();
+        let curve = json_of(&detail);
+        let token_mint = &curve["constants"]["token_mint"];
+        assert!(
+            token_mint["optionsCount"].as_u64().unwrap() > 0,
+            "the verified-tokens catalog must be visible as a summary"
+        );
+        assert!(token_mint.get("options").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_resolves_pump_coin_mints_for_both_programs() {
+        let surfpool = Surfpool::new();
+
+        let result = surfpool
+            .search_constant_options(search("pump-bonding-curve-custom", None, "pump"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        let results = payload["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "a pump coin must be findable");
+        assert!(
+            results
+                .iter()
+                .all(|r| !r["value"].as_str().unwrap().is_empty()),
+            "every result must carry the mint create_scenario expects"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r["value"].as_str().unwrap().ends_with("pump")),
+            "pump.fun mints are recognizable by their suffix"
+        );
+
+        let result = surfpool
+            .search_constant_options(search("pump-amm-canonical-pool", Some("token_mint"), ""))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        assert!(
+            payload["totalMatches"].as_u64().unwrap() > 0,
+            "the canonical pool template must expose base mints to search"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_token_catalogs_offer_only_pump_mints() {
+        let registry = TemplateRegistry::new();
+        for template_id in ["pump-bonding-curve-custom", "pump-amm-canonical-pool"] {
+            let template = registry.get(template_id).expect("template");
+            let constant = template.constants.get("token_mint").expect("constant");
+            assert_eq!(
+                constant.options.len(),
+                976,
+                "{template_id} must offer every pump-suffixed catalog mint (976 in the CSV)"
+            );
+            assert!(
+                constant.options.iter().all(|o| o.value.ends_with("pump")),
+                "{template_id} must offer only pump.fun mints"
+            );
+        }
+
+        let surfpool = Surfpool::new();
+        for mint in [
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        ] {
+            let result = surfpool
+                .search_constant_options(search("pump-bonding-curve-custom", None, mint))
+                .await
+                .unwrap();
+            let payload = json_of(&result);
+            assert_eq!(
+                payload["totalMatches"].as_u64().unwrap(),
+                0,
+                "{mint} must not be offered for a bonding curve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_bad_pump_overrides_before_any_http_call() {
+        let surfpool = Surfpool::new();
+        let registry = TemplateRegistry::new();
+        let curve_address = registry
+            .get("pump-bonding-curve-custom")
+            .expect("template")
+            .address
+            .clone();
+
+        let mut unknown = surfpool_types::Scenario::new(
+            "bad template".to_string(),
+            "unknown templateId must be rejected".to_string(),
+        );
+        unknown.add_override(surfpool_types::OverrideInstance::new(
+            "pump-bonding-curve".to_string(),
+            0,
+            curve_address.clone(),
+        ));
+        let result = surfpool.create_scenario(Parameters(unknown)).await.unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid templateId"),
+            "a misremembered id must be named, got: {text}"
+        );
+
+        let mut incomplete = surfpool_types::Scenario::new(
+            "missing mint".to_string(),
+            "a PDA constant without a value must be rejected".to_string(),
+        );
+        incomplete.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                curve_address,
+            )
+            .with_values(HashMap::from([(
+                "complete".to_string(),
+                serde_json::json!(true),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(incomplete))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Missing required value") && text.contains("token_mint"),
+            "the missing PDA seed value must be named, got: {text}"
+        );
+
+        let mut wrong_type = surfpool_types::Scenario::new(
+            "numeric mint".to_string(),
+            "a non-string mint must be rejected, not silently skipped".to_string(),
+        );
+        wrong_type.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!(12345),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(wrong_type))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("must be a base-58 mint address string") && text.contains("token_mint"),
+            "the wrong-typed mint must be named, got: {text}"
+        );
+
+        let mut tampered = surfpool_types::Scenario::new(
+            "tampered mint".to_string(),
+            "base58 is case-sensitive; a case-folded match targets another PDA".to_string(),
+        );
+        tampered.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!("9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgPUMP"),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(tampered))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid value"),
+            "a case-flipped mint must be rejected, got: {text}"
+        );
     }
 }

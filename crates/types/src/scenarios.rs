@@ -390,6 +390,8 @@ pub struct OverrideTemplate {
     /// Account type name from the IDL (e.g., "PriceAccount")
     /// This specifies which account struct in the IDL to use
     pub account_type: String,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     /// List of editable properties with full metadata
     pub properties: Vec<Property>,
     /// Protocol-specific constants (e.g., AMM configs, well-known tokens)
@@ -422,6 +424,7 @@ impl OverrideTemplate {
             idl,
             address,
             account_type,
+            write_mode: OverrideWriteMode::default(),
             properties,
             constants: HashMap::new(),
             tags: Vec::new(),
@@ -459,6 +462,15 @@ impl OverrideTemplate {
     pub fn property_paths(&self) -> Vec<&str> {
         self.properties.iter().map(|p| p.path.as_str()).collect()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideWriteMode {
+    #[default]
+    Idl,
+    #[serde(rename = "token_2022_account_amount")]
+    Token2022AccountAmount,
 }
 
 /// A concrete instance of an override template with specific values
@@ -626,6 +638,8 @@ pub struct YamlOverrideTemplateFile {
     pub version: String,
     pub account_type: String,
     #[serde(default)]
+    pub write_mode: OverrideWriteMode,
+    #[serde(default)]
     pub properties: Vec<YamlProperty>,
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
@@ -649,6 +663,7 @@ impl YamlOverrideTemplateFile {
             idl,
             address: self.address.into(),
             account_type: self.account_type,
+            write_mode: self.write_mode,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
                 .constants
@@ -706,6 +721,9 @@ pub enum YamlConstantSource {
         /// Optional limit on number of tokens to include
         #[serde(default)]
         limit: Option<usize>,
+        /// Optional required suffix on the token's mint address (e.g. "pump")
+        #[serde(default)]
+        address_suffix: Option<String>,
     },
 }
 
@@ -731,13 +749,14 @@ impl YamlConstantDefinition {
                 source,
                 filter_tags,
                 limit,
+                address_suffix,
             } => {
                 if source == "verified_tokens" {
-                    use crate::verified_tokens::VERIFIED_TOKENS_BY_SYMBOL;
+                    use crate::verified_tokens::VERIFIED_TOKENS;
 
-                    let mut tokens: Vec<_> = VERIFIED_TOKENS_BY_SYMBOL
+                    let mut tokens: Vec<_> = VERIFIED_TOKENS
                         .iter()
-                        .filter(|(_, _token)| {
+                        .filter(|_token| {
                             // If no filter tags specified, include all tokens
                             if filter_tags.is_empty() {
                                 return true;
@@ -748,8 +767,14 @@ impl YamlConstantDefinition {
                             // TODO: Parse tags from CSV into TokenInfo struct
                             true
                         })
-                        .map(|(symbol, token)| ConstantOption {
-                            id: symbol.to_lowercase(),
+                        .filter(|token| {
+                            address_suffix
+                                .as_deref()
+                                .map_or(true, |suffix| token.address.ends_with(suffix))
+                        })
+                        .map(|token| ConstantOption {
+                            // The mint address: unique even when symbols collide
+                            id: token.address.clone(),
                             label: format!("{} ({})", token.symbol, token.name),
                             description: Some(token.name.clone()),
                             value: token.address.clone(),
@@ -774,8 +799,8 @@ impl YamlConstantDefinition {
                         })
                         .collect();
 
-                    // Sort by symbol for consistent ordering
-                    tokens.sort_by(|a, b| a.id.cmp(&b.id));
+                    // Deterministic order keeps search_constant_options paging stable
+                    tokens.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
 
                     // Apply limit if specified
                     if let Some(limit) = limit {
@@ -922,6 +947,8 @@ pub struct YamlOverrideTemplateEntry {
     /// Account type name from the IDL (overrides collection-level account_type)
     #[serde(default)]
     pub idl_account_name: Option<String>,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     /// Properties with full metadata
     #[serde(default)]
     pub properties: Vec<YamlProperty>,
@@ -955,6 +982,7 @@ impl YamlOverrideTemplateCollection {
                 account_type: entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone()),
+                write_mode: entry.write_mode,
                 properties: entry.properties.into_iter().map(Into::into).collect(),
                 constants: constants.clone(),
                 tags: self.tags.clone(),
@@ -974,6 +1002,8 @@ pub struct YamlOverrideTemplate {
     pub protocol: String,
     pub version: String,
     pub account_type: String,
+    #[serde(default)]
+    pub write_mode: OverrideWriteMode,
     pub idl: Idl,
     pub address: YamlAccountAddress,
     #[serde(default)]
@@ -998,6 +1028,7 @@ impl YamlOverrideTemplate {
             idl: self.idl,
             address: self.address.into(),
             account_type: self.account_type,
+            write_mode: self.write_mode,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
                 .constants
