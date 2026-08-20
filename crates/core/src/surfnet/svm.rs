@@ -230,6 +230,13 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
     }
 }
 
+/// The bundled template registry, parsed once and reused.
+fn template_registry() -> &'static crate::scenarios::TemplateRegistry {
+    static REGISTRY: std::sync::OnceLock<crate::scenarios::TemplateRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(crate::scenarios::TemplateRegistry::new)
+}
+
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
 fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
@@ -253,16 +260,16 @@ fn json_to_txtx_value_for_idl_type(
         }
         (IdlType::U128, _) => {
             let digits = json_integer_digits(json, "u128")?;
-            let value = digits.parse::<u128>().map_err(|e| {
-                SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}"))
-            })?;
+            let value = digits
+                .parse::<u128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}")))?;
             Ok(txtx_addon_network_svm_types::SvmValue::u128(value))
         }
         (IdlType::I128, _) => {
             let digits = json_integer_digits(json, "i128")?;
-            let value = digits.parse::<i128>().map_err(|e| {
-                SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}"))
-            })?;
+            let value = digits
+                .parse::<i128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}")))?;
             Ok(txtx_addon_network_svm_types::SvmValue::i128(value))
         }
         (IdlType::Vec(inner), serde_json::Value::Array(items))
@@ -754,7 +761,11 @@ impl SurfnetSvm {
     fn register_builtin_template_idls(&mut self) {
         let registry = TemplateRegistry::new();
         for (_, template) in registry.templates.into_iter() {
-            let _ = self.register_idl(template.idl, None);
+            // Templates for programs with no IDL have nothing to register; they write through
+            // `raw_layout` instead.
+            if let Some(idl) = template.idl {
+                let _ = self.register_idl(idl, None);
+            }
         }
     }
 
@@ -2880,6 +2891,55 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
+
+                // Programs with no usable IDL carry a byte layout instead, and this MUST come
+                // before the IDL lookup below: those programs have no registered IDL at all, so the
+                // lookup would `continue` and silently drop the override.
+                let raw_template = template_registry()
+                    .get(&override_instance.template_id)
+                    .filter(|t| t.raw_layout.is_some())
+                    .cloned();
+                if let Some(template) = raw_template {
+                    let raw_layout = template.raw_layout.expect("filtered above");
+                    let properties = template.properties;
+                    match raw_layout.materialize(
+                        account.data(),
+                        &properties,
+                        &account_values,
+                        target_slot,
+                    ) {
+                        Ok(new_data) => {
+                            let modified = Account {
+                                lamports: account.lamports(),
+                                data: new_data,
+                                owner: *account.owner(),
+                                executable: account.executable(),
+                                rent_epoch: account.rent_epoch(),
+                            };
+                            if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                                warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                            } else {
+                                debug!(
+                                    "Raw-layout override {} applied {} field(s) to {}",
+                                    override_instance.id,
+                                    account_values.len(),
+                                    account_pubkey
+                                );
+                                settled_this_slot.insert(account_pubkey);
+                                if override_instance.persist && override_instance.fetch_before_use {
+                                    let mut requeued = override_instance.clone();
+                                    requeued.fetch_before_use = false;
+                                    self.reschedule_override_for_next_slot(&requeued, target_slot);
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Raw-layout override {} failed on {}: {}",
+                            override_instance.id, account_pubkey, e
+                        ),
+                    }
+                    continue;
+                }
 
                 // Get the account owner (program ID)
                 let owner_program_id = account.owner();
@@ -5275,10 +5335,18 @@ mod tests {
         assert!(!epoch_schedule.warmup);
 
         let registry = TemplateRegistry::new();
+        let mut checked = 0usize;
         for (_, template) in registry.templates {
-            let program_id = template.idl.address.clone();
+            // Templates for programs that publish no IDL have nothing to register.
+            let Some(idl) = template.idl else { continue };
+            let program_id = idl.address.clone();
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
+            checked += 1;
         }
+        assert!(
+            checked > 0,
+            "no template carried an IDL, so this proved nothing about registration"
+        );
         assert!(svm.skip_blockhash_check);
     }
 
@@ -7221,7 +7289,11 @@ mod tests {
             1_234,
             "the first override must survive the second override's fetch"
         );
-        assert_eq!(read(ALLOWED_OFFSET), 5_678, "the second override must apply");
+        assert_eq!(
+            read(ALLOWED_OFFSET),
+            5_678,
+            "the second override must apply"
+        );
     }
 
     #[tokio::test]

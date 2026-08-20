@@ -23,6 +23,7 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -69,6 +70,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_bisonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -106,6 +108,10 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_bisonfi_overrides(&mut self) {
+        self.load_protocol_overrides_without_idl(BISONFI_OVERRIDES_CONTENT, "bisonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -172,7 +178,25 @@ impl TemplateRegistry {
             Ok(idl) => idl,
             Err(e) => panic!("unable to load {} idl: {}", protocol_name, e),
         };
+        self.load_collection(Some(idl), overrides_content, protocol_name);
+    }
 
+    /// For programs that publish no IDL. Their templates must carry a `raw_layout` and spell out
+    /// every property description, since there is no schema to fall back on.
+    fn load_protocol_overrides_without_idl(
+        &mut self,
+        overrides_content: &str,
+        protocol_name: &str,
+    ) {
+        self.load_collection(None, overrides_content, protocol_name);
+    }
+
+    fn load_collection(
+        &mut self,
+        idl: Option<anchor_lang_idl::types::Idl>,
+        overrides_content: &str,
+        protocol_name: &str,
+    ) {
         let collection =
             match serde_yaml::from_str::<YamlOverrideTemplateCollection>(overrides_content) {
                 Ok(c) => c,
@@ -234,7 +258,7 @@ impl TemplateRegistry {
 #[cfg(test)]
 mod tests {
     use anchor_lang_idl::types::IdlType;
-    use std::{collections::HashMap, collections::BTreeSet, str::FromStr};
+    use std::{collections::BTreeSet, collections::HashMap, str::FromStr};
 
     use solana_pubkey::Pubkey;
     use surfpool_types::{AccountAddress, PdaSeed};
@@ -381,11 +405,11 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) + Whirlpool(6) + SPL Token (2) = 57 total
+        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) + Whirlpool(6) + SPL Token (2) + BisonFi (4) = 61 total
         assert_eq!(
             registry.count(),
-            57,
-            "Registry should load 57 templates total"
+            61,
+            "Registry should load 61 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -601,7 +625,7 @@ mod tests {
         let registry = TemplateRegistry::new();
         let jupiter_template = registry.get("jupiter-token-ledger-override").unwrap();
         let has_token_ledger = jupiter_template
-            .idl
+            .idl()
             .accounts
             .iter()
             .any(|acc| acc.name == "TokenLedger");
@@ -1040,18 +1064,24 @@ mod tests {
         let registry = TemplateRegistry::new();
         let mut errors = Vec::new();
 
+        let mut checked = 0usize;
         for template in registry.all() {
+            // Templates for programs that publish no IDL declare their own byte offsets, so there
+            // is no schema for their paths to resolve against. Their offsets are covered instead by
+            // the per-property write tests in `tests/kamino`.
+            let Some(idl) = template.idl.as_ref() else {
+                continue;
+            };
             for property in &template.properties {
                 // constant_ref properties are UI dropdowns (e.g. token pickers), not
                 // account fields, so they are not expected to resolve against the IDL.
                 if property.is_constant_ref() {
                     continue;
                 }
-                if let Err(e) = surfpool_types::resolve_idl_type(
-                    &template.idl,
-                    &template.account_type,
-                    &property.path,
-                ) {
+                checked += 1;
+                if let Err(e) =
+                    surfpool_types::resolve_idl_type(idl, &template.account_type, &property.path)
+                {
                     errors.push(format!("[{}] {}: {}", template.id, property.path, e));
                 }
             }
@@ -1062,6 +1092,12 @@ mod tests {
             "{} template propert(ies) do not exist in their IDL:\n  {}",
             errors.len(),
             errors.join("\n  ")
+        );
+        // Without this the skip above could silently swallow every template and the test would pass
+        // having resolved nothing.
+        assert!(
+            checked > 0,
+            "no property was resolved against an IDL, so this proved nothing"
         );
     }
 
@@ -1222,7 +1258,7 @@ mod tests {
             ("ref_price.0", IdlType::U16),
         ] {
             let resolved =
-                surfpool_types::resolve_idl_type(&template.idl, &template.account_type, path)
+                surfpool_types::resolve_idl_type(template.idl(), &template.account_type, path)
                     .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
             assert_eq!(
                 *resolved, expected,
@@ -1235,7 +1271,7 @@ mod tests {
             .get("kamino-obligation-positions")
             .expect("kamino-obligation-positions should exist");
         let resolved = surfpool_types::resolve_idl_type(
-            &obligation.idl,
+            obligation.idl(),
             &obligation.account_type,
             "deposits.0.deposit_reserve",
         )
