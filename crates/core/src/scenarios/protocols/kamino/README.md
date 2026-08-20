@@ -198,7 +198,7 @@ kamino-swap-order
 | Price rejected as stale | Set `prices.N.last_updated_slot` / `unix_timestamp` to now, or raise `config.token_info.max_age_price_seconds` on `kamino-reserve-oracle` |
 | Price rejected for TWAP divergence | Move the matching entry with `kamino-scope-twap`, or raise `max_twap_divergence_bps` |
 | Your override silently did nothing | The field name does not exist in the IDL - surfpool logs a `warn!` and drops the whole override. Check the log |
-| `expected svm::u128, found string` | Numbers must be JSON numbers, not quoted strings |
+| `exceeds what a JSON number can hold exactly` | Pass large `u128`/`i128` values as decimal strings, e.g. `"1152921504606846976000"`. Plain JSON numbers are fine below 2^53 |
 | `Account with discriminator ... not found in IDL` | The account is not Anchor-based (e.g. Raydium AMM v4). It cannot be overridden through the IDL path |
 | `Failed to resolve account address` | The `pubkey` is not valid base58 |
 | Override reverted after a transaction touched the account | Add `"persist": true` - but only if that field is an input, not state the transaction is meant to change |
