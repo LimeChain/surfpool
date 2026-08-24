@@ -626,12 +626,9 @@ impl Minimal for SurfpoolMinimalRpc {
 
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)
-                | GetAccountResult::FoundProgramAccount((_, account), _)
-                | GetAccountResult::FoundTokenAccount((_, account), _) => account.lamports,
+                | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.lamports,
                 GetAccountResult::None(_) => 0,
             };
-
-            svm_locker.write_account_update(account_update);
 
             #[cfg(feature = "prometheus")]
             if let Some(m) = crate::telemetry::metrics() {
