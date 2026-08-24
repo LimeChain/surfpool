@@ -1,4 +1,4 @@
-protocol: bisonfi
+protocol: BisonFi
 # The pool-account version this layout describes, and the only one supported. BisonFi ships no
 # program semver; the guard below rejects the one remaining version-2 account outright.
 version: v3
