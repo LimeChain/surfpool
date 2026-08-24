@@ -3034,7 +3034,11 @@ impl SurfnetSvm {
             .flatten()
             .unwrap_or_default();
 
-        if let Some(existing) = next.iter_mut().find(|queued| queued.id == instance.id) {
+        if let Some(existing) = next.iter_mut().find(|queued| {
+            queued.id == instance.id
+                && queued.account == instance.account
+                && queued.template_id == instance.template_id
+        }) {
             *existing = instance.clone();
         } else {
             next.push(instance.clone());
@@ -7422,6 +7426,55 @@ mod tests {
             "the first override must survive the second override's fetch"
         );
         assert_eq!(read(ALLOWED_OFFSET), 5_678, "the second override must apply");
+    }
+
+    /// Two persistent overrides that share a caller-supplied id but target different accounts must both survive re-arming.
+    #[tokio::test]
+    async fn test_reschedule_keeps_overrides_sharing_an_id_across_accounts() {
+        const SLOT: u64 = 500;
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+        let first_account = Pubkey::new_unique();
+        let second_account = Pubkey::new_unique();
+
+        let mut first = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(first_account.to_string()),
+        );
+        // The collision this guards against: a hand-written scenario reusing a plain id.
+        first.id = "ov-1".to_string();
+        first.persist = true;
+
+        let mut second = first.clone();
+        second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
+
+        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        surfnet_svm.reschedule_override_for_next_slot(&second, SLOT);
+
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
+        assert_eq!(
+            queued.len(),
+            2,
+            "two overrides on different accounts share the id 'ov-1'; keying only on the id drops \
+             one of them, so a scenario silently stops being applied"
+        );
+
+        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
+        assert_eq!(
+            queued.len(),
+            2,
+            "re-arming an override must replace its own queued copy, not append a duplicate"
+        );
     }
 
     #[tokio::test]
