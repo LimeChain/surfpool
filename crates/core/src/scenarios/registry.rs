@@ -24,6 +24,7 @@ pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
 pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");

@@ -58,7 +58,7 @@ use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
-    RunbookExecutionStatusReport, SimnetEvent, StartupError, SurfnetStartupStatus,
+    RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
     types::{
@@ -86,7 +86,7 @@ use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::TemplateRegistry,
-    storage::{OverlayStorage, Storage, new_kv_store, new_kv_store_with_default},
+    storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -407,7 +407,7 @@ pub struct SurfnetSvm {
     pub perf_samples: VecDeque<RpcPerfSample>,
     pub transactions_processed: u64,
     pub latest_epoch_info: EpochInfo,
-    pub simnet_events_tx: Sender<SimnetEvent>,
+    pub simnet_events_tx: SimnetEventsTx,
     pub geyser_events_tx: Sender<GeyserEvent>,
     pub signature_subscriptions: HashMap<Signature, Vec<SignatureSubscriptionData>>,
     pub account_subscriptions: AccountSubscriptionData,
@@ -476,6 +476,10 @@ pub struct SurfnetSvm {
     pub slot_checkpoint: Box<dyn Storage<String, u64>>,
     /// Tracks the slot at which we last persisted the checkpoint.
     pub last_checkpoint_slot: u64,
+    /// The storage backend every kv store above was opened on. Owns the
+    /// surfnet's database connections; kept so shutdown has one place to
+    /// flush and so the connections live exactly as long as the surfnet.
+    storage_backend: StorageBackend,
 }
 
 /// Add `pubkey_str` to the pubkey-list at `key`, creating the entry when absent
@@ -618,25 +622,7 @@ impl SurfnetSvm {
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
     pub fn shutdown(&self) {
-        self.inner.shutdown();
-        self.blocks.shutdown();
-        self.transactions.shutdown();
-        self.jito_bundles.shutdown();
-        self.token_accounts.shutdown();
-        self.token_mints.shutdown();
-        self.accounts_by_owner.shutdown();
-        self.token_accounts_by_owner.shutdown();
-        self.token_accounts_by_delegate.shutdown();
-        self.token_accounts_by_mint.shutdown();
-        self.streamed_accounts.shutdown();
-        self.scheduled_overrides.shutdown();
-        self.registered_idls.shutdown();
-        self.profile_tag_map.shutdown();
-        self.simulated_transaction_profiles.shutdown();
-        self.executed_transaction_profiles.shutdown();
-        self.account_associated_data.shutdown();
-        self.offline_accounts.shutdown();
-        self.slot_checkpoint.shutdown();
+        self.storage_backend.shutdown();
     }
 
     /// Creates a clone of the SVM with overlay storage wrappers for all database-backed fields.
@@ -656,7 +642,7 @@ impl SurfnetSvm {
     /// and `sandbox_geyser_events_rx`. Bundle commit code can drain these to replay the events
     /// on the original VM's channels.
     pub fn clone_for_profiling(&self) -> Self {
-        let (dummy_simnet_tx, _) = crossbeam_channel::bounded(1);
+        let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
         let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
 
         Self {
@@ -740,6 +726,7 @@ impl SurfnetSvm {
             genesis_updated_at: self.genesis_updated_at,
             slot_checkpoint: OverlayStorage::wrap(self.slot_checkpoint.clone_box()),
             last_checkpoint_slot: self.last_checkpoint_slot,
+            storage_backend: self.storage_backend.clone(),
         }
     }
 
@@ -783,7 +770,7 @@ impl SurfnetSvm {
     pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
-        let (simnet_tx, simnet_rx) = crossbeam_channel::unbounded();
+        let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
         svm.geyser_events_tx = geyser_tx;
         svm.simnet_events_tx = simnet_tx;
         BundleSandbox {
@@ -937,7 +924,7 @@ impl SurfnetSvm {
 
         // 6. Drain buffered simnet events; replay onto self's real channel.
         while let Ok(event) = simnet_rx.try_recv() {
-            let _ = self.simnet_events_tx.try_send(event);
+            self.simnet_events_tx.log(event);
         }
 
         // 7. Fire signature/logs subscribers and Success acks for each committed tx.
@@ -975,7 +962,7 @@ impl SurfnetSvm {
         database_url: Option<&str>,
         config: SurfnetSvmConfig,
     ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
-        let (simnet_events_tx, simnet_events_rx) = crossbeam_channel::bounded(1024);
+        let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::channel(1024);
         let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
         let surfnet_id = config.surfnet_id;
 
@@ -984,7 +971,8 @@ impl SurfnetSvm {
         // constructed exactly once, with the correct features and feature
         // accounts loaded. See `compose_feature_set` for the composition rules.
         let feature_set = compose_feature_set(&config.feature_config);
-        let inner = SurfnetLiteSvm::new(database_url, &surfnet_id, feature_set.clone())?;
+        let storage_backend = StorageBackend::open(&database_url, &surfnet_id)?;
+        let inner = SurfnetLiteSvm::new(&storage_backend, feature_set.clone())?;
 
         let native_mint_account = inner
             .get_account(&spl_token_interface::native_mint::ID)?
@@ -1016,20 +1004,20 @@ impl SurfnetSvm {
 
         // Load native mint into owned account and token mint indexes
         let mut accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "accounts_by_owner", &surfnet_id)?;
+            storage_backend.open_store("accounts_by_owner")?;
         accounts_by_owner_db.store(
             native_mint_account.owner.to_string(),
             vec![spl_token_interface::native_mint::ID.to_string()],
         )?;
-        let blocks_db = new_kv_store(&database_url, "blocks", &surfnet_id)?;
-        let transactions_db = new_kv_store(&database_url, "transactions", &surfnet_id)?;
-        let jito_bundles_db = new_kv_store(&database_url, "jito_bundles", &surfnet_id)?;
-        let token_accounts_db = new_kv_store(&database_url, "token_accounts", &surfnet_id)?;
+        let blocks_db = storage_backend.open_store("blocks")?;
+        let transactions_db = storage_backend.open_store("transactions")?;
+        let jito_bundles_db = storage_backend.open_store("jito_bundles")?;
+        let token_accounts_db = storage_backend.open_store("token_accounts")?;
         let mut token_mints_db: Box<dyn Storage<String, MintAccount>> =
-            new_kv_store(&database_url, "token_mints", &surfnet_id)?;
+            storage_backend.open_store("token_mints")?;
         let mut account_associated_data_db: Box<
             dyn Storage<String, SerializableAccountAdditionalData>,
-        > = new_kv_store(&database_url, "account_associated_data", &surfnet_id)?;
+        > = storage_backend.open_store("account_associated_data")?;
         // Store initial account associated data (native mint)
         account_associated_data_db.store(
             spl_token_interface::native_mint::ID.to_string(),
@@ -1040,30 +1028,28 @@ impl SurfnetSvm {
             parsed_mint_account,
         )?;
         let token_accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_owner", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_owner")?;
         let token_accounts_by_delegate_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_delegate", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_delegate")?;
         let token_accounts_by_mint_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_mint", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_mint")?;
         let streamed_accounts_db: Box<dyn Storage<String, bool>> =
-            new_kv_store(&database_url, "streamed_accounts", &surfnet_id)?;
+            storage_backend.open_store("streamed_accounts")?;
         let scheduled_overrides_db: Box<dyn Storage<u64, Vec<OverrideInstance>>> =
-            new_kv_store(&database_url, "scheduled_overrides", &surfnet_id)?;
+            storage_backend.open_store("scheduled_overrides")?;
         let offline_accounts_db: Box<dyn Storage<String, OfflineAccountConfig>> =
-            new_kv_store(&database_url, "offline_accounts", &surfnet_id)?;
+            storage_backend.open_store("offline_accounts")?;
         let registered_idls_db: Box<dyn Storage<String, Vec<VersionedIdl>>> =
-            new_kv_store(&database_url, "registered_idls", &surfnet_id)?;
+            storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
-            new_kv_store(&database_url, "profile_tag_map", &surfnet_id)?;
+            storage_backend.open_store("profile_tag_map")?;
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            new_kv_store(&database_url, "simulated_transaction_profiles", &surfnet_id)?;
+            storage_backend.open_store("simulated_transaction_profiles")?;
         let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
             // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
             let max_profiles = max(1, config.max_profiles);
-            new_kv_store_with_default(
-                &database_url,
+            storage_backend.open_store_with_default(
                 "executed_transaction_profiles",
-                &surfnet_id,
                 // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
                 // (when no on-disk DB is provided)
                 move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
@@ -1073,7 +1059,7 @@ impl SurfnetSvm {
         let mut epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
         let slot_checkpoint_db: Box<dyn Storage<String, u64>> =
-            new_kv_store(&database_url, "slot_checkpoint", &surfnet_id)?;
+            storage_backend.open_store("slot_checkpoint")?;
 
         // Recover chain state: prefer slot checkpoint, fall back to max block in DB.
         let checkpoint_slot = slot_checkpoint_db.get(&"latest_slot".to_string())?;
@@ -1201,6 +1187,7 @@ impl SurfnetSvm {
             genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
             last_checkpoint_slot,
+            storage_backend,
         };
 
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);
@@ -1380,28 +1367,24 @@ impl SurfnetSvm {
         for recipient in addresses {
             match self.airdrop(recipient, lamports) {
                 Ok(_) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::info(format!(
+                    self.simnet_events_tx.info(format!(
                         "Genesis airdrop successful {}: {}",
                         recipient, lamports
-                    )));
+                    ));
                 }
                 Err(AirdropError::ZeroAmount) => {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::info("Skipping 0 lamport airdrop"));
+                    let _ = self.simnet_events_tx.info("Skipping 0 lamport airdrop");
                     return;
                 }
                 Err(AirdropError::BelowRentExemption { lamports, min_rent }) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
+                    self.simnet_events_tx.error(format!(
                         "Skipping invalid airdrop: amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
-                    )));
+                    ));
                     return;
                 }
                 Err(AirdropError::Other(e)) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
-                        "Genesis airdrop failed {}: {}",
-                        recipient, e
-                    )));
+                    self.simnet_events_tx
+                        .error(format!("Genesis airdrop failed {}: {}", recipient, e));
                 }
             };
         }
@@ -1763,9 +1746,7 @@ impl SurfnetSvm {
         // Notify program subscribers
         self.notify_program_subscribers(pubkey, &account);
 
-        let _ = self
-            .simnet_events_tx
-            .send(SimnetEvent::account_update(*pubkey));
+        let _ = self.simnet_events_tx.account_update(*pubkey);
         Ok(())
     }
 
@@ -2140,17 +2121,17 @@ impl SurfnetSvm {
 
         // Log any errors that occurred
         if !errors.is_empty() {
-            let _ = self.simnet_events_tx.send(SimnetEvent::warn(format!(
+            self.simnet_events_tx.warn(format!(
                 "Snapshot restore completed with {} errors: {}",
                 errors.len(),
                 errors.join("; ")
-            )));
+            ));
         }
 
-        let _ = self.simnet_events_tx.send(SimnetEvent::info(format!(
+        self.simnet_events_tx.info(format!(
             "Restored {} accounts from snapshot",
             restored_count
-        )));
+        ));
 
         Ok(restored_count)
     }
@@ -2181,7 +2162,7 @@ impl SurfnetSvm {
 
         if cu_analysis_enabled {
             let estimation_result = self.estimate_compute_units(&tx);
-            let _ = self.simnet_events_tx.try_send(SimnetEvent::info(format!(
+            self.simnet_events_tx.info(format!(
                 "CU Estimation for tx: {} | Consumed: {} | Success: {} | Logs: {:?} | Error: {:?}",
                 tx.signatures
                     .first()
@@ -2190,7 +2171,7 @@ impl SurfnetSvm {
                 estimation_result.success,
                 estimation_result.log_messages,
                 estimation_result.error_message
-            )));
+            ));
         }
         self.transactions_processed += 1;
 
@@ -2200,12 +2181,8 @@ impl SurfnetSvm {
 
             let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
 
-            let _ = self
-                .simnet_events_tx
-                .try_send(SimnetEvent::transaction_processed(
-                    transaction_meta,
-                    Some(err.clone()),
-                ));
+            self.simnet_events_tx
+                .transaction_processed(transaction_meta, Some(err.clone()));
             return Err(FailedTransactionMetadata { err, meta });
         }
 
@@ -2215,12 +2192,8 @@ impl SurfnetSvm {
                 let transaction_meta =
                     convert_transaction_metadata_from_canonical(&tx_failure.meta);
 
-                let _ = self
-                    .simnet_events_tx
-                    .try_send(SimnetEvent::transaction_processed(
-                        transaction_meta,
-                        Some(tx_failure.err.clone()),
-                    ));
+                self.simnet_events_tx
+                    .transaction_processed(transaction_meta, Some(tx_failure.err.clone()));
                 Err(tx_failure)
             }
         }
@@ -2454,23 +2427,17 @@ impl SurfnetSvm {
                                 if let Err(e) =
                                     self.set_account(&programdata_address, programdata_account)
                                 {
-                                    let _ = self
-                                        .simnet_events_tx
-                                        .send(SimnetEvent::error(e.to_string()));
+                                    let _ = self.simnet_events_tx.error(e.to_string());
                                 }
                             }
                             Ok(Some(_)) => {}
                             Err(e) => {
-                                let _ = self
-                                    .simnet_events_tx
-                                    .send(SimnetEvent::error(e.to_string()));
+                                let _ = self.simnet_events_tx.error(e.to_string());
                             }
                         }
                     }
                     if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                        let _ = self
-                            .simnet_events_tx
-                            .send(SimnetEvent::error(e.to_string()));
+                        let _ = self.simnet_events_tx.error(e.to_string());
                     }
                 }
             }
@@ -2483,30 +2450,22 @@ impl SurfnetSvm {
                             if let Err(e) =
                                 self.set_account(&programdata_address, programdata_account)
                             {
-                                let _ = self
-                                    .simnet_events_tx
-                                    .send(SimnetEvent::error(e.to_string()));
+                                let _ = self.simnet_events_tx.error(e.to_string());
                             }
                         }
                         Ok(Some(_)) => {}
                         Err(e) => {
-                            let _ = self
-                                .simnet_events_tx
-                                .send(SimnetEvent::error(e.to_string()));
+                            let _ = self.simnet_events_tx.error(e.to_string());
                         }
                     }
                 }
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::FoundProgramAccount(
@@ -2519,14 +2478,10 @@ impl SurfnetSvm {
             ) => {
                 // The data account _must_ be set first, as the program account depends on it.
                 if let Err(e) = self.set_account(&coupled_pubkey, coupled_account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::None(_) => {}
@@ -2689,9 +2644,7 @@ impl SurfnetSvm {
             leader_schedule_epoch: 0, // todo
         };
 
-        let _ = self
-            .simnet_events_tx
-            .send(SimnetEvent::SystemClockUpdated(clock.clone()));
+        let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
         self.inner.set_sysvar(&clock);
 
         self.finalize_transactions()?;
@@ -3060,7 +3013,11 @@ impl SurfnetSvm {
             .flatten()
             .unwrap_or_default();
 
-        if let Some(existing) = next.iter_mut().find(|queued| queued.id == instance.id) {
+        if let Some(existing) = next.iter_mut().find(|queued| {
+            queued.id == instance.id
+                && queued.account == instance.account
+                && queued.template_id == instance.template_id
+        }) {
             *existing = instance.clone();
         } else {
             next.push(instance.clone());
@@ -4149,15 +4106,8 @@ impl SurfnetSvm {
         // subscriber exists yet, so a late subscriber's first borrow() is current.
         self.startup_status_watch_tx
             .send_replace(self.startup_status.clone());
-        // try_send: callers hold the SVM write guard, and the bounded events
-        // channel may belong to an embedder that never drains it. The watch
-        // channel above is the reliable path; the event stream is a best
-        // effort sequence, and dropping an entry must not wedge the SVM.
-        let _ = self
-            .simnet_events_tx
-            .try_send(SimnetEvent::StartupStatusChanged(
-                self.startup_status.clone(),
-            ));
+        self.simnet_events_tx
+            .startup_status_changed(self.startup_status.clone());
     }
 
     pub fn complete_runbook_execution(&mut self, runbook_id: &str, error: Option<Vec<String>>) {
@@ -7289,10 +7239,55 @@ mod tests {
             1_234,
             "the first override must survive the second override's fetch"
         );
+        assert_eq!(read(ALLOWED_OFFSET), 5_678, "the second override must apply");
+    }
+
+    /// Two persistent overrides that share a caller-supplied id but target different accounts must both survive re-arming.
+    #[tokio::test]
+    async fn test_reschedule_keeps_overrides_sharing_an_id_across_accounts() {
+        const SLOT: u64 = 500;
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+        let first_account = Pubkey::new_unique();
+        let second_account = Pubkey::new_unique();
+
+        let mut first = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(first_account.to_string()),
+        );
+        // The collision this guards against: a hand-written scenario reusing a plain id.
+        first.id = "ov-1".to_string();
+        first.persist = true;
+
+        let mut second = first.clone();
+        second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
+
+        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        surfnet_svm.reschedule_override_for_next_slot(&second, SLOT);
+
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
         assert_eq!(
-            read(ALLOWED_OFFSET),
-            5_678,
-            "the second override must apply"
+            queued.len(),
+            2,
+            "two overrides on different accounts share the id 'ov-1'; keying only on the id drops \
+             one of them, so a scenario silently stops being applied"
+        );
+
+        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
+        assert_eq!(
+            queued.len(),
+            2,
+            "re-arming an override must replace its own queued copy, not append a duplicate"
         );
     }
 

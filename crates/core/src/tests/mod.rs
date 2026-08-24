@@ -5,3 +5,4 @@ pub mod bisonfi;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
 pub mod plugin;
+pub mod simnet_events;
