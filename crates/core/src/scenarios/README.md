@@ -34,9 +34,16 @@ whole struct or array) also works, but it must be **complete** - every field of 
 padding included - because the account is re-encoded with Borsh. An out-of-range index or a
 non-numeric segment on an array is a hard error, never a silent write elsewhere.
 
-By default an override applies to exactly one slot. Set `"persist": true` and it is re-applied on
-every following slot, which is needed when something else writes the account in between - a
-transaction, or another override fetching it fresh. Persist inputs nothing in the scenario writes
+By default an override applies to exactly one slot. `"persist"` controls how long it keeps
+re-applying: `true` re-applies indefinitely and `{"slots": 10}` applies in ten slots in total, counting the
+first. Prefer a
+bounded window - an indefinite one outlives the scenario that created it.
+
+Registering a scenario replaces any override it has already queued, matched on id, account and
+template together. That is how an override is updated, and how a persisted one is stopped: register
+it again with `"persist": false` and the queued copy becomes a one-shot, so it stops re-arming.
+Re-applying is what you want when something else writes the account in between - a transaction, or
+another override fetching it fresh. Persist inputs nothing in the scenario writes
 (an oracle price, a disabled switch, a risk parameter), never state the transactions under test
 mutate: re-applying reverts their writes at the start of the next slot, so a pool would refill
 itself after every swap. Only one entry is queued per override, so it is never applied twice to
