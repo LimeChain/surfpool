@@ -3018,12 +3018,18 @@ impl SurfnetSvm {
         instance.persist = next_persist;
         let instance = &instance;
 
-        let mut next = self
-            .scheduled_overrides
-            .get(&next_slot)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let mut next = match self.scheduled_overrides.get(&next_slot) {
+            Ok(Some(queued)) => queued,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                error!(
+                    "Could not read the overrides queued for slot {next_slot} ({e}); not \
+                     rescheduling override {} rather than risk overwriting them",
+                    instance.id
+                );
+                return;
+            }
+        };
 
         if let Some(existing) = next.iter_mut().find(|queued| {
             queued.id == instance.id
@@ -3035,8 +3041,11 @@ impl SurfnetSvm {
             next.push(instance.clone());
         }
         if let Err(e) = self.scheduled_overrides.store(next_slot, next) {
-            warn!(
-                "Failed to reschedule override {} for slot {}: {}",
+            // Nothing upstream can recover from this: the caller is the slot tick, not a request, so
+            // there is no response to fail. The override simply stops persisting from here on, which
+            // is worth an error rather than a warning.
+            error!(
+                "Failed to reschedule override {} for slot {}: {}. It will stop persisting.",
                 instance.id, next_slot, e
             );
         }
@@ -7467,6 +7476,90 @@ mod tests {
                 .is_empty(),
             "the override was cancelled, so it must not re-arm for the next slot"
         );
+    }
+
+    #[tokio::test]
+    async fn test_failed_read_does_not_overwrite_the_next_slots_overrides() {
+        use crate::storage::{Storage, StorageError, StorageResult};
+
+        #[derive(Clone)]
+        struct FailingReads {
+            inner: HashMap<u64, Vec<surfpool_types::OverrideInstance>>,
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Storage<u64, Vec<surfpool_types::OverrideInstance>> for FailingReads {
+            fn store(
+                &mut self,
+                key: u64,
+                value: Vec<surfpool_types::OverrideInstance>,
+            ) -> StorageResult<()> {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.insert(key, value);
+                Ok(())
+            }
+            fn clear(&mut self) -> StorageResult<()> {
+                self.inner.clear();
+                Ok(())
+            }
+            fn get(&self, _key: &u64) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Err(StorageError::SqliteNotEnabled)
+            }
+            fn take(
+                &mut self,
+                key: &u64,
+            ) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Ok(self.inner.remove(key))
+            }
+            fn keys(&self) -> StorageResult<Vec<u64>> {
+                Ok(self.inner.keys().copied().collect())
+            }
+            fn into_iter(
+                &self,
+            ) -> StorageResult<
+                Box<dyn Iterator<Item = (u64, Vec<surfpool_types::OverrideInstance>)> + '_>,
+            > {
+                Ok(Box::new(
+                    self.inner.iter().map(|(k, v)| (*k, v.clone())),
+                ))
+            }
+            fn count(&self) -> StorageResult<u64> {
+                Ok(self.inner.len() as u64)
+            }
+            fn clone_box(&self) -> Box<dyn Storage<u64, Vec<surfpool_types::OverrideInstance>>> {
+                Box::new(self.clone())
+            }
+        }
+
+        const SLOT: u64 = 500;
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+
+        // Something else is already queued for the next slot.
+        let mut bystander = instance.clone();
+        bystander.id = "someone-elses-override".to_string();
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        svm.scheduled_overrides = Box::new(FailingReads {
+            inner: HashMap::from([(SLOT + 1, vec![bystander.clone()])]),
+            writes: writes.clone(),
+        });
+
+        svm.reschedule_override_for_next_slot(&instance, SLOT);
+
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed read must not be followed by a write; the queue would be replaced by a single \
+             entry and every other override for that slot lost"
+        );
+        let survivors = svm
+            .scheduled_overrides
+            .take(&(SLOT + 1))
+            .expect("take")
+            .expect("the bystander must still be queued");
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, "someone-elses-override");
     }
 
     #[tokio::test]
