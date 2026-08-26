@@ -290,16 +290,16 @@ fn json_to_txtx_value_for_idl_type(
         }
         (IdlType::U128, _) => {
             let digits = json_integer_digits(json, "u128")?;
-            let value = digits.parse::<u128>().map_err(|e| {
-                SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}"))
-            })?;
+            let value = digits
+                .parse::<u128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}")))?;
             Ok(txtx_addon_network_svm_types::SvmValue::u128(value))
         }
         (IdlType::I128, _) => {
             let digits = json_integer_digits(json, "i128")?;
-            let value = digits.parse::<i128>().map_err(|e| {
-                SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}"))
-            })?;
+            let value = digits
+                .parse::<i128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}")))?;
             Ok(txtx_addon_network_svm_types::SvmValue::i128(value))
         }
         (IdlType::Vec(inner), serde_json::Value::Array(items))
@@ -629,6 +629,17 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
     // Pre-genesis slot hashes only exist to cover the finalized warmup window.
     // Keep them deterministic and distinct from local chain-index hashes.
     SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
+}
+
+/// What one `fetch_before_use` attempt settled. Decides whether a persisted override keeps
+/// asking on later slots, which it must while another attempt could still change the answer.
+enum FetchOutcome {
+    /// Nothing was asked for, or nothing a further attempt could change.
+    Retired,
+    /// The remote has no such account. It may be created later.
+    NotOnRemote,
+    /// No answer was obtained. Another attempt may get one.
+    Unanswered,
 }
 
 impl SurfnetSvm {
@@ -2786,7 +2797,23 @@ impl SurfnetSvm {
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
 
-        for override_instance in overrides {
+        // `take` already emptied the slot, so bailing out mid-loop would drop every override that
+        // has not been reached yet. Put the unprocessed tail back before returning the error.
+        let restore_unprocessed = |svm: &mut Self, from: usize| {
+            if let Err(e) = svm
+                .scheduled_overrides
+                .store(target_slot, overrides[from..].to_vec())
+            {
+                error!(
+                    "Failed to restore {} unprocessed override(s) for slot {}: {}",
+                    overrides.len() - from,
+                    target_slot,
+                    e
+                );
+            }
+        };
+
+        for (index, override_instance) in overrides.iter().enumerate() {
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
                 continue;
@@ -2823,7 +2850,9 @@ impl SurfnetSvm {
                 override_instance.id, account_pubkey, override_instance.label
             );
 
-            let mut fetch_answered = false;
+            // Defaults to Retired: nothing was asked for, the account was already forked by an
+            // earlier override this slot, or there is no remote to ask.
+            let mut fetch_outcome = FetchOutcome::Retired;
 
             // Fetch fresh account data from remote if requested
             if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
@@ -2833,43 +2862,68 @@ impl SurfnetSvm {
                         account_pubkey
                     );
 
-                    match client
+                    let fetched = match client
                         .get_account(&account_pubkey, CommitmentConfig::confirmed())
                         .await
                     {
                         Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
-                            debug!(
-                                "Fetched account {} from remote: {} lamports, {} bytes",
-                                account_pubkey,
-                                remote_account.lamports(),
-                                remote_account.data().len()
-                            );
-
-                            // Set the fresh account data in the SVM
-                            if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
-                                warn!(
-                                    "Failed to set account {} from remote: {}",
-                                    account_pubkey, e
-                                );
-                            } else {
-                                settled_this_slot.insert(account_pubkey);
-                                fetch_answered = true;
-                            }
+                            Some((remote_account, None))
                         }
+                        Ok(GetAccountResult::FoundCoupledAccount(
+                            (_pubkey, remote_account),
+                            coupled,
+                            _,
+                        )) => Some((
+                            remote_account,
+                            match coupled {
+                                CoupledAccount::ProgramData(pubkey, account)
+                                | CoupledAccount::Mint(pubkey, account) => {
+                                    account.map(|account| (pubkey, account))
+                                }
+                            },
+                        )),
                         Ok(GetAccountResult::None(_)) => {
                             debug!("Account {} not found on remote", account_pubkey);
-                            // A definitive answer, not a failure - retrying cannot change it.
-                            fetch_answered = true;
-                        }
-                        Ok(_) => {
-                            debug!("Account {} fetched (other variant)", account_pubkey);
-                            fetch_answered = true;
+                            fetch_outcome = FetchOutcome::NotOnRemote;
+                            None
                         }
                         Err(e) => {
                             warn!(
                                 "Failed to fetch account {} from remote: {}",
                                 account_pubkey, e
                             );
+                            fetch_outcome = FetchOutcome::Unanswered;
+                            None
+                        }
+                    };
+
+                    if let Some((remote_account, coupled)) = fetched {
+                        debug!(
+                            "Fetched account {} from remote: {} lamports, {} bytes",
+                            account_pubkey,
+                            remote_account.lamports(),
+                            remote_account.data().len()
+                        );
+
+                        if let Some((coupled_pubkey, coupled_account)) = coupled {
+                            if let Err(e) = self.inner.set_account(coupled_pubkey, coupled_account)
+                            {
+                                warn!(
+                                    "Failed to set coupled account {} from remote: {}",
+                                    coupled_pubkey, e
+                                );
+                            }
+                        }
+
+                        // Set the fresh account data in the SVM
+                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
+                            warn!(
+                                "Failed to set account {} from remote: {}",
+                                account_pubkey, e
+                            );
+                            fetch_outcome = FetchOutcome::Unanswered;
+                        } else {
+                            settled_this_slot.insert(account_pubkey);
                         }
                     }
                 } else {
@@ -2877,21 +2931,35 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
-                    fetch_answered = true;
                 }
-            } else if override_instance.fetch_before_use {
-                // Another override already forked this account this slot.
-                fetch_answered = true;
             }
 
-            let existing_account = self.inner.get_account(&account_pubkey)?;
+            let existing_account = match self.inner.get_account(&account_pubkey) {
+                Ok(account) => account,
+                Err(e) => {
+                    restore_unprocessed(self, index);
+                    return Err(e);
+                }
+            };
+
+            // The request is only retired when another attempt could no longer change anything.
+            let fetch_retired = match fetch_outcome {
+                FetchOutcome::Retired => true,
+                FetchOutcome::Unanswered => false,
+                // The account may be created later, so keep asking while there is nothing to work
+                // on. Once something local exists, stop - a later fetch would overwrite it.
+                FetchOutcome::NotOnRemote => existing_account.is_some(),
+            };
 
             if override_instance.persist {
                 let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && fetch_answered {
+                if requeued.fetch_before_use && fetch_retired {
                     requeued.fetch_before_use = false;
                 }
-                self.reschedule_override_for_next_slot(&requeued, target_slot)?;
+                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                    restore_unprocessed(self, index);
+                    return Err(e);
+                }
             }
 
             // Apply the override values to the account data
@@ -7452,6 +7520,167 @@ mod tests {
         }
     }
 
+    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
+    /// the remote-fetch branches can be exercised without a network.
+    async fn canned_rpc(result_json: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind canned rpc");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// The remote having no such account is only an answer about this slot - accounts get created
+    /// later. While there is nothing local to work on, a persisted override must keep asking, or
+    /// it stays inert for the rest of the run.
+    #[tokio::test]
+    async fn test_persisted_override_retries_while_the_account_is_not_on_remote() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // An address the SVM has never seen, so there is no local account to fall back on.
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the account may appear later, so the next slot must keep asking for it"
+        );
+    }
+
+    /// The mirror case: the remote has nothing but a local account already exists, so the override
+    /// can work. Asking again would only risk overwriting that local account once the address is
+    /// populated upstream.
+    #[tokio::test]
+    async fn test_persisted_override_stops_asking_when_only_a_local_account_exists() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            !next[0].fetch_before_use,
+            "the local account is usable, so later fetches must not overwrite it"
+        );
+    }
+
+    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
+    /// a catch-all that logged and dropped the account, so the fetch reported success while the
+    /// target was never forked - every later write then failed with "not found in SVM".
+    #[tokio::test]
+    async fn test_fetch_before_use_materializes_a_coupled_account() {
+        const SLOT: u64 = 500;
+        // A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
+        // coupled-mint path. The canned server answers the mint lookup with the same body.
+        const TOKEN_ACCOUNT: &str = concat!(
+            r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"","base64"],"executable":false,"lamports":2039280,"#,
+            r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
+        );
+
+        let url = canned_rpc(TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let target = Pubkey::new_unique();
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        );
+        instance.fetch_before_use = true;
+
+        assert!(
+            svm.inner
+                .get_account(&target)
+                .expect("get_account")
+                .is_none(),
+            "the target must start absent so the fetch is what materializes it"
+        );
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let forked = svm
+            .inner
+            .get_account(&target)
+            .expect("get_account")
+            .expect("the coupled account must be written into the SVM");
+        assert_eq!(forked.data.len(), 165, "the token account data was forked");
+        assert_eq!(forked.lamports, 2_039_280, "lamports came from the remote");
+    }
+
     /// A transient RPC failure must not be mistaken for a satisfied fetch. The account already
     /// being present locally is not enough - the override asked for fresh data and did not get it,
     /// so with `persist` the flag has to survive or it pins stale data for the rest of the run.
@@ -7481,8 +7710,7 @@ mod tests {
             .expect("storage read")
             .expect("next slot should have queued overrides");
         assert_eq!(next.len(), 1, "one entry per override id");
-        assert!(
-            next[0].persist, "persist must survive rescheduling");
+        assert!(next[0].persist, "persist must survive rescheduling");
         assert!(
             next[0].fetch_before_use,
             "the fetch failed, so the next slot must retry it instead of pinning stale data"
@@ -7534,7 +7762,11 @@ mod tests {
             1_234,
             "the first override must survive the second override's fetch"
         );
-        assert_eq!(read(ALLOWED_OFFSET), 5_678, "the second override must apply");
+        assert_eq!(
+            read(ALLOWED_OFFSET),
+            5_678,
+            "the second override must apply"
+        );
     }
 
     /// Two persistent overrides that share a caller-supplied id but target different accounts must both survive re-arming.
@@ -7558,8 +7790,12 @@ mod tests {
         let mut second = first.clone();
         second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
 
-        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
-        surfnet_svm.reschedule_override_for_next_slot(&second, SLOT);
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
+        surfnet_svm
+            .reschedule_override_for_next_slot(&second, SLOT)
+            .expect("reschedule");
 
         let queued = surfnet_svm
             .scheduled_overrides
@@ -7573,7 +7809,9 @@ mod tests {
              one of them, so a scenario silently stops being applied"
         );
 
-        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
         let queued = surfnet_svm
             .scheduled_overrides
             .get(&(SLOT + 1))
