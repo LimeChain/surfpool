@@ -1037,7 +1037,6 @@ pub struct YamlOverrideTemplateEntry {
     pub llm_context: Option<String>,
 }
 
-
 // ========================================
 // Raw byte layouts (programs with no usable IDL)
 // ========================================
@@ -1143,11 +1142,21 @@ impl RawEncoding {
                     .to_bytes()
                     .to_vec()
             }
-            RawEncoding::Slot { lead } => (target_slot as i64)
-                .saturating_add(*lead)
-                .max(0)
-                .to_le_bytes()
-                .to_vec(),
+            RawEncoding::Slot { lead } => {
+                let lead = match value {
+                    serde_json::Value::Null => *lead,
+                    _ => {
+                        let d = digits("slot lead")?;
+                        d.parse::<i64>()
+                            .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
+                    }
+                };
+                (target_slot as i64)
+                    .saturating_add(lead)
+                    .max(0)
+                    .to_le_bytes()
+                    .to_vec()
+            }
         })
     }
 }
@@ -1584,14 +1593,26 @@ mod tests {
         let bytes = RawEncoding::I64.encode(&json!(-25599i64 << 32), 0).unwrap();
         assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()) >> 32, -25599);
 
-        let bytes = RawEncoding::Slot { lead: -1 }
+        // The supplied value is the lead, so one property covers live and stale.
+        let bytes = RawEncoding::Slot { lead: 0 }
             .encode(&json!(0), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 500);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-5), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 495);
+
+        // The manifest lead is the default, used when no value is given.
+        let bytes = RawEncoding::Slot { lead: -1 }
+            .encode(&json!(null), 500)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 499);
 
         // A lead that would go below zero clamps rather than wrapping.
-        let bytes = RawEncoding::Slot { lead: -10 }
-            .encode(&json!(0), 3)
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-10), 3)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
     }

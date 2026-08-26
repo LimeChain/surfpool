@@ -30,7 +30,6 @@ use crate::{
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
 };
 
-
 // ---------------------------------------------------------------- fetch/diff helpers
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -72,8 +71,7 @@ async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => account.data,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.data,
             GetAccountResult::None(_) => {
                 panic!("{address} no longer exists on mainnet; the test needs a new address")
             }
@@ -102,8 +100,7 @@ async fn fetch_optional(addresses: &[&str]) -> Vec<Option<Vec<u8>>> {
         .into_iter()
         .map(|r| match r {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => Some(account.data),
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => Some(account.data),
             GetAccountResult::None(_) => None,
         })
         .collect()
@@ -139,8 +136,7 @@ async fn fetch_owners(addresses: &[Pubkey]) -> Vec<Pubkey> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => account.owner,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.owner,
             GetAccountResult::None(_) => panic!("{address} no longer exists on mainnet"),
         })
         .collect()
@@ -169,7 +165,6 @@ fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
 fn spl_amount(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[64..72].try_into().unwrap())
 }
-
 
 /// Like [`fetch`] but keeps each account's lamports. A wrapped-SOL vault's lamports are part of its
 /// state, so overwriting them with a placeholder makes the runtime reject the transaction as
@@ -203,8 +198,7 @@ async fn fetch_with_lamports(addresses: &[&str]) -> Vec<(Vec<u8>, u64)> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => {
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => {
                 (account.data, account.lamports)
             }
             GetAccountResult::None(_) => panic!("{address} no longer exists on mainnet"),
@@ -644,9 +638,10 @@ impl BisonfiRig {
             .collect();
         let props = template.properties.clone();
         let layout = raw_layout.clone();
+        let target_slot = u64::from_le_bytes(data[72..80].try_into().expect("8 bytes"));
         bisonfi_replay(&self.elf, pool, data, tp, amount_in, direction, move |d| {
             let forged = layout
-                .materialize(d.as_slice(), &props, &map, 0)
+                .materialize(d.as_slice(), &props, &map, target_slot)
                 .unwrap_or_else(|e| panic!("materialize failed: {e}"));
             *d = forged;
         })
@@ -928,7 +923,7 @@ async fn bisonfi_scenario_silence_the_maker() {
             data,
             *tp,
             "bisonfi-freshness",
-            &[("last_update_slot", serde_json::json!(published - 1))],
+            &[("last_update_slot", serde_json::json!(-1))],
             size,
             0,
         );
@@ -945,10 +940,7 @@ async fn bisonfi_scenario_silence_the_maker() {
                 data,
                 *tp,
                 "bisonfi-freshness",
-                &[(
-                    "last_update_slot",
-                    serde_json::json!(published.saturating_sub(back)),
-                )],
+                &[("last_update_slot", serde_json::json!(-(back as i64)))],
                 size,
                 0,
             );
@@ -1436,7 +1428,6 @@ async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
     let rig = bisonfi_rig().await;
     let (pool, data, tp) = rig.quoting.first().expect("a quoting market");
     let pool_key = pool.parse::<Pubkey>().expect("pool address");
-    let published = u64::from_le_bytes(data[72..80].try_into().unwrap());
     let size = BisonfiRig::sell_size(data);
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
@@ -1460,7 +1451,7 @@ async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
          transaction executes"
             .to_string(),
     );
-    for (relative, value) in [(QUOTE_AT, published), (FILL_AT, published - 5)] {
+    for (relative, value) in [(QUOTE_AT, 0i64), (FILL_AT, -5i64)] {
         scenario.add_override(
             OverrideInstance::new(
                 "bisonfi-freshness".to_string(),
@@ -1491,19 +1482,21 @@ async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
     }
 
     let field_at = |slot: u64| u64::from_le_bytes(images[&slot][72..80].try_into().unwrap());
+    // The lead is resolved against the slot each step materializes at, so the first step stamps
+    // its own slot and the second lands five behind its own.
     assert_eq!(
         field_at(BASE_SLOT),
-        published,
+        BASE_SLOT,
         "at the quoting slot the venue must still be publishing"
     );
     assert_eq!(
         field_at(BASE_SLOT + 1),
-        published,
+        BASE_SLOT,
         "no override is scheduled for the intermediate slot, so the account must be untouched"
     );
     assert_eq!(
         field_at(BASE_SLOT + FILL_AT),
-        published - 5,
+        BASE_SLOT + FILL_AT - 5,
         "the second step must have fired by the slot the transaction lands on"
     );
 
