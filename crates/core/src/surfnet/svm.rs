@@ -3222,14 +3222,30 @@ impl SurfnetSvm {
             .get(&next_slot)?
             .unwrap_or_default();
 
-        if let Some(existing) = next.iter_mut().find(|queued| {
+        let same_override = |queued: &OverrideInstance| {
             queued.id == instance.id
                 && queued.account == instance.account
                 && queued.template_id == instance.template_id
-        }) {
-            *existing = instance.clone();
-        } else {
-            next.push(instance.clone());
+        };
+
+        match next
+            .iter()
+            .position(|queued| queued.re_armed && same_override(queued))
+        {
+            // Replace our own previous continuation, so one slot never holds two.
+            Some(index) => next[index] = instance.clone(),
+            None if next.iter().any(same_override) => {
+                // The operator has scheduled this override for that slot themselves. Theirs is the
+                // newer instruction and carries its own `persist`, so a continuation would only
+                // overwrite it with the values being carried forward - which is the transition they
+                // asked for, undone. Appending would do the same, just later in the slot.
+                debug!(
+                    "Override {} is already scheduled for slot {}, so no continuation is queued",
+                    instance.id, next_slot
+                );
+                return Ok(());
+            }
+            None => next.push(instance.clone()),
         }
         self.scheduled_overrides.store(next_slot, next)?;
         Ok(())
@@ -4546,6 +4562,12 @@ impl SurfnetSvm {
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+
+            // Scheduler bookkeeping, never a caller input: it is hidden from the schema and the
+            // bindings but still deserializes, and a caller who set it would have their own entry
+            // swept as though the scheduler had queued it.
+            let mut override_instance = override_instance;
+            override_instance.re_armed = false;
 
             planned.push((absolute_slot, override_instance));
         }
@@ -8672,6 +8694,90 @@ mod tests {
             "the earlier step must still have been applied"
         );
         assert_eq!(read(ALLOWED_OFFSET), 5_678, "and so must the later one");
+    }
+
+    /// A persisted step immediately before a deliberate transition on the same id: re-arming lands
+    /// in the transition's bucket, and must not replace it with the values it is carrying forward.
+    #[tokio::test]
+    async fn test_re_arming_does_not_overwrite_a_scheduled_transition() {
+        const SLOT: u64 = 500;
+        const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
+
+        let (mut svm, account_pubkey, persisted) = scheduled_persist_fixture(true);
+
+        // The deliberate transition, one slot later, same identity, different field.
+        let mut transition = persisted.clone();
+        transition.scenario_relative_slot = 1;
+        transition.persist = surfpool_types::Persist::Always(false);
+        transition.values = HashMap::from([(
+            "allowed_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        )]);
+
+        let scenario = |o: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![o],
+        };
+        svm.register_scenario(scenario(persisted), Some(SLOT))
+            .expect("register the persisted step");
+        svm.register_scenario(scenario(transition), Some(SLOT))
+            .expect("register the transition");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize the persisted step");
+        svm.materialize_overrides_for_slot(&None, SLOT + 1)
+            .await
+            .expect("materialize the transition");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let read = |off: usize| {
+            u128::from_le_bytes(account.data[off..off + 16].try_into().expect("16 bytes"))
+        };
+        assert_eq!(
+            read(ALLOWED_OFFSET),
+            5_678,
+            "the scheduled transition must have applied; re-arming replaced it instead"
+        );
+    }
+
+    /// `re_armed` is the scheduler's bookkeeping. A caller who sets it on a deliberate entry would
+    /// have that entry swept as though the scheduler had queued it, so registration clears it.
+    #[tokio::test]
+    async fn test_caller_supplied_re_armed_is_ignored() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _pk, mut instance) = scheduled_persist_fixture(false);
+        instance.re_armed = true;
+
+        svm.register_scenario(
+            surfpool_types::Scenario {
+                id: "s-1".to_string(),
+                name: "s".to_string(),
+                description: String::new(),
+                tags: vec![],
+                overrides: vec![instance],
+            },
+            Some(SLOT),
+        )
+        .expect("register");
+
+        let queued = svm
+            .scheduled_overrides
+            .get(&SLOT)
+            .expect("read")
+            .expect("queued");
+        assert!(
+            !queued[0].re_armed,
+            "registration must clear the flag, or a caller can have their own entry swept"
+        );
     }
 
     /// `slots: 0` asks for zero applications, which no override can honour - it always applies on
