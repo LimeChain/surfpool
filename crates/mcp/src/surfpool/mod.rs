@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
@@ -13,14 +14,24 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use set_token_account::{SeededAccount, SetAccountSuccess, SetTokenAccountsResponse};
+use solana_commitment_config::CommitmentConfig;
+use solana_pubkey::Pubkey;
 use start_surfnet::StartSurfnetResponse;
-use surfpool_core::scenarios::TemplateRegistry;
+use surfpool_core::{
+    scenarios::{
+        TemplateRegistry,
+        pump_graduation::{build_pump_graduation_scenario, pump_graduation_addresses},
+        pump_swap_price_shock::build_pump_swap_price_shock_scenario,
+    },
+    surfnet::remote::SurfnetRemoteClient,
+};
 use surfpool_types::{
     CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, Scenario, VERIFIED_TOKENS_BY_SYMBOL,
 };
 
 use crate::helpers::find_next_available_surfnet_port;
 
+mod pump_scenarios;
 mod set_token_account;
 mod start_surfnet;
 
@@ -111,6 +122,10 @@ pub struct CreatePumpGraduationScenarioParams {
         description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
     )]
     pub token_mint: String,
+    #[schemars(
+        description = "RPC URL of the running surfnet to read live state through (e.g., http://127.0.0.1:8899). Defaults to the local surfnet on the default RPC port."
+    )]
+    pub surfnet_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -122,6 +137,10 @@ pub struct CreatePumpSwapPriceShockScenarioParams {
     pub token_mint: String,
     #[schemars(description = "Positive virtual quote reserve amount, passed as a decimal string.")]
     pub virtual_quote_reserves: String,
+    #[schemars(
+        description = "RPC URL of the running surfnet to read live state through (e.g., http://127.0.0.1:8899). Defaults to the local surfnet on the default RPC port."
+    )]
+    pub surfnet_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -324,6 +343,13 @@ impl RegisterScenarioResponse {
             url: None,
         }
     }
+}
+
+fn scenario_error(message: impl Into<String>) -> Result<CallToolResult, McpError> {
+    let response = RegisterScenarioResponse::error(message.into());
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::to_string(&response).unwrap_or_default(),
+    )]))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -915,124 +941,137 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Pump Graduation state-preparation scenario for the required tokenMint. If validation fails, report that error and do not retry. The backend validates the mint, incomplete bonding curve, curve vault, and absent canonical PumpSwap pool."
+        description = "Creates an editable Pump Graduation state-preparation scenario for the required tokenMint. Live state is read through the surfnet RPC (a fork pulls it from mainnet on demand) and validated: the mint must be Token-2022 with an incomplete SOL-quoted bonding curve, a curve vault, and no canonical PumpSwap pool yet. If validation fails, report that error and do not retry. The response carries the completingBuyAmount a real buy_v2 needs to finish the curve."
     )]
     async fn create_pump_graduation_scenario(
         &self,
         Parameters(params): Parameters<CreatePumpGraduationScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios/pump-graduation",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let response = match reqwest::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({ "tokenMint": params.token_mint }))
-            .send()
+        let Ok(token_mint) = Pubkey::from_str(params.token_mint.trim()) else {
+            return scenario_error("Invalid token mint");
+        };
+        let surfnet_address = pump_scenarios::resolve_surfnet_address(params.surfnet_address);
+        let remote = SurfnetRemoteClient::new(&surfnet_address);
+        let addresses = pump_graduation_addresses(&token_mint);
+        let accounts = match remote
+            .get_multiple_accounts(
+                &[
+                    token_mint,
+                    addresses.bonding_curve,
+                    addresses.curve_vault,
+                    addresses.canonical_pool,
+                    addresses.global,
+                ],
+                CommitmentConfig::confirmed(),
+            )
             .await
         {
-            Ok(response) => response,
+            Ok(accounts) => accounts,
             Err(error) => {
-                let result = RegisterScenarioResponse::error(format!(
-                    "Failed to reach the Pump graduation endpoint: {error}"
+                return scenario_error(format!(
+                    "Failed to fetch accounts from the surfnet at {surfnet_address}: {error}"
                 ));
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&result).unwrap_or_default(),
-                )]));
             }
         };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let result = RegisterScenarioResponse::error(if body.is_empty() {
-                format!("Pump graduation validation failed with HTTP {status}")
-            } else {
-                body
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&result).unwrap_or_default(),
-            )]));
-        }
+        let Some(mint_account) = accounts[0].account() else {
+            return scenario_error("Token mint not found");
+        };
+        let Some(curve_account) = accounts[1].account() else {
+            return scenario_error("Pump bonding curve not found");
+        };
+        let Some(curve_vault_account) = accounts[2].account() else {
+            return scenario_error("Token-2022 curve vault not found");
+        };
+        let Some(global_account) = accounts[4].account() else {
+            return scenario_error("Pump Global account not found");
+        };
 
-        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-            McpError::internal_error(format!("Invalid Pump graduation response: {error}"), None)
-        })?;
-        let scenario_id = response
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| McpError::internal_error("Pump graduation response has no id", None))?;
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let result = RegisterScenarioResponse::success(url);
+        let preparation = match build_pump_graduation_scenario(
+            token_mint,
+            mint_account,
+            curve_account,
+            curve_vault_account,
+            accounts[3].account(),
+            global_account,
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => return scenario_error(error.to_string()),
+        };
+
+        let scenario_id = match pump_scenarios::stage_scenario(&preparation.scenario).await {
+            Ok(id) => id,
+            Err(message) => return scenario_error(message),
+        };
+        let result = serde_json::json!({
+            "error": null,
+            "url": pump_scenarios::studio_editor_url(&scenario_id),
+            "tokenMint": preparation.token_mint.to_string(),
+            "completingBuyAmount": preparation.completing_buy_amount,
+            "migrationReserve": preparation.migration_reserve,
+            "addresses": {
+                "bondingCurve": preparation.addresses.bonding_curve.to_string(),
+                "curveVault": preparation.addresses.curve_vault.to_string(),
+                "canonicalPool": preparation.addresses.canonical_pool.to_string(),
+            },
+        });
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&result).unwrap_or_default(),
+            result.to_string(),
         )]))
     }
 
     #[tool(
-        description = "Creates an editable PumpSwap price-shock scenario for a required migrated tokenMint and positive virtualQuoteReserves decimal string. The backend validates that the mint has a canonical WSOL PumpSwap pool. Prepare state only; do not build or execute swaps."
+        description = "Creates an editable PumpSwap price-shock scenario for a required migrated tokenMint and positive virtualQuoteReserves decimal string. The canonical WSOL PumpSwap pool is read through the surfnet RPC (a fork pulls it from mainnet on demand) and validated. Prepare state only; do not build or execute swaps."
     )]
     async fn create_pump_swap_price_shock_scenario(
         &self,
         Parameters(params): Parameters<CreatePumpSwapPriceShockScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios/pump-swap-price-shock",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let response = match reqwest::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({
-                "tokenMint": params.token_mint,
-                "virtualQuoteReserves": params.virtual_quote_reserves,
-            }))
-            .send()
+        let Ok(token_mint) = Pubkey::from_str(params.token_mint.trim()) else {
+            return scenario_error("Invalid token mint");
+        };
+        let Ok(virtual_quote_reserves) = params.virtual_quote_reserves.trim().parse::<u64>() else {
+            return scenario_error("Invalid virtual quote reserves");
+        };
+        let surfnet_address = pump_scenarios::resolve_surfnet_address(params.surfnet_address);
+        let remote = SurfnetRemoteClient::new(&surfnet_address);
+        let canonical_pool = pump_graduation_addresses(&token_mint).canonical_pool;
+        let accounts = match remote
+            .get_multiple_accounts(&[canonical_pool], CommitmentConfig::confirmed())
             .await
         {
-            Ok(response) => response,
+            Ok(accounts) => accounts,
             Err(error) => {
-                let result = RegisterScenarioResponse::error(format!(
-                    "Failed to reach the PumpSwap price shock endpoint: {error}"
+                return scenario_error(format!(
+                    "Failed to fetch accounts from the surfnet at {surfnet_address}: {error}"
                 ));
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&result).unwrap_or_default(),
-                )]));
             }
         };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let result = RegisterScenarioResponse::error(if body.is_empty() {
-                format!("PumpSwap price shock validation failed with HTTP {status}")
-            } else {
-                body
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&result).unwrap_or_default(),
-            )]));
-        }
+        let Some(canonical_pool_account) = accounts[0].account() else {
+            return scenario_error("Canonical PumpSwap pool not found");
+        };
 
-        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-            McpError::internal_error(
-                format!("Invalid PumpSwap price shock response: {error}"),
-                None,
-            )
-        })?;
-        let scenario_id = response
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                McpError::internal_error("PumpSwap price shock response has no id", None)
-            })?;
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let result = RegisterScenarioResponse::success(url);
+        let preparation = match build_pump_swap_price_shock_scenario(
+            token_mint,
+            canonical_pool_account,
+            virtual_quote_reserves,
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => return scenario_error(error.to_string()),
+        };
+
+        let scenario_id = match pump_scenarios::stage_scenario(&preparation.scenario).await {
+            Ok(id) => id,
+            Err(message) => return scenario_error(message),
+        };
+        let result = serde_json::json!({
+            "error": null,
+            "url": pump_scenarios::studio_editor_url(&scenario_id),
+            "tokenMint": preparation.token_mint.to_string(),
+            "canonicalPool": preparation.canonical_pool.to_string(),
+            "virtualQuoteReserves": preparation.virtual_quote_reserves.to_string(),
+        });
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&result).unwrap_or_default(),
+            result.to_string(),
         )]))
     }
 

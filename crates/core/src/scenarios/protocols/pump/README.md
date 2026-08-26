@@ -131,18 +131,20 @@ against live mainnet data).
 
 ## Recipe: prepare a graduation
 
-`POST /v1/scenarios/pump-graduation` builds the whole preparation from live state — no
-field math needed. Also available as the _Pump Graduation_ preset card in Studio and the
-`create_pump_graduation_scenario` MCP tool.
+The `create_pump_graduation_scenario` MCP tool builds the whole preparation from live
+state — no field math needed. It reads the mint, bonding curve, curve vault, canonical
+pool address, and pump Global through the surfnet RPC (a fork pulls them from mainnet on
+demand), then stores the built scenario through the generic `POST /v1/scenarios`
+endpoint so it appears in the Studio list.
 
-```sh
-curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-graduation \
-  -H 'content-type: application/json' \
-  -d '{"tokenMint": "<SOL-quoted pump.fun mint still on its bonding curve>"}'
+```json
+create_pump_graduation_scenario({
+  "tokenMint": "<SOL-quoted pump.fun mint still on its bonding curve>"
+})
 ```
 
 The coin must have a **Token-2022 mint**, a SOL-quoted incomplete curve, and no canonical
-PumpSwap pool yet. Eligibility failures return a 400 naming the failed check. The preset
+PumpSwap pool yet. Eligibility failures return an error naming the failed check. The preset
 does not cover coins with a classic SPL-Token mint or a non-SOL quote mint — their curve
 can still be overridden field by field with `pump-bonding-curve-custom`, but the vault
 template and this graduation flow are Token-2022 and SOL-quote only. The response carries
@@ -162,14 +164,15 @@ reserve as its base liquidity.
 
 ## Recipe: shock a migrated pool's price
 
-`POST /v1/scenarios/pump-swap-price-shock` targets the WSOL-quoted canonical pool of a
-migrated coin (also a Studio preset card and the
-`create_pump_swap_price_shock_scenario` MCP tool):
+The `create_pump_swap_price_shock_scenario` MCP tool targets the WSOL-quoted canonical
+pool of a migrated coin, reading it through the surfnet RPC and storing the built
+scenario through the generic `POST /v1/scenarios` endpoint:
 
-```sh
-curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-swap-price-shock \
-  -H 'content-type: application/json' \
-  -d '{"tokenMint": "<WSOL-paired migrated pump.fun mint>", "virtualQuoteReserves": "15000000000000"}'
+```json
+create_pump_swap_price_shock_scenario({
+  "tokenMint": "<WSOL-paired migrated pump.fun mint>",
+  "virtualQuoteReserves": "15000000000000"
+})
 ```
 
 `virtualQuoteReserves` (lamports, as a string) is appended to the quote vault balance
