@@ -184,7 +184,7 @@ pub async fn handle_start_local_surfnet_command(
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: None,
     };
-    
+
     let explorer_handle = match start_studio_and_scenario_server(
         studio_binding_address,
         sanitized_config.clone(),
