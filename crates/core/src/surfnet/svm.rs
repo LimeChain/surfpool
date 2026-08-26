@@ -634,8 +634,9 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
 /// What one `fetch_before_use` attempt settled. Decides whether a persisted override keeps
 /// asking on later slots, which it must while another attempt could still change the answer.
 enum FetchOutcome {
-    /// Nothing was asked for, or nothing a further attempt could change.
     Retired,
+    /// There is no remote to ask. Only a local account can satisfy the request.
+    NoRemote,
     /// The remote has no such account. It may be created later.
     NotOnRemote,
     /// No answer was obtained. Another attempt may get one.
@@ -2931,6 +2932,7 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
+                    fetch_outcome = FetchOutcome::NoRemote;
                 }
             }
 
@@ -2946,9 +2948,7 @@ impl SurfnetSvm {
             let fetch_retired = match fetch_outcome {
                 FetchOutcome::Retired => true,
                 FetchOutcome::Unanswered => false,
-                // The account may be created later, so keep asking while there is nothing to work
-                // on. Once something local exists, stop - a later fetch would overwrite it.
-                FetchOutcome::NotOnRemote => existing_account.is_some(),
+                FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
             };
 
             if override_instance.persist {
@@ -7679,6 +7679,47 @@ mod tests {
             .expect("the coupled account must be written into the SVM");
         assert_eq!(forked.data.len(), 165, "the token account data was forked");
         assert_eq!(forked.lamports, 2_039_280, "lamports came from the remote");
+    }
+
+    /// With no remote client there is nothing to fetch from, but the request is still unmet while
+    /// the account is absent. `materialize_overrides_for_slot` is public, so a caller can pass a
+    /// client on a later slot - retiring the flag here would permanently disable that.
+    #[tokio::test]
+    async fn test_persisted_override_keeps_asking_when_absent_and_no_remote() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the request is still unmet, so it must not be retired"
+        );
     }
 
     /// A transient RPC failure must not be mistaken for a satisfied fetch. The account already
