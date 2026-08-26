@@ -280,9 +280,9 @@ impl GetAccountResult {
     pub fn account(&self) -> Option<&Account> {
         match self {
             Self::None(_) => None,
-            Self::FoundAccount(_, account, _)
-            | Self::FoundProgramAccount((_, account), _)
-            | Self::FoundTokenAccount((_, account), _) => Some(account),
+            Self::FoundAccount(_, account, _) | Self::FoundCoupledAccount((_, account), _, _) => {
+                Some(account)
+            }
         }
     }
 

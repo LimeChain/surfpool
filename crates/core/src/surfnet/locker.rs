@@ -4972,7 +4972,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             remote_result,
-            GetAccountResult::FoundTokenAccount(..)
+            GetAccountResult::FoundCoupledAccount(_, CoupledAccount::Mint(_, _), _)
         ));
 
         let values = HashMap::from([
