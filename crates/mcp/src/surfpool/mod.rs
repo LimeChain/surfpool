@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -13,10 +15,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use set_token_account::{SeededAccount, SetAccountSuccess, SetTokenAccountsResponse};
+use solana_account::Account;
+use solana_pubkey::Pubkey;
 use start_surfnet::StartSurfnetResponse;
-use surfpool_core::scenarios::TemplateRegistry;
+use surfpool_core::scenarios::{
+    TemplateRegistry,
+    pump_graduation_builder::{build_pump_graduation_scenario, pump_graduation_addresses},
+};
 use surfpool_types::{
-    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, Scenario, VERIFIED_TOKENS_BY_SYMBOL,
+    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, DEFAULT_RPC_PORT, Scenario,
+    VERIFIED_TOKENS_BY_SYMBOL,
 };
 
 use crate::helpers::find_next_available_surfnet_port;
@@ -114,17 +122,6 @@ pub struct CreatePumpGraduationScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreatePumpSwapPriceShockScenarioParams {
-    #[schemars(
-        description = "Mint of a migrated pump.fun coin with a canonical WSOL PumpSwap pool."
-    )]
-    pub token_mint: String,
-    #[schemars(description = "Positive virtual quote reserve amount, passed as a decimal string.")]
-    pub virtual_quote_reserves: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StartSurfnetWithTokenAccountsParams {
     #[schemars(
         description = "A list of accounts to create or fund. For each account, an optional owner can be specified; if omitted, a new wallet is generated. Token parameters include the mint, program ID, and amount."
@@ -153,16 +150,79 @@ pub struct CallSurfnetRpcParams {
 pub struct Surfpool {
     pub surfnets: Arc<RwLock<HashMap<u16, u16>>>,
     pub template_registry: Arc<RwLock<TemplateRegistry>>,
+    rpc_url: Arc<str>,
+    studio_url: Arc<str>,
     tool_router: ToolRouter<Surfpool>,
 }
 
 impl Surfpool {
     pub fn new() -> Self {
+        Self::with_runtime_urls(
+            format!("http://127.0.0.1:{DEFAULT_RPC_PORT}"),
+            format!("http://127.0.0.1:{CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED}"),
+        )
+    }
+
+    pub fn with_runtime_urls(rpc_url: impl Into<String>, studio_url: impl Into<String>) -> Self {
         Self {
             surfnets: Arc::new(RwLock::new(HashMap::new())),
             template_registry: Arc::new(RwLock::new(TemplateRegistry::new())),
+            rpc_url: Arc::from(rpc_url.into().trim_end_matches('/').to_string()),
+            studio_url: Arc::from(studio_url.into().trim_end_matches('/').to_string()),
             tool_router: Self::tool_router(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcResponse<T> {
+    result: Option<T>,
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcValue<T> {
+    value: T,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcAccount {
+    lamports: u64,
+    data: Value,
+    owner: String,
+    executable: bool,
+    rent_epoch: u64,
+}
+
+impl RpcAccount {
+    fn decode(self) -> Result<Account, String> {
+        let data = self
+            .data
+            .as_array()
+            .and_then(|encoded| encoded.first())
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "Surfnet returned account data in an unsupported encoding".to_string()
+            })?;
+        let data = BASE64_STANDARD
+            .decode(data)
+            .map_err(|error| format!("Surfnet returned invalid base64 account data: {error}"))?;
+        let owner = Pubkey::from_str(&self.owner)
+            .map_err(|error| format!("Surfnet returned an invalid account owner: {error}"))?;
+
+        Ok(Account {
+            lamports: self.lamports,
+            data,
+            owner,
+            executable: self.executable,
+            rent_epoch: self.rent_epoch,
+        })
     }
 }
 
@@ -326,6 +386,13 @@ impl RegisterScenarioResponse {
     }
 }
 
+fn scenario_tool_error(message: String) -> CallToolResult {
+    let response = RegisterScenarioResponse::error(message);
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string(&response).unwrap_or_default(),
+    )])
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetTokenAddressParams {
     #[schemars(description = "The token symbol to look up (e.g., 'USDC', 'SOL', 'JUP')")]
@@ -362,6 +429,123 @@ impl TokenAddressResponse {
                 symbol
             )),
         }
+    }
+}
+
+impl Surfpool {
+    async fn fetch_surfnet_accounts(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, String> {
+        let addresses: Vec<String> = pubkeys.iter().map(ToString::to_string).collect();
+        let response = reqwest::Client::new()
+            .post(self.rpc_url.as_ref())
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getMultipleAccounts",
+                "params": [addresses, { "encoding": "base64" }],
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("Failed to read accounts from Surfnet: {error}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("Failed to read the Surfnet response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "Surfnet account read failed with HTTP {status}: {body}"
+            ));
+        }
+
+        let response: JsonRpcResponse<RpcValue<Vec<Option<RpcAccount>>>> =
+            serde_json::from_str(&body).map_err(|error| {
+                format!("Surfnet returned an invalid account response: {error}")
+            })?;
+        if let Some(error) = response.error {
+            return Err(format!("Surfnet account read failed: {}", error.message));
+        }
+        let accounts = response
+            .result
+            .ok_or_else(|| "Surfnet account read returned no result".to_string())?
+            .value;
+        if accounts.len() != pubkeys.len() {
+            return Err(format!(
+                "Surfnet returned {} accounts for {} requested addresses",
+                accounts.len(),
+                pubkeys.len()
+            ));
+        }
+
+        accounts
+            .into_iter()
+            .map(|account| account.map(RpcAccount::decode).transpose())
+            .collect()
+    }
+
+    async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
+        let endpoint = format!("{}/v1/scenarios", self.studio_url);
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .json(&scenario)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to load scenarios at {endpoint}: {error}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to read response text: {error}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        let response: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(response) => response,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to parse JSON response: {error}. Response: {body}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        if status == reqwest::StatusCode::CONFLICT {
+            let response = RegisterScenarioResponse::error(format!(
+                "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
+                scenario.id
+            ));
+            let json = serde_json::to_string(&response).unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+        if let Some(error) = response.get("error") {
+            let response = RegisterScenarioResponse::error(format!("RPC error: {error}"));
+            let json = serde_json::to_string(&response).unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        let scenario_id = response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&scenario.id);
+        let url = format!("{}/scenarios?id={scenario_id}&tab=editor", self.studio_url);
+        let response = RegisterScenarioResponse::success(url);
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 
@@ -833,85 +1017,7 @@ impl Surfpool {
             return Ok(CallToolResult::success(vec![Content::text(json_str)]));
         }
 
-        let load_scenarios_endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let payload = serde_json::json!(scenario);
-
-        let client = reqwest::Client::new();
-        let http_response = match client
-            .post(&load_scenarios_endpoint)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                let response = RegisterScenarioResponse::error(format!(
-                    "Failed to load scenarios at {}: {}",
-                    load_scenarios_endpoint, e
-                ));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
-        };
-
-        let status = http_response.status();
-
-        let response_text = match http_response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                let response =
-                    RegisterScenarioResponse::error(format!("Failed to read response text: {}", e));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
-        };
-
-        let rpc_response: serde_json::Value = match serde_json::from_str(&response_text) {
-            Ok(json) => json,
-            Err(e) => {
-                let response = RegisterScenarioResponse::error(format!(
-                    "Failed to parse JSON response: {}. Response: {}",
-                    e, response_text
-                ));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
-        };
-
-        // A different scenario already occupies this id: say so instead of
-        // reporting a success the model would trust
-        if status == reqwest::StatusCode::CONFLICT {
-            let response = RegisterScenarioResponse::error(format!(
-                "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
-                scenario.id
-            ));
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-        }
-
-        if let Some(error) = rpc_response.get("error") {
-            let response = RegisterScenarioResponse::error(format!("RPC error: {}", error));
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-        }
-
-        // Extract the scenario id from the response
-        let scenario_id = rpc_response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&scenario.id);
-
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let response = RegisterScenarioResponse::success(url);
-        let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        self.stage_scenario(scenario).await
     }
 
     #[tool(
@@ -921,119 +1027,52 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<CreatePumpGraduationScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios/pump-graduation",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let response = match reqwest::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({ "tokenMint": params.token_mint }))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                let result = RegisterScenarioResponse::error(format!(
-                    "Failed to reach the Pump graduation endpoint: {error}"
-                ));
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&result).unwrap_or_default(),
-                )]));
-            }
+        let token_mint = match Pubkey::from_str(params.token_mint.trim()) {
+            Ok(token_mint) => token_mint,
+            Err(error) => return Ok(scenario_tool_error(format!("Invalid token mint: {error}"))),
         };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let result = RegisterScenarioResponse::error(if body.is_empty() {
-                format!("Pump graduation validation failed with HTTP {status}")
-            } else {
-                body
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&result).unwrap_or_default(),
-            )]));
-        }
-
-        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-            McpError::internal_error(format!("Invalid Pump graduation response: {error}"), None)
-        })?;
-        let scenario_id = response
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| McpError::internal_error("Pump graduation response has no id", None))?;
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let result = RegisterScenarioResponse::success(url);
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&result).unwrap_or_default(),
-        )]))
-    }
-
-    #[tool(
-        description = "Creates an editable PumpSwap price-shock scenario for a required migrated tokenMint and positive virtualQuoteReserves decimal string. The backend validates that the mint has a canonical WSOL PumpSwap pool. Prepare state only; do not build or execute swaps."
-    )]
-    async fn create_pump_swap_price_shock_scenario(
-        &self,
-        Parameters(params): Parameters<CreatePumpSwapPriceShockScenarioParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios/pump-swap-price-shock",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let response = match reqwest::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({
-                "tokenMint": params.token_mint,
-                "virtualQuoteReserves": params.virtual_quote_reserves,
-            }))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                let result = RegisterScenarioResponse::error(format!(
-                    "Failed to reach the PumpSwap price shock endpoint: {error}"
-                ));
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string(&result).unwrap_or_default(),
-                )]));
-            }
+        let addresses = pump_graduation_addresses(&token_mint);
+        let pubkeys = [
+            token_mint,
+            addresses.bonding_curve,
+            addresses.curve_vault,
+            addresses.canonical_pool,
+            addresses.global,
+        ];
+        let accounts = match self.fetch_surfnet_accounts(&pubkeys).await {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
         };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let result = RegisterScenarioResponse::error(if body.is_empty() {
-                format!("PumpSwap price shock validation failed with HTTP {status}")
-            } else {
-                body
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&result).unwrap_or_default(),
-            )]));
-        }
+        let required = |index: usize, name: &str| {
+            accounts[index]
+                .as_ref()
+                .ok_or_else(|| format!("Pump {name} account not found"))
+        };
+        let preparation = match build_pump_graduation_scenario(
+            token_mint,
+            match required(0, "mint") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            match required(1, "bonding curve") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            match required(2, "curve vault") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            accounts[3].as_ref(),
+            match required(4, "global") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
 
-        let response: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-            McpError::internal_error(
-                format!("Invalid PumpSwap price shock response: {error}"),
-                None,
-            )
-        })?;
-        let scenario_id = response
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                McpError::internal_error("PumpSwap price shock response has no id", None)
-            })?;
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let result = RegisterScenarioResponse::success(url);
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&result).unwrap_or_default(),
-        )]))
+        self.stage_scenario(preparation.scenario).await
     }
 
     #[tool(
@@ -1287,7 +1326,111 @@ impl ServerHandler for Surfpool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc::{Receiver, channel},
+        thread::JoinHandle,
+        time::Duration,
+    };
+
+    use surfpool_types::AccountSnapshot;
+
     use super::*;
+
+    fn spawn_json_server(
+        response: serde_json::Value,
+    ) -> (
+        String,
+        Receiver<(String, serde_json::Value)>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = channel();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "expected request was not received"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test server failed to accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let (path, body) = loop {
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                assert!(bytes_read > 0, "request ended before its JSON body");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                let Some(headers_end) = request.windows(4).position(|value| value == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("Content-Length")
+                            .then_some(value.trim())
+                    })
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let body_start = headers_end + 4;
+                if request.len() < body_start + content_length {
+                    continue;
+                }
+                break (
+                    path,
+                    request[body_start..body_start + content_length].to_vec(),
+                );
+            };
+            request_tx
+                .send((path, serde_json::from_slice(&body).unwrap()))
+                .unwrap();
+            let response = serde_json::to_vec(&response).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        (format!("http://{address}"), request_rx, server)
+    }
+
+    fn rpc_account(account: &Account) -> serde_json::Value {
+        serde_json::json!({
+            "lamports": account.lamports,
+            "data": [BASE64_STANDARD.encode(&account.data), "base64"],
+            "owner": account.owner.to_string(),
+            "executable": account.executable,
+            "rentEpoch": account.rent_epoch,
+            "space": account.data.len(),
+        })
+    }
 
     #[test]
     fn search_takes_its_template_id_the_way_the_response_names_it() {
@@ -1315,18 +1458,117 @@ mod tests {
     }
 
     #[test]
-    fn pump_swap_price_shock_inputs_are_required() {
-        assert!(
-            serde_json::from_value::<CreatePumpSwapPriceShockScenarioParams>(serde_json::json!({}))
-                .is_err()
-        );
-        let parsed: CreatePumpSwapPriceShockScenarioParams =
-            serde_json::from_value(serde_json::json!({
-                "tokenMint": "mint",
-                "virtualQuoteReserves": "15000000000000",
+    fn rpc_accounts_decode_base64_data_and_owner() {
+        let owner = Pubkey::new_unique();
+        let account = RpcAccount {
+            lamports: 42,
+            data: serde_json::json!([BASE64_STANDARD.encode([1, 2, 3]), "base64"]),
+            owner: owner.to_string(),
+            executable: false,
+            rent_epoch: 7,
+        }
+        .decode()
+        .expect("account decodes");
+
+        assert_eq!(account.lamports, 42);
+        assert_eq!(account.data, vec![1, 2, 3]);
+        assert_eq!(account.owner, owner);
+        assert!(!account.executable);
+        assert_eq!(account.rent_epoch, 7);
+    }
+
+    #[test]
+    fn runtime_urls_drop_trailing_slashes() {
+        let surfpool = Surfpool::with_runtime_urls("http://rpc/", "http://studio/");
+        assert_eq!(surfpool.rpc_url.as_ref(), "http://rpc");
+        assert_eq!(surfpool.studio_url.as_ref(), "http://studio");
+    }
+
+    #[tokio::test]
+    async fn pump_graduation_rejects_invalid_inputs_before_rpc() {
+        let surfpool = Surfpool::with_runtime_urls("http://unreachable", "http://unreachable");
+
+        let graduation = surfpool
+            .create_pump_graduation_scenario(Parameters(CreatePumpGraduationScenarioParams {
+                token_mint: "not-a-mint".to_string(),
             }))
+            .await
+            .expect("tool result");
+        assert!(
+            json_of(&graduation)["error"]
+                .as_str()
+                .expect("error")
+                .contains("Invalid token mint")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pump_graduation_uses_runtime_rpc_and_generic_scenario_endpoint() {
+        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
+            include_str!("../../../core/src/tests/assets/pump_token2022_graduation.snapshot.json"),
+        )
+        .unwrap();
+        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
+        let addresses = pump_graduation_addresses(&mint);
+        let account = |pubkey: &Pubkey| {
+            snapshot[&pubkey.to_string()]
+                .as_ref()
+                .unwrap()
+                .to_account()
+                .unwrap()
+        };
+        let rpc_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context": {"slot": 1},
+                "value": [
+                    rpc_account(&account(&mint)),
+                    rpc_account(&account(&addresses.bonding_curve)),
+                    rpc_account(&account(&addresses.curve_vault)),
+                    null,
+                    rpc_account(&account(&addresses.global)),
+                ]
+            },
+            "id": 1,
+        });
+        let scenario_id = "graduation-runtime-routing";
+        let (rpc_url, rpc_request_rx, rpc_server) = spawn_json_server(rpc_response);
+        let (studio_url, studio_request_rx, studio_server) =
+            spawn_json_server(serde_json::json!({"id": scenario_id}));
+        let surfpool = Surfpool::with_runtime_urls(&rpc_url, &studio_url);
+
+        let result = surfpool
+            .create_pump_graduation_scenario(Parameters(CreatePumpGraduationScenarioParams {
+                token_mint: mint.to_string(),
+            }))
+            .await
             .unwrap();
-        assert_eq!(parsed.virtual_quote_reserves, "15000000000000");
+        let payload = json_of(&result);
+        assert_eq!(payload["error"], serde_json::Value::Null, "{payload}");
+        rpc_server.join().unwrap();
+        studio_server.join().unwrap();
+
+        let (rpc_path, rpc_request) = rpc_request_rx.recv().unwrap();
+        assert_eq!(rpc_path, "/");
+        assert_eq!(rpc_request["method"], "getMultipleAccounts");
+        assert_eq!(
+            rpc_request["params"][0],
+            serde_json::json!([
+                mint.to_string(),
+                addresses.bonding_curve.to_string(),
+                addresses.curve_vault.to_string(),
+                addresses.canonical_pool.to_string(),
+                addresses.global.to_string(),
+            ])
+        );
+        let (studio_path, scenario) = studio_request_rx.recv().unwrap();
+        assert_eq!(studio_path, "/v1/scenarios");
+        assert_eq!(scenario["name"], "Pump Graduation");
+        assert_eq!(scenario["overrides"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            payload["url"],
+            format!("{studio_url}/scenarios?id={scenario_id}&tab=editor")
+        );
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {

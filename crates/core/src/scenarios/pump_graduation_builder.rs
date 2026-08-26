@@ -29,7 +29,7 @@ const REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const COMPLETE_OFFSET: usize = 48;
 const QUOTE_MINT_OFFSET: usize = 83;
 const POOL_MIGRATION_FEE_OFFSET: usize = 146;
-const PREPARATION_SLOT: u64 = 1;
+const GRADUATION_PREPARATION_SLOT: u64 = 1;
 const MIGRATION_FEE_BUFFER: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +209,7 @@ pub fn build_pump_graduation_scenario(
     let global_values = HashMap::from([("enable_migrate".to_string(), serde_json::json!(true))]);
     let mut curve_override = OverrideInstance::new(
         curve_template.id.clone(),
-        PREPARATION_SLOT,
+        GRADUATION_PREPARATION_SLOT,
         curve_template.address.clone(),
     )
     .with_values(curve_values)
@@ -217,7 +217,7 @@ pub fn build_pump_graduation_scenario(
     curve_override.fetch_before_use = true;
     let mut vault_override = OverrideInstance::new(
         vault_template.id.clone(),
-        PREPARATION_SLOT,
+        GRADUATION_PREPARATION_SLOT,
         vault_template.address.clone(),
     )
     .with_values(vault_values)
@@ -225,7 +225,7 @@ pub fn build_pump_graduation_scenario(
     vault_override.fetch_before_use = true;
     let mut global_override = OverrideInstance::new(
         global_template.id.clone(),
-        PREPARATION_SLOT,
+        GRADUATION_PREPARATION_SLOT,
         global_template.address.clone(),
     )
     .with_values(global_values)
@@ -385,7 +385,7 @@ mod tests {
                 .scenario
                 .overrides
                 .iter()
-                .all(|item| item.scenario_relative_slot == PREPARATION_SLOT)
+                .all(|item| item.scenario_relative_slot == GRADUATION_PREPARATION_SLOT)
         );
     }
 
@@ -439,6 +439,49 @@ mod tests {
             error
                 .to_string()
                 .contains("Pump graduation preset supports SOL-quoted bonding curves only")
+        );
+    }
+
+    #[test]
+    fn graduation_uses_the_supplied_curve_state() {
+        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
+            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
+        )
+        .unwrap();
+        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
+        let addresses = pump_graduation_addresses(&mint);
+        let remote_curve = fixture_account(&snapshot, &addresses.bonding_curve);
+        let global_account = fixture_account(&snapshot, &addresses.global);
+        let mut modified_curve = remote_curve.clone();
+        let virtual_quote_reserves = read_u64(
+            &modified_curve.data,
+            VIRTUAL_QUOTE_RESERVES_OFFSET,
+            "virtual_quote_reserves",
+        )
+        .unwrap();
+        modified_curve.data[VIRTUAL_QUOTE_RESERVES_OFFSET..VIRTUAL_QUOTE_RESERVES_OFFSET + 8]
+            .copy_from_slice(&(virtual_quote_reserves * 2).to_le_bytes());
+        let original = build_pump_graduation_scenario(
+            mint,
+            &fixture_account(&snapshot, &mint),
+            &remote_curve,
+            &fixture_account(&snapshot, &addresses.curve_vault),
+            None,
+            &global_account,
+        )
+        .unwrap();
+        let modified = build_pump_graduation_scenario(
+            mint,
+            &fixture_account(&snapshot, &mint),
+            &modified_curve,
+            &fixture_account(&snapshot, &addresses.curve_vault),
+            None,
+            &global_account,
+        )
+        .unwrap();
+        assert_ne!(
+            modified.completing_buy_amount,
+            original.completing_buy_amount
         );
     }
 }

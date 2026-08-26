@@ -80,7 +80,7 @@ curve-lifetime invariants when you touch reserves (`virtual − real` = 279.9T t
 Create it in the Studio editor (Pump tile → _Override Bonding Curve (Custom)_), which
 fills the envelope automatically, or POST the full REST `Scenario` shape below to
 `/v1/scenarios` — every envelope field is required by the endpoint, and the `account`
-recipe is copied verbatim from the template. Then press Play:
+derivation is copied verbatim from the template. Then press Play:
 
 ```json
 {
@@ -129,25 +129,25 @@ Variant — a semantically valid _completed_ curve (rejects buys/sells with
 curve-lifetime invariants (`virtual − real` = 279.9T tokens / 30 SOL of quote, verified
 against live mainnet data).
 
-## Recipe: prepare a graduation
+## Prepare a graduation
 
-`POST /v1/scenarios/pump-graduation` builds the whole preparation from live state — no
-field math needed. Also available as the _Pump Graduation_ preset card in Studio and the
-`create_pump_graduation_scenario` MCP tool.
+The `create_pump_graduation_scenario` MCP tool builds the whole preparation from Surfnet
+state, with no field math required from the caller. Accounts already present locally are
+authoritative; Surfnet fetches only missing accounts from mainnet. The same tool powers the
+_Pump Graduation_ preset card in Studio.
 
-```sh
-curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-graduation \
-  -H 'content-type: application/json' \
-  -d '{"tokenMint": "<SOL-quoted pump.fun mint still on its bonding curve>"}'
+```json
+{
+  "tokenMint": "<SOL-quoted pump.fun mint still on its bonding curve>"
+}
 ```
 
 The coin must have a **Token-2022 mint**, a SOL-quoted incomplete curve, and no canonical
-PumpSwap pool yet. Eligibility failures return a 400 naming the failed check. The preset
+PumpSwap pool yet. Eligibility failures are returned in the MCP tool result. The preset
 does not cover coins with a classic SPL-Token mint or a non-SOL quote mint — their curve
 can still be overridden field by field with `pump-bonding-curve-custom`, but the vault
-template and this graduation flow are Token-2022 and SOL-quote only. The response carries
-`completingBuyAmount`, `migrationReserve`, and the derived addresses, and the scenario
-appears in the Studio list with three overrides:
+template and this graduation flow are Token-2022 and SOL-quote only. A successful tool call
+returns the Studio editor URL, where the stored scenario contains three overrides:
 
 1. the curve one buy away from completion (`real_token_reserves` = the finishing buy,
    sized so the buy also clears the migration fee),
@@ -156,34 +156,42 @@ appears in the Studio list with three overrides:
    `real_token_reserves` would make migration fail with `ZeroBaseAmount`,
 3. `Global.enable_migrate = true`.
 
-Press Play, then drive it like a user would: a real `buy_v2` of `completingBuyAmount`
-completes the curve, and a real `migrate_v2` creates the canonical WSOL pool with the
-reserve as its base liquidity.
+Press Play, then drive it like a user would: a real `buy_v2` of the curve override's
+`real_token_reserves` completes the curve, and a real `migrate_v2` creates the canonical
+WSOL pool with the reserve as its base liquidity.
 
-## Recipe: shock a migrated pool's price
+## Shock a migrated pool's price
 
-`POST /v1/scenarios/pump-swap-price-shock` targets the WSOL-quoted canonical pool of a
-migrated coin (also a Studio preset card and the
-`create_pump_swap_price_shock_scenario` MCP tool):
+Use the existing `pump-amm-canonical-pool` template through the standard scenario API or
+the generic `create_scenario` MCP tool. The Studio preset follows the same path: it loads
+the registered template, supplies the mint and reserve value, and stores a normal scenario.
 
-```sh
-curl -X POST http://127.0.0.1:18488/v1/scenarios/pump-swap-price-shock \
-  -H 'content-type: application/json' \
-  -d '{"tokenMint": "<WSOL-paired migrated pump.fun mint>", "virtualQuoteReserves": "15000000000000"}'
+```json
+{
+  "templateId": "pump-amm-canonical-pool",
+  "values": {
+    "base_mint": "<WSOL-paired migrated pump.fun mint>",
+    "virtual_quote_reserves": 15000000000000
+  },
+  "scenarioRelativeSlot": 1,
+  "fetchBeforeUse": true
+}
 ```
 
-`virtualQuoteReserves` (lamports, as a string) is appended to the quote vault balance
+`virtual_quote_reserves` is appended to the quote vault balance
 when the AMM quotes, so raising it makes the same sell return more quote without
-touching any token balance. After Play, the identical sell transaction simulates with a
-higher quote-token output than before.
+touching any token balance. The template derives the canonical WSOL pool from `base_mint`.
+If the derived account is absent or invalid, Play reports the materialization failure.
+After a successful Play, the identical sell transaction simulates with a higher quote-token
+output than before.
 
 ## Verification
 
 - Address identity: `cargo test -p surfpool-core --lib pump` — template PDAs pinned to
   externally documented addresses (pump-public-docs), plus byte-exact apply-path tests
   over real 151/300-byte mainnet snapshots.
-- MCP surface: `cargo test -p surfpool-mcp --lib` — compact template listing, catalog
-  scoping, pre-HTTP validation errors.
+- MCP surface: `cargo test -p surfpool-mcp surfpool::tests` — compact template listing,
+  catalog scoping, generic scenario validation, runtime URLs, and Surfnet account decoding.
 - Behavioral regression: `cargo test -p surfpool-core
   test_pump_token2022_graduation_lifecycle -- --ignored --nocapture` prepares the
   frozen Token-2022 fixture through the production graduation scenario builder and

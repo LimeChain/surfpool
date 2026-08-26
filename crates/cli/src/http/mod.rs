@@ -26,20 +26,7 @@ use rmcp_actix_web::transport::StreamableHttpService;
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use solana_commitment_config::CommitmentConfig;
-use solana_pubkey::Pubkey;
-use surfpool_core::{
-    scenarios::{
-        TemplateRegistry,
-        pump_graduation::{
-            PumpGraduationPreparation, build_pump_graduation_scenario, pump_graduation_addresses,
-        },
-        pump_swap_price_shock::{
-            PumpSwapPriceShockPreparation, build_pump_swap_price_shock_scenario,
-        },
-    },
-    surfnet::remote::SurfnetRemoteClient,
-};
+use surfpool_core::scenarios::TemplateRegistry;
 use surfpool_mcp::Surfpool;
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
@@ -59,8 +46,6 @@ pub struct Asset;
 fn configure_api(cfg: &mut web::ServiceConfig) {
     cfg.service(get_config)
         .service(get_scenario_templates)
-        .service(post_pump_graduation_scenario)
-        .service(post_pump_swap_price_shock_scenario)
         .service(post_scenarios)
         .service(get_scenarios)
         .service(delete_scenario)
@@ -70,171 +55,28 @@ fn configure_api(cfg: &mut web::ServiceConfig) {
         .service(web::scope("/v1").default_service(web::route().to(api_not_found)));
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PumpGraduationScenarioRequest {
-    token_mint: String,
-}
-
-#[derive(Clone)]
-struct PumpScenarioDataSource(Option<SurfnetRemoteClient>);
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PumpSwapPriceShockScenarioRequest {
-    token_mint: String,
-    virtual_quote_reserves: String,
-}
-
-async fn prepare_pump_graduation_mint(
-    remote: &SurfnetRemoteClient,
-    token_mint: Pubkey,
-) -> Result<PumpGraduationPreparation, Error> {
-    let addresses = pump_graduation_addresses(&token_mint);
-    let accounts = remote
-        .get_multiple_accounts(
-            &[
-                token_mint,
-                addresses.bonding_curve,
-                addresses.curve_vault,
-                addresses.canonical_pool,
-                addresses.global,
-            ],
-            CommitmentConfig::confirmed(),
-        )
-        .await
-        .map_err(actix_web::error::ErrorBadGateway)?;
-    let mint_account = accounts[0]
-        .account()
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Token mint not found"))?;
-    let curve_account = accounts[1]
-        .account()
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Pump bonding curve not found"))?;
-    let curve_vault_account = accounts[2]
-        .account()
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Token-2022 curve vault not found"))?;
-    let global_account = accounts[4]
-        .account()
-        .ok_or_else(|| actix_web::error::ErrorBadGateway("Pump Global account not found"))?;
-
-    build_pump_graduation_scenario(
-        token_mint,
-        mint_account,
-        curve_account,
-        curve_vault_account,
-        accounts[3].account(),
-        global_account,
-    )
-    .map_err(|error| actix_web::error::ErrorBadRequest(error.to_string()))
-}
-
-#[post("/v1/scenarios/pump-graduation")]
-async fn post_pump_graduation_scenario(
-    request: web::Json<PumpGraduationScenarioRequest>,
-    source: Data<PumpScenarioDataSource>,
-    data: Data<RwLock<LoadedScenarios>>,
-) -> Result<HttpResponse, Error> {
-    let token_mint = Pubkey::from_str(request.token_mint.trim())
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid token mint"))?;
-    let remote = source.0.as_ref().ok_or_else(|| {
-        actix_web::error::ErrorServiceUnavailable(
-            "Pump graduation requires an online datasource connection",
-        )
-    })?;
-    let preparation = prepare_pump_graduation_mint(remote, token_mint).await?;
-    let scenario_id = preparation.scenario.id.clone();
-
-    data.write()
-        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?
-        .scenarios
-        .push(preparation.scenario);
-
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "id": scenario_id,
-        "tokenMint": preparation.token_mint.to_string(),
-        "completingBuyAmount": preparation.completing_buy_amount,
-        "migrationReserve": preparation.migration_reserve,
-        "addresses": {
-            "bondingCurve": preparation.addresses.bonding_curve.to_string(),
-            "curveVault": preparation.addresses.curve_vault.to_string(),
-            "canonicalPool": preparation.addresses.canonical_pool.to_string(),
-        },
-    })))
-}
-
-async fn prepare_pump_swap_price_shock(
-    remote: &SurfnetRemoteClient,
-    token_mint: Pubkey,
-    virtual_quote_reserves: u64,
-) -> Result<PumpSwapPriceShockPreparation, Error> {
-    let canonical_pool = pump_graduation_addresses(&token_mint).canonical_pool;
-    let accounts = remote
-        .get_multiple_accounts(&[canonical_pool], CommitmentConfig::confirmed())
-        .await
-        .map_err(actix_web::error::ErrorBadGateway)?;
-    let canonical_pool_account = accounts[0]
-        .account()
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Canonical PumpSwap pool not found"))?;
-
-    build_pump_swap_price_shock_scenario(token_mint, canonical_pool_account, virtual_quote_reserves)
-        .map_err(|error| actix_web::error::ErrorBadRequest(error.to_string()))
-}
-
-#[post("/v1/scenarios/pump-swap-price-shock")]
-async fn post_pump_swap_price_shock_scenario(
-    request: web::Json<PumpSwapPriceShockScenarioRequest>,
-    source: Data<PumpScenarioDataSource>,
-    data: Data<RwLock<LoadedScenarios>>,
-) -> Result<HttpResponse, Error> {
-    let token_mint = Pubkey::from_str(request.token_mint.trim())
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid token mint"))?;
-    let virtual_quote_reserves = request
-        .virtual_quote_reserves
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid virtual quote reserves"))?;
-    let remote = source.0.as_ref().ok_or_else(|| {
-        actix_web::error::ErrorServiceUnavailable(
-            "PumpSwap price shock requires an online datasource connection",
-        )
-    })?;
-    let preparation =
-        prepare_pump_swap_price_shock(remote, token_mint, virtual_quote_reserves).await?;
-    let scenario_id = preparation.scenario.id.clone();
-
-    data.write()
-        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?
-        .scenarios
-        .push(preparation.scenario);
-
-    Ok(HttpResponse::Ok().json(serde_json::json!({
-        "id": scenario_id,
-        "tokenMint": preparation.token_mint.to_string(),
-        "canonicalPool": preparation.canonical_pool.to_string(),
-        "virtualQuoteReserves": preparation.virtual_quote_reserves.to_string(),
-    })))
-}
-
 pub async fn start_studio_and_scenario_server(
     network_binding: String,
     config: SanitizedConfig,
-    remote_rpc_url: Option<String>,
     subgraph_events_tx: Sender<SubgraphEvent>,
     ctx: &Context,
     enable_studio: bool,
 ) -> Result<ServerHandle, Box<dyn StdError>> {
     let config_wrapped = Data::new(RwLock::new(config.clone()));
-    let pump_scenario_data_source = Data::new(PumpScenarioDataSource(
-        remote_rpc_url.and_then(SurfnetRemoteClient::new_unsafe),
-    ));
-
     // Initialize template registry and load templates
     let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
     // Initialize MCP service
+    let mcp_rpc_url = config.rpc_url.clone();
+    let mcp_studio_url = config.studio_url.clone();
     let mcp_service = StreamableHttpService::builder()
-        .service_factory(Arc::new(|| Ok(Surfpool::new())))
+        .service_factory(Arc::new(move || {
+            Ok(Surfpool::with_runtime_urls(
+                mcp_rpc_url.clone(),
+                mcp_studio_url.clone(),
+            ))
+        }))
         .session_manager(Arc::new(LocalSessionManager::default()))
         .stateful_mode(true)
         .sse_keep_alive(Duration::from_secs(30))
@@ -243,7 +85,6 @@ pub async fn start_studio_and_scenario_server(
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
-            .app_data(pump_scenario_data_source.clone())
             .app_data(template_registry_wrapped.clone())
             .app_data(loaded_scenarios.clone())
             .wrap(
@@ -340,14 +181,14 @@ impl LoadedScenarios {
 
 #[post("/v1/scenarios")]
 async fn post_scenarios(
-    req: HttpRequest,
     scenario: web::Json<Scenario>,
     data: Data<RwLock<LoadedScenarios>>,
 ) -> Result<HttpResponse, Error> {
+    let scenario_data = scenario.into_inner();
+
     let mut loaded_scenarios = data
         .write()
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
-    let scenario_data = scenario.into_inner();
     let scenario_id = scenario_data.id.clone();
 
     if let Some(existing) = loaded_scenarios
@@ -493,6 +334,27 @@ mod tests {
         })
     }
 
+    fn scenario_with_override_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "legacy-scenario",
+            "name": "Legacy scenario",
+            "description": "Created through the existing scenario contract",
+            "overrides": [{
+                "id": "legacy-override",
+                "templateId": "spl-token-account",
+                "values": { "amount": 42 },
+                "scenarioRelativeSlot": 0,
+                "label": "Legacy token balance",
+                "enabled": true,
+                "fetchBeforeUse": false,
+                "account": {
+                    "pubkey": "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"
+                }
+            }],
+            "tags": ["legacy"],
+        })
+    }
+
     fn post_scenario(body: serde_json::Value) -> test::TestRequest {
         test::TestRequest::post()
             .uri("/v1/scenarios")
@@ -555,63 +417,21 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn pump_graduation_rejects_an_invalid_mint_before_fetching_accounts() {
+    async fn existing_scenario_payloads_are_stored_unchanged() {
+        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
         let app = test::init_service(
             App::new()
-                .app_data(Data::new(RwLock::new(SanitizedConfig::default())))
-                .app_data(Data::new(RwLock::new(LoadedScenarios::new())))
-                .app_data(Data::new(PumpScenarioDataSource(None)))
+                .app_data(loaded_scenarios.clone())
                 .configure(configure_api),
         )
         .await;
-        let request = test::TestRequest::post()
-            .uri("/v1/scenarios/pump-graduation")
-            .set_json(serde_json::json!({ "tokenMint": "not-a-mint" }))
-            .to_request();
+        let body = scenario_with_override_body();
+        let expected: Scenario = serde_json::from_value(body.clone()).unwrap();
 
-        let response = test::call_service(&app, request).await;
+        let response = test::call_service(&app, post_scenario(body).to_request()).await;
 
-        assert_eq!(response.status(), 400);
-
-        let missing_mint_request = test::TestRequest::post()
-            .uri("/v1/scenarios/pump-graduation")
-            .set_json(serde_json::json!({}))
-            .to_request();
-        let missing_mint_response = test::call_service(&app, missing_mint_request).await;
-
-        assert_eq!(missing_mint_response.status(), 400);
-    }
-
-    #[actix_web::test]
-    async fn pump_swap_price_shock_rejects_invalid_inputs_before_fetching_accounts() {
-        let app = test::init_service(
-            App::new()
-                .app_data(Data::new(RwLock::new(SanitizedConfig::default())))
-                .app_data(Data::new(RwLock::new(LoadedScenarios::new())))
-                .app_data(Data::new(PumpScenarioDataSource(None)))
-                .configure(configure_api),
-        )
-        .await;
-        let invalid_mint = test::TestRequest::post()
-            .uri("/v1/scenarios/pump-swap-price-shock")
-            .set_json(serde_json::json!({
-                "tokenMint": "not-a-mint",
-                "virtualQuoteReserves": "15000000000000",
-            }))
-            .to_request();
-        let invalid_reserves = test::TestRequest::post()
-            .uri("/v1/scenarios/pump-swap-price-shock")
-            .set_json(serde_json::json!({
-                "tokenMint": "7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump",
-                "virtualQuoteReserves": "not-a-number",
-            }))
-            .to_request();
-
-        assert_eq!(test::call_service(&app, invalid_mint).await.status(), 400);
-        assert_eq!(
-            test::call_service(&app, invalid_reserves).await.status(),
-            400
-        );
+        assert_eq!(response.status(), 200);
+        assert_eq!(loaded_scenarios.read().unwrap().scenarios, vec![expected]);
     }
 
     #[actix_web::test]

@@ -1,8 +1,6 @@
 use super::*;
-use crate::scenarios::{
-    pump_graduation::build_pump_graduation_scenario,
-    pump_swap_price_shock::build_pump_swap_price_shock_scenario,
-};
+use crate::scenarios::{TemplateRegistry, pump_graduation_builder::build_pump_graduation_scenario};
+use surfpool_types::{OverrideInstance, Scenario};
 
 const PUMP: Pubkey = Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const PAMM: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -538,15 +536,28 @@ async fn test_pump_token2022_graduation_lifecycle() {
     let baseline_user_quote =
         simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), fixture.user_quote)
             .await;
-    let price_shock = build_pump_swap_price_shock_scenario(
-        MINT,
-        &rpc.get_account(&fixture.pool).await.unwrap(),
-        pre_pool_quote.checked_mul(9).unwrap(),
-    )
-    .unwrap();
-    locker
-        .register_scenario(price_shock.scenario, Some(0))
-        .unwrap();
+    let template_registry = TemplateRegistry::new();
+    let template = template_registry
+        .get("pump-amm-canonical-pool")
+        .expect("PumpSwap template");
+    let values = std::collections::HashMap::from([
+        ("base_mint".to_string(), serde_json::json!(MINT.to_string())),
+        (
+            "virtual_quote_reserves".to_string(),
+            serde_json::json!(pre_pool_quote.checked_mul(9).unwrap()),
+        ),
+    ]);
+    let mut pool_override = OverrideInstance::new(template.id.clone(), 1, template.address.clone())
+        .with_values(values)
+        .with_label("PumpSwap virtual quote reserve shock".to_string());
+    pool_override.fetch_before_use = true;
+    let mut price_shock = Scenario::new(
+        "PumpSwap Price Shock".to_string(),
+        "Shift a canonical PumpSwap pool price through its virtual quote reserves.".to_string(),
+    );
+    price_shock.tags = vec!["pumpswap".to_string(), "price-shock".to_string()];
+    price_shock.add_override(pool_override);
+    locker.register_scenario(price_shock, Some(0)).unwrap();
     locker
         .materialize_overrides_for_slot(&None, 1)
         .await

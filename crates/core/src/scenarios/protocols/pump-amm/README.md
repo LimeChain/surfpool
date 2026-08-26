@@ -49,9 +49,10 @@ Two ways to move the price:
 - override the vault balances with the spl-token template — the vault addresses are in the
   `Pool` account's `pool_base_token_account` / `pool_quote_token_account` fields.
 
-For the canonical WSOL pool of a migrated coin there is a ready-made preset:
-`POST /v1/scenarios/pump-swap-price-shock` (recipe in
-[`../pump/README.md`](../pump/README.md)).
+For the canonical WSOL pool of a migrated coin, the Studio preset loads the existing
+`pump-amm-canonical-pool` template and stores a standard scenario. AI clients use the same
+template through the generic `create_scenario` MCP tool. See the complete example in
+[`../pump/README.md`](../pump/README.md).
 
 ## Notes
 
