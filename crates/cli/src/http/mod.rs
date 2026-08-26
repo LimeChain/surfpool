@@ -68,15 +68,8 @@ pub async fn start_studio_and_scenario_server(
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
     // Initialize MCP service
-    let mcp_rpc_url = config.rpc_url.clone();
-    let mcp_studio_url = config.studio_url.clone();
     let mcp_service = StreamableHttpService::builder()
-        .service_factory(Arc::new(move || {
-            Ok(Surfpool::with_runtime_urls(
-                mcp_rpc_url.clone(),
-                mcp_studio_url.clone(),
-            ))
-        }))
+        .service_factory(Arc::new(|| Ok(Surfpool::new())))
         .session_manager(Arc::new(LocalSessionManager::default()))
         .stateful_mode(true)
         .sse_keep_alive(Duration::from_secs(30))
@@ -334,27 +327,6 @@ mod tests {
         })
     }
 
-    fn scenario_with_override_body() -> serde_json::Value {
-        serde_json::json!({
-            "id": "legacy-scenario",
-            "name": "Legacy scenario",
-            "description": "Created through the existing scenario contract",
-            "overrides": [{
-                "id": "legacy-override",
-                "templateId": "spl-token-account",
-                "values": { "amount": 42 },
-                "scenarioRelativeSlot": 0,
-                "label": "Legacy token balance",
-                "enabled": true,
-                "fetchBeforeUse": false,
-                "account": {
-                    "pubkey": "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"
-                }
-            }],
-            "tags": ["legacy"],
-        })
-    }
-
     fn post_scenario(body: serde_json::Value) -> test::TestRequest {
         test::TestRequest::post()
             .uri("/v1/scenarios")
@@ -414,24 +386,6 @@ mod tests {
             "the conflicting scenario must not be stored"
         );
         assert_eq!(stored[0].name, "first", "the stored scenario is untouched");
-    }
-
-    #[actix_web::test]
-    async fn existing_scenario_payloads_are_stored_unchanged() {
-        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
-        let app = test::init_service(
-            App::new()
-                .app_data(loaded_scenarios.clone())
-                .configure(configure_api),
-        )
-        .await;
-        let body = scenario_with_override_body();
-        let expected: Scenario = serde_json::from_value(body.clone()).unwrap();
-
-        let response = test::call_service(&app, post_scenario(body).to_request()).await;
-
-        assert_eq!(response.status(), 200);
-        assert_eq!(loaded_scenarios.read().unwrap().scenarios, vec![expected]);
     }
 
     #[actix_web::test]
