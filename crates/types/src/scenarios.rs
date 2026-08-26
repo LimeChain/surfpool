@@ -503,9 +503,7 @@ impl OverrideTemplate {
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 pub enum Persist {
     Always(bool),
-    Slots {
-        slots: Slot,
-    },
+    Slots { slots: Slot },
 }
 
 impl Default for Persist {
@@ -570,12 +568,16 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
-    /// Whether to re-apply this override on every subsequent slot, rather than only once
+    /// How long to keep re-applying this override: `false` applies it once, `true` re-applies it
+    /// on every following slot, and `{ slots: N }` applies it N times in total, counting the first
     #[schemars(
-        description = "If true, re-applies this override every following slot. Use only for values no transaction writes: it reverts transaction writes to the same fields."
+        description = "false applies once; true re-applies every following slot; {\"slots\": N} re-applies until N applications have happened, counting the first. Use only for values no transaction writes: re-applying reverts transaction writes to the same fields."
     )]
     #[serde(default)]
-    #[cfg_attr(feature = "ts-bindings", ts(type = "boolean | { slots: number }", optional))]
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(type = "boolean | { slots: number }", optional)
+    )]
     pub persist: Persist,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
@@ -617,7 +619,8 @@ impl OverrideInstance {
     pub fn with_persist_for_slots(mut self, slots: Slot) -> Self {
         self.persist = Persist::Slots { slots };
         self
-    }}
+    }
+}
 
 /// A scenario containing a timeline of overrides
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1065,7 +1068,9 @@ pub enum RawEncoding {
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus `lead` (may be negative).
-    Slot { lead: i64 },
+    Slot {
+        lead: i64,
+    },
 }
 
 impl RawEncoding {
@@ -1093,11 +1098,7 @@ impl RawEncoding {
     }
 
     /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
-    pub fn encode(
-        &self,
-        value: &serde_json::Value,
-        target_slot: Slot,
-    ) -> Result<Vec<u8>, String> {
+    pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
         // Read the digits as text so nothing passes through f64, which cannot hold a u128
         // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
         let digits = |what: &str| -> Result<String, String> {
@@ -1110,7 +1111,9 @@ impl RawEncoding {
                 }
                 serde_json::Value::Number(n) => Ok(n.to_string()),
                 serde_json::Value::String(s) => Ok(s.trim().to_string()),
-                other => Err(format!("expected a number or decimal string for {what}, found {other}")),
+                other => Err(format!(
+                    "expected a number or decimal string for {what}, found {other}"
+                )),
             }
         };
         macro_rules! int {
@@ -1226,9 +1229,10 @@ impl RawLayout {
             let (count, stride) = encoding.placements();
             for i in 0..count {
                 let at = offset
-                    .checked_add(i.checked_mul(stride).ok_or_else(|| {
-                        format!("stride overflow for '{name}'")
-                    })?)
+                    .checked_add(
+                        i.checked_mul(stride)
+                            .ok_or_else(|| format!("stride overflow for '{name}'"))?,
+                    )
                     .ok_or_else(|| format!("offset overflow for '{name}'"))?;
                 let end = at
                     .checked_add(bytes.len())
@@ -1396,7 +1400,11 @@ impl YamlOverrideTemplateCollection {
                     protocol: self.protocol.clone(),
                     idl: idl.clone(),
                     address: entry.address.into(),
-                    properties: describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type),
+                    properties: describe_properties_from_idl(
+                        entry.properties,
+                        idl.as_ref(),
+                        &account_type,
+                    ),
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
@@ -1576,11 +1584,15 @@ mod tests {
         let bytes = RawEncoding::I64.encode(&json!(-25599i64 << 32), 0).unwrap();
         assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()) >> 32, -25599);
 
-        let bytes = RawEncoding::Slot { lead: -1 }.encode(&json!(0), 500).unwrap();
+        let bytes = RawEncoding::Slot { lead: -1 }
+            .encode(&json!(0), 500)
+            .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 499);
 
         // A lead that would go below zero clamps rather than wrapping.
-        let bytes = RawEncoding::Slot { lead: -10 }.encode(&json!(0), 3).unwrap();
+        let bytes = RawEncoding::Slot { lead: -10 }
+            .encode(&json!(0), 3)
+            .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
     }
 
@@ -1648,7 +1660,12 @@ mod tests {
         property.encoding = Some(RawEncoding::U64);
 
         let err = layout
-            .materialize(&[0u8; 16], &[property], &HashMap::from([("tail".to_string(), json!(1))]), 0)
+            .materialize(
+                &[0u8; 16],
+                &[property],
+                &HashMap::from([("tail".to_string(), json!(1))]),
+                0,
+            )
             .expect_err("a field crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
     }
@@ -1688,7 +1705,10 @@ mod tests {
         let written: Vec<usize> = (0..3).flat_map(|i| (4 + i * 16)..(8 + i * 16)).collect();
         for (i, b) in out.iter().enumerate() {
             if !written.contains(&i) {
-                assert_eq!(*b, 0, "byte {i} lies between strided slots and must not change");
+                assert_eq!(
+                    *b, 0,
+                    "byte {i} lies between strided slots and must not change"
+                );
             }
         }
     }
