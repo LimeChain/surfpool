@@ -2822,6 +2822,24 @@ impl SurfnetSvm {
             return Ok(());
         }
 
+        let mut deduped: Vec<OverrideInstance> = Vec::with_capacity(overrides.len());
+        for instance in overrides.into_iter().rev() {
+            if deduped.iter().any(|kept| {
+                kept.id == instance.id
+                    && kept.account == instance.account
+                    && kept.template_id == instance.template_id
+            }) {
+                debug!(
+                    "Dropping a superseded copy of override {} claimed from an earlier slot",
+                    instance.id
+                );
+                continue;
+            }
+            deduped.push(instance);
+        }
+        deduped.reverse();
+        let overrides = deduped;
+
         debug!(
             "Materializing {} override(s) for slot {}",
             overrides.len(),
@@ -4521,12 +4539,7 @@ impl SurfnetSvm {
                 ))
             })?;
 
-            // Re-registering as a one-shot is how a persisted override is cancelled, but by then it
-            // has already armed a copy one slot ahead - in a bucket this registration never
-            // touches. Without this it keeps re-arming forever.
-            if !override_instance.persist.is_enabled() {
-                self.cancel_queued_copies_after(&override_instance, absolute_slot)?;
-            }
+            self.remove_queued_copies_elsewhere(&override_instance, absolute_slot)?;
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4558,23 +4571,25 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Drops copies of `instance` queued for any slot after `from_slot`.
+    /// Drops copies of `instance` queued for any slot other than `keep_slot`.
     ///
     /// Matching is the same (id, account, template_id) triple the scheduler dedupes on, so this
-    /// removes the override's own re-armed copies and nothing else.
-    fn cancel_queued_copies_after(
+    /// only removes the override's own copies - in practice the one it armed for the next slot.
+    /// Sweeping every other bucket rather than only later ones matters because the armed copy sits
+    /// *before* a cancellation scheduled at a positive relative slot.
+    fn remove_queued_copies_elsewhere(
         &mut self,
         instance: &OverrideInstance,
-        from_slot: Slot,
+        keep_slot: Slot,
     ) -> SurfpoolResult<()> {
-        let later: Vec<Slot> = self
+        let others: Vec<Slot> = self
             .scheduled_overrides
             .keys()?
             .into_iter()
-            .filter(|slot| *slot > from_slot)
+            .filter(|slot| *slot != keep_slot)
             .collect();
 
-        for slot in later {
+        for slot in others {
             let Some(mut queued) = self.scheduled_overrides.get(&slot)? else {
                 continue;
             };
@@ -4586,12 +4601,18 @@ impl SurfnetSvm {
             });
             if queued.len() != before {
                 debug!(
-                    "Cancelled {} queued copy(ies) of override {} at slot {}",
+                    "Removed {} superseded copy(ies) of override {} at slot {}",
                     before - queued.len(),
                     instance.id,
                     slot
                 );
-                self.scheduled_overrides.store(slot, queued)?;
+                // Drop the key rather than leaving an empty vec behind: a slot that holds nothing
+                // still shows up in `keys()`, so every sweep would walk more dead entries.
+                if queued.is_empty() {
+                    self.scheduled_overrides.take(&slot)?;
+                } else {
+                    self.scheduled_overrides.store(slot, queued)?;
+                }
             }
         }
 
@@ -8300,6 +8321,158 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "and it must not re-arm from there"
+        );
+    }
+
+    /// Cancelling at a FUTURE relative slot. The armed copy sits before the cancellation bucket, so
+    /// sweeping only later slots leaves it alive - and when it re-arms it lands on the cancellation
+    /// bucket and replaces the one-shot with itself, so the override never stops.
+    #[tokio::test]
+    async fn test_cancelling_at_a_future_slot_stops_the_override() {
+        const SLOT: u64 = 500;
+        const CANCEL_AT: u64 = 5;
+
+        let (mut svm, _pk, mut instance) = scheduled_persist_fixture(true);
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register persisted");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        // Cancel, but scheduled a few slots out rather than for the current slot.
+        instance.persist = surfpool_types::Persist::Always(false);
+        instance.scenario_relative_slot = CANCEL_AT;
+        svm.register_scenario(scenario(instance), Some(SLOT))
+            .expect("register the cancelling one-shot");
+
+        // Run past the cancellation slot.
+        for slot in (SLOT + 1)..=(SLOT + CANCEL_AT + 2) {
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize");
+        }
+
+        let leftover: Vec<u64> = svm
+            .scheduled_overrides
+            .keys()
+            .expect("keys")
+            .into_iter()
+            .filter(|slot| {
+                !svm.scheduled_overrides
+                    .get(slot)
+                    .expect("read")
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the override was cancelled, so nothing may still be queued; found {leftover:?}"
+        );
+    }
+
+    /// Claiming several overdue buckets at once must still apply an override only once. The final
+    /// state hides a duplicate - both copies write the same bytes and the second re-arm replaces
+    /// the first - so this counts the work instead: one application means one reschedule write.
+    #[tokio::test]
+    async fn test_overdue_buckets_apply_an_override_once() {
+        use crate::storage::{Storage, StorageResult};
+
+        #[derive(Clone)]
+        struct CountingStore {
+            inner: HashMap<u64, Vec<surfpool_types::OverrideInstance>>,
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Storage<u64, Vec<surfpool_types::OverrideInstance>> for CountingStore {
+            fn store(
+                &mut self,
+                key: u64,
+                value: Vec<surfpool_types::OverrideInstance>,
+            ) -> StorageResult<()> {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.insert(key, value);
+                Ok(())
+            }
+            fn clear(&mut self) -> StorageResult<()> {
+                self.inner.clear();
+                Ok(())
+            }
+            fn get(
+                &self,
+                key: &u64,
+            ) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Ok(self.inner.get(key).cloned())
+            }
+            fn take(
+                &mut self,
+                key: &u64,
+            ) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Ok(self.inner.remove(key))
+            }
+            fn keys(&self) -> StorageResult<Vec<u64>> {
+                Ok(self.inner.keys().copied().collect())
+            }
+            fn into_iter(
+                &self,
+            ) -> StorageResult<
+                Box<dyn Iterator<Item = (u64, Vec<surfpool_types::OverrideInstance>)> + '_>,
+            > {
+                Ok(Box::new(self.inner.iter().map(|(k, v)| (*k, v.clone()))))
+            }
+            fn count(&self) -> StorageResult<u64> {
+                Ok(self.inner.len() as u64)
+            }
+            fn clone_box(&self) -> Box<dyn Storage<u64, Vec<surfpool_types::OverrideInstance>>> {
+                Box::new(self.clone())
+            }
+        }
+
+        const SLOT: u64 = 500;
+
+        let (mut svm, _pk, base) = scheduled_persist_fixture(true);
+
+        let mut earlier = base.clone();
+        earlier.persist = surfpool_types::Persist::Slots { slots: 5 };
+        let mut later = base.clone();
+        later.persist = surfpool_types::Persist::Slots { slots: 2 };
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        svm.scheduled_overrides = Box::new(CountingStore {
+            inner: HashMap::from([(SLOT, vec![earlier]), (SLOT + 1, vec![later])]),
+            writes: writes.clone(),
+        });
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 1)
+            .await
+            .expect("materialize both overdue buckets");
+
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the override must be handled once, so it re-arms once; a duplicate would reschedule \
+             twice and could fetch or write on behalf of a copy the operator has superseded"
+        );
+
+        let armed = svm
+            .scheduled_overrides
+            .get(&(SLOT + 2))
+            .expect("read")
+            .unwrap_or_default();
+        assert_eq!(armed.len(), 1, "one entry per override id");
+        assert_eq!(
+            armed[0].persist,
+            surfpool_types::Persist::Slots { slots: 1 },
+            "the copy scheduled latest must win, so its window is the one that advances"
         );
     }
 
