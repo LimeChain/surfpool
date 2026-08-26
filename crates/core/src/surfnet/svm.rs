@@ -2876,12 +2876,16 @@ impl SurfnetSvm {
 
             let existing_account = self.inner.get_account(&account_pubkey)?;
 
+            let account_materialized = existing_account
+                .as_ref()
+                .is_some_and(|account| account.data().len() >= 8);
+
             if override_instance.persist {
                 let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && existing_account.is_some() {
+                if requeued.fetch_before_use && account_materialized {
                     requeued.fetch_before_use = false;
                 }
-                self.reschedule_override_for_next_slot(&requeued, target_slot);
+                self.reschedule_override_for_next_slot(&requeued, target_slot)?;
             }
 
             // Apply the override values to the account data
@@ -3022,13 +3026,11 @@ impl SurfnetSvm {
         &mut self,
         instance: &OverrideInstance,
         target_slot: Slot,
-    ) {
+    ) -> SurfpoolResult<()> {
         let next_slot = target_slot + 1;
         let mut next = self
             .scheduled_overrides
-            .get(&next_slot)
-            .ok()
-            .flatten()
+            .get(&next_slot)?
             .unwrap_or_default();
 
         if let Some(existing) = next.iter_mut().find(|queued| {
@@ -3040,12 +3042,8 @@ impl SurfnetSvm {
         } else {
             next.push(instance.clone());
         }
-        if let Err(e) = self.scheduled_overrides.store(next_slot, next) {
-            warn!(
-                "Failed to reschedule override {} for slot {}: {}",
-                instance.id, next_slot, e
-            );
-        }
+        self.scheduled_overrides.store(next_slot, next)?;
+        Ok(())
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -7446,6 +7444,50 @@ mod tests {
                 queued.id
             );
         }
+    }
+
+    /// A local entry too short to hold a discriminator is not a materialized account - the write
+    /// rejects it and tells the user to enable `fetchBeforeUse`, so clearing the flag here would
+    /// strand the override on an unusable stub forever.
+    #[tokio::test]
+    async fn test_persisted_override_keeps_fetching_past_a_stub_account() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+
+        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+        svm.inner
+            .set_account(
+                account_pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; 4],
+                    owner: klend,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .expect("set stub account");
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the stub cannot be written to, so the next slot must retry the fetch"
+        );
     }
 
     /// The flag is only cleared once there is something local to keep. An override whose account
