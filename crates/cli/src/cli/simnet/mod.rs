@@ -15,10 +15,7 @@ use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use surfpool_core::{
-    runloops::start_local_surfnet_runloop,
-    surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
-};
+use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
 use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SimnetEventsTx, SubgraphEvent};
 use txtx_core::kit::{channel::Receiver, helpers::fs::FileLocation, types::frontend::BlockEvent};
 use txtx_gql::kit::{indexmap::IndexMap, types::frontend::LogLevel, uuid::Uuid};
@@ -187,8 +184,6 @@ pub async fn handle_start_local_surfnet_command(
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: None,
     };
-    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
-
     let explorer_handle = match start_studio_and_scenario_server(
         studio_binding_address,
         sanitized_config.clone(),
@@ -216,8 +211,8 @@ pub async fn handle_start_local_surfnet_command(
     let simnet_events_tx_for_thread = simnet_events_tx.clone();
     let simnet_handle = hiro_system_kit::thread_named("simnet")
         .spawn(move || {
-            let future = start_local_surfnet_runloop(
-                svm_locker,
+            let future = start_local_surfnet(
+                surfnet_svm,
                 config_copy,
                 simnet_commands_tx_copy,
                 simnet_commands_rx,

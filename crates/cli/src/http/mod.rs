@@ -2,7 +2,6 @@
 use std::{
     collections::HashMap,
     error::Error as StdError,
-    str::FromStr,
     sync::{Arc, RwLock},
     thread::JoinHandle,
     time::Duration,
@@ -63,6 +62,7 @@ pub async fn start_studio_and_scenario_server(
     enable_studio: bool,
 ) -> Result<ServerHandle, Box<dyn StdError>> {
     let config_wrapped = Data::new(RwLock::new(config.clone()));
+
     // Initialize template registry and load templates
     let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
@@ -174,14 +174,14 @@ impl LoadedScenarios {
 
 #[post("/v1/scenarios")]
 async fn post_scenarios(
+    req: HttpRequest,
     scenario: web::Json<Scenario>,
     data: Data<RwLock<LoadedScenarios>>,
 ) -> Result<HttpResponse, Error> {
-    let scenario_data = scenario.into_inner();
-
     let mut loaded_scenarios = data
         .write()
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to acquire write lock"))?;
+    let scenario_data = scenario.into_inner();
     let scenario_id = scenario_data.id.clone();
 
     if let Some(existing) = loaded_scenarios
