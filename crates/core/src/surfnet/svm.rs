@@ -2823,6 +2823,8 @@ impl SurfnetSvm {
                 override_instance.id, account_pubkey, override_instance.label
             );
 
+            let mut fetch_answered = false;
+
             // Fetch fresh account data from remote if requested
             if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
                 if let Some((client, _)) = remote_ctx {
@@ -2851,13 +2853,17 @@ impl SurfnetSvm {
                                 );
                             } else {
                                 settled_this_slot.insert(account_pubkey);
+                                fetch_answered = true;
                             }
                         }
                         Ok(GetAccountResult::None(_)) => {
                             debug!("Account {} not found on remote", account_pubkey);
+                            // A definitive answer, not a failure - retrying cannot change it.
+                            fetch_answered = true;
                         }
                         Ok(_) => {
                             debug!("Account {} fetched (other variant)", account_pubkey);
+                            fetch_answered = true;
                         }
                         Err(e) => {
                             warn!(
@@ -2871,18 +2877,18 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
+                    fetch_answered = true;
                 }
+            } else if override_instance.fetch_before_use {
+                // Another override already forked this account this slot.
+                fetch_answered = true;
             }
 
             let existing_account = self.inner.get_account(&account_pubkey)?;
 
-            let account_materialized = existing_account
-                .as_ref()
-                .is_some_and(|account| account.data().len() >= 8);
-
             if override_instance.persist {
                 let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && account_materialized {
+                if requeued.fetch_before_use && fetch_answered {
                     requeued.fetch_before_use = false;
                 }
                 self.reschedule_override_for_next_slot(&requeued, target_slot)?;
@@ -7446,35 +7452,26 @@ mod tests {
         }
     }
 
-    /// A local entry too short to hold a discriminator is not a materialized account - the write
-    /// rejects it and tells the user to enable `fetchBeforeUse`, so clearing the flag here would
-    /// strand the override on an unusable stub forever.
+    /// A transient RPC failure must not be mistaken for a satisfied fetch. The account already
+    /// being present locally is not enough - the override asked for fresh data and did not get it,
+    /// so with `persist` the flag has to survive or it pins stale data for the rest of the run.
     #[tokio::test]
-    async fn test_persisted_override_keeps_fetching_past_a_stub_account() {
+    async fn test_persisted_override_retries_after_a_failed_fetch() {
         const SLOT: u64 = 500;
 
-        let (mut svm, account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        // Unroutable port: the fetch fails without touching the network.
+        let unreachable = (
+            SurfnetRemoteClient::new("http://127.0.0.1:1"),
+            CommitmentConfig::confirmed(),
+        );
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
         instance.fetch_before_use = true;
-
-        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
-        svm.inner
-            .set_account(
-                account_pubkey,
-                Account {
-                    lamports: 1_000_000,
-                    data: vec![0u8; 4],
-                    owner: klend,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .expect("set stub account");
-
         svm.scheduled_overrides
             .store(SLOT, vec![instance])
             .expect("schedule override");
 
-        svm.materialize_overrides_for_slot(&None, SLOT)
+        svm.materialize_overrides_for_slot(&Some(unreachable), SLOT)
             .await
             .expect("materialize");
 
@@ -7485,48 +7482,10 @@ mod tests {
             .expect("next slot should have queued overrides");
         assert_eq!(next.len(), 1, "one entry per override id");
         assert!(
-            next[0].fetch_before_use,
-            "the stub cannot be written to, so the next slot must retry the fetch"
-        );
-    }
-
-    /// The flag is only cleared once there is something local to keep. An override whose account
-    /// never materialized must keep fetching, or it can never recover.
-    #[tokio::test]
-    async fn test_persisted_override_keeps_fetching_while_the_account_is_missing() {
-        const SLOT: u64 = 500;
-
-        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
-
-        let mut absent = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
-        )
-        .with_values(HashMap::from([(
-            "unhealthy_borrow_value_sf".to_string(),
-            serde_json::json!(1_234u64),
-        )]));
-        absent.persist = true;
-        absent.fetch_before_use = true;
-
-        svm.scheduled_overrides
-            .store(SLOT, vec![absent])
-            .expect("schedule override");
-
-        svm.materialize_overrides_for_slot(&None, SLOT)
-            .await
-            .expect("materialize");
-
-        let next = svm
-            .scheduled_overrides
-            .get(&(SLOT + 1))
-            .expect("storage read")
-            .expect("next slot should have queued overrides");
-        assert_eq!(next.len(), 1, "one entry per override id");
+            next[0].persist, "persist must survive rescheduling");
         assert!(
             next[0].fetch_before_use,
-            "the account is still missing, so the next slot must retry the fetch"
+            "the fetch failed, so the next slot must retry it instead of pinning stale data"
         );
     }
 
