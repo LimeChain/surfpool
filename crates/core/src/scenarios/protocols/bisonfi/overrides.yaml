@@ -239,9 +239,13 @@ templates:
     properties:
       - path: last_update_slot
         offset: 72
-        encoding: u64
-        label: Last update slot
-        description: "Slot of the most recent mid publication. Example: 439868588"
+        encoding:
+          slot:
+            lead: 0
+        label: Slots behind the chain
+        description: >-
+          How far behind the executing slot the quote was published, as a signed offset. 0 is live,
+          -1 still fills, -2 or lower is silent.
     llm_context: |
       This field is the venue's liveness signal.
 
@@ -252,13 +256,21 @@ templates:
       makes this template the precondition for the other three: if your scenario spends more than a
       slot before executing, refresh this field first.
 
+      THE VALUE IS AN OFFSET, NOT A SLOT NUMBER. It is resolved against the slot the override
+      materializes at, so 0 means "published this slot". An absolute slot number would be wrong here:
+      persist replays the same value every slot, so a fixed number ages by one slot per slot and the
+      quote goes stale anyway.
+
       HOW TO USE THIS TEMPLATE:
-      1. Set last_update_slot to the current slot. The venue resumes quoting the price it already
-         held - a fresh timestamp is enough, no new price is needed
-      2. Set persist: true, or the next slot's state overwrites your value
+      1. Set last_update_slot to 0. The venue resumes quoting the price it already held - a fresh
+         timestamp is enough, no new price is needed
+      2. Set persist: true, so every slot re-stamps itself and the quote stays live indefinitely
 
       A scenario that executes within a slot of forking does not need this. One that spends longer on
       setup does.
 
-      EXAMPLE - "keep the maker quoting at chain slot 439868588":
-      last_update_slot: 439868588
+      EXAMPLE - "keep the maker quoting for the whole run":
+      last_update_slot: 0, persist: true
+
+      EXAMPLE - "the maker went dark five slots ago":
+      last_update_slot: -5

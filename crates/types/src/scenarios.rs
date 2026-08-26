@@ -1023,7 +1023,9 @@ pub enum RawEncoding {
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus `lead` (may be negative).
-    Slot { lead: i64 },
+    Slot {
+        lead: i64,
+    },
 }
 
 impl RawEncoding {
@@ -1051,11 +1053,7 @@ impl RawEncoding {
     }
 
     /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
-    pub fn encode(
-        &self,
-        value: &serde_json::Value,
-        target_slot: Slot,
-    ) -> Result<Vec<u8>, String> {
+    pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
         // Read the digits as text so nothing passes through f64, which cannot hold a u128
         // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
         let digits = |what: &str| -> Result<String, String> {
@@ -1068,7 +1066,9 @@ impl RawEncoding {
                 }
                 serde_json::Value::Number(n) => Ok(n.to_string()),
                 serde_json::Value::String(s) => Ok(s.trim().to_string()),
-                other => Err(format!("expected a number or decimal string for {what}, found {other}")),
+                other => Err(format!(
+                    "expected a number or decimal string for {what}, found {other}"
+                )),
             }
         };
         macro_rules! int {
@@ -1098,11 +1098,21 @@ impl RawEncoding {
                     .to_bytes()
                     .to_vec()
             }
-            RawEncoding::Slot { lead } => (target_slot as i64)
-                .saturating_add(*lead)
-                .max(0)
-                .to_le_bytes()
-                .to_vec(),
+            RawEncoding::Slot { lead } => {
+                let lead = match value {
+                    serde_json::Value::Null => *lead,
+                    _ => {
+                        let d = digits("slot lead")?;
+                        d.parse::<i64>()
+                            .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
+                    }
+                };
+                (target_slot as i64)
+                    .saturating_add(lead)
+                    .max(0)
+                    .to_le_bytes()
+                    .to_vec()
+            }
         })
     }
 }
@@ -1184,9 +1194,10 @@ impl RawLayout {
             let (count, stride) = encoding.placements();
             for i in 0..count {
                 let at = offset
-                    .checked_add(i.checked_mul(stride).ok_or_else(|| {
-                        format!("stride overflow for '{name}'")
-                    })?)
+                    .checked_add(
+                        i.checked_mul(stride)
+                            .ok_or_else(|| format!("stride overflow for '{name}'"))?,
+                    )
                     .ok_or_else(|| format!("offset overflow for '{name}'"))?;
                 let end = at
                     .checked_add(bytes.len())
@@ -1354,7 +1365,11 @@ impl YamlOverrideTemplateCollection {
                     protocol: self.protocol.clone(),
                     idl: idl.clone(),
                     address: entry.address.into(),
-                    properties: describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type),
+                    properties: describe_properties_from_idl(
+                        entry.properties,
+                        idl.as_ref(),
+                        &account_type,
+                    ),
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
@@ -1534,11 +1549,27 @@ mod tests {
         let bytes = RawEncoding::I64.encode(&json!(-25599i64 << 32), 0).unwrap();
         assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()) >> 32, -25599);
 
-        let bytes = RawEncoding::Slot { lead: -1 }.encode(&json!(0), 500).unwrap();
+        // The supplied value is the lead, so one property covers live and stale.
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 500);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-5), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 495);
+
+        // The manifest lead is the default, used when no value is given.
+        let bytes = RawEncoding::Slot { lead: -1 }
+            .encode(&json!(null), 500)
+            .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 499);
 
         // A lead that would go below zero clamps rather than wrapping.
-        let bytes = RawEncoding::Slot { lead: -10 }.encode(&json!(0), 3).unwrap();
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-10), 3)
+            .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
     }
 
@@ -1555,7 +1586,12 @@ mod tests {
         property.encoding = Some(RawEncoding::U64);
 
         let err = layout
-            .materialize(&[0u8; 16], &[property], &HashMap::from([("tail".to_string(), json!(1))]), 0)
+            .materialize(
+                &[0u8; 16],
+                &[property],
+                &HashMap::from([("tail".to_string(), json!(1))]),
+                0,
+            )
             .expect_err("a field crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
     }
@@ -1595,7 +1631,10 @@ mod tests {
         let written: Vec<usize> = (0..3).flat_map(|i| (4 + i * 16)..(8 + i * 16)).collect();
         for (i, b) in out.iter().enumerate() {
             if !written.contains(&i) {
-                assert_eq!(*b, 0, "byte {i} lies between strided slots and must not change");
+                assert_eq!(
+                    *b, 0,
+                    "byte {i} lies between strided slots and must not change"
+                );
             }
         }
     }
