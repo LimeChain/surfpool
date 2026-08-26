@@ -584,6 +584,12 @@ pub struct OverrideInstance {
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
     )]
     pub account: AccountAddress,
+    /// Set by the scheduler, not by callers: marks a copy this override queued for itself to
+    /// continue persisting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(skip)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub re_armed: bool,
 }
 
 impl OverrideInstance {
@@ -598,6 +604,7 @@ impl OverrideInstance {
             fetch_before_use: false,
             persist: Persist::default(),
             account,
+            re_armed: false,
         }
     }
 
