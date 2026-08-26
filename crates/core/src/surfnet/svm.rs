@@ -2874,9 +2874,14 @@ impl SurfnetSvm {
                 }
             }
 
-            // Queued before the write so a failed apply is retried next slot, still fetching.
+            let existing_account = self.inner.get_account(&account_pubkey)?;
+
             if override_instance.persist {
-                self.reschedule_override_for_next_slot(&override_instance, target_slot);
+                let mut requeued = override_instance.clone();
+                if requeued.fetch_before_use && existing_account.is_some() {
+                    requeued.fetch_before_use = false;
+                }
+                self.reschedule_override_for_next_slot(&requeued, target_slot);
             }
 
             // Apply the override values to the account data
@@ -2907,7 +2912,7 @@ impl SurfnetSvm {
                 );
 
                 // Get the account from the SVM
-                let Some(account) = self.inner.get_account(&account_pubkey)? else {
+                let Some(account) = existing_account else {
                     warn!(
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
@@ -3004,14 +3009,6 @@ impl SurfnetSvm {
                         override_instance.id
                     );
                     settled_this_slot.insert(account_pubkey);
-                    // The account is forked now. Re-fetching it every slot would cost one RPC
-                    // per slot and overwrite whatever local transactions wrote to the fields
-                    // this override leaves alone, so later slots re-pin without fetching.
-                    if override_instance.persist && override_instance.fetch_before_use {
-                        let mut requeued = override_instance.clone();
-                        requeued.fetch_before_use = false;
-                        self.reschedule_override_for_next_slot(&requeued, target_slot);
-                    }
                 }
             }
         }
@@ -7377,6 +7374,117 @@ mod tests {
         assert!(
             !next[0].fetch_before_use,
             "the account is forked, so later slots must not re-fetch it and discard local writes"
+        );
+    }
+
+    /// An override that writes no account fields still forks the account, so it must stop fetching too.
+    #[tokio::test]
+    async fn test_persisted_override_that_writes_no_fields_stops_refetching() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // Values consumed entirely by PDA derivation, so `account_values` filters down to empty.
+        let seed_only = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pda {
+                program_id: "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".to_string(),
+                seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+            },
+        )
+        .with_values(HashMap::from([(
+            "market".to_string(),
+            serde_json::json!(account_pubkey.to_string()),
+        )]));
+
+        // Point the derived address at a real forked account so presence is what is being tested.
+        let derived = seed_only
+            .account
+            .resolve(Some(&seed_only.values))
+            .expect("derive pda");
+        let forked = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("fixture account present");
+        svm.inner
+            .set_account(derived, forked)
+            .expect("set derived account");
+
+        let mut no_values = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-noop".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        no_values.persist = true;
+        no_values.fetch_before_use = true;
+
+        let mut seed_only = seed_only;
+        seed_only.persist = true;
+        seed_only.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![seed_only, no_values])
+            .expect("schedule overrides");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 2, "both overrides re-armed, one entry each");
+        for queued in &next {
+            assert!(queued.persist, "persist must survive rescheduling");
+            assert!(
+                !queued.fetch_before_use,
+                "override {} forked its account, so later slots must not re-fetch it",
+                queued.id
+            );
+        }
+    }
+
+    /// The flag is only cleared once there is something local to keep. An override whose account
+    /// never materialized must keep fetching, or it can never recover.
+    #[tokio::test]
+    async fn test_persisted_override_keeps_fetching_while_the_account_is_missing() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the account is still missing, so the next slot must retry the fetch"
         );
     }
 
