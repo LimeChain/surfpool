@@ -72,8 +72,7 @@ async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => account.data,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.data,
             GetAccountResult::None(_) => {
                 panic!("{address} no longer exists on mainnet; the test needs a new address")
             }
@@ -102,8 +101,7 @@ async fn fetch_optional(addresses: &[&str]) -> Vec<Option<Vec<u8>>> {
         .into_iter()
         .map(|r| match r {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => Some(account.data),
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => Some(account.data),
             GetAccountResult::None(_) => None,
         })
         .collect()
@@ -139,8 +137,7 @@ async fn fetch_owners(addresses: &[Pubkey]) -> Vec<Pubkey> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => account.owner,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.owner,
             GetAccountResult::None(_) => panic!("{address} no longer exists on mainnet"),
         })
         .collect()
@@ -203,8 +200,7 @@ async fn fetch_with_lamports(addresses: &[&str]) -> Vec<(Vec<u8>, u64)> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => {
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => {
                 (account.data, account.lamports)
             }
             GetAccountResult::None(_) => panic!("{address} no longer exists on mainnet"),

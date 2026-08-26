@@ -77,8 +77,7 @@ async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _) => account.data,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.data,
             GetAccountResult::None(_) => {
                 panic!("{address} no longer exists on mainnet; the test needs a new address")
             }

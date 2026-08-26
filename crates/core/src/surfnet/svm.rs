@@ -49,7 +49,10 @@ use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
-use solana_transaction_status::{TransactionDetails, TransactionStatusMeta, UiConfirmedBlock};
+use solana_transaction_status::{
+    TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
+    TransactionStatusMeta, UiConfirmedBlock,
+};
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
     scaled_ui_amount::ScaledUiAmountConfig,
@@ -77,8 +80,9 @@ use txtx_addon_network_svm_types::idl::{
 use uuid::Uuid;
 
 use super::{
-    AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
-    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
+    AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
+    FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
+    GeyserEvent, GeyserSlotStatus, LocalSignatureStatus, LocalSignatureStatusOrSubscription,
     ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
     SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
@@ -116,6 +120,39 @@ lazy_static::lazy_static! {
             .and_then(|s| s.parse().ok())
             .unwrap_or(150)
     };
+}
+
+/// Determines how an account result may change the SVM.
+///
+/// The result's [`AccountSource`] describes where the data came from; this
+/// policy describes what the current operation is allowed to do with it.
+///
+/// | Result | Source | `Authoritative` | `HydrateIfAbsent` |
+/// | --- | --- | --- | --- |
+/// | `None` | Any | No-op | No-op |
+/// | `FoundAccount` | `Svm` | No-op; it is already live | No-op |
+/// | `FoundAccount` | `Database` or `Remote` | Replace when explicitly applied | Insert only when absent; preserve live state |
+/// | `FoundAccount` | `Generated` | Replace when explicitly applied | No-op; generated state is already an explicit mutation |
+/// | `FoundCoupledAccount::ProgramData` | `Database` or `Remote` | Apply program-data before program | Hydrate each missing component, preserving live state |
+/// | `FoundCoupledAccount::Mint` | `Database` or `Remote` | Apply mint before token account when present | Hydrate each missing component, preserving live state |
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccountUpdatePolicy {
+    /// Replace local state with the supplied account update.
+    Authoritative,
+    /// Keep any live LiteSVM state and rehydrate database-only state instead
+    /// of replacing it with a fetched result.
+    HydrateIfAbsent,
+}
+
+impl AccountUpdatePolicy {
+    /// Converts account provenance into the non-authoritative policy used when
+    /// a result needs to be materialized in LiteSVM.
+    pub(crate) const fn for_source(source: AccountSource) -> Option<Self> {
+        match source {
+            AccountSource::Database | AccountSource::Remote => Some(Self::HydrateIfAbsent),
+            AccountSource::Svm | AccountSource::Generated => None,
+        }
+    }
 }
 
 /// Helper function to apply an override to a decoded account value using dot notation
@@ -599,6 +636,18 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
     // Pre-genesis slot hashes only exist to cover the finalized warmup window.
     // Keep them deterministic and distinct from local chain-index hashes.
     SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
+}
+
+/// What one `fetch_before_use` attempt settled. Decides whether a persisted override keeps
+/// asking on later slots, which it must while another attempt could still change the answer.
+enum FetchOutcome {
+    Retired,
+    /// There is no remote to ask. Only a local account can satisfy the request.
+    NoRemote,
+    /// The remote has no such account. It may be created later.
+    NotOnRemote,
+    /// No answer was obtained. Another attempt may get one.
+    Unanswered,
 }
 
 impl SurfnetSvm {
@@ -2375,117 +2424,161 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Writes account updates to the SVM state based on the provided account update result.
-    ///
-    /// # Arguments
-    /// * `account_update` - The account update result to process.
-    pub fn write_account_update(&mut self, account_update: GetAccountResult) {
-        let init_programdata_account = |program_account: &Account| {
-            if !program_account.executable {
-                return None;
-            }
-            if !program_account
-                .owner
-                .eq(&solana_sdk_ids::bpf_loader_upgradeable::id())
-            {
-                return None;
-            }
-            let Ok(UpgradeableLoaderState::Program {
-                programdata_address,
-            }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
-            else {
-                return None;
-            };
+    /// Materializes an account lookup result into the SVM according to its
+    /// source policy. This is the sole insertion path for `GetAccountResult`;
+    /// callers must state whether the result is authoritative or cache-only.
+    pub(crate) fn apply_account_update(
+        &mut self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<()> {
+        let account_update = self.account_update_for_policy(account_update, policy)?;
 
-            let programdata_state = UpgradeableLoaderState::ProgramData {
-                upgrade_authority_address: Some(system_program::id()),
-                slot: self.get_latest_absolute_slot(),
-            };
-            let mut data = bincode::serialize(&programdata_state).unwrap();
-
-            data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
-            let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
-            Some((
-                programdata_address,
-                Account {
-                    lamports,
-                    data,
-                    owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            ))
-        };
         match account_update {
-            GetAccountResult::FoundAccount(pubkey, account, do_update_account) => {
-                if do_update_account {
-                    if let Some((programdata_address, programdata_account)) =
-                        init_programdata_account(&account)
-                    {
-                        match self.get_account(&programdata_address) {
-                            Ok(None) => {
-                                if let Err(e) =
-                                    self.set_account(&programdata_address, programdata_account)
-                                {
-                                    let _ = self.simnet_events_tx.error(e.to_string());
-                                }
-                            }
-                            Ok(Some(_)) => {}
-                            Err(e) => {
-                                let _ = self.simnet_events_tx.error(e.to_string());
-                            }
-                        }
-                    }
-                    if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                        let _ = self.simnet_events_tx.error(e.to_string());
-                    }
-                }
-            }
-            GetAccountResult::FoundProgramAccount((pubkey, account), (_, None)) => {
-                if let Some((programdata_address, programdata_account)) =
-                    init_programdata_account(&account)
-                {
-                    match self.get_account(&programdata_address) {
-                        Ok(None) => {
-                            if let Err(e) =
-                                self.set_account(&programdata_address, programdata_account)
-                            {
-                                let _ = self.simnet_events_tx.error(e.to_string());
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                        Err(e) => {
-                            let _ = self.simnet_events_tx.error(e.to_string());
-                        }
-                    }
-                }
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
-            }
-            GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
-            }
-            GetAccountResult::FoundProgramAccount(
-                (pubkey, account),
-                (coupled_pubkey, Some(coupled_account)),
-            )
-            | GetAccountResult::FoundTokenAccount(
-                (pubkey, account),
-                (coupled_pubkey, Some(coupled_account)),
-            ) => {
-                // The data account _must_ be set first, as the program account depends on it.
-                if let Err(e) = self.set_account(&coupled_pubkey, coupled_account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
-            }
             GetAccountResult::None(_) => {}
+            GetAccountResult::FoundAccount(pubkey, account, source) => {
+                if source != AccountSource::Svm {
+                    self.apply_synthetic_programdata(&account)?;
+                    self.apply_account_component(pubkey, account, policy)?;
+                }
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::ProgramData(_, None),
+                _,
+            ) => {
+                self.apply_synthetic_programdata(&account)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::ProgramData(coupled_pubkey, Some(coupled_account)),
+                _,
+            ) => {
+                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::Mint(coupled_pubkey, Some(coupled_account)),
+                _,
+            ) => {
+                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::Mint(_, None),
+                _,
+            ) => {
+                self.apply_account_component(pubkey, account, policy)?;
+            }
         }
+
+        Ok(())
+    }
+
+    fn account_update_for_policy(
+        &self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<GetAccountResult> {
+        if policy != AccountUpdatePolicy::HydrateIfAbsent {
+            return Ok(account_update);
+        }
+
+        let pubkey = match &account_update {
+            GetAccountResult::None(pubkey) | GetAccountResult::FoundAccount(pubkey, ..) => *pubkey,
+            GetAccountResult::FoundCoupledAccount((pubkey, _), _, _) => *pubkey,
+        };
+        let local = self.inner.get_account_result(&pubkey)?;
+
+        // A database result includes its own associated programdata or mint
+        // account. Prefer that complete local representation to a stale
+        // fetched result. Conversely, a live primary makes the entire fetched
+        // result stale: do not install its coupled mint or programdata before
+        // skipping the primary, or the live account could observe mismatched
+        // dependency state.
+        if local
+            .source()
+            .and_then(AccountUpdatePolicy::for_source)
+            .is_some()
+        {
+            Ok(local)
+        } else if local.is_none() {
+            Ok(account_update)
+        } else {
+            Ok(GetAccountResult::None(pubkey))
+        }
+    }
+
+    fn apply_account_component(
+        &mut self,
+        pubkey: Pubkey,
+        account: Account,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<()> {
+        let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
+            match self.inner.get_account_result(&pubkey)? {
+                GetAccountResult::None(_) => account,
+                local
+                    if local
+                        .source()
+                        .and_then(AccountUpdatePolicy::for_source)
+                        .is_some() =>
+                {
+                    local.map_account()?
+                }
+                _ => return Ok(()),
+            }
+        } else {
+            account
+        };
+
+        // Preserve the established behavior for fetched data: an account that
+        // LiteSVM rejects (such as an incomplete program upload) is still
+        // returned to the caller, with the insertion failure emitted as an
+        // event for observability.
+        if let Err(error) = self.set_account(&pubkey, account) {
+            let _ = self.simnet_events_tx.error(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn apply_synthetic_programdata(&mut self, program_account: &Account) -> SurfpoolResult<()> {
+        if !program_account.executable
+            || program_account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+        {
+            return Ok(());
+        }
+        let Ok(UpgradeableLoaderState::Program {
+            programdata_address,
+        }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
+        else {
+            return Ok(());
+        };
+
+        let programdata_state = UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address: Some(system_program::id()),
+            slot: self.get_latest_absolute_slot(),
+        };
+        let mut data = bincode::serialize(&programdata_state).unwrap();
+        data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
+        let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
+
+        // A synthesized fallback is never authoritative: retain any real
+        // programdata already held in memory or in the configured database.
+        self.apply_account_component(
+            programdata_address,
+            Account {
+                lamports,
+                data,
+                owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
     }
 
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
@@ -2716,7 +2809,23 @@ impl SurfnetSvm {
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
 
-        for override_instance in overrides {
+        // `take` already emptied the slot, so bailing out mid-loop would drop every override that
+        // has not been reached yet. Put the unprocessed tail back before returning the error.
+        let restore_unprocessed = |svm: &mut Self, from: usize| {
+            if let Err(e) = svm
+                .scheduled_overrides
+                .store(target_slot, overrides[from..].to_vec())
+            {
+                error!(
+                    "Failed to restore {} unprocessed override(s) for slot {}: {}",
+                    overrides.len() - from,
+                    target_slot,
+                    e
+                );
+            }
+        };
+
+        for (index, override_instance) in overrides.iter().enumerate() {
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
                 continue;
@@ -2753,6 +2862,10 @@ impl SurfnetSvm {
                 override_instance.id, account_pubkey, override_instance.label
             );
 
+            // Defaults to Retired: nothing was asked for, the account was already forked by an
+            // earlier override this slot, or there is no remote to ask.
+            let mut fetch_outcome = FetchOutcome::Retired;
+
             // Fetch fresh account data from remote if requested
             if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
                 if let Some((client, _)) = remote_ctx {
@@ -2761,39 +2874,68 @@ impl SurfnetSvm {
                         account_pubkey
                     );
 
-                    match client
+                    let fetched = match client
                         .get_account(&account_pubkey, CommitmentConfig::confirmed())
                         .await
                     {
                         Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
-                            debug!(
-                                "Fetched account {} from remote: {} lamports, {} bytes",
-                                account_pubkey,
-                                remote_account.lamports(),
-                                remote_account.data().len()
-                            );
-
-                            // Set the fresh account data in the SVM
-                            if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
-                                warn!(
-                                    "Failed to set account {} from remote: {}",
-                                    account_pubkey, e
-                                );
-                            } else {
-                                settled_this_slot.insert(account_pubkey);
-                            }
+                            Some((remote_account, None))
                         }
+                        Ok(GetAccountResult::FoundCoupledAccount(
+                            (_pubkey, remote_account),
+                            coupled,
+                            _,
+                        )) => Some((
+                            remote_account,
+                            match coupled {
+                                CoupledAccount::ProgramData(pubkey, account)
+                                | CoupledAccount::Mint(pubkey, account) => {
+                                    account.map(|account| (pubkey, account))
+                                }
+                            },
+                        )),
                         Ok(GetAccountResult::None(_)) => {
                             debug!("Account {} not found on remote", account_pubkey);
-                        }
-                        Ok(_) => {
-                            debug!("Account {} fetched (other variant)", account_pubkey);
+                            fetch_outcome = FetchOutcome::NotOnRemote;
+                            None
                         }
                         Err(e) => {
                             warn!(
                                 "Failed to fetch account {} from remote: {}",
                                 account_pubkey, e
                             );
+                            fetch_outcome = FetchOutcome::Unanswered;
+                            None
+                        }
+                    };
+
+                    if let Some((remote_account, coupled)) = fetched {
+                        debug!(
+                            "Fetched account {} from remote: {} lamports, {} bytes",
+                            account_pubkey,
+                            remote_account.lamports(),
+                            remote_account.data().len()
+                        );
+
+                        if let Some((coupled_pubkey, coupled_account)) = coupled {
+                            if let Err(e) = self.inner.set_account(coupled_pubkey, coupled_account)
+                            {
+                                warn!(
+                                    "Failed to set coupled account {} from remote: {}",
+                                    coupled_pubkey, e
+                                );
+                            }
+                        }
+
+                        // Set the fresh account data in the SVM
+                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
+                            warn!(
+                                "Failed to set account {} from remote: {}",
+                                account_pubkey, e
+                            );
+                            fetch_outcome = FetchOutcome::Unanswered;
+                        } else {
+                            settled_this_slot.insert(account_pubkey);
                         }
                     }
                 } else {
@@ -2801,12 +2943,34 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
+                    fetch_outcome = FetchOutcome::NoRemote;
                 }
             }
 
-            // Queued before the write so a failed apply is retried next slot, still fetching.
+            let existing_account = match self.inner.get_account(&account_pubkey) {
+                Ok(account) => account,
+                Err(e) => {
+                    restore_unprocessed(self, index);
+                    return Err(e);
+                }
+            };
+
+            // The request is only retired when another attempt could no longer change anything.
+            let fetch_retired = match fetch_outcome {
+                FetchOutcome::Retired => true,
+                FetchOutcome::Unanswered => false,
+                FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
+            };
+
             if override_instance.persist {
-                self.reschedule_override_for_next_slot(&override_instance, target_slot);
+                let mut requeued = override_instance.clone();
+                if requeued.fetch_before_use && fetch_retired {
+                    requeued.fetch_before_use = false;
+                }
+                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                    restore_unprocessed(self, index);
+                    return Err(e);
+                }
             }
 
             // Apply the override values to the account data
@@ -2837,7 +3001,7 @@ impl SurfnetSvm {
                 );
 
                 // Get the account from the SVM
-                let Some(account) = self.inner.get_account(&account_pubkey)? else {
+                let Some(account) = existing_account else {
                     warn!(
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
@@ -2879,11 +3043,6 @@ impl SurfnetSvm {
                                     account_pubkey
                                 );
                                 settled_this_slot.insert(account_pubkey);
-                                if override_instance.persist && override_instance.fetch_before_use {
-                                    let mut requeued = override_instance.clone();
-                                    requeued.fetch_before_use = false;
-                                    self.reschedule_override_for_next_slot(&requeued, target_slot);
-                                }
                             }
                         }
                         Err(e) => warn!(
@@ -2983,14 +3142,6 @@ impl SurfnetSvm {
                         override_instance.id
                     );
                     settled_this_slot.insert(account_pubkey);
-                    // The account is forked now. Re-fetching it every slot would cost one RPC
-                    // per slot and overwrite whatever local transactions wrote to the fields
-                    // this override leaves alone, so later slots re-pin without fetching.
-                    if override_instance.persist && override_instance.fetch_before_use {
-                        let mut requeued = override_instance.clone();
-                        requeued.fetch_before_use = false;
-                        self.reschedule_override_for_next_slot(&requeued, target_slot);
-                    }
                 }
             }
         }
@@ -3004,13 +3155,16 @@ impl SurfnetSvm {
         &mut self,
         instance: &OverrideInstance,
         target_slot: Slot,
-    ) {
-        let next_slot = target_slot + 1;
+    ) -> SurfpoolResult<()> {
+        let next_slot = target_slot.checked_add(1).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Override {} cannot persist past slot {}: there is no next slot",
+                instance.id, target_slot
+            ))
+        })?;
         let mut next = self
             .scheduled_overrides
-            .get(&next_slot)
-            .ok()
-            .flatten()
+            .get(&next_slot)?
             .unwrap_or_default();
 
         if let Some(existing) = next.iter_mut().find(|queued| {
@@ -3022,12 +3176,8 @@ impl SurfnetSvm {
         } else {
             next.push(instance.clone());
         }
-        if let Err(e) = self.scheduled_overrides.store(next_slot, next) {
-            warn!(
-                "Failed to reschedule override {} for slot {}: {}",
-                instance.id, next_slot, e
-            );
-        }
+        self.scheduled_overrides.store(next_slot, next)?;
+        Ok(())
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -3179,6 +3329,46 @@ impl SurfnetSvm {
             .or_default()
             .push((subscription_type, tx));
         rx
+    }
+
+    /// Atomically returns a local signature status that already satisfies a subscription, or
+    /// registers the subscription before releasing the SVM write lock.
+    ///
+    /// This closes the check-then-subscribe race for WebSocket clients: a transaction cannot be
+    /// committed between the local status check and receiver registration. The compact status is
+    /// derived directly from the stored transaction metadata, avoiding transaction encoding.
+    pub fn get_local_signature_status_or_subscribe(
+        &mut self,
+        signature: &Signature,
+        subscription_type: SignatureSubscriptionType,
+    ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
+        let current_slot = self.get_latest_absolute_slot();
+        if let Some(SurfnetTransactionStatus::Processed(transaction)) =
+            self.transactions.get(&signature.to_string())?
+        {
+            let (transaction, _) = transaction.as_ref();
+            let confirmation_status =
+                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
+                    RpcTransactionConfirmationStatus::Finalized
+                } else if current_slot > transaction.slot {
+                    RpcTransactionConfirmationStatus::Confirmed
+                } else {
+                    RpcTransactionConfirmationStatus::Processed
+                };
+
+            if subscription_type.is_satisfied_by(confirmation_status) {
+                return Ok(LocalSignatureStatusOrSubscription::Status(
+                    LocalSignatureStatus {
+                        slot: transaction.slot,
+                        err: transaction.meta.status.clone().err(),
+                    },
+                ));
+            }
+        }
+
+        Ok(LocalSignatureStatusOrSubscription::Subscription(
+            self.subscribe_for_signature_updates(signature, subscription_type),
+        ))
     }
 
     pub fn subscribe_for_account_updates(
@@ -4278,7 +4468,13 @@ impl SurfnetSvm {
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
-            let absolute_slot = base_slot + scenario_relative_slot;
+            // Both operands are caller-supplied, so the sum has to be checked.
+            let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
+                    override_instance.id, base_slot, scenario_relative_slot
+                ))
+            })?;
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4287,9 +4483,7 @@ impl SurfnetSvm {
 
             let mut slot_overrides = self
                 .scheduled_overrides
-                .get(&absolute_slot)
-                .ok()
-                .flatten()
+                .get(&absolute_slot)?
                 .unwrap_or_default();
             slot_overrides.push(override_instance);
             self.scheduled_overrides
@@ -4716,6 +4910,63 @@ mod tests {
         )
     }
 
+    #[test]
+    fn hydrate_if_absent_skips_coupled_dependencies_when_primary_is_live() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let local_primary = Account {
+            lamports: 1,
+            data: vec![1],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let fetched_primary = Account {
+            lamports: 2,
+            data: vec![2],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let token_primary = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        svm.set_account(&token_primary, local_primary.clone())
+            .unwrap();
+        svm.apply_account_update(
+            GetAccountResult::FoundCoupledAccount(
+                (token_primary, fetched_primary.clone()),
+                CoupledAccount::Mint(token_mint, Some(fetched_primary.clone())),
+                AccountSource::Remote,
+            ),
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.get_account(&token_primary).unwrap(),
+            Some(local_primary.clone())
+        );
+        assert!(svm.inner.get_account_no_db(&token_mint).is_none());
+
+        let program_primary = Pubkey::new_unique();
+        let programdata = Pubkey::new_unique();
+        svm.set_account(&program_primary, local_primary.clone())
+            .unwrap();
+        svm.apply_account_update(
+            GetAccountResult::FoundCoupledAccount(
+                (program_primary, fetched_primary.clone()),
+                CoupledAccount::ProgramData(programdata, Some(fetched_primary)),
+                AccountSource::Remote,
+            ),
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.get_account(&program_primary).unwrap(),
+            Some(local_primary)
+        );
+        assert!(svm.inner.get_account_no_db(&programdata).is_none());
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
@@ -4732,27 +4983,32 @@ mod tests {
             rent_epoch: 0,
         };
 
-        // GetAccountResult::None should be a noop when writing account updates
+        // GetAccountResult::None should be a noop when materializing account updates.
         {
             let index_before = svm.get_all_accounts().unwrap();
             let empty_update = GetAccountResult::None(pubkey);
-            svm.write_account_update(empty_update);
+            svm.apply_account_update(empty_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
-        // GetAccountResult::FoundAccount with `DoUpdateSvm` flag to false should be a noop
+        // An account already present in LiteSVM is not materialized again.
         {
             let index_before = svm.get_all_accounts().unwrap();
-            let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), false);
-            svm.write_account_update(found_update);
+            let found_update =
+                GetAccountResult::FoundAccount(pubkey, account.clone(), AccountSource::Svm);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
-        // GetAccountResult::FoundAccount with `DoUpdateSvm` flag to true should update the account
+        // A generated account is explicitly materialized by the caller.
         {
             let index_before = svm.get_all_accounts().unwrap();
-            let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), true);
-            svm.write_account_update(found_update);
+            let found_update =
+                GetAccountResult::FoundAccount(pubkey, account.clone(), AccountSource::Generated);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1
@@ -4764,7 +5020,59 @@ mod tests {
             }
         }
 
-        // GetAccountResult::FoundProgramAccount with no program account inserts a default programdata account
+        // Hydration preserves live LiteSVM state, while an authoritative
+        // update explicitly replaces it.
+        {
+            let policy_pubkey = Pubkey::new_unique();
+            let local_account = Account {
+                lamports: 1,
+                data: vec![1],
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            let fetched_account = Account {
+                lamports: 2,
+                data: vec![2],
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&policy_pubkey, local_account.clone())
+                .unwrap();
+
+            svm.apply_account_update(
+                GetAccountResult::FoundAccount(
+                    policy_pubkey,
+                    fetched_account.clone(),
+                    AccountSource::Remote,
+                ),
+                AccountUpdatePolicy::HydrateIfAbsent,
+            )
+            .unwrap();
+            assert_eq!(
+                svm.get_account(&policy_pubkey).unwrap(),
+                Some(local_account)
+            );
+
+            svm.apply_account_update(
+                GetAccountResult::FoundAccount(
+                    policy_pubkey,
+                    fetched_account.clone(),
+                    AccountSource::Remote,
+                ),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
+            assert_eq!(
+                svm.get_account(&policy_pubkey).unwrap(),
+                Some(fetched_account)
+            );
+
+            while events_rx.try_recv().is_ok() {}
+        }
+
+        // A coupled program result with no program-data account inserts a default programdata account.
         {
             let (program_address, program_account, program_data_address, _) =
                 create_program_accounts();
@@ -4789,11 +5097,16 @@ mod tests {
             };
 
             let index_before = svm.get_all_accounts().unwrap();
-            let found_program_account_update = GetAccountResult::FoundProgramAccount(
+            let found_program_account_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, None),
+                CoupledAccount::ProgramData(program_data_address, None),
+                AccountSource::Remote,
             );
-            svm.write_account_update(found_program_account_update);
+            svm.apply_account_update(
+                found_program_account_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
 
             if !expect_account_update_event(
                 &events_rx,
@@ -4808,7 +5121,7 @@ mod tests {
 
             if !expect_account_update_event(&events_rx, &svm, &program_address, &program_account) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program pubkey"
+                    "Expected account update event not received after coupled program update for program pubkey"
                 );
             }
             assert_eq!(
@@ -4817,17 +5130,25 @@ mod tests {
             );
         }
 
-        // GetAccountResult::FoundProgramAccount with program account + program data account inserts two accounts
+        // A coupled program result with program data inserts both accounts.
         {
             let (program_address, program_account, program_data_address, program_data_account) =
                 create_program_accounts();
 
             let index_before = svm.get_all_accounts().unwrap();
-            let found_program_account_update = GetAccountResult::FoundProgramAccount(
+            let found_program_account_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, Some(program_data_account.clone())),
+                CoupledAccount::ProgramData(
+                    program_data_address,
+                    Some(program_data_account.clone()),
+                ),
+                AccountSource::Remote,
             );
-            svm.write_account_update(found_program_account_update);
+            svm.apply_account_update(
+                found_program_account_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 2
@@ -4839,18 +5160,18 @@ mod tests {
                 &program_data_account,
             ) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program data pubkey"
+                    "Expected account update event not received after coupled program update for program data pubkey"
                 );
             }
 
             if !expect_account_update_event(&events_rx, &svm, &program_address, &program_account) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program pubkey"
+                    "Expected account update event not received after coupled program update for program pubkey"
                 );
             }
         }
 
-        // If we insert the program data account ahead of time, then have a GetAccountResult::FoundProgramAccount with just the program data account,
+        // If we insert the program data account ahead of time, then apply a coupled program result,
         // we should get one insert
         {
             let (program_address, program_account, program_data_address, program_data_account) =
@@ -4860,9 +5181,10 @@ mod tests {
             let found_update = GetAccountResult::FoundAccount(
                 program_data_address,
                 program_data_account.clone(),
-                true,
+                AccountSource::Remote,
             );
-            svm.write_account_update(found_update);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1
@@ -4879,11 +5201,16 @@ mod tests {
             }
 
             let index_before = svm.get_all_accounts().unwrap();
-            let program_account_found_update = GetAccountResult::FoundProgramAccount(
+            let program_account_found_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, None),
+                CoupledAccount::ProgramData(program_data_address, None),
+                AccountSource::Remote,
             );
-            svm.write_account_update(program_account_found_update);
+            svm.apply_account_update(
+                program_account_found_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1
@@ -7194,6 +7521,345 @@ mod tests {
         );
     }
 
+    /// An override that writes no account fields still forks the account, so it must stop fetching too.
+    #[tokio::test]
+    async fn test_persisted_override_that_writes_no_fields_stops_refetching() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // Values consumed entirely by PDA derivation, so `account_values` filters down to empty.
+        let seed_only = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pda {
+                program_id: "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".to_string(),
+                seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+            },
+        )
+        .with_values(HashMap::from([(
+            "market".to_string(),
+            serde_json::json!(account_pubkey.to_string()),
+        )]));
+
+        // Point the derived address at a real forked account so presence is what is being tested.
+        let derived = seed_only
+            .account
+            .resolve(Some(&seed_only.values))
+            .expect("derive pda");
+        let forked = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("fixture account present");
+        svm.inner
+            .set_account(derived, forked)
+            .expect("set derived account");
+
+        let mut no_values = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-noop".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        no_values.persist = true;
+        no_values.fetch_before_use = true;
+
+        let mut seed_only = seed_only;
+        seed_only.persist = true;
+        seed_only.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![seed_only, no_values])
+            .expect("schedule overrides");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 2, "both overrides re-armed, one entry each");
+        for queued in &next {
+            assert!(queued.persist, "persist must survive rescheduling");
+            assert!(
+                !queued.fetch_before_use,
+                "override {} forked its account, so later slots must not re-fetch it",
+                queued.id
+            );
+        }
+    }
+
+    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
+    /// the remote-fetch branches can be exercised without a network.
+    async fn canned_rpc(result_json: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind canned rpc");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// The remote having no such account is only an answer about this slot - accounts get created
+    /// later. While there is nothing local to work on, a persisted override must keep asking, or
+    /// it stays inert for the rest of the run.
+    #[tokio::test]
+    async fn test_persisted_override_retries_while_the_account_is_not_on_remote() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // An address the SVM has never seen, so there is no local account to fall back on.
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the account may appear later, so the next slot must keep asking for it"
+        );
+    }
+
+    /// The mirror case: the remote has nothing but a local account already exists, so the override
+    /// can work. Asking again would only risk overwriting that local account once the address is
+    /// populated upstream.
+    #[tokio::test]
+    async fn test_persisted_override_stops_asking_when_only_a_local_account_exists() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            !next[0].fetch_before_use,
+            "the local account is usable, so later fetches must not overwrite it"
+        );
+    }
+
+    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
+    /// a catch-all that logged and dropped the account, so the fetch reported success while the
+    /// target was never forked - every later write then failed with "not found in SVM".
+    #[tokio::test]
+    async fn test_fetch_before_use_materializes_a_coupled_account() {
+        const SLOT: u64 = 500;
+        // A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
+        // coupled-mint path. The canned server answers the mint lookup with the same body.
+        const TOKEN_ACCOUNT: &str = concat!(
+            r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"","base64"],"executable":false,"lamports":2039280,"#,
+            r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
+        );
+
+        let url = canned_rpc(TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let target = Pubkey::new_unique();
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        );
+        instance.fetch_before_use = true;
+
+        assert!(
+            svm.inner
+                .get_account(&target)
+                .expect("get_account")
+                .is_none(),
+            "the target must start absent so the fetch is what materializes it"
+        );
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let forked = svm
+            .inner
+            .get_account(&target)
+            .expect("get_account")
+            .expect("the coupled account must be written into the SVM");
+        assert_eq!(forked.data.len(), 165, "the token account data was forked");
+        assert_eq!(forked.lamports, 2_039_280, "lamports came from the remote");
+    }
+
+    /// With no remote client there is nothing to fetch from, but the request is still unmet while
+    /// the account is absent. `materialize_overrides_for_slot` is public, so a caller can pass a
+    /// client on a later slot - retiring the flag here would permanently disable that.
+    #[tokio::test]
+    async fn test_persisted_override_keeps_asking_when_absent_and_no_remote() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the request is still unmet, so it must not be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slot_overflow_is_an_error_not_a_wrap() {
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+
+        assert!(
+            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+                .is_err(),
+            "there is no slot after u64::MAX"
+        );
+
+        let mut far = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            10,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        far.scenario_relative_slot = 10;
+        let scenario = surfpool_types::Scenario {
+            id: "overflow".to_string(),
+            name: "overflow".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![far],
+        };
+
+        assert!(
+            svm.register_scenario(scenario, Some(u64::MAX - 1)).is_err(),
+            "base slot plus relative slot overflows and must be rejected"
+        );
+    }
+
+    /// A transient RPC failure must not be mistaken for a satisfied fetch. The account already
+    /// being present locally is not enough - the override asked for fresh data and did not get it,
+    /// so with `persist` the flag has to survive or it pins stale data for the rest of the run.
+    #[tokio::test]
+    async fn test_persisted_override_retries_after_a_failed_fetch() {
+        const SLOT: u64 = 500;
+
+        // Unroutable port: the fetch fails without touching the network.
+        let unreachable = (
+            SurfnetRemoteClient::new("http://127.0.0.1:1"),
+            CommitmentConfig::confirmed(),
+        );
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(unreachable), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            next[0].fetch_before_use,
+            "the fetch failed, so the next slot must retry it instead of pinning stale data"
+        );
+    }
+
     /// Guards the ordering invariant only. The re-fetch that used to clobber the first override
     /// needs a remote client, so `remote_ctx: &None` cannot reproduce it here - that path is
     /// covered against a live fork.
@@ -7263,8 +7929,12 @@ mod tests {
         let mut second = first.clone();
         second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
 
-        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
-        surfnet_svm.reschedule_override_for_next_slot(&second, SLOT);
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
+        surfnet_svm
+            .reschedule_override_for_next_slot(&second, SLOT)
+            .expect("reschedule");
 
         let queued = surfnet_svm
             .scheduled_overrides
@@ -7278,7 +7948,9 @@ mod tests {
              one of them, so a scenario silently stops being applied"
         );
 
-        surfnet_svm.reschedule_override_for_next_slot(&first, SLOT);
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
         let queued = surfnet_svm
             .scheduled_overrides
             .get(&(SLOT + 1))
