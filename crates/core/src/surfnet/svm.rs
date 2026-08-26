@@ -3101,7 +3101,12 @@ impl SurfnetSvm {
         instance: &OverrideInstance,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
-        let next_slot = target_slot + 1;
+        let next_slot = target_slot.checked_add(1).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Override {} cannot persist past slot {}: there is no next slot",
+                instance.id, target_slot
+            ))
+        })?;
         let mut next = self
             .scheduled_overrides
             .get(&next_slot)?
@@ -4408,7 +4413,13 @@ impl SurfnetSvm {
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
-            let absolute_slot = base_slot + scenario_relative_slot;
+            // Both operands are caller-supplied, so the sum has to be checked.
+            let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
+                    override_instance.id, base_slot, scenario_relative_slot
+                ))
+            })?;
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4417,9 +4428,7 @@ impl SurfnetSvm {
 
             let mut slot_overrides = self
                 .scheduled_overrides
-                .get(&absolute_slot)
-                .ok()
-                .flatten()
+                .get(&absolute_slot)?
                 .unwrap_or_default();
             slot_overrides.push(override_instance);
             self.scheduled_overrides
@@ -7719,6 +7728,36 @@ mod tests {
         assert!(
             next[0].fetch_before_use,
             "the request is still unmet, so it must not be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slot_overflow_is_an_error_not_a_wrap() {
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+
+        assert!(
+            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+                .is_err(),
+            "there is no slot after u64::MAX"
+        );
+
+        let mut far = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            10,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        far.scenario_relative_slot = 10;
+        let scenario = surfpool_types::Scenario {
+            id: "overflow".to_string(),
+            name: "overflow".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![far],
+        };
+
+        assert!(
+            svm.register_scenario(scenario, Some(u64::MAX - 1)).is_err(),
+            "base slot plus relative slot overflows and must be rejected"
         );
     }
 
