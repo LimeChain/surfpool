@@ -4516,7 +4516,11 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Validate and resolve every override before touching storage, so a scenario that is
+        // rejected leaves nothing behind: the RPC returns an error and the caller can assume none
+        // of it was scheduled.
+        let mut planned: Vec<(Slot, surfpool_types::OverrideInstance)> =
+            Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             if matches!(
                 override_instance.persist,
@@ -4539,7 +4543,19 @@ impl SurfnetSvm {
                 ))
             })?;
 
-            self.remove_queued_copies_elsewhere(&override_instance, absolute_slot)?;
+            planned.push((absolute_slot, override_instance));
+        }
+
+        // Slots this scenario is about to write. The sweep below must leave them alone: a scenario
+        // may deliberately schedule one override at several slots to walk a value over a timeline,
+        // and those entries are not the re-armed copies the sweep is there to clear.
+        let scenario_slots: Vec<Slot> = planned.iter().map(|(slot, _)| *slot).collect();
+
+        // Schedule overrides by adding base slot to their scenario-relative slots
+        for (absolute_slot, override_instance) in planned {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
+
+            self.remove_queued_copies_elsewhere(&override_instance, &scenario_slots)?;
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4571,22 +4587,24 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Drops copies of `instance` queued for any slot other than `keep_slot`.
+    /// Drops copies of `instance` queued for any slot the registering scenario does not itself
+    /// write.
     ///
     /// Matching is the same (id, account, template_id) triple the scheduler dedupes on, so this
     /// only removes the override's own copies - in practice the one it armed for the next slot.
     /// Sweeping every other bucket rather than only later ones matters because the armed copy sits
-    /// *before* a cancellation scheduled at a positive relative slot.
+    /// *before* a cancellation scheduled at a positive relative slot. `keep_slots` holds every slot
+    /// the scenario schedules, so a deliberate timeline that reuses one id across slots survives.
     fn remove_queued_copies_elsewhere(
         &mut self,
         instance: &OverrideInstance,
-        keep_slot: Slot,
+        keep_slots: &[Slot],
     ) -> SurfpoolResult<()> {
         let others: Vec<Slot> = self
             .scheduled_overrides
             .keys()?
             .into_iter()
-            .filter(|slot| *slot != keep_slot)
+            .filter(|slot| !keep_slots.contains(slot))
             .collect();
 
         for slot in others {
@@ -8473,6 +8491,85 @@ mod tests {
             armed[0].persist,
             surfpool_types::Persist::Slots { slots: 1 },
             "the copy scheduled latest must win, so its window is the one that advances"
+        );
+    }
+
+    /// A scenario may walk one override across a timeline, reusing the same id at several slots.
+    /// The sweep that clears re-armed copies must not eat those deliberate entries.
+    #[tokio::test]
+    async fn test_a_timeline_sharing_one_id_survives_registration() {
+        const SLOT: u64 = 500;
+        const LATER: u64 = 3;
+
+        let (mut svm, _pk, first) = scheduled_persist_fixture(false);
+        let mut second = first.clone();
+        second.scenario_relative_slot = LATER;
+
+        svm.register_scenario(
+            surfpool_types::Scenario {
+                id: "s-1".to_string(),
+                name: "s".to_string(),
+                description: String::new(),
+                tags: vec![],
+                overrides: vec![first, second],
+            },
+            Some(SLOT),
+        )
+        .expect("register the timeline");
+
+        for slot in [SLOT, SLOT + LATER] {
+            assert_eq!(
+                svm.scheduled_overrides
+                    .get(&slot)
+                    .expect("read")
+                    .unwrap_or_default()
+                    .len(),
+                1,
+                "the step at slot {slot} must still be scheduled"
+            );
+        }
+    }
+
+    /// A rejected scenario must schedule nothing. Validating while writing left the overrides ahead
+    /// of the bad one queued, so the caller saw an error and got half a scenario.
+    #[tokio::test]
+    async fn test_a_rejected_scenario_schedules_nothing() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _pk, good) = scheduled_persist_fixture(false);
+        let mut bad = good.clone();
+        bad.id = "the-invalid-one".to_string();
+        bad.scenario_relative_slot = 1;
+        bad.persist = surfpool_types::Persist::Slots { slots: 0 };
+
+        svm.register_scenario(
+            surfpool_types::Scenario {
+                id: "s-1".to_string(),
+                name: "s".to_string(),
+                description: String::new(),
+                tags: vec![],
+                overrides: vec![good, bad],
+            },
+            Some(SLOT),
+        )
+        .expect_err("slots: 0 must reject the whole scenario");
+
+        let scheduled: Vec<u64> = svm
+            .scheduled_overrides
+            .keys()
+            .expect("keys")
+            .into_iter()
+            .filter(|slot| {
+                !svm.scheduled_overrides
+                    .get(slot)
+                    .expect("read")
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .collect();
+        assert!(
+            scheduled.is_empty(),
+            "the valid override must not have been scheduled either; found {scheduled:?}"
         );
     }
 

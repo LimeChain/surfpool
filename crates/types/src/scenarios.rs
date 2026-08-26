@@ -576,7 +576,7 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(
         feature = "ts-bindings",
-        ts(type = "boolean | { slots: number }", optional)
+        ts(type = "boolean | { slots: number | bigint }", optional)
     )]
     pub persist: Persist,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
