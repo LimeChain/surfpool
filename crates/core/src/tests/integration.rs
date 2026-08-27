@@ -86,6 +86,7 @@ use surfpool_types::{
 use test_case::test_case;
 use tokio::{sync::RwLock, task};
 use uuid::Uuid;
+
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 use crate::{
@@ -127,7 +128,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(15);
 /// never starts and a runloop that never stops present the same way: a test
 /// that does not finish.
 #[derive(Debug)]
-enum RunloopError {
+pub(crate) enum RunloopError {
     /// The OS refused a thread. This is the shape thread exhaustion arrives
     /// in, so it is the first thing to fail if the guards below stop working.
     Spawn(std::io::Error),
@@ -170,7 +171,7 @@ impl std::fmt::Display for RunloopError {
 impl std::error::Error for RunloopError {}
 
 /// A running surfnet and the thread it runs on. Dropping it stops the runloop.
-struct RunloopGuard {
+pub(crate) struct RunloopGuard {
     commands: Sender<SimnetCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -238,7 +239,7 @@ impl Drop for RunloopGuard {
 /// Bind the guard for as long as the test needs the surfnet, conventionally
 /// `let _runloop = spawn_runloop(...)`. A plain `let _ =` drops it there and
 /// then, which stops the runloop before the test has used it.
-fn spawn_runloop(
+pub(crate) fn spawn_runloop(
     svm_locker: SurfnetSvmLocker,
     config: SurfpoolConfig,
     commands: (
@@ -273,7 +274,7 @@ fn spawn_runloop(
 
 /// Waits for the surfnet to say it is ready and that it reached its
 /// datasource.
-fn wait_for_ready_and_connected(
+pub(crate) fn wait_for_ready_and_connected(
     simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>,
 ) -> Result<(), RunloopError> {
     wait_for_startup(simnet_events_rx, Connection::Required)
