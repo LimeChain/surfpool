@@ -197,30 +197,13 @@ output than before.
   network connection (`SURFPOOL_TEST_RPC_URL` overrides the public mainnet endpoint).
   It round-trips live mainnet curve, pool, and config accounts through the bundled
   IDLs to catch layout drift after a program upgrade, proves overrides touch only
-  their target bytes on real account data, exercises the graduation builder's
-  validation against live state, and runs the full lifecycle: the frozen Token-2022
-  fixture is prepared through the production graduation scenario builder and
-  materializer, then real `buy_v2`, `migrate_v2`, and PumpSwap `sell` instructions
-  execute against live mainnet programs, including a baseline vs. price-shocked sell
-  simulation whose quote-token output must differ.
-
-### The test snapshot and how to retake it
-
-`crates/core/src/tests/assets/pump_token2022_graduation.snapshot.json` freezes the
-HRTz coin (`HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump`, Token-2022, incomplete
-SOL-quoted curve) plus everything a buy/migrate/sell reads: pump `Global`, both
-programs' fee-program `FeeConfig`s, the PumpSwap `GlobalConfig` (mayhem mode left on,
-exactly as on mainnet), the fee recipients and their WSOL ATAs, and the other accounts
-those instructions read along the way. Entries owned by the system program with 0
-lamports (the canonical pool and its accounts) deliberately pin those addresses
-**absent** — the surfnet then neither finds them locally nor fetches them remotely, so
-`migrate_v2` gets to create them. The two programs are *not* frozen on purpose: they load
-live from the mainnet fork, so an on-chain upgrade against the frozen config fails the
-test instead of passing silently.
-
-The file is the same account-map shape `surfpool start --snapshot` accepts. To retake
-it, fetch every pubkey already present in the file in one `getMultipleAccounts` request
-with base64 encoding, record the response context slot, and replace the frozen entries
-wholesale while keeping the zero-lamport pinned-absent entries as they are. Pick a coin
-state matching the checks above (Token-2022 mint, incomplete SOL-quoted curve, no
-canonical pool) if HRTz has since graduated.
+  their target bytes on real account data, and exercises the graduation builder's
+  validation against live state. The lifecycle test discovers a fresh, still-trading
+  Token-2022 coin from the pump program's recent transactions (no fixed coin stays
+  incomplete; the fork freezes its state on first read), prepares it through the
+  production builder and materializer, then executes real `buy_v2` and `migrate_v2`
+  against the live programs. The price-shock test compares a baseline and a shocked
+  PumpSwap `sell` simulation on the established live canonical pool and requires the
+  quote-token output to change, then executes the sell for real. Trading against a
+  freshly migrated (cashback-era) pool uses a different fee wiring and is an open
+  follow-up.

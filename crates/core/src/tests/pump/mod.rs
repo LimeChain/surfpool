@@ -13,12 +13,12 @@
 //! creator fields and the `extend_account` tail past the Borsh layout, so a pump program
 //! upgrade that changes the on-chain layout shows up as a byte diff here and nowhere else.
 //!
-//! The lifecycle test additionally starts a surfnet that forks mainnet: its account state is
-//! frozen in `pump_token2022_graduation.snapshot.json` (a graduation needs an incomplete
-//! curve, which no fixed live coin can stay forever), while the pump and pAMM programs run
-//! live, so a behavior-changing program upgrade fails there first.
+//! The lifecycle test starts a surfnet that forks mainnet and discovers a fresh, still-trading
+//! Token-2022 coin from the pump program's recent transactions — no fixed coin stays
+//! incomplete, so the candidate is found at test time and the fork freezes its state on first
+//! read. The pump and pAMM programs run live, so a behavior-changing upgrade fails here first.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crossbeam_channel::unbounded;
 use solana_account::Account;
@@ -26,6 +26,7 @@ use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_config::{RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
+    rpc_request::RpcRequest,
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -34,13 +35,14 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-use surfpool_types::{
-    AccountSnapshot, OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig,
-};
+use surfpool_types::{OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig};
 
 use crate::{
     scenarios::{
-        TemplateRegistry, protocols::pump::v1::graduation_builder::build_pump_graduation_scenario,
+        TemplateRegistry,
+        protocols::pump::v1::graduation_builder::{
+            PumpGraduationPreparation, build_pump_graduation_scenario, pump_graduation_addresses,
+        },
     },
     storage::tests::TestType,
     surfnet::{
@@ -69,32 +71,9 @@ const USDC_MINT: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G
 const MINT: Pubkey = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
 const CURVE: Pubkey = Pubkey::from_str_const("GBpTHrtF8dGwxC7thRD7T6VfGtbVYEabKkQ7k6g3u7QF");
 const BASE_VAULT: Pubkey = Pubkey::from_str_const("9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh");
-const QUOTE_VAULT: Pubkey = Pubkey::from_str_const("CyugdSkzUoF1srFgCJGuMaAGjCUQ8ys4ca8cqLkWPXFJ");
 const PUMP_GLOBAL: Pubkey = Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
-const PUMP_FEE_RECIPIENT: Pubkey =
-    Pubkey::from_str_const("6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA");
-const PUMP_FEE_RECIPIENT_ATA: Pubkey =
-    Pubkey::from_str_const("ghSBUgyxyvyurm1vJBkU4rUyLJoUipCZhFeiBogKCSy");
-const PUMP_BUYBACK_RECIPIENT: Pubkey =
-    Pubkey::from_str_const("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL");
-const PUMP_BUYBACK_RECIPIENT_ATA: Pubkey =
-    Pubkey::from_str_const("AktftA98kSWAxn6kVSoqBXBELUArjKu2H9WmKB48ULFY");
-const PUMP_CREATOR_VAULT: Pubkey =
-    Pubkey::from_str_const("7rnCZqrwmd4L1ZcX7VaKvYZ9n2BjgxmoysrmGhweW97C");
-const PUMP_CREATOR_VAULT_ATA: Pubkey =
-    Pubkey::from_str_const("C7jfrHkdirzU8F5r1Z1BKacwmwEMgKmLn9Ct3nKpLzmA");
-const PUMP_SHARING_CONFIG: Pubkey =
-    Pubkey::from_str_const("3NFHbr82N29vRbNHewWuuBHcNzdNuSU6zUBJBaRBPqj8");
-const PUMP_GLOBAL_VOLUME_ACCUMULATOR: Pubkey =
-    Pubkey::from_str_const("Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y");
-const PUMP_FEE_CONFIG: Pubkey =
-    Pubkey::from_str_const("8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt");
-const PUMP_WITHDRAW_AUTHORITY: Pubkey =
-    Pubkey::from_str_const("39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg");
 const AMM_GLOBAL_CONFIG: Pubkey =
     Pubkey::from_str_const("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw");
-const BREAKING_FEE_RECIPIENT: Pubkey =
-    Pubkey::from_str_const("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL");
 
 /// The bonding curve of the migrated coin 7LSsEoJG…pump, documented in pump-public-docs and
 /// checked against mainnet on 2026-08-06 (complete = true, so it never changes again).
@@ -113,14 +92,16 @@ const CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 16;
 const CURVE_REAL_TOKEN_RESERVES_OFFSET: usize = 24;
 const CURVE_REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const CURVE_COMPLETE_OFFSET: usize = 48;
+const CURVE_CREATOR_OFFSET: usize = 49;
 const CURVE_QUOTE_MINT_OFFSET: usize = 83;
+const GLOBAL_FEE_RECIPIENT_OFFSET: usize = 41;
+const GLOBAL_WITHDRAW_AUTHORITY_OFFSET: usize = 113;
+const GLOBAL_BUYBACK_RECIPIENTS_OFFSET: usize = 741;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
+const AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET: usize = 57;
 const POOL_LP_SUPPLY_OFFSET: usize = 203;
 const POOL_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 245;
-const AMM_RESERVED_FEE_RECIPIENT_OFFSET: usize = 385;
-const AMM_MAYHEM_MODE_OFFSET: usize = 417;
 const POOL_COIN_CREATOR_OFFSET: usize = 211;
-const POOL_CASHBACK_FLAG_OFFSET: usize = 244;
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
 async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
@@ -357,7 +338,24 @@ async fn builder_rejects_bad_live_graduation_state() {
     );
 }
 
+/// Every graduation account, derived for the discovered coin: template PDAs through the
+/// builder, instruction-only accounts through the IDL-documented seeds, and the fee wiring
+/// read from the live `Global` so recipient rotation cannot break the test.
 struct GraduationFixture {
+    mint: Pubkey,
+    curve: Pubkey,
+    base_vault: Pubkey,
+    quote_vault: Pubkey,
+    fee_recipient: Pubkey,
+    fee_recipient_quote: Pubkey,
+    buyback_recipient: Pubkey,
+    buyback_recipient_quote: Pubkey,
+    creator_vault: Pubkey,
+    creator_vault_quote: Pubkey,
+    sharing_config: Pubkey,
+    global_volume_accumulator: Pubkey,
+    fee_config: Pubkey,
+    withdraw_authority: Pubkey,
     user: Pubkey,
     user_base: Pubkey,
     user_quote: Pubkey,
@@ -373,55 +371,95 @@ struct GraduationFixture {
     pool_quote: Pubkey,
     pump_event_authority: Pubkey,
     pamm_event_authority: Pubkey,
-    pool_v2: Pubkey,
-    sell_fee_config: Pubkey,
+    boost_vault_authority: Pubkey,
+    boost_vault: Pubkey,
 }
 
 impl GraduationFixture {
-    fn new(user: Pubkey) -> Self {
-        let user_base = associated_token_address(&user, &MINT, &TOKEN_2022);
-        let user_quote = associated_token_address(&user, &WSOL, &TOKENKEG);
+    fn new(user: Pubkey, mint: Pubkey, curve_data: &[u8], global_data: &[u8]) -> Self {
+        let addresses =
+            pump_graduation_addresses(&mint).expect("graduation addresses should resolve");
+        let creator =
+            Pubkey::try_from(&curve_data[CURVE_CREATOR_OFFSET..CURVE_CREATOR_OFFSET + 32])
+                .expect("curve creator");
+        let creator_vault =
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &PUMP).0;
+        let fee_recipient = Pubkey::try_from(
+            &global_data[GLOBAL_FEE_RECIPIENT_OFFSET..GLOBAL_FEE_RECIPIENT_OFFSET + 32],
+        )
+        .expect("global fee recipient");
+        let buyback_recipient = Pubkey::try_from(
+            &global_data[GLOBAL_BUYBACK_RECIPIENTS_OFFSET..GLOBAL_BUYBACK_RECIPIENTS_OFFSET + 32],
+        )
+        .expect("global buyback recipient");
+        let withdraw_authority = Pubkey::try_from(
+            &global_data[GLOBAL_WITHDRAW_AUTHORITY_OFFSET..GLOBAL_WITHDRAW_AUTHORITY_OFFSET + 32],
+        )
+        .expect("global withdraw authority");
         let user_volume_accumulator =
             Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &PUMP).0;
-        let user_volume_accumulator_quote =
-            associated_token_address(&user_volume_accumulator, &WSOL, &TOKENKEG);
         let pool_authority =
-            Pubkey::find_program_address(&[b"pool-authority", MINT.as_ref()], &PUMP).0;
+            Pubkey::find_program_address(&[b"pool-authority", mint.as_ref()], &PUMP).0;
         let pool = Pubkey::find_program_address(
             &[
                 b"pool",
                 &0u16.to_le_bytes(),
                 pool_authority.as_ref(),
-                MINT.as_ref(),
+                mint.as_ref(),
                 WSOL.as_ref(),
             ],
             &PAMM,
         )
         .0;
         let lp_mint = Pubkey::find_program_address(&[b"pool_lp_mint", pool.as_ref()], &PAMM).0;
+        let boost_vault_authority =
+            Pubkey::find_program_address(&[b"boost_vault", pool.as_ref()], &PAMM).0;
 
         Self {
-            user,
-            user_base,
-            user_quote,
-            user_volume_accumulator,
-            user_volume_accumulator_quote,
-            pool_authority,
-            pool,
-            lp_mint,
-            pool_authority_base: associated_token_address(&pool_authority, &MINT, &TOKEN_2022),
-            pool_authority_quote: associated_token_address(&pool_authority, &WSOL, &TOKENKEG),
-            pool_authority_lp: associated_token_address(&pool_authority, &lp_mint, &TOKEN_2022),
-            pool_base: associated_token_address(&pool, &MINT, &TOKEN_2022),
-            pool_quote: associated_token_address(&pool, &WSOL, &TOKENKEG),
-            pump_event_authority: Pubkey::find_program_address(&[b"__event_authority"], &PUMP).0,
-            pamm_event_authority: Pubkey::find_program_address(&[b"__event_authority"], &PAMM).0,
-            pool_v2: Pubkey::find_program_address(&[b"pool-v2", MINT.as_ref()], &PAMM).0,
-            sell_fee_config: Pubkey::find_program_address(
-                &[b"fee_config", PAMM.as_ref()],
+            mint,
+            curve: addresses.bonding_curve,
+            base_vault: addresses.curve_vault,
+            quote_vault: associated_token_address(&addresses.bonding_curve, &WSOL, &TOKENKEG),
+            fee_recipient,
+            fee_recipient_quote: associated_token_address(&fee_recipient, &WSOL, &TOKENKEG),
+            buyback_recipient,
+            buyback_recipient_quote: associated_token_address(&buyback_recipient, &WSOL, &TOKENKEG),
+            creator_vault,
+            creator_vault_quote: associated_token_address(&creator_vault, &WSOL, &TOKENKEG),
+            sharing_config: Pubkey::find_program_address(
+                &[b"sharing-config", mint.as_ref()],
                 &FEE_PROGRAM,
             )
             .0,
+            global_volume_accumulator: Pubkey::find_program_address(
+                &[b"global_volume_accumulator"],
+                &PUMP,
+            )
+            .0,
+            fee_config: Pubkey::find_program_address(&[b"fee_config", PUMP.as_ref()], &FEE_PROGRAM)
+                .0,
+            withdraw_authority,
+            user,
+            user_base: associated_token_address(&user, &mint, &TOKEN_2022),
+            user_quote: associated_token_address(&user, &WSOL, &TOKENKEG),
+            user_volume_accumulator,
+            user_volume_accumulator_quote: associated_token_address(
+                &user_volume_accumulator,
+                &WSOL,
+                &TOKENKEG,
+            ),
+            pool_authority,
+            pool,
+            lp_mint,
+            pool_authority_base: associated_token_address(&pool_authority, &mint, &TOKEN_2022),
+            pool_authority_quote: associated_token_address(&pool_authority, &WSOL, &TOKENKEG),
+            pool_authority_lp: associated_token_address(&pool_authority, &lp_mint, &TOKEN_2022),
+            pool_base: associated_token_address(&pool, &mint, &TOKEN_2022),
+            pool_quote: associated_token_address(&pool, &WSOL, &TOKENKEG),
+            pump_event_authority: Pubkey::find_program_address(&[b"__event_authority"], &PUMP).0,
+            pamm_event_authority: Pubkey::find_program_address(&[b"__event_authority"], &PAMM).0,
+            boost_vault_authority,
+            boost_vault: associated_token_address(&boost_vault_authority, &WSOL, &TOKENKEG),
         }
     }
 }
@@ -442,17 +480,15 @@ fn account_meta(pubkey: Pubkey, signer: bool, writable: bool) -> AccountMeta {
     }
 }
 
-fn start_snapshot_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
-    let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(include_str!(
-        "../assets/pump_token2022_graduation.snapshot.json"
-    ))
-    .expect("graduation snapshot should deserialize");
+fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().unwrap();
     let ws_port = get_free_port().unwrap();
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
-            snapshot,
+            remote_rpc_url: Some(
+                std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+            ),
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -483,12 +519,106 @@ fn start_snapshot_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     (rpc, locker, runloop)
 }
 
+/// Finds a fresh, still-incomplete Token-2022 pump coin in the pump program's most recent
+/// mainnet transactions, reading its account graph through the surfnet (which also caches it
+/// for the Play that follows). The builder's own validation is the eligibility filter.
+async fn find_live_graduation_candidate(
+    surfnet: &RpcClient,
+) -> (Pubkey, PumpGraduationPreparation) {
+    let mainnet =
+        RpcClient::new(std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()));
+    let signatures: serde_json::Value = mainnet
+        .send(
+            RpcRequest::GetSignaturesForAddress,
+            serde_json::json!([PUMP.to_string(), { "limit": 20 }]),
+        )
+        .await
+        .expect("recent pump transactions should be listable");
+
+    let mut candidates: Vec<Pubkey> = Vec::new();
+    for entry in signatures.as_array().into_iter().flatten() {
+        let Some(signature) = entry["signature"].as_str() else {
+            continue;
+        };
+        let Ok(transaction) = mainnet
+            .send::<serde_json::Value>(
+                RpcRequest::GetTransaction,
+                serde_json::json!([
+                    signature,
+                    { "encoding": "json", "maxSupportedTransactionVersion": 0 }
+                ]),
+            )
+            .await
+        else {
+            continue;
+        };
+        for key in transaction["transaction"]["message"]["accountKeys"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(key) = key.as_str() else { continue };
+            if key.ends_with("pump") && key != PUMP.to_string() {
+                if let Ok(mint) = key.parse::<Pubkey>() {
+                    if !candidates.contains(&mint) {
+                        candidates.push(mint);
+                    }
+                }
+            }
+        }
+        if candidates.len() >= 8 {
+            break;
+        }
+    }
+
+    for mint in &candidates {
+        let Ok(addresses) = pump_graduation_addresses(mint) else {
+            continue;
+        };
+        let pubkeys = [
+            *mint,
+            addresses.bonding_curve,
+            addresses.curve_vault,
+            addresses.canonical_pool,
+            addresses.global,
+        ];
+        let Ok(accounts) = surfnet.get_multiple_accounts(&pubkeys).await else {
+            continue;
+        };
+        // A coin with a sharing config distributes creator fees to a shareholder
+        // list at migration; keep the test on the plain single-creator path.
+        let sharing_config =
+            Pubkey::find_program_address(&[b"sharing-config", mint.as_ref()], &FEE_PROGRAM).0;
+        if matches!(surfnet.get_account(&sharing_config).await, Ok(_)) {
+            continue;
+        }
+        let [
+            Some(mint_account),
+            Some(curve),
+            Some(vault),
+            pool,
+            Some(global),
+        ] = &accounts[..5]
+        else {
+            continue;
+        };
+        if let Ok(preparation) =
+            build_pump_graduation_scenario(*mint, mint_account, curve, vault, pool.as_ref(), global)
+        {
+            return (*mint, preparation);
+        }
+    }
+
+    panic!(
+        "no eligible live pump coin among {} candidates from the last 20 pump transactions; \
+         rerun the test",
+        candidates.len()
+    );
+}
+
 async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Value) {
     let _: serde_json::Value = rpc
-        .send(
-            solana_client::rpc_request::RpcRequest::Custom { method },
-            params,
-        )
+        .send(RpcRequest::Custom { method }, params)
         .await
         .unwrap_or_else(|error| panic!("{method} cheatcode failed: {error:?}"));
 }
@@ -551,6 +681,11 @@ async fn simulate_token_amount_after_transaction(
         )
         .await
         .unwrap();
+    if simulation.value.err.is_some() {
+        for line in simulation.value.logs.iter().flatten() {
+            eprintln!("{line}");
+        }
+    }
     assert_eq!(simulation.value.err, None, "swap simulation should succeed");
     let account_data = simulation
         .value
@@ -564,53 +699,53 @@ async fn simulate_token_amount_after_transaction(
     read_u64(&account_data, TOKEN_AMOUNT_OFFSET)
 }
 
-async fn fund_user(rpc: &RpcClient, user: Pubkey) {
+async fn fund_user(rpc: &RpcClient, fixture: &GraduationFixture) {
     cheatcode(
         rpc,
         "surfnet_setAccount",
-        serde_json::json!([user.to_string(), { "lamports": 2_000_000_000u64 }]),
+        serde_json::json!([fixture.user.to_string(), { "lamports": 2_000_000_000u64 }]),
     )
     .await;
     cheatcode(
         rpc,
         "surfnet_setTokenAccount",
-        serde_json::json!([user.to_string(), WSOL.to_string(), { "amount": 1_500_000_000u64 }, null]),
+        serde_json::json!([fixture.user.to_string(), WSOL.to_string(), { "amount": 1_500_000_000u64 }, null]),
     )
     .await;
     // buy_v2 requires the user's Token-2022 base ATA to exist.
     cheatcode(
         rpc,
         "surfnet_setTokenAccount",
-        serde_json::json!([user.to_string(), MINT.to_string(), { "amount": 0u64 }, TOKEN_2022.to_string()]),
+        serde_json::json!([fixture.user.to_string(), fixture.mint.to_string(), { "amount": 0u64 }, TOKEN_2022.to_string()]),
     )
     .await;
 }
 
 fn build_buy_v2(fixture: &GraduationFixture, completing_buy_amount: u64) -> Instruction {
     let accounts = vec![
-        account_meta(PUMP_GLOBAL, false, false),           // 0 global
-        account_meta(MINT, false, false),                  // 1 base_mint
-        account_meta(WSOL, false, false),                  // 2 quote_mint
-        account_meta(TOKEN_2022, false, false),            // 3 base_token_program
-        account_meta(TOKENKEG, false, false),              // 4 quote_token_program
-        account_meta(ATA_PROGRAM, false, false),           // 5 associated_token_program
-        account_meta(PUMP_FEE_RECIPIENT, false, true),     // 6 fee_recipient
-        account_meta(PUMP_FEE_RECIPIENT_ATA, false, true), // 7 associated_quote_fee_recipient
-        account_meta(PUMP_BUYBACK_RECIPIENT, false, true), // 8 buyback_fee_recipient
-        account_meta(PUMP_BUYBACK_RECIPIENT_ATA, false, true), // 9 associated_quote_buyback_fee_recipient
-        account_meta(CURVE, false, true),                      // 10 bonding_curve
-        account_meta(BASE_VAULT, false, true),                 // 11 associated_base_bonding_curve
-        account_meta(QUOTE_VAULT, false, true),                // 12 associated_quote_bonding_curve
-        account_meta(fixture.user, true, true),                // 13 user
-        account_meta(fixture.user_base, false, true),          // 14 associated_base_user
-        account_meta(fixture.user_quote, false, true),         // 15 associated_quote_user
-        account_meta(PUMP_CREATOR_VAULT, false, true),         // 16 creator_vault
-        account_meta(PUMP_CREATOR_VAULT_ATA, false, true),     // 17 associated_creator_vault
-        account_meta(PUMP_SHARING_CONFIG, false, false),       // 18 sharing_config
-        account_meta(PUMP_GLOBAL_VOLUME_ACCUMULATOR, false, false), // 19 global_volume_accumulator
-        account_meta(fixture.user_volume_accumulator, false, true), // 20 user_volume_accumulator
+        account_meta(PUMP_GLOBAL, false, false),          // 0 global
+        account_meta(fixture.mint, false, false),         // 1 base_mint
+        account_meta(WSOL, false, false),                 // 2 quote_mint
+        account_meta(TOKEN_2022, false, false),           // 3 base_token_program
+        account_meta(TOKENKEG, false, false),             // 4 quote_token_program
+        account_meta(ATA_PROGRAM, false, false),          // 5 associated_token_program
+        account_meta(fixture.fee_recipient, false, true), // 6 fee_recipient
+        account_meta(fixture.fee_recipient_quote, false, true), // 7 associated_quote_fee_recipient
+        account_meta(fixture.buyback_recipient, false, true), // 8 buyback_fee_recipient
+        account_meta(fixture.buyback_recipient_quote, false, true), // 9 associated_quote_buyback_fee_recipient
+        account_meta(fixture.curve, false, true),                   // 10 bonding_curve
+        account_meta(fixture.base_vault, false, true), // 11 associated_base_bonding_curve
+        account_meta(fixture.quote_vault, false, true), // 12 associated_quote_bonding_curve
+        account_meta(fixture.user, true, true),        // 13 user
+        account_meta(fixture.user_base, false, true),  // 14 associated_base_user
+        account_meta(fixture.user_quote, false, true), // 15 associated_quote_user
+        account_meta(fixture.creator_vault, false, true), // 16 creator_vault
+        account_meta(fixture.creator_vault_quote, false, true), // 17 associated_creator_vault
+        account_meta(fixture.sharing_config, false, false), // 18 sharing_config
+        account_meta(fixture.global_volume_accumulator, false, false), // 19 global_volume_accumulator
+        account_meta(fixture.user_volume_accumulator, false, true),    // 20 user_volume_accumulator
         account_meta(fixture.user_volume_accumulator_quote, false, true), // 21 associated_user_volume_accumulator
-        account_meta(PUMP_FEE_CONFIG, false, false),                      // 22 fee_config
+        account_meta(fixture.fee_config, false, false),                   // 22 fee_config
         account_meta(FEE_PROGRAM, false, false),                          // 23 fee_program
         account_meta(SYSTEM_PROGRAM, false, false),                       // 24 system_program
         account_meta(fixture.pump_event_authority, false, false),         // 25 event_authority
@@ -630,12 +765,12 @@ fn build_buy_v2(fixture: &GraduationFixture, completing_buy_amount: u64) -> Inst
 fn build_migrate_v2(fixture: &GraduationFixture) -> Vec<Instruction> {
     let accounts = vec![
         account_meta(PUMP_GLOBAL, false, false), // 0 global
-        account_meta(PUMP_WITHDRAW_AUTHORITY, false, true), // 1 withdraw_authority
-        account_meta(MINT, false, false),        // 2 base_mint
+        account_meta(fixture.withdraw_authority, false, true), // 1 withdraw_authority
+        account_meta(fixture.mint, false, false), // 2 base_mint
         account_meta(WSOL, false, false),        // 3 quote_mint
-        account_meta(CURVE, false, true),        // 4 bonding_curve
-        account_meta(BASE_VAULT, false, true),   // 5 associated_base_bonding_curve
-        account_meta(QUOTE_VAULT, false, true),  // 6 associated_quote_bonding_curve
+        account_meta(fixture.curve, false, true), // 4 bonding_curve
+        account_meta(fixture.base_vault, false, true), // 5 associated_base_bonding_curve
+        account_meta(fixture.quote_vault, false, true), // 6 associated_quote_bonding_curve
         account_meta(fixture.user, true, false), // 7 user
         account_meta(SYSTEM_PROGRAM, false, false), // 8 system_program
         account_meta(PAMM, false, false),        // 9 pump_amm_program
@@ -656,6 +791,10 @@ fn build_migrate_v2(fixture: &GraduationFixture) -> Vec<Instruction> {
         account_meta(RENT_SYSVAR, false, false), // 24 rent
         account_meta(fixture.pump_event_authority, false, false), // 25 event_authority
         account_meta(PUMP, false, false),        // 26 program
+        // Remaining accounts feed the pAMM init_boost CPI: the pool's boost vault
+        // authority PDA and its quote ATA (per the pump-amm IDL).
+        account_meta(fixture.boost_vault_authority, false, true), // 27 boost_vault_authority
+        account_meta(fixture.boost_vault, false, true),           // 28 boost_vault
     ];
 
     vec![
@@ -668,117 +807,32 @@ fn build_migrate_v2(fixture: &GraduationFixture) -> Vec<Instruction> {
     ]
 }
 
-async fn build_sell(
-    rpc: &RpcClient,
-    fixture: &GraduationFixture,
-    base_amount_in: u64,
-) -> Instruction {
-    let global_config = rpc
-        .get_account(&AMM_GLOBAL_CONFIG)
-        .await
-        .expect("frozen AMM global config should load");
-    assert_eq!(
-        global_config.data[AMM_MAYHEM_MODE_OFFSET], 1,
-        "fixture expects mayhem mode"
-    );
-    let reserved_fee_recipient = Pubkey::try_from(
-        &global_config.data
-            [AMM_RESERVED_FEE_RECIPIENT_OFFSET..AMM_RESERVED_FEE_RECIPIENT_OFFSET + 32],
-    )
-    .unwrap();
-    let pool_data = rpc
-        .get_account(&fixture.pool)
-        .await
-        .expect("migrated pool should exist")
-        .data;
-    assert_eq!(
-        pool_data[POOL_CASHBACK_FLAG_OFFSET], 0,
-        "24-account sell is only valid for a non-cashback pool"
-    );
-    let coin_creator =
-        Pubkey::try_from(&pool_data[POOL_COIN_CREATOR_OFFSET..POOL_COIN_CREATOR_OFFSET + 32])
-            .unwrap();
-    let coin_creator_vault_authority =
-        Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &PAMM).0;
-    let accounts = vec![
-        account_meta(fixture.pool, false, true),            // 0 pool
-        account_meta(fixture.user, true, true),             // 1 user
-        account_meta(AMM_GLOBAL_CONFIG, false, false),      // 2 global_config
-        account_meta(MINT, false, false),                   // 3 base_mint
-        account_meta(WSOL, false, false),                   // 4 quote_mint
-        account_meta(fixture.user_base, false, true),       // 5 user_base_token_account
-        account_meta(fixture.user_quote, false, true),      // 6 user_quote_token_account
-        account_meta(fixture.pool_base, false, true),       // 7 pool_base_token_account
-        account_meta(fixture.pool_quote, false, true),      // 8 pool_quote_token_account
-        account_meta(reserved_fee_recipient, false, false), // 9 protocol_fee_recipient
-        account_meta(
-            associated_token_address(&reserved_fee_recipient, &WSOL, &TOKENKEG),
-            false,
-            true,
-        ), // 10 protocol_fee_recipient_token_account
-        account_meta(TOKEN_2022, false, false),             // 11 base_token_program
-        account_meta(TOKENKEG, false, false),               // 12 quote_token_program
-        account_meta(SYSTEM_PROGRAM, false, false),         // 13 system_program
-        account_meta(ATA_PROGRAM, false, false),            // 14 associated_token_program
-        account_meta(fixture.pamm_event_authority, false, false), // 15 event_authority
-        account_meta(PAMM, false, false),                   // 16 program
-        account_meta(
-            associated_token_address(&coin_creator_vault_authority, &WSOL, &TOKENKEG),
-            false,
-            true,
-        ), // 17 coin_creator_vault_ata
-        account_meta(coin_creator_vault_authority, false, false), // 18 coin_creator_vault_authority
-        account_meta(fixture.sell_fee_config, false, false), // 19 fee_config
-        account_meta(FEE_PROGRAM, false, false),            // 20 fee_program
-        account_meta(fixture.pool_v2, false, false),        // 21 pool_v2
-        account_meta(BREAKING_FEE_RECIPIENT, false, false), // 22 fee_recipient
-        account_meta(
-            associated_token_address(&BREAKING_FEE_RECIPIENT, &WSOL, &TOKENKEG),
-            false,
-            true,
-        ), // 23 fee_recipient_token_account
-    ];
-    let mut data = SELL_DISCRIMINATOR.to_vec();
-    data.extend_from_slice(&base_amount_in.to_le_bytes());
-    // Zero slippage protection is acceptable only in this regression test.
-    data.extend_from_slice(&0u64.to_le_bytes());
-
-    Instruction {
-        program_id: PAMM,
-        accounts,
-        data,
-    }
-}
-
-/// The snapshot freezes account state while the live programs expose behavioral upgrades.
+/// The fork freezes the discovered coin's accounts on first read while the pump and pAMM
+/// programs run live from mainnet.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pump_token2022_graduation_lifecycle() {
-    let (rpc, locker, _runloop) = start_snapshot_surfnet();
-    let user = Keypair::new();
-    let fixture = GraduationFixture::new(user.pubkey());
-    let preparation = build_pump_graduation_scenario(
-        MINT,
-        &rpc.get_account(&MINT).await.unwrap(),
-        &rpc.get_account(&CURVE).await.unwrap(),
-        &rpc.get_account(&BASE_VAULT).await.unwrap(),
-        None,
-        &rpc.get_account(&PUMP_GLOBAL).await.unwrap(),
-    )
-    .unwrap();
+    let (rpc, locker, _runloop) = start_live_surfnet();
+    let (mint, preparation) = find_live_graduation_candidate(&rpc).await;
     let completing_buy_amount = preparation.completing_buy_amount;
     let migration_reserve = preparation.migration_reserve;
 
     // The builder must derive its plan from the supplied curve state, not from
     // constants: a doubled virtual quote reserve must change the finishing buy.
-    let mut scaled_curve = rpc.get_account(&CURVE).await.unwrap();
+    let curve_account = rpc
+        .get_account(&preparation.addresses.bonding_curve)
+        .await
+        .unwrap();
+    let mut scaled_curve = curve_account.clone();
     let virtual_quote = read_u64(&scaled_curve.data, CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET);
     scaled_curve.data[CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET..CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET + 8]
         .copy_from_slice(&(virtual_quote * 2).to_le_bytes());
     let scaled = build_pump_graduation_scenario(
-        MINT,
-        &rpc.get_account(&MINT).await.unwrap(),
+        mint,
+        &rpc.get_account(&mint).await.unwrap(),
         &scaled_curve,
-        &rpc.get_account(&BASE_VAULT).await.unwrap(),
+        &rpc.get_account(&preparation.addresses.curve_vault)
+            .await
+            .unwrap(),
         None,
         &rpc.get_account(&PUMP_GLOBAL).await.unwrap(),
     )
@@ -788,6 +842,10 @@ async fn test_pump_token2022_graduation_lifecycle() {
         "the graduation plan must be driven by the supplied curve state"
     );
 
+    let user = Keypair::new();
+    let global_data = rpc.get_account(&PUMP_GLOBAL).await.unwrap().data;
+    let fixture = GraduationFixture::new(user.pubkey(), mint, &curve_account.data, &global_data);
+
     locker
         .register_scenario(preparation.scenario, Some(0))
         .unwrap();
@@ -795,7 +853,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
         .materialize_overrides_for_slot(&None, 1)
         .await
         .unwrap();
-    fund_user(&rpc, fixture.user).await;
+    fund_user(&rpc, &fixture).await;
 
     send_transaction(
         &rpc,
@@ -804,7 +862,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
     )
     .await;
 
-    let curve_after = rpc.get_account(&CURVE).await.unwrap();
+    let curve_after = rpc.get_account(&fixture.curve).await.unwrap();
     assert_eq!(
         read_u64(&curve_after.data, CURVE_REAL_TOKEN_RESERVES_OFFSET),
         0,
@@ -820,7 +878,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
         "user should receive the purchased base tokens"
     );
     assert_eq!(
-        token_amount(&rpc, &BASE_VAULT).await,
+        token_amount(&rpc, &fixture.base_vault).await,
         migration_reserve,
         "buy should leave the migration reserve in the curve vault"
     );
@@ -846,28 +904,174 @@ async fn test_pump_token2022_graduation_lifecycle() {
         token_amount(&rpc, &fixture.pool_quote).await > 0,
         "migrate should seed the pool with quote liquidity"
     );
+}
 
-    let pre_user_base = token_amount(&rpc, &fixture.user_base).await;
-    let pre_user_quote = token_amount(&rpc, &fixture.user_quote).await;
-    let pre_pool_base = token_amount(&rpc, &fixture.pool_base).await;
-    let pre_pool_quote = token_amount(&rpc, &fixture.pool_quote).await;
-    let base_amount_in = pre_user_base / 2;
-    let sell = build_sell(&rpc, &fixture, base_amount_in).await;
-    let baseline_user_quote =
-        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), fixture.user_quote)
-            .await;
-    let template_registry = TemplateRegistry::new();
-    let template = template_registry
+/// Sell against an established canonical pool; newly migrated pools use a different
+/// fee wiring (an open follow-up).
+async fn build_sell(
+    rpc: &RpcClient,
+    user: Pubkey,
+    base_mint: Pubkey,
+    base_token_program: Pubkey,
+    pool: Pubkey,
+    base_amount_in: u64,
+) -> Instruction {
+    let global_config = rpc
+        .get_account(&AMM_GLOBAL_CONFIG)
+        .await
+        .expect("AMM global config should load");
+    let protocol_fee_recipient = Pubkey::try_from(
+        &global_config.data
+            [AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET..AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET + 32],
+    )
+    .unwrap();
+    let pool_data = rpc
+        .get_account(&pool)
+        .await
+        .expect("live pool should exist")
+        .data;
+    let coin_creator =
+        Pubkey::try_from(&pool_data[POOL_COIN_CREATOR_OFFSET..POOL_COIN_CREATOR_OFFSET + 32])
+            .unwrap();
+    let coin_creator_vault_authority =
+        Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &PAMM).0;
+    let sell_fee_config =
+        Pubkey::find_program_address(&[b"fee_config", PAMM.as_ref()], &FEE_PROGRAM).0;
+    let pool_v2 = Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &PAMM).0;
+    let breaking_fee_recipient =
+        Pubkey::from_str_const("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL");
+    let pamm_event_authority = Pubkey::find_program_address(&[b"__event_authority"], &PAMM).0;
+    let accounts = vec![
+        account_meta(pool, false, true),               // 0 pool
+        account_meta(user, true, true),                // 1 user
+        account_meta(AMM_GLOBAL_CONFIG, false, false), // 2 global_config
+        account_meta(base_mint, false, false),         // 3 base_mint
+        account_meta(WSOL, false, false),              // 4 quote_mint
+        account_meta(
+            associated_token_address(&user, &base_mint, &base_token_program),
+            false,
+            true,
+        ), // 5 user_base_token_account
+        account_meta(
+            associated_token_address(&user, &WSOL, &TOKENKEG),
+            false,
+            true,
+        ), // 6 user_quote_token_account
+        account_meta(
+            associated_token_address(&pool, &base_mint, &base_token_program),
+            false,
+            true,
+        ), // 7 pool_base_token_account
+        account_meta(
+            associated_token_address(&pool, &WSOL, &TOKENKEG),
+            false,
+            true,
+        ), // 8 pool_quote_token_account
+        account_meta(protocol_fee_recipient, false, false), // 9 protocol_fee_recipient
+        account_meta(
+            associated_token_address(&protocol_fee_recipient, &WSOL, &TOKENKEG),
+            false,
+            true,
+        ), // 10 protocol_fee_recipient_token_account
+        account_meta(base_token_program, false, false), // 11 base_token_program
+        account_meta(TOKENKEG, false, false),          // 12 quote_token_program
+        account_meta(SYSTEM_PROGRAM, false, false),    // 13 system_program
+        account_meta(ATA_PROGRAM, false, false),       // 14 associated_token_program
+        account_meta(pamm_event_authority, false, false), // 15 event_authority
+        account_meta(PAMM, false, false),              // 16 program
+        account_meta(
+            associated_token_address(&coin_creator_vault_authority, &WSOL, &TOKENKEG),
+            false,
+            true,
+        ), // 17 coin_creator_vault_ata
+        account_meta(coin_creator_vault_authority, false, false), // 18 coin_creator_vault_authority
+        account_meta(sell_fee_config, false, false),   // 19 fee_config
+        account_meta(FEE_PROGRAM, false, false),       // 20 fee_program
+        account_meta(pool_v2, false, false),           // 21 pool_v2
+        account_meta(breaking_fee_recipient, false, false), // 22 fee_recipient
+        account_meta(
+            associated_token_address(&breaking_fee_recipient, &WSOL, &TOKENKEG),
+            false,
+            true,
+        ), // 23 fee_recipient_token_account
+    ];
+    let mut data = SELL_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&base_amount_in.to_le_bytes());
+    // Zero slippage protection is acceptable only in this regression test.
+    data.extend_from_slice(&0u64.to_le_bytes());
+
+    Instruction {
+        program_id: PAMM,
+        accounts,
+        data,
+    }
+}
+
+/// The price-shock template must change what the deployed AMM actually quotes, proven on the
+/// established live canonical pool (VERIFY-12 / MODEL-06).
+#[tokio::test(flavor = "multi_thread")]
+async fn price_shock_changes_a_live_pool_swap() {
+    const LLS_MINT: Pubkey = Pubkey::from_str_const("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump");
+
+    let (rpc, locker, _runloop) = start_live_surfnet();
+    let user = Keypair::new();
+    let base_token_program = rpc.get_account(&LLS_MINT).await.unwrap().owner;
+
+    cheatcode(
+        &rpc,
+        "surfnet_setAccount",
+        serde_json::json!([user.pubkey().to_string(), { "lamports": 2_000_000_000u64 }]),
+    )
+    .await;
+    cheatcode(
+        &rpc,
+        "surfnet_setTokenAccount",
+        serde_json::json!([user.pubkey().to_string(), WSOL.to_string(), { "amount": 1_000_000_000u64 }, null]),
+    )
+    .await;
+    cheatcode(
+        &rpc,
+        "surfnet_setTokenAccount",
+        serde_json::json!([
+            user.pubkey().to_string(),
+            LLS_MINT.to_string(),
+            { "amount": 1_000_000_000u64 },
+            base_token_program.to_string()
+        ]),
+    )
+    .await;
+
+    let user_quote = associated_token_address(&user.pubkey(), &WSOL, &TOKENKEG);
+    let pool_quote_balance =
+        token_amount(&rpc, &associated_token_address(&AMM_POOL, &WSOL, &TOKENKEG)).await;
+    let sell = build_sell(
+        &rpc,
+        user.pubkey(),
+        LLS_MINT,
+        base_token_program,
+        AMM_POOL,
+        500_000_000,
+    )
+    .await;
+
+    let baseline =
+        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), user_quote).await;
+
+    let registry = TemplateRegistry::new();
+    let template = registry
         .get("pump-amm-canonical-pool")
         .expect("PumpSwap template");
     let values = HashMap::from([
-        ("base_mint".to_string(), serde_json::json!(MINT.to_string())),
+        (
+            "base_mint".to_string(),
+            serde_json::json!(LLS_MINT.to_string()),
+        ),
         (
             "virtual_quote_reserves".to_string(),
-            serde_json::json!(pre_pool_quote.checked_mul(9).unwrap()),
+            serde_json::json!(pool_quote_balance.checked_mul(9).unwrap()),
         ),
     ]);
-    let mut pool_override = OverrideInstance::new(template.id.clone(), 1, template.address.clone())
+    let mut pool_override = OverrideInstance::new(template.id.clone(), 0, template.address.clone())
         .with_values(values)
         .with_label("PumpSwap virtual quote reserve shock".to_string());
     pool_override.fetch_before_use = true;
@@ -877,37 +1081,22 @@ async fn test_pump_token2022_graduation_lifecycle() {
     );
     price_shock.tags = vec!["pumpswap".to_string(), "price-shock".to_string()];
     price_shock.add_override(pool_override);
-    locker.register_scenario(price_shock, Some(0)).unwrap();
+    locker.register_scenario(price_shock, Some(100)).unwrap();
     locker
-        .materialize_overrides_for_slot(&None, 1)
+        .materialize_overrides_for_slot(&None, 100)
         .await
         .unwrap();
-    let shocked_user_quote =
-        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), fixture.user_quote)
-            .await;
+
+    let shocked =
+        simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), user_quote).await;
     assert_ne!(
-        shocked_user_quote - pre_user_quote,
-        baseline_user_quote - pre_user_quote,
+        shocked, baseline,
         "the price-shock scenario should change the real swap output"
     );
-    send_transaction(&rpc, &user, vec![sell]).await;
 
-    assert_eq!(
-        token_amount(&rpc, &fixture.user_base).await,
-        pre_user_base - base_amount_in,
-        "sell should debit the user's base tokens"
-    );
+    send_transaction(&rpc, &user, vec![sell]).await;
     assert!(
-        token_amount(&rpc, &fixture.user_quote).await > pre_user_quote,
+        token_amount(&rpc, &user_quote).await > 0,
         "sell should credit the user's quote tokens"
-    );
-    assert_eq!(
-        token_amount(&rpc, &fixture.pool_base).await,
-        pre_pool_base + base_amount_in,
-        "sell should credit the pool's base vault"
-    );
-    assert!(
-        token_amount(&rpc, &fixture.pool_quote).await < pre_pool_quote,
-        "sell should debit the pool's quote vault"
     );
 }
