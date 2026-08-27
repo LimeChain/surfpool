@@ -1070,25 +1070,6 @@ impl TokenAccount {
         }
     }
 
-    pub fn unpack_for_program(bytes: &[u8], token_program_id: &Pubkey) -> SurfpoolResult<Self> {
-        if *token_program_id == spl_token_2022_interface::id() {
-            if let Ok(account) =
-                StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(bytes)
-            {
-                return Ok(Self::SplToken2022(account.base));
-            }
-            return spl_token_2022_interface::state::Account::unpack(bytes)
-                .map(Self::SplToken2022)
-                .map_err(|_| SurfpoolError::unpack_token_account());
-        }
-        if *token_program_id == spl_token_interface::id() {
-            return spl_token_interface::state::Account::unpack(bytes)
-                .map(Self::SplToken)
-                .map_err(|_| SurfpoolError::unpack_token_account());
-        }
-        Err(SurfpoolError::unsupported_token_program(*token_program_id))
-    }
-
     pub fn new(
         token_program_id: &Pubkey,
         owner: Pubkey,
@@ -1140,16 +1121,6 @@ impl TokenAccount {
             Self::SplToken2022(account) => account.pack_into_slice(&mut data[..base_len]),
             Self::SplToken(account) => account.pack_into_slice(&mut data[..base_len]),
         }
-        Ok(data)
-    }
-
-    pub fn patch_amount_preserving_extensions(&self, original: &[u8]) -> SurfpoolResult<Vec<u8>> {
-        if original.len() < spl_token_interface::state::Account::LEN {
-            return Err(SurfpoolError::unpack_token_account());
-        }
-
-        let mut data = original.to_vec();
-        data[64..72].copy_from_slice(&self.amount().to_le_bytes());
         Ok(data)
     }
 
@@ -1288,7 +1259,7 @@ mod token_account_packing_tests {
     }
 
     #[test]
-    fn amount_patch_changes_only_the_amount_bytes() {
+    fn amount_only_repack_changes_only_the_amount_bytes() {
         for token_program in [spl_token_interface::id(), spl_token_2022_interface::id()] {
             let mut token_account = TokenAccount::new(
                 &token_program,
@@ -1303,7 +1274,7 @@ mod token_account_packing_tests {
             token_account.set_amount(42);
 
             let patched = token_account
-                .patch_amount_preserving_extensions(&original)
+                .pack_into_preserving_extensions(&original)
                 .unwrap();
 
             assert_eq!(patched.len(), original.len());
@@ -1311,22 +1282,6 @@ mod token_account_packing_tests {
             assert_eq!(&patched[..64], &original[..64]);
             assert_eq!(&patched[72..], &original[72..]);
         }
-    }
-
-    #[test]
-    fn unpack_for_program_uses_the_account_owner() {
-        let classic = TokenAccount::new(
-            &spl_token_interface::id(),
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            None,
-        )
-        .pack_into_vec();
-
-        assert!(matches!(
-            TokenAccount::unpack_for_program(&classic, &spl_token_interface::id()).unwrap(),
-            TokenAccount::SplToken(_)
-        ));
     }
 }
 

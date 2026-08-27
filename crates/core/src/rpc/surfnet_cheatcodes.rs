@@ -1627,12 +1627,6 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
         Box::pin(async move {
             let confidential = update.confidential.clone();
-            let amount_only = update.amount.is_some()
-                && update.delegate.is_none()
-                && update.state.is_none()
-                && update.delegated_amount.is_none()
-                && update.close_authority.is_none()
-                && confidential.is_none();
 
             if confidential.is_some() && token_program_id != spl_token_2022_interface::id() {
                 return Err(Error::invalid_params(
@@ -1691,11 +1685,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 )
                 .await?;
 
-            let mut token_account_data =
-                TokenAccount::unpack_for_program(token_account.expected_data(), &token_program_id)
-                    .map_err(|e| {
-                        Error::invalid_params(format!("Failed to unpack token account data: {}", e))
-                    })?;
+            let mut token_account_data = TokenAccount::unpack(token_account.expected_data())
+                .map_err(|e| {
+                    Error::invalid_params(format!("Failed to unpack token account data: {}", e))
+                })?;
 
             update.apply(&mut token_account_data)?;
 
@@ -1720,18 +1713,6 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                         .minimum_balance_for_rent_exemption(data.len())
                 });
                 (data, Some(rent))
-            } else if amount_only {
-                (
-                    token_account_data
-                        .patch_amount_preserving_extensions(token_account.expected_data())
-                        .map_err(|e| {
-                            Error::invalid_params(format!(
-                                "Failed to patch token account amount: {}",
-                                e
-                            ))
-                        })?,
-                    native_lamports,
-                )
             } else {
                 (
                     token_account_data

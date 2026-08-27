@@ -188,16 +188,19 @@ output than before.
 ## Verification
 
 - Address identity: `cargo test -p surfpool-core --lib pump` — template PDAs pinned to
-  externally documented addresses (pump-public-docs), plus byte-exact apply-path tests
-  over real 151/300-byte mainnet snapshots.
+  externally documented addresses (pump-public-docs).
 - MCP surface: `cargo test -p surfpool-mcp surfpool::tests` — compact template listing,
-  catalog scoping, generic scenario validation, runtime URLs, and Surfnet account decoding.
-- Behavioral regression: `cargo test -p surfpool-core
-  test_pump_token2022_graduation_lifecycle -- --ignored --nocapture` prepares the
-  frozen Token-2022 fixture through the production graduation scenario builder and
-  materializer, then executes real `buy_v2`, `migrate_v2`, and PumpSwap `sell`
-  instructions against live mainnet programs. It also compares baseline and
-  price-shocked sell simulations and requires the quote-token output to change.
+  catalog scoping, and generic scenario validation.
+- Integration: `cargo test -p surfpool-core --features integration-tests pump` needs a
+  network connection (`SURFPOOL_TEST_RPC_URL` overrides the public mainnet endpoint).
+  It round-trips live mainnet curve, pool, and config accounts through the bundled
+  IDLs to catch layout drift after a program upgrade, proves overrides touch only
+  their target bytes on real account data, exercises the graduation builder's
+  validation against live state, and runs the full lifecycle: the frozen Token-2022
+  fixture is prepared through the production graduation scenario builder and
+  materializer, then real `buy_v2`, `migrate_v2`, and PumpSwap `sell` instructions
+  execute against live mainnet programs, including a baseline vs. price-shocked sell
+  simulation whose quote-token output must differ.
 
 ### The test snapshot and how to retake it
 

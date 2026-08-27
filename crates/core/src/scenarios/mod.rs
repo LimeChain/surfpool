@@ -1,4 +1,4 @@
-pub mod pump_graduation_builder;
+pub mod protocols;
 pub mod registry;
 
 pub use registry::TemplateRegistry;

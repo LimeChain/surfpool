@@ -13,7 +13,6 @@ categories = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = { workspace = true }
 bs58 = { workspace = true }
 crossbeam-channel = { workspace = true }
 hiro-system-kit = { workspace = true }

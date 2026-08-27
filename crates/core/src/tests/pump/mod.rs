@@ -1,6 +1,59 @@
-use super::*;
-use crate::scenarios::{TemplateRegistry, pump_graduation_builder::build_pump_graduation_scenario};
-use surfpool_types::{OverrideInstance, Scenario};
+//! Pump / PumpSwap integration tests.
+//!
+//! These fetch the real accounts from mainnet rather than embedding captured copies, so they
+//! need a network connection and are compiled only behind a feature:
+//!
+//! ```text
+//! cargo test -p surfpool-core --features integration-tests pump
+//! ```
+//!
+//! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
+//!
+//! What these cover that unit tests cannot: real accounts carry live values, populated
+//! creator fields and the `extend_account` tail past the Borsh layout, so a pump program
+//! upgrade that changes the on-chain layout shows up as a byte diff here and nowhere else.
+//!
+//! The lifecycle test additionally starts a surfnet that forks mainnet: its account state is
+//! frozen in `pump_token2022_graduation.snapshot.json` (a graduation needs an incomplete
+//! curve, which no fixed live coin can stay forever), while the pump and pAMM programs run
+//! live, so a behavior-changing program upgrade fails there first.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crossbeam_channel::unbounded;
+use solana_account::Account;
+use solana_account_decoder::UiAccountEncoding;
+use solana_client::{
+    nonblocking::rpc_client::RpcClient,
+    rpc_config::{RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
+};
+use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use surfpool_types::{
+    AccountSnapshot, OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig,
+};
+
+use crate::{
+    scenarios::{
+        TemplateRegistry, protocols::pump::v1::graduation_builder::build_pump_graduation_scenario,
+    },
+    storage::tests::TestType,
+    surfnet::{
+        GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
+    },
+    tests::{
+        helpers::get_free_port,
+        integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
+    },
+};
+
+const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
+const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const PUMP: Pubkey = Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const PAMM: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -11,6 +64,7 @@ const WSOL: Pubkey = Pubkey::from_str_const("So111111111111111111111111111111111
 const ATA_PROGRAM: Pubkey = Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SYSTEM_PROGRAM: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
 const RENT_SYSVAR: Pubkey = Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");
+const USDC_MINT: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 const MINT: Pubkey = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
 const CURVE: Pubkey = Pubkey::from_str_const("GBpTHrtF8dGwxC7thRD7T6VfGtbVYEabKkQ7k6g3u7QF");
@@ -42,19 +96,266 @@ const AMM_GLOBAL_CONFIG: Pubkey =
 const BREAKING_FEE_RECIPIENT: Pubkey =
     Pubkey::from_str_const("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL");
 
+/// The bonding curve of the migrated coin 7LSsEoJG…pump, documented in pump-public-docs and
+/// checked against mainnet on 2026-08-06 (complete = true, so it never changes again).
+const LLS_CURVE: Pubkey = Pubkey::from_str_const("3MUkKMbuornHohtAtzrToSzqkj1gEEhQqYVz8sZnmQg1");
+/// The canonical PumpSwap pool of the same migrated coin.
+const AMM_POOL: Pubkey = Pubkey::from_str_const("GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J");
+
 const BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
 const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
 const MAX_SOL_COST: u64 = 1_000_000_000;
 
+const CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET: usize = 8;
+const CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 16;
 const CURVE_REAL_TOKEN_RESERVES_OFFSET: usize = 24;
+const CURVE_REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const CURVE_COMPLETE_OFFSET: usize = 48;
+const CURVE_QUOTE_MINT_OFFSET: usize = 83;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
+const POOL_LP_SUPPLY_OFFSET: usize = 203;
+const POOL_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 245;
 const AMM_RESERVED_FEE_RECIPIENT_OFFSET: usize = 385;
 const AMM_MAYHEM_MODE_OFFSET: usize = 417;
 const POOL_COIN_CREATOR_OFFSET: usize = 211;
 const POOL_CASHBACK_FLAG_OFFSET: usize = 244;
+
+/// Fetches the accounts in one request, so every account returned is from the same slot.
+async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
+    let client = SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+    );
+
+    client
+        .get_multiple_accounts(addresses, CommitmentConfig::confirmed())
+        .await
+        .unwrap_or_else(|e| panic!("failed to fetch {addresses:?} from mainnet: {e}"))
+        .into_iter()
+        .zip(addresses)
+        .map(|(result, address)| match result {
+            GetAccountResult::FoundAccount(_, account, _)
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account,
+            GetAccountResult::None(_) => {
+                panic!("{address} no longer exists on mainnet; the test needs a new address")
+            }
+        })
+        .collect()
+}
+
+/// Byte indices at which two buffers differ.
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// A failure here means a bundled IDL disagrees with the live on-chain layout.
+#[tokio::test]
+async fn real_mainnet_accounts_round_trip_unchanged() {
+    let cases: &[(&str, &str, Pubkey)] = &[
+        ("pump-bonding-curve-custom", "BondingCurve", LLS_CURVE),
+        ("pump-bonding-curve-custom", "BondingCurve", CURVE),
+        ("pump-global", "Global", PUMP_GLOBAL),
+        ("pump-amm-canonical-pool", "Pool", AMM_POOL),
+        ("pump-amm-global-config", "GlobalConfig", AMM_GLOBAL_CONFIG),
+    ];
+
+    let addresses: Vec<Pubkey> = cases.iter().map(|(_, _, a)| *a).collect();
+    let accounts = fetch(&addresses).await;
+
+    let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let registry = TemplateRegistry::new();
+    let pubkey = Pubkey::new_unique();
+
+    for ((template_id, account_name, address), account) in cases.iter().zip(&accounts) {
+        let template = registry
+            .get(template_id)
+            .unwrap_or_else(|| panic!("template {template_id} should exist"));
+
+        let account_def = template
+            .idl
+            .accounts
+            .iter()
+            .find(|a| a.name == *account_name)
+            .unwrap_or_else(|| panic!("{account_name} not in the IDL"));
+        assert_eq!(
+            &account.data[..8],
+            account_def.discriminator.as_slice(),
+            "{address}: discriminator does not match the IDL - wrong account type?"
+        );
+
+        let forged = surfnet_svm
+            .get_forged_account_data(&pubkey, &account.data, &template.idl, &HashMap::new())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "live mainnet {account_name} {address} failed to decode/re-encode with the \
+                     bundled IDL: {e}"
+                )
+            });
+
+        assert_eq!(
+            forged.len(),
+            account.data.len(),
+            "{account_name} {address} changed size on round-trip"
+        );
+        let diffs = diff_indices(&forged, &account.data);
+        assert!(
+            diffs.is_empty(),
+            "live mainnet {account_name} {address} was altered by a no-op round-trip at {} \
+             byte(s), first at {:?}",
+            diffs.len(),
+            diffs.first()
+        );
+    }
+}
+
+/// Catches collateral damage from the Borsh re-encode against real bytes: only the overridden
+/// fields may change, and the `extend_account` tail past the Borsh layout must survive.
+#[tokio::test]
+async fn override_on_real_account_touches_only_target_bytes() {
+    let accounts = fetch(&[LLS_CURVE, AMM_POOL]).await;
+    let (curve_data, pool_data) = (&accounts[0].data, &accounts[1].data);
+
+    let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let registry = TemplateRegistry::new();
+    let pubkey = Pubkey::new_unique();
+
+    // A semantically valid just-completed curve: complete=true requires
+    // real_token_reserves = 0, and the curve-lifetime invariants hold
+    // (virtual - real stays at 279.9T tokens / 30 SOL of quote).
+    let curve = registry.get("pump-bonding-curve-custom").expect("template");
+    let overrides = HashMap::from([
+        (
+            "virtual_token_reserves".to_string(),
+            serde_json::json!(279_900_000_000_000u64),
+        ),
+        (
+            "virtual_quote_reserves".to_string(),
+            serde_json::json!(115_000_000_000u64),
+        ),
+        ("real_token_reserves".to_string(), serde_json::json!(0u64)),
+        (
+            "real_quote_reserves".to_string(),
+            serde_json::json!(85_000_000_000u64),
+        ),
+        ("complete".to_string(), serde_json::json!(true)),
+    ]);
+    let forged = surfnet_svm
+        .get_forged_account_data(&pubkey, curve_data, &curve.idl, &overrides)
+        .expect("curve override on the live bonding curve");
+    assert_eq!(
+        forged.len(),
+        curve_data.len(),
+        "the curve's extend_account tail must survive"
+    );
+    let reserves = CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET..CURVE_REAL_QUOTE_RESERVES_OFFSET + 8;
+    let diffs = diff_indices(&forged, curve_data);
+    assert!(
+        diffs
+            .iter()
+            .all(|i| reserves.contains(i) || *i == CURVE_COMPLETE_OFFSET),
+        "only the overridden curve fields may change, got {diffs:?}"
+    );
+    assert_eq!(
+        read_u64(&forged, CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET),
+        279_900_000_000_000
+    );
+    assert_eq!(
+        read_u64(&forged, CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET),
+        115_000_000_000
+    );
+    assert_eq!(read_u64(&forged, CURVE_REAL_TOKEN_RESERVES_OFFSET), 0);
+    assert_eq!(
+        read_u64(&forged, CURVE_REAL_QUOTE_RESERVES_OFFSET),
+        85_000_000_000
+    );
+    assert_eq!(forged[CURVE_COMPLETE_OFFSET], 1);
+
+    let pool = registry.get("pump-amm-canonical-pool").expect("template");
+    let overrides = HashMap::from([
+        ("lp_supply".to_string(), serde_json::json!(9_876_543_210u64)),
+        (
+            "virtual_quote_reserves".to_string(),
+            serde_json::json!(5_000_000_000i64),
+        ),
+    ]);
+    let forged = surfnet_svm
+        .get_forged_account_data(&pubkey, pool_data, &pool.idl, &overrides)
+        .expect("pool override on the live canonical pool");
+    assert_eq!(
+        forged.len(),
+        pool_data.len(),
+        "the pool's extend_account tail must survive"
+    );
+    let lp_supply = POOL_LP_SUPPLY_OFFSET..POOL_LP_SUPPLY_OFFSET + 8;
+    let virtual_quote = POOL_VIRTUAL_QUOTE_RESERVES_OFFSET..POOL_VIRTUAL_QUOTE_RESERVES_OFFSET + 16;
+    let diffs = diff_indices(&forged, pool_data);
+    assert!(
+        diffs
+            .iter()
+            .all(|i| lp_supply.contains(i) || virtual_quote.contains(i)),
+        "only lp_supply and the i128 virtual_quote_reserves may change, got {diffs:?}"
+    );
+    assert_eq!(read_u64(&forged, POOL_LP_SUPPLY_OFFSET), 9_876_543_210);
+    assert_eq!(
+        i128::from_le_bytes(
+            forged[POOL_VIRTUAL_QUOTE_RESERVES_OFFSET..POOL_VIRTUAL_QUOTE_RESERVES_OFFSET + 16]
+                .try_into()
+                .unwrap()
+        ),
+        5_000_000_000
+    );
+}
+
+/// The production builder's validation against live pump state. Single-byte tweaks pin each
+/// rejection branch regardless of where the live coin currently is in its lifecycle.
+#[tokio::test]
+async fn builder_rejects_bad_live_graduation_state() {
+    let accounts = fetch(&[MINT, CURVE, BASE_VAULT, PUMP_GLOBAL]).await;
+    let (mint, curve, vault, global) = (&accounts[0], &accounts[1], &accounts[2], &accounts[3]);
+
+    let mut complete_curve = curve.clone();
+    complete_curve.data[CURVE_COMPLETE_OFFSET] = 1;
+    let error = build_pump_graduation_scenario(MINT, mint, &complete_curve, vault, None, global)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("already complete"),
+        "unexpected error: {error}"
+    );
+
+    let mut incomplete_curve = curve.clone();
+    incomplete_curve.data[CURVE_COMPLETE_OFFSET] = 0;
+    let error = build_pump_graduation_scenario(
+        MINT,
+        mint,
+        &incomplete_curve,
+        vault,
+        Some(&Account::default()),
+        global,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("canonical PumpSwap pool already exists"),
+        "unexpected error: {error}"
+    );
+
+    let mut usdc_curve = incomplete_curve.clone();
+    usdc_curve.data[CURVE_QUOTE_MINT_OFFSET..CURVE_QUOTE_MINT_OFFSET + 32]
+        .copy_from_slice(USDC_MINT.as_ref());
+    let error =
+        build_pump_graduation_scenario(MINT, mint, &usdc_curve, vault, None, global).unwrap_err();
+    assert!(
+        error.to_string().contains("SOL-quoted bonding curves only"),
+        "unexpected error: {error}"
+    );
+}
 
 struct GraduationFixture {
     user: Pubkey,
@@ -142,11 +443,10 @@ fn account_meta(pubkey: Pubkey, signer: bool, writable: bool) -> AccountMeta {
 }
 
 fn start_snapshot_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
-    let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
-        serde_json::from_str(include_str!(
-            "../assets/pump_token2022_graduation.snapshot.json"
-        ))
-        .expect("graduation snapshot should deserialize");
+    let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(include_str!(
+        "../assets/pump_token2022_graduation.snapshot.json"
+    ))
+    .expect("graduation snapshot should deserialize");
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().unwrap();
     let ws_port = get_free_port().unwrap();
@@ -452,7 +752,6 @@ async fn build_sell(
 
 /// The snapshot freezes account state while the live programs expose behavioral upgrades.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires network: forks mainnet for the live pump and pAMM programs"]
 async fn test_pump_token2022_graduation_lifecycle() {
     let (rpc, locker, _runloop) = start_snapshot_surfnet();
     let user = Keypair::new();
@@ -468,6 +767,27 @@ async fn test_pump_token2022_graduation_lifecycle() {
     .unwrap();
     let completing_buy_amount = preparation.completing_buy_amount;
     let migration_reserve = preparation.migration_reserve;
+
+    // The builder must derive its plan from the supplied curve state, not from
+    // constants: a doubled virtual quote reserve must change the finishing buy.
+    let mut scaled_curve = rpc.get_account(&CURVE).await.unwrap();
+    let virtual_quote = read_u64(&scaled_curve.data, CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET);
+    scaled_curve.data[CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET..CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET + 8]
+        .copy_from_slice(&(virtual_quote * 2).to_le_bytes());
+    let scaled = build_pump_graduation_scenario(
+        MINT,
+        &rpc.get_account(&MINT).await.unwrap(),
+        &scaled_curve,
+        &rpc.get_account(&BASE_VAULT).await.unwrap(),
+        None,
+        &rpc.get_account(&PUMP_GLOBAL).await.unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        scaled.completing_buy_amount, completing_buy_amount,
+        "the graduation plan must be driven by the supplied curve state"
+    );
+
     locker
         .register_scenario(preparation.scenario, Some(0))
         .unwrap();
@@ -540,7 +860,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
     let template = template_registry
         .get("pump-amm-canonical-pool")
         .expect("PumpSwap template");
-    let values = std::collections::HashMap::from([
+    let values = HashMap::from([
         ("base_mint".to_string(), serde_json::json!(MINT.to_string())),
         (
             "virtual_quote_reserves".to_string(),

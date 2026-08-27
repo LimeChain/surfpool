@@ -52,7 +52,6 @@ templates:
     name: Override Pump Token-2022 Curve Balance
     description: Override the Token-2022 base-token vault belonging to a pump.fun bonding curve.
     idl_account_name: TokenAccount
-    write_mode: token_2022_account_amount
     properties:
       - path: amount
         label: Curve Vault Amount

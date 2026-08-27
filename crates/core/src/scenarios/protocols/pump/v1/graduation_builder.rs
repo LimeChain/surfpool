@@ -4,23 +4,16 @@ use solana_account::Account;
 use solana_pubkey::Pubkey;
 use surfpool_types::{OverrideInstance, Scenario};
 
-use super::TemplateRegistry;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
+    scenarios::TemplateRegistry,
     types::TokenAccount,
 };
 
 const PUMP_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const PUMP_AMM_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-const WSOL_MINT: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
-const GLOBAL_ACCOUNT: Pubkey =
-    Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
 
 const VIRTUAL_TOKEN_RESERVES_OFFSET: usize = 8;
 const VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 16;
@@ -49,38 +42,31 @@ pub struct PumpGraduationPreparation {
     pub migration_reserve: u64,
 }
 
-pub fn pump_graduation_addresses(token_mint: &Pubkey) -> PumpGraduationAddresses {
-    let bonding_curve =
-        Pubkey::find_program_address(&[b"bonding-curve", token_mint.as_ref()], &PUMP_PROGRAM_ID).0;
-    let curve_vault = Pubkey::find_program_address(
-        &[
-            bonding_curve.as_ref(),
-            TOKEN_2022_PROGRAM_ID.as_ref(),
-            token_mint.as_ref(),
-        ],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0;
-    let pool_authority =
-        Pubkey::find_program_address(&[b"pool-authority", token_mint.as_ref()], &PUMP_PROGRAM_ID).0;
-    let canonical_pool = Pubkey::find_program_address(
-        &[
-            b"pool",
-            &0u16.to_le_bytes(),
-            pool_authority.as_ref(),
-            token_mint.as_ref(),
-            WSOL_MINT.as_ref(),
-        ],
-        &PUMP_AMM_PROGRAM_ID,
-    )
-    .0;
+/// Resolved from the templates' PDA specs, so the builder reads the addresses
+/// the materializer writes to.
+pub fn pump_graduation_addresses(token_mint: &Pubkey) -> SurfpoolResult<PumpGraduationAddresses> {
+    let registry = TemplateRegistry::new();
+    let resolve = |template_id: &str, mint_property: Option<&str>| {
+        let template = registry.get(template_id).ok_or_else(|| {
+            SurfpoolError::internal(format!("{template_id} template is unavailable"))
+        })?;
+        let values = mint_property.map(|property| {
+            HashMap::from([(
+                property.to_string(),
+                serde_json::json!(token_mint.to_string()),
+            )])
+        });
+        template.address.resolve(values.as_ref()).ok_or_else(|| {
+            SurfpoolError::internal(format!("{template_id} address does not resolve"))
+        })
+    };
 
-    PumpGraduationAddresses {
-        bonding_curve,
-        curve_vault,
-        canonical_pool,
-        global: GLOBAL_ACCOUNT,
-    }
+    Ok(PumpGraduationAddresses {
+        bonding_curve: resolve("pump-bonding-curve-custom", Some("token_mint"))?,
+        curve_vault: resolve("pump-token-2022-curve-balance", Some("token_mint"))?,
+        canonical_pool: resolve("pump-amm-canonical-pool", Some("base_mint"))?,
+        global: resolve("pump-global", None)?,
+    })
 }
 
 pub fn build_pump_graduation_scenario(
@@ -127,8 +113,7 @@ pub fn build_pump_graduation_scenario(
         .checked_sub(real_quote_reserves)
         .ok_or_else(|| invalid_curve("virtual quote reserves are below real quote reserves"))?;
 
-    let token_account =
-        TokenAccount::unpack_for_program(&curve_vault_account.data, &curve_vault_account.owner)?;
+    let token_account = TokenAccount::unpack(&curve_vault_account.data)?;
     let migration_reserve = token_account
         .amount()
         .checked_sub(real_token_reserves)
@@ -245,7 +230,7 @@ pub fn build_pump_graduation_scenario(
     Ok(PumpGraduationPreparation {
         scenario,
         token_mint,
-        addresses: pump_graduation_addresses(&token_mint),
+        addresses: pump_graduation_addresses(&token_mint)?,
         completing_buy_amount,
         migration_reserve,
     })
@@ -279,8 +264,7 @@ fn validate_accounts(
     if curve_vault_account.owner != TOKEN_2022_PROGRAM_ID {
         return Err(invalid_curve("curve vault is not owned by Token-2022"));
     }
-    let token_account =
-        TokenAccount::unpack_for_program(&curve_vault_account.data, &curve_vault_account.owner)?;
+    let token_account = TokenAccount::unpack(&curve_vault_account.data)?;
     if token_account.mint() != token_mint {
         return Err(invalid_curve("curve vault contains a different mint"));
     }
@@ -313,175 +297,4 @@ fn div_ceil(numerator: u128, denominator: u128) -> SurfpoolResult<u128> {
 
 fn invalid_curve(message: impl Into<String>) -> SurfpoolError {
     SurfpoolError::internal(message.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use surfpool_types::AccountSnapshot;
-
-    use super::*;
-
-    fn fixture_account(
-        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
-        address: &Pubkey,
-    ) -> Account {
-        snapshot[&address.to_string()]
-            .as_ref()
-            .unwrap()
-            .to_account()
-            .unwrap()
-    }
-
-    #[test]
-    fn builds_the_verified_hrt_z_graduation_scenario() {
-        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
-            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
-        )
-        .unwrap();
-        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
-        let addresses = pump_graduation_addresses(&mint);
-        let preparation = build_pump_graduation_scenario(
-            mint,
-            &fixture_account(&snapshot, &mint),
-            &fixture_account(&snapshot, &addresses.bonding_curve),
-            &fixture_account(&snapshot, &addresses.curve_vault),
-            None,
-            &fixture_account(&snapshot, &addresses.global),
-        )
-        .unwrap();
-
-        assert_eq!(
-            preparation.addresses.bonding_curve.to_string(),
-            "GBpTHrtF8dGwxC7thRD7T6VfGtbVYEabKkQ7k6g3u7QF"
-        );
-        assert_eq!(
-            preparation.addresses.curve_vault.to_string(),
-            "9sXf9hAtryY1mncMxKGZnLMJzQbnTsUoSu8GJTX3FpFh"
-        );
-        assert_eq!(
-            preparation.addresses.canonical_pool.to_string(),
-            "FFgT2bSo5xrGs5uHyRY7xztL8hntvwuswGM8iYLrdBgx"
-        );
-        assert_eq!(preparation.completing_buy_amount, 216_645_197_009);
-        assert_eq!(preparation.migration_reserve, 206_900_000_000_000);
-        assert_eq!(preparation.token_mint, mint);
-        assert_eq!(
-            preparation
-                .scenario
-                .overrides
-                .iter()
-                .map(|item| item.template_id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "pump-bonding-curve-custom",
-                "pump-token-2022-curve-balance",
-                "pump-global",
-            ]
-        );
-        assert!(
-            preparation
-                .scenario
-                .overrides
-                .iter()
-                .all(|item| item.scenario_relative_slot == GRADUATION_PREPARATION_SLOT)
-        );
-    }
-
-    #[test]
-    fn rejects_a_mint_with_an_existing_pool() {
-        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
-            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
-        )
-        .unwrap();
-        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
-        let addresses = pump_graduation_addresses(&mint);
-        let pool = Account::default();
-
-        assert!(
-            build_pump_graduation_scenario(
-                mint,
-                &fixture_account(&snapshot, &mint),
-                &fixture_account(&snapshot, &addresses.bonding_curve),
-                &fixture_account(&snapshot, &addresses.curve_vault),
-                Some(&pool),
-                &fixture_account(&snapshot, &addresses.global),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_a_non_sol_quoted_bonding_curve() {
-        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
-            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
-        )
-        .unwrap();
-        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
-        let addresses = pump_graduation_addresses(&mint);
-        let mut curve_account = fixture_account(&snapshot, &addresses.bonding_curve);
-        let usdc_mint = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-        curve_account.data[QUOTE_MINT_OFFSET..QUOTE_MINT_OFFSET + 32]
-            .copy_from_slice(usdc_mint.as_ref());
-
-        let error = build_pump_graduation_scenario(
-            mint,
-            &fixture_account(&snapshot, &mint),
-            &curve_account,
-            &fixture_account(&snapshot, &addresses.curve_vault),
-            None,
-            &fixture_account(&snapshot, &addresses.global),
-        )
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("Pump graduation preset supports SOL-quoted bonding curves only")
-        );
-    }
-
-    #[test]
-    fn graduation_uses_the_supplied_curve_state() {
-        let snapshot: BTreeMap<String, Option<AccountSnapshot>> = serde_json::from_str(
-            include_str!("../tests/assets/pump_token2022_graduation.snapshot.json"),
-        )
-        .unwrap();
-        let mint = Pubkey::from_str_const("HRTzNRJNnY78xe8e4a9DuMotw6qA97GwSQLzpVw9pump");
-        let addresses = pump_graduation_addresses(&mint);
-        let remote_curve = fixture_account(&snapshot, &addresses.bonding_curve);
-        let global_account = fixture_account(&snapshot, &addresses.global);
-        let mut modified_curve = remote_curve.clone();
-        let virtual_quote_reserves = read_u64(
-            &modified_curve.data,
-            VIRTUAL_QUOTE_RESERVES_OFFSET,
-            "virtual_quote_reserves",
-        )
-        .unwrap();
-        modified_curve.data[VIRTUAL_QUOTE_RESERVES_OFFSET..VIRTUAL_QUOTE_RESERVES_OFFSET + 8]
-            .copy_from_slice(&(virtual_quote_reserves * 2).to_le_bytes());
-        let original = build_pump_graduation_scenario(
-            mint,
-            &fixture_account(&snapshot, &mint),
-            &remote_curve,
-            &fixture_account(&snapshot, &addresses.curve_vault),
-            None,
-            &global_account,
-        )
-        .unwrap();
-        let modified = build_pump_graduation_scenario(
-            mint,
-            &fixture_account(&snapshot, &mint),
-            &modified_curve,
-            &fixture_account(&snapshot, &addresses.curve_vault),
-            None,
-            &global_account,
-        )
-        .unwrap();
-        assert_ne!(
-            modified.completing_buy_amount,
-            original.completing_buy_amount
-        );
-    }
 }
