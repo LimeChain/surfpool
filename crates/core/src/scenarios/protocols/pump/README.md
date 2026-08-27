@@ -41,8 +41,10 @@ Notes:
 
 - The mint catalogs offer only verified tokens whose address ends in `pump`
   (976 mints in the bundled catalog; `address_suffix: pump` in both `overrides.yaml`
-  files). Coins outside the verified catalog — including freshly launched ones — can
-  only be targeted through the raw REST payload, which performs no catalog validation.
+  files). Coins outside the verified catalog — including freshly launched ones — are
+  still reachable through the graduation MCP tool and its Studio preset, which validate
+  live on-chain state instead of the catalog, or through the raw REST payload, which
+  performs no catalog validation.
 - `pump-amm-canonical-pool` covers WSOL-quoted canonical migrations only; any other
   pool goes through `pump-amm-pool-state` with its address.
 - Always set `fetchBeforeUse: true` so non-overridden fields keep their live values.
