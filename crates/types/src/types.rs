@@ -643,7 +643,18 @@ impl SimnetEventsTx {
             | SimnetEvent::SystemClockUpdated(..)
             | SimnetEvent::StartupStatusChanged(..)
             | SimnetEvent::AccountUpdate(..) => self.log(event),
-            _ => self.emit(event),
+            SimnetEvent::CoreStarted(..)
+            | SimnetEvent::Connected(..)
+            | SimnetEvent::Aborted(..)
+            | SimnetEvent::Shutdown
+            | SimnetEvent::ClockUpdate(..)
+            | SimnetEvent::EpochInfoUpdate(..)
+            | SimnetEvent::PluginLoaded(..)
+            | SimnetEvent::TransactionReceived(..)
+            | SimnetEvent::TransactionProcessed(..)
+            | SimnetEvent::TaggedProfile { .. }
+            | SimnetEvent::RunbookStarted(..)
+            | SimnetEvent::RunbookCompleted(..) => self.emit(event),
         }
     }
 
