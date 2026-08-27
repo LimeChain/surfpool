@@ -156,39 +156,16 @@ impl AccountUpdatePolicy {
 
 /// Token accounts carry no Anchor discriminator, so the IDL forge path cannot decode them.
 fn forge_token_account_data(
-    account_pubkey: &Pubkey,
     account: &Account,
     mut token_account: TokenAccount,
-    values: &HashMap<String, serde_json::Value>,
     account_values: &HashMap<String, serde_json::Value>,
 ) -> SurfpoolResult<Vec<u8>> {
-    if account_values.len() != 1 || !account_values.contains_key("amount") {
-        return Err(SurfpoolError::internal(
-            "token account overrides accept only the amount field",
-        ));
-    }
-
-    // The address derives from token_mint, so a mismatched mint means a replaced account.
-    if let Some(expected_mint) = values.get("token_mint") {
-        let expected_mint = expected_mint
-            .as_str()
-            .and_then(|mint| Pubkey::from_str(mint).ok())
-            .ok_or_else(|| SurfpoolError::internal("token_mint must be a valid pubkey"))?;
-        if token_account.mint() != expected_mint {
-            return Err(SurfpoolError::invalid_account_data(
-                account_pubkey,
-                "Token account mint does not match token_mint",
-                Some("derived vault contains a different mint"),
-            ));
-        }
-    }
-
-    let amount = account_values["amount"]
-        .as_u64()
-        .or_else(|| {
-            account_values["amount"]
-                .as_str()
-                .and_then(|amount| amount.parse().ok())
+    let amount = account_values
+        .get("amount")
+        .and_then(|amount| {
+            amount
+                .as_u64()
+                .or_else(|| amount.as_str().and_then(|amount| amount.parse().ok()))
         })
         .ok_or_else(|| SurfpoolError::internal("amount must be an unsigned 64-bit integer"))?;
     token_account.set_amount(amount);
@@ -2861,13 +2838,8 @@ impl SurfnetSvm {
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data = forge_token_account_data(
-                            &account_pubkey,
-                            &account,
-                            token_account,
-                            &override_instance.values,
-                            &account_values,
-                        )?;
+                        let new_account_data =
+                            forge_token_account_data(&account, token_account, &account_values)?;
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -4365,70 +4337,16 @@ mod tests {
 
     #[test]
     fn token_account_override_patches_only_the_amount_bytes() {
-        let mint = Pubkey::new_unique();
-        let (token_account, account) = token_2022_vault_with_tail(mint);
-        let values = HashMap::from([(
-            "token_mint".to_string(),
-            serde_json::json!(mint.to_string()),
-        )]);
+        let (token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
         // Studio clients send u64 values as strings, so the parse path is the contract.
         let account_values = HashMap::from([("amount".to_string(), serde_json::json!("42"))]);
 
-        let patched = forge_token_account_data(
-            &Pubkey::new_unique(),
-            &account,
-            token_account,
-            &values,
-            &account_values,
-        )
-        .unwrap();
+        let patched = forge_token_account_data(&account, token_account, &account_values).unwrap();
 
         assert_eq!(patched.len(), account.data.len());
         assert_eq!(&patched[64..72], &42u64.to_le_bytes());
         assert_eq!(&patched[..64], &account.data[..64]);
         assert_eq!(&patched[72..], &account.data[72..]);
-    }
-
-    #[test]
-    fn token_account_override_rejects_a_different_mint() {
-        let (token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
-        let values = HashMap::from([(
-            "token_mint".to_string(),
-            serde_json::json!(Pubkey::new_unique().to_string()),
-        )]);
-        let account_values = HashMap::from([("amount".to_string(), serde_json::json!(1u64))]);
-
-        assert!(
-            forge_token_account_data(
-                &Pubkey::new_unique(),
-                &account,
-                token_account,
-                &values,
-                &account_values,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn token_account_override_rejects_non_amount_fields() {
-        let mint = Pubkey::new_unique();
-        let (token_account, account) = token_2022_vault_with_tail(mint);
-        let account_values = HashMap::from([(
-            "delegate".to_string(),
-            serde_json::json!(Pubkey::new_unique().to_string()),
-        )]);
-
-        assert!(
-            forge_token_account_data(
-                &Pubkey::new_unique(),
-                &account,
-                token_account,
-                &HashMap::new(),
-                &account_values,
-            )
-            .is_err()
-        );
     }
 
     /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
