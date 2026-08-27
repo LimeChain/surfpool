@@ -25,6 +25,7 @@ use crossbeam_channel::{Receiver, Sender};
 pub use jsonrpc_core;
 pub use jsonrpc_http_server;
 pub use litesvm;
+pub use solana_account;
 pub use solana_commitment_config;
 use solana_pubkey::Pubkey;
 pub use solana_rpc_client;

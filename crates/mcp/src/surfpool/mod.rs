@@ -14,7 +14,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use set_token_account::{SeededAccount, SetAccountSuccess, SetTokenAccountsResponse};
-use solana_account::Account;
 use solana_pubkey::Pubkey;
 use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
@@ -24,6 +23,7 @@ use surfpool_core::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
     },
+    solana_account::Account,
     solana_commitment_config::CommitmentConfig,
     surfnet::remote::SurfnetRemoteClient,
 };

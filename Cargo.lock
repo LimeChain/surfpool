@@ -12075,7 +12075,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "solana-account 4.3.1",
  "solana-keypair",
  "solana-pubkey 3.0.0",
  "solana-signer",
