@@ -130,7 +130,7 @@ pub fn build_pump_graduation_scenario(
     let target_quote = pool_migration_fee
         .checked_mul(MIGRATION_FEE_BUFFER)
         .ok_or_else(|| invalid_curve("pool migration fee overflows"))?;
-    let prepared_real_quote_reserves = 1u64;
+    let prepared_real_quote_reserves = 0u64;
     let prepared_virtual_quote_reserves = quote_offset
         .checked_add(prepared_real_quote_reserves)
         .ok_or_else(|| invalid_curve("virtual quote reserves overflow"))?;
@@ -192,30 +192,27 @@ pub fn build_pump_graduation_scenario(
         ),
     ]);
     let global_values = HashMap::from([("enable_migrate".to_string(), serde_json::json!(true))]);
-    let mut curve_override = OverrideInstance::new(
+    let curve_override = OverrideInstance::new(
         curve_template.id.clone(),
         GRADUATION_PREPARATION_SLOT,
         curve_template.address.clone(),
     )
     .with_values(curve_values)
     .with_label("Near-complete bonding curve".to_string());
-    curve_override.fetch_before_use = true;
-    let mut vault_override = OverrideInstance::new(
+    let vault_override = OverrideInstance::new(
         vault_template.id.clone(),
         GRADUATION_PREPARATION_SLOT,
         vault_template.address.clone(),
     )
     .with_values(vault_values)
     .with_label("Migration-safe curve vault".to_string());
-    vault_override.fetch_before_use = true;
-    let mut global_override = OverrideInstance::new(
+    let global_override = OverrideInstance::new(
         global_template.id.clone(),
         GRADUATION_PREPARATION_SLOT,
         global_template.address.clone(),
     )
     .with_values(global_values)
     .with_label("Migration enabled".to_string());
-    global_override.fetch_before_use = true;
 
     let mut scenario = Scenario::new(
         "Pump Graduation".to_string(),

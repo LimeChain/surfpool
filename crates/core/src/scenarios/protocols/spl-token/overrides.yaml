@@ -64,7 +64,6 @@ templates:
       Use this together with pump-bonding-curve-custom when preparing a Token-2022
       pump.fun coin near graduation. The amount must equal the new real_token_reserves
       plus the coin's existing migration reserve. Never set it to real_token_reserves alone.
-      Set fetchBeforeUse: true so Token-2022 extensions remain intact.
     address:
       type: pda
       program_id: ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
