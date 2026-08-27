@@ -109,7 +109,7 @@ pub fn build_pump_graduation_scenario(
     let token_offset = virtual_token_reserves
         .checked_sub(real_token_reserves)
         .ok_or_else(|| invalid_curve("virtual token reserves are below real token reserves"))?;
-    let quote_offset = virtual_quote_reserves
+    virtual_quote_reserves
         .checked_sub(real_quote_reserves)
         .ok_or_else(|| invalid_curve("virtual quote reserves are below real quote reserves"))?;
 
@@ -127,15 +127,16 @@ pub fn build_pump_graduation_scenario(
         POOL_MIGRATION_FEE_OFFSET,
         "pool_migration_fee",
     )?;
-    let target_quote = pool_migration_fee
+    let target_final_quote = pool_migration_fee
         .checked_mul(MIGRATION_FEE_BUFFER)
         .ok_or_else(|| invalid_curve("pool migration fee overflows"))?;
-    let prepared_real_quote_reserves = 0u64;
-    let prepared_virtual_quote_reserves = quote_offset
-        .checked_add(prepared_real_quote_reserves)
-        .ok_or_else(|| invalid_curve("virtual quote reserves overflow"))?;
+    let required_quote_in = target_final_quote
+        .saturating_sub(real_quote_reserves)
+        .max(1);
+    let prepared_real_quote_reserves = real_quote_reserves;
+    let prepared_virtual_quote_reserves = virtual_quote_reserves;
     let completing_buy_amount = div_ceil(
-        u128::from(target_quote) * u128::from(token_offset),
+        u128::from(required_quote_in) * u128::from(token_offset),
         u128::from(prepared_virtual_quote_reserves),
     )?;
     let completing_buy_amount = u64::try_from(completing_buy_amount)
@@ -294,4 +295,107 @@ fn div_ceil(numerator: u128, denominator: u128) -> SurfpoolResult<u128> {
 
 fn invalid_curve(message: impl Into<String>) -> SurfpoolError {
     SurfpoolError::internal(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_u64(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn graduation_preserves_quote_reserves_and_sizes_only_the_shortfall() {
+        let token_mint = Pubkey::new_unique();
+        let token_offset = 1_000;
+        let real_token_reserves = 500;
+        let virtual_token_reserves = token_offset + real_token_reserves;
+        let real_quote_reserves = 200;
+        let virtual_quote_reserves = 500;
+        let pool_migration_fee = 100;
+        let migration_reserve = 50;
+
+        let mint_account = Account {
+            owner: TOKEN_2022_PROGRAM_ID,
+            ..Account::default()
+        };
+        let mut curve_data = vec![0; QUOTE_MINT_OFFSET + 32];
+        write_u64(
+            &mut curve_data,
+            VIRTUAL_TOKEN_RESERVES_OFFSET,
+            virtual_token_reserves,
+        );
+        write_u64(
+            &mut curve_data,
+            VIRTUAL_QUOTE_RESERVES_OFFSET,
+            virtual_quote_reserves,
+        );
+        write_u64(
+            &mut curve_data,
+            REAL_TOKEN_RESERVES_OFFSET,
+            real_token_reserves,
+        );
+        write_u64(
+            &mut curve_data,
+            REAL_QUOTE_RESERVES_OFFSET,
+            real_quote_reserves,
+        );
+        let curve_account = Account {
+            owner: PUMP_PROGRAM_ID,
+            data: curve_data,
+            ..Account::default()
+        };
+
+        let mut vault = TokenAccount::new(
+            &TOKEN_2022_PROGRAM_ID,
+            Pubkey::new_unique(),
+            token_mint,
+            None,
+        );
+        vault.set_amount(real_token_reserves + migration_reserve);
+        let curve_vault_account = Account {
+            owner: TOKEN_2022_PROGRAM_ID,
+            data: vault.pack_into_vec(),
+            ..Account::default()
+        };
+
+        let mut global_data = vec![0; POOL_MIGRATION_FEE_OFFSET + 8];
+        write_u64(
+            &mut global_data,
+            POOL_MIGRATION_FEE_OFFSET,
+            pool_migration_fee,
+        );
+        let global_account = Account {
+            owner: PUMP_PROGRAM_ID,
+            data: global_data,
+            ..Account::default()
+        };
+
+        let preparation = build_pump_graduation_scenario(
+            token_mint,
+            &mint_account,
+            &curve_account,
+            &curve_vault_account,
+            None,
+            &global_account,
+        )
+        .expect("valid graduation state");
+
+        assert_eq!(preparation.completing_buy_amount, 200);
+        let curve_override = preparation
+            .scenario
+            .overrides
+            .iter()
+            .find(|instance| instance.template_id == "pump-bonding-curve-custom")
+            .expect("curve override");
+        assert_eq!(
+            curve_override.values["real_quote_reserves"],
+            serde_json::json!(real_quote_reserves)
+        );
+        assert_eq!(
+            curve_override.values["virtual_quote_reserves"],
+            serde_json::json!(virtual_quote_reserves)
+        );
+    }
 }
