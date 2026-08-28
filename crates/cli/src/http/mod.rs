@@ -550,8 +550,8 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn full_document_patch_replaces_like_before() {
-        let existing = scenario_of(scenario_json("s1", "before"));
+    async fn full_patch_replaces_all_field_values() {
+        let existing = scenario_of(scenario_json("s1", "original"));
         let patch = serde_json::json!({
             "id": "s1", "name": "after", "description": "", "overrides": [], "tags": []
         });
@@ -559,7 +559,8 @@ mod tests {
         let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
 
         assert_eq!(merged.name, "after");
-        assert!(merged.overrides.is_empty(), "a full doc still replaces");
+        assert!(merged.description.is_empty());
+        assert!(merged.overrides.is_empty(), "a full document replaces");
         assert!(merged.tags.is_empty());
     }
 
