@@ -39,6 +39,11 @@ pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/
 pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pump-amm/v1/overrides.yaml");
 
+pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/editor-schema.json");
+pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -59,6 +64,7 @@ impl TemplateRegistry {
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
         default.load_pump_overrides();
+        default.load_phoenix_overrides();
         default
     }
 
@@ -125,6 +131,14 @@ impl TemplateRegistry {
             PUMP_AMM_V1_IDL_CONTENT,
             PUMP_AMM_V1_OVERRIDES_CONTENT,
             "pump-amm",
+        );
+    }
+
+    pub fn load_phoenix_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PHOENIX_ETERNAL_IDL_CONTENT,
+            PHOENIX_ETERNAL_OVERRIDES_CONTENT,
+            "phoenix-eternal",
         );
     }
 
@@ -426,11 +440,11 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 29 total
+        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (3) = 32 total
         assert_eq!(
             registry.count(),
-            29,
-            "Registry should load 29 templates total"
+            32,
+            "Registry should load 32 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -472,6 +486,9 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+
+        assert!(registry.contains("phoenix-trader-collateral-stress"));
+        assert!(registry.contains("phoenix-direct-mark-risk-shock"));
     }
 
     #[test]
@@ -531,6 +548,13 @@ mod tests {
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        let phoenix_templates = registry.by_protocol("Phoenix Eternal");
+        assert_eq!(
+            phoenix_templates.len(),
+            3,
+            "Should have 3 Phoenix Eternal templates"
         );
     }
 

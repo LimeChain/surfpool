@@ -1,0 +1,74 @@
+{
+  "address": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+  "metadata": {
+    "name": "phoenix_eternal_write_mode_schema",
+    "version": "0.3.4",
+    "spec": "0.1.0",
+    "description": "Editor schema for specialized Phoenix scenario writers; not an account serialization contract"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "TraderCollateralOverride",
+      "discriminator": [41, 97, 73, 105, 110, 214, 112, 9]
+    },
+    {
+      "name": "DirectMarkOverride",
+      "discriminator": [142, 54, 115, 223, 124, 239, 108, 38]
+    },
+    {
+      "name": "ReferencePriceOverride",
+      "discriminator": [210, 123, 24, 82, 132, 17, 53, 94]
+    }
+  ],
+  "types": [
+    {
+      "name": "TraderCollateralOverride",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "quote_lot_collateral",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DirectMarkOverride",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "symbol",
+            "type": "string"
+          },
+          {
+            "name": "target_ticks",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReferencePriceOverride",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "symbol",
+            "type": "string"
+          },
+          {
+            "name": "spot_ticks",
+            "type": "string"
+          },
+          {
+            "name": "perp_ticks",
+            "type": "string"
+          }
+        ]
+      }
+    }
+  ]
+}

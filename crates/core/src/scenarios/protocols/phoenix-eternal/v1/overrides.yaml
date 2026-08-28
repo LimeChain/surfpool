@@ -1,0 +1,312 @@
+protocol: Phoenix Eternal
+version: v1
+account_type: TraderCollateralOverride
+idl_file_path: editor-schema.json
+
+tags:
+  - perpetuals
+  - collateral
+  - risk
+
+constants:
+  # The perp markets listed on the live PerpAssetMap (captured 2026-08-31). A newly
+  # listed market reaches this catalog on the next update; until then the raw
+  # scenario API accepts any symbol and the writer validates it against live state.
+  market_symbol:
+    label: Market
+    description: Select a Phoenix Eternal perp market
+    options:
+      - id: aapl
+        label: AAPL
+        value: AAPL
+      - id: aave
+        label: AAVE
+        value: AAVE
+      - id: ada
+        label: ADA
+        value: ADA
+      - id: amat
+        label: AMAT
+        value: AMAT
+      - id: amd
+        label: AMD
+        value: AMD
+      - id: amzn
+        label: AMZN
+        value: AMZN
+      - id: ansem
+        label: ANSEM
+        value: ANSEM
+      - id: arm
+        label: ARM
+        value: ARM
+      - id: asml
+        label: ASML
+        value: ASML
+      - id: avgo
+        label: AVGO
+        value: AVGO
+      - id: baba
+        label: BABA
+        value: BABA
+      - id: bnb
+        label: BNB
+        value: BNB
+      - id: btc
+        label: BTC
+        value: BTC
+      - id: cbrs
+        label: CBRS
+        value: CBRS
+      - id: chip
+        label: CHIP
+        value: CHIP
+      - id: coin
+        label: COIN
+        value: COIN
+      - id: copper
+        label: COPPER
+        value: COPPER
+      - id: crcl
+        label: CRCL
+        value: CRCL
+      - id: crv
+        label: CRV
+        value: CRV
+      - id: crwd
+        label: CRWD
+        value: CRWD
+      - id: crwv
+        label: CRWV
+        value: CRWV
+      - id: doge
+        label: DOGE
+        value: DOGE
+      - id: ena
+        label: ENA
+        value: ENA
+      - id: eth
+        label: ETH
+        value: ETH
+      - id: fartcoin
+        label: FARTCOIN
+        value: FARTCOIN
+      - id: fet
+        label: FET
+        value: FET
+      - id: gold
+        label: GOLD
+        value: GOLD
+      - id: googl
+        label: GOOGL
+        value: GOOGL
+      - id: hood
+        label: HOOD
+        value: HOOD
+      - id: hype
+        label: HYPE
+        value: HYPE
+      - id: intc
+        label: INTC
+        value: INTC
+      - id: iren
+        label: IREN
+        value: IREN
+      - id: jto
+        label: JTO
+        value: JTO
+      - id: jup
+        label: JUP
+        value: JUP
+      - id: link
+        label: LINK
+        value: LINK
+      - id: lit
+        label: LIT
+        value: LIT
+      - id: lly
+        label: LLY
+        value: LLY
+      - id: mega
+        label: MEGA
+        value: MEGA
+      - id: met
+        label: MET
+        value: MET
+      - id: meta
+        label: META
+        value: META
+      - id: mon
+        label: MON
+        value: MON
+      - id: morpho
+        label: MORPHO
+        value: MORPHO
+      - id: mrna
+        label: MRNA
+        value: MRNA
+      - id: mrvl
+        label: MRVL
+        value: MRVL
+      - id: msft
+        label: MSFT
+        value: MSFT
+      - id: mstr
+        label: MSTR
+        value: MSTR
+      - id: mu
+        label: MU
+        value: MU
+      - id: nbis
+        label: NBIS
+        value: NBIS
+      - id: near
+        label: NEAR
+        value: NEAR
+      - id: net
+        label: NET
+        value: NET
+      - id: nflx
+        label: NFLX
+        value: NFLX
+      - id: nvda
+        label: NVDA
+        value: NVDA
+      - id: ondo
+        label: ONDO
+        value: ONDO
+      - id: pltr
+        label: PLTR
+        value: PLTR
+      - id: pump
+        label: PUMP
+        value: PUMP
+      - id: qcom
+        label: QCOM
+        value: QCOM
+      - id: render
+        label: RENDER
+        value: RENDER
+      - id: silver
+        label: SILVER
+        value: SILVER
+      - id: skhy
+        label: SKHY
+        value: SKHY
+      - id: skr
+        label: SKR
+        value: SKR
+      - id: sndk
+        label: SNDK
+        value: SNDK
+      - id: sol
+        label: SOL
+        value: SOL
+      - id: spcx
+        label: SPCX
+        value: SPCX
+      - id: sui
+        label: SUI
+        value: SUI
+      - id: tao
+        label: TAO
+        value: TAO
+      - id: trx
+        label: TRX
+        value: TRX
+      - id: tsla
+        label: TSLA
+        value: TSLA
+      - id: tsm
+        label: TSM
+        value: TSM
+      - id: virtual
+        label: VIRTUAL
+        value: VIRTUAL
+      - id: vvv
+        label: VVV
+        value: VVV
+      - id: wld
+        label: WLD
+        value: WLD
+      - id: wtioil
+        label: WTIOIL
+        value: WTIOIL
+      - id: xlm
+        label: XLM
+        value: XLM
+      - id: xpl
+        label: XPL
+        value: XPL
+      - id: xrp
+        label: XRP
+        value: XRP
+      - id: zec
+        label: ZEC
+        value: ZEC
+
+templates:
+  - id: phoenix-trader-collateral-stress
+    name: Phoenix Trader Collateral Stress
+    description: Set exact signed quote-lot collateral on one validated Phoenix Eternal Trader account.
+    idl_account_name: TraderCollateralOverride
+    properties:
+      - path: quote_lot_collateral
+        label: Target Collateral in Quote Lots
+        description: Exact signed quote-lot collateral encoded as a decimal string
+    llm_context: |
+      This prepares collateral stress state. It does not guarantee liquidation and does not execute liquidation.
+      For a liquidation cascade, pair it with phoenix-direct-mark-risk-shock at the next slot. Keep override labels short.
+      Pass quote_lot_collateral as a decimal string. Builder-created scenarios leave fetchBeforeUse off; the value applies to the local fork state.
+    address:
+      type: pubkey
+
+  - id: phoenix-direct-mark-risk-shock
+    name: Phoenix Direct Mark Risk Shock
+    description: Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
+    idl_account_name: DirectMarkOverride
+    properties:
+      - path: symbol
+        type: constant_ref
+        label: Market Symbol
+        constant: market_symbol
+        description: Exact Phoenix market symbol
+      - path: target_ticks
+        label: Target Mark Ticks
+        description: Exact unsigned mark-price ticks encoded as a decimal string
+    llm_context: |
+      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
+      Pass target_ticks as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+    # The singleton named by GlobalConfig's perp_asset_map field, which only moves if the
+    # protocol migrates the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-reference-price-divergence
+    name: Phoenix Spot/Perp Reference Divergence
+    description: Set independent spot and external-perp reference ticks while preserving the current mark price.
+    idl_account_name: ReferencePriceOverride
+    properties:
+      - path: symbol
+        type: constant_ref
+        label: Market Symbol
+        constant: market_symbol
+        description: Exact Phoenix market symbol
+      - path: spot_ticks
+        label: Spot Reference Ticks
+        description: Exact spot reference ticks encoded as a decimal string
+      - path: perp_ticks
+        label: Perp Reference Ticks
+        description: Exact external-perp reference ticks encoded as a decimal string
+    llm_context: |
+      This prepares spot/perp reference and mark divergence state for bots to act on, setting the cached reference ticks and stamping their slots with the materialization slot.
+      It preserves the current mark, orderbook, and spline liquidity and does not execute a trade.
+      Pass both tick values as decimal strings. The account is the singleton PerpAssetMap, so this template carries its address.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
