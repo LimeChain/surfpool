@@ -60,6 +60,11 @@ pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/
 pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pump-amm/v1/overrides.yaml");
 
+pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/editor-schema.json");
+pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -80,6 +85,7 @@ impl TemplateRegistry {
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
         default.load_pump_overrides();
+        default.load_phoenix_overrides();
         default
     }
 
@@ -176,6 +182,14 @@ impl TemplateRegistry {
             PUMP_AMM_V1_IDL_CONTENT,
             PUMP_AMM_V1_OVERRIDES_CONTENT,
             "pump-amm",
+        );
+    }
+
+    pub fn load_phoenix_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PHOENIX_ETERNAL_IDL_CONTENT,
+            PHOENIX_ETERNAL_OVERRIDES_CONTENT,
+            "phoenix-eternal",
         );
     }
 
@@ -482,11 +496,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (3) = 65
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            65,
+            "Registry should load 65 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -557,6 +571,9 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+
+        assert!(registry.contains("phoenix-trader-collateral-stress"));
+        assert!(registry.contains("phoenix-direct-mark-risk-shock"));
     }
 
     #[test]
@@ -678,6 +695,13 @@ mod tests {
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        let phoenix_templates = registry.by_protocol("Phoenix Eternal");
+        assert_eq!(
+            phoenix_templates.len(),
+            3,
+            "Should have 3 Phoenix Eternal templates"
         );
     }
 
@@ -1160,10 +1184,16 @@ mod tests {
         let mut errors = Vec::new();
 
         for template in registry.all() {
+            // Phoenix market templates feed the typed PerpAssetMap price codec in svm.rs, so
+            // their inputs (market symbol, ticks) are codec arguments, not IDL fields.
+            if template.protocol == "Phoenix Eternal" && template.account_type == "PerpAssetMap" {
+                continue;
+            }
             for property in &template.properties {
-                // constant_ref properties are UI dropdowns (e.g. token pickers), not
-                // account fields, so they are not expected to resolve against the IDL.
-                if property.is_constant_ref() {
+                // constant_ref and dynamic_ref properties are UI dropdowns (e.g. token or
+                // market pickers), not account fields, so they are not expected to resolve
+                // against the IDL.
+                if property.is_constant_ref() || property.is_dynamic_ref() {
                     continue;
                 }
                 if let Err(e) = surfpool_types::resolve_idl_type(

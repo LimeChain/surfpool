@@ -1,0 +1,41 @@
+{
+  "id": "phoenix-eternal-liquidation-cascade-example",
+  "name": "Phoenix Eternal Liquidation Cascade - BTC",
+  "description": "Stresses one Phoenix Eternal Trader's collateral, then shocks the BTC mark price a slot later, so the trader crosses into liquidation territory while the run is live. Replace the trader pubkey with an account that exists on your fork; collateral can only be lowered, since an override cannot mint the vault backing it. Both values are decimal strings because they span the full i64/u64 range.",
+  "tags": [
+    "phoenix-eternal",
+    "liquidation",
+    "multi-slot"
+  ],
+  "overrides": [
+    {
+      "id": "trader-collateral-stress",
+      "templateId": "phoenix-trader-collateral-stress",
+      "label": "Phoenix Trader collateral stress",
+      "scenarioRelativeSlot": 0,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "account": {
+        "pubkey": "<a Phoenix Eternal Trader account on your fork>"
+      },
+      "values": {
+        "quote_lot_collateral": "900000000"
+      }
+    },
+    {
+      "id": "btc-direct-mark-shock",
+      "templateId": "phoenix-direct-mark-risk-shock",
+      "label": "Phoenix BTC direct mark risk shock",
+      "scenarioRelativeSlot": 1,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "account": {
+        "pubkey": "2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC"
+      },
+      "values": {
+        "symbol": "BTC",
+        "target_ticks": "1"
+      }
+    }
+  ]
+}
