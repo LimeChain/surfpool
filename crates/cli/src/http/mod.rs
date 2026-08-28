@@ -281,16 +281,15 @@ fn merge_scenario_patch(
     deserialize_scenario_strictly(merged)
 }
 
-fn scenario_from_full_patch(patch: &serde_json::Value, path_id: &str) -> Result<Scenario, String> {
-    let mut scenario = patch.clone();
-    let obj = scenario
+fn scenario_from_full_patch(mut patch: serde_json::Value, path_id: &str) -> Result<Scenario, String> {
+    let obj = patch
         .as_object_mut()
         .ok_or_else(|| "PATCH body must be a JSON object".to_string())?;
     obj.insert(
         "id".to_string(),
         serde_json::Value::String(path_id.to_string()),
     );
-    deserialize_scenario_strictly(scenario)
+    deserialize_scenario_strictly(patch)
 }
 
 fn deserialize_scenario_strictly(value: serde_json::Value) -> Result<Scenario, String> {
@@ -351,7 +350,7 @@ async fn patch_scenario(
         Some(index) => {
             merge_scenario_patch(&loaded_scenarios.scenarios[index], &patch, &scenario_id)
         }
-        None => scenario_from_full_patch(&patch, &scenario_id),
+        None => scenario_from_full_patch(patch.into_inner(), &scenario_id),
     };
 
     match updated {
@@ -654,7 +653,7 @@ mod tests {
             }
         });
 
-        let scenario = scenario_from_full_patch(&patch, "s1").unwrap();
+        let scenario = scenario_from_full_patch(patch.clone(), "s1").unwrap();
 
         assert_eq!(
             scenario.overrides[0].values["custom"],
