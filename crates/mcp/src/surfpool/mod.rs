@@ -19,6 +19,7 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
+        protocols::phoenix_eternal::v1::state_builder::build_phoenix_collateral_scenario,
         protocols::pump::v1::graduation_builder::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
@@ -124,6 +125,21 @@ pub struct CreatePumpGraduationScenarioParams {
         description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
     )]
     pub token_mint: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePhoenixCollateralScenarioParams {
+    #[schemars(description = "Phoenix Eternal Trader account pubkey.")]
+    pub trader: String,
+    #[schemars(
+        description = "Exact signed collateral target in quote lots, encoded as a decimal string."
+    )]
+    pub target_quote_lots: String,
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
@@ -1002,6 +1018,45 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The backend fetches and validates the live Trader account. This prepares risk state; it does not guarantee or execute liquidation."
+    )]
+    async fn create_phoenix_collateral_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let trader = match Pubkey::from_str(params.trader.trim()) {
+            Ok(trader) => trader,
+            Err(error) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid Trader pubkey: {error}"
+                )));
+            }
+        };
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[trader])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let Some(trader_account) = accounts[0].as_ref() else {
+            return Ok(scenario_tool_error(format!(
+                "Phoenix Trader account {trader} was not found"
+            )));
+        };
+        let preparation = match build_phoenix_collateral_scenario(
+            trader,
+            trader_account,
+            &params.target_quote_lots,
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        self.stage_scenario(preparation.scenario).await
+    }
+
+    #[tool(
         description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
@@ -1295,6 +1350,43 @@ mod tests {
                 .as_str()
                 .expect("error")
                 .contains("Invalid token mint")
+        );
+    }
+
+    #[tokio::test]
+    async fn phoenix_collateral_rejects_invalid_inputs_before_rpc() {
+        let surfpool = Surfpool::new();
+
+        let collateral = surfpool
+            .create_phoenix_collateral_scenario(Parameters(CreatePhoenixCollateralScenarioParams {
+                surfnet_port: None,
+                trader: "not-a-pubkey".to_string(),
+                target_quote_lots: "1".to_string(),
+            }))
+            .await
+            .expect("tool result");
+        assert!(
+            json_of(&collateral)["error"]
+                .as_str()
+                .expect("error")
+                .contains("Invalid Trader pubkey")
+        );
+    }
+
+    #[test]
+    fn phoenix_collateral_requires_exact_string_inputs() {
+        assert!(
+            serde_json::from_value::<CreatePhoenixCollateralScenarioParams>(serde_json::json!({
+                "trader": "GHkq1eHeZGi96RmGPZ23e3BDEcdfpPzsPwpYdm17SWgc",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CreatePhoenixCollateralScenarioParams>(serde_json::json!({
+                "trader": "GHkq1eHeZGi96RmGPZ23e3BDEcdfpPzsPwpYdm17SWgc",
+                "targetQuoteLots": 1,
+            }))
+            .is_err()
         );
     }
 
