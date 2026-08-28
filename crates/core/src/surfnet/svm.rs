@@ -92,7 +92,12 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
-    scenarios::TemplateRegistry,
+    scenarios::{
+        TemplateRegistry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override,
+        },
+    },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
@@ -3092,8 +3097,30 @@ impl SurfnetSvm {
                             rent_epoch: account.rent_epoch(),
                         };
                         self.inner.set_account(account_pubkey, modified_account)?;
+                        settled_this_slot.insert(account_pubkey);
                         continue;
                     }
+                }
+
+                // Phoenix Eternal accounts are zero-copy: route them by owner through
+                // the typed codec, the same seam the token path uses.
+                if account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID {
+                    let new_account_data = forge_phoenix_override(
+                        &account_pubkey,
+                        &account,
+                        &account_values,
+                        target_slot,
+                    )?;
+                    let modified_account = Account {
+                        lamports: account.lamports(),
+                        data: new_account_data,
+                        owner: *account.owner(),
+                        executable: account.executable(),
+                        rent_epoch: account.rent_epoch(),
+                    };
+                    self.inner.set_account(account_pubkey, modified_account)?;
+                    settled_this_slot.insert(account_pubkey);
+                    continue;
                 }
 
                 // Get the account owner (program ID)
@@ -4731,6 +4758,83 @@ mod tests {
             "only the explicitly refreshed target may be overwritten; the coupled account was \
              not requested and must keep its local state"
         );
+    }
+
+    /// Two overrides on the same account in the same slot: the later one asks for a
+    /// refresh, which must not reinstall remote bytes over the earlier patch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_before_use_preserves_an_earlier_same_slot_patch() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let target = Pubkey::new_unique();
+
+        // The local account's lamports are the marker: a remote reinstall would replace them.
+        let local = crate::types::TokenAccount::new(
+            &spl_token_interface::id(),
+            Pubkey::new_unique(),
+            Pubkey::default(),
+            None,
+        );
+        locker.with_svm_writer(|svm_writer| {
+            svm_writer
+                .set_account(
+                    &target,
+                    Account {
+                        lamports: 1_000_000,
+                        data: local.pack_into_vec(),
+                        owner: spl_token_interface::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        });
+
+        let mut scenario = surfpool_types::Scenario::new(
+            "same-slot patches".to_string(),
+            "a later refresh must not erase an earlier same-slot patch".to_string(),
+        );
+        let first = surfpool_types::OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!("42"),
+        )]));
+        scenario.add_override(first);
+        let mut second = surfpool_types::OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!("77"),
+        )]));
+        second.fetch_before_use = true;
+        scenario.add_override(second);
+
+        locker.register_scenario(scenario, Some(100)).unwrap();
+        locker
+            .materialize_overrides_for_slot(&Some(remote), 100)
+            .await
+            .unwrap();
+
+        let after = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.lamports, 1_000_000,
+            "the second override's refresh must be skipped: this account was already patched \
+             in the same slot"
+        );
+        let token = crate::types::TokenAccount::unpack(&after.data).unwrap();
+        assert_eq!(token.amount(), 77);
     }
 
     fn build_transfer_transaction(
