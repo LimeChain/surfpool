@@ -564,14 +564,14 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn explicit_empty_array_still_clears() {
-        let existing = scenario_of(scenario_json("s1", "before"));
+    async fn explicit_empty_array_patch_clears_scenario_overrides() {
+        let existing = scenario_of(scenario_json("s1", "original"));
         let patch = serde_json::json!({ "overrides": [] });
 
         let merged = merge_scenario_patch(&existing, &patch, "s1").unwrap();
 
         assert!(merged.overrides.is_empty(), "an explicit [] clears");
-        assert_eq!(merged.name, "before", "other fields untouched");
+        assert_eq!(merged.name, "original", "other fields untouched");
     }
 
     #[actix_web::test]
