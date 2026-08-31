@@ -22,6 +22,7 @@ use surfpool_core::{
         protocols::pump::v1::graduation_builder::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
+        protocols::tessera::v1::{TesseraMarket, build_tessera_fair_value_scenario},
     },
     solana_account::Account,
     solana_commitment_config::CommitmentConfig,
@@ -36,6 +37,29 @@ use crate::helpers::find_next_available_surfnet_port;
 
 mod set_token_account;
 mod start_surfnet;
+
+fn scenario_tool_error(message: String) -> CallToolResult {
+    let response = RegisterScenarioResponse::error(message);
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string(&response).unwrap_or_default(),
+    )])
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CreateTesseraFairValueScenarioParams {
+    #[schemars(
+        description = "The Tessera market account. Resolve one through search_constant_options on the tessera-fair-value template's `market` constant; omit to use the default SOL/USDC market."
+    )]
+    pub market: Option<String>,
+    #[schemars(
+        description = "The price of one base token in quote tokens, as a positive decimal string such as \"100.25\". Not atomic units: the builder derives the scale from the market's mint decimals."
+    )]
+    pub price: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StartSurfnetParams {
@@ -332,13 +356,6 @@ impl RegisterScenarioResponse {
     }
 }
 
-fn scenario_tool_error(message: String) -> CallToolResult {
-    let response = RegisterScenarioResponse::error(message);
-    CallToolResult::success(vec![Content::text(
-        serde_json::to_string(&response).unwrap_or_default(),
-    )])
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetTokenAddressParams {
     #[schemars(description = "The token symbol to look up (e.g., 'USDC', 'SOL', 'JUP')")]
@@ -399,6 +416,10 @@ impl Surfpool {
             .collect())
     }
 
+    /// Posts a scenario to this process's own scenarios API and returns the editor link.
+    ///
+    /// The self-call uses the bind address; the advertised Studio URL is a different axis and
+    /// may not be reachable from here.
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
         let endpoint = format!(
             "http://127.0.0.1:{}/v1/scenarios",
@@ -413,49 +434,42 @@ impl Surfpool {
         {
             Ok(response) => response,
             Err(error) => {
-                let response = RegisterScenarioResponse::error(format!(
+                return Ok(scenario_tool_error(format!(
                     "Failed to load scenarios at {endpoint}: {error}"
-                ));
-                let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                )));
             }
         };
         let status = response.status();
         let body = match response.text().await {
             Ok(body) => body,
             Err(error) => {
-                let response = RegisterScenarioResponse::error(format!(
+                return Ok(scenario_tool_error(format!(
                     "Failed to read response text: {error}"
-                ));
-                let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                )));
             }
         };
-        let response: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(response) => response,
+        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(parsed) => parsed,
             Err(error) => {
-                let response = RegisterScenarioResponse::error(format!(
+                return Ok(scenario_tool_error(format!(
                     "Failed to parse JSON response: {error}. Response: {body}"
-                ));
-                let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                )));
             }
         };
+
+        // A different scenario already occupies this id: say so instead of
+        // reporting a success the model would trust
         if status == reqwest::StatusCode::CONFLICT {
-            let response = RegisterScenarioResponse::error(format!(
+            return Ok(scenario_tool_error(format!(
                 "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
                 scenario.id
-            ));
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            )));
         }
-        if let Some(error) = response.get("error") {
-            let response = RegisterScenarioResponse::error(format!("RPC error: {error}"));
-            let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        if let Some(error) = parsed.get("error") {
+            return Ok(scenario_tool_error(format!("RPC error: {error}")));
         }
 
-        let scenario_id = response
+        let scenario_id = parsed
             .get("id")
             .and_then(|value| value.as_str())
             .unwrap_or(&scenario.id);
@@ -464,8 +478,9 @@ impl Surfpool {
             CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
         );
         let response = RegisterScenarioResponse::success(url);
-        let json = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&response).unwrap_or_default(),
+        )]))
     }
 }
 
@@ -1002,6 +1017,75 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Creates one editable Tessera fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet, derives the pair of reciprocal atomic ratios from their decimals, and keeps the quote fresh while the scenario runs. Prepares state; sends no swap. Resolve `market` through search_constant_options on the tessera-fair-value template's `market` constant."
+    )]
+    async fn create_tessera_fair_value_scenario(
+        &self,
+        Parameters(params): Parameters<CreateTesseraFairValueScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let market_address = match params.market.as_deref().map(str::trim) {
+            None | Some("") => {
+                surfpool_core::scenarios::protocols::tessera::v1::TESSERA_DEFAULT_MARKET
+            }
+            Some(address) => match Pubkey::from_str(address) {
+                Ok(market) => market,
+                Err(error) => {
+                    return Ok(scenario_tool_error(format!(
+                        "Invalid Tessera market pubkey: {error}"
+                    )));
+                }
+            },
+        };
+
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[market_address])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let Some(market_account) = accounts[0].as_ref() else {
+            return Ok(scenario_tool_error(format!(
+                "Tessera market account {market_address} was not found"
+            )));
+        };
+        let (base_mint, quote_mint) = match TesseraMarket::mint_addresses(market_account) {
+            Ok(mints) => mints,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        let mints = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[base_mint, quote_mint])
+            .await
+        {
+            Ok(mints) => mints,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let (Some(base_account), Some(quote_account)) = (mints[0].as_ref(), mints[1].as_ref())
+        else {
+            return Ok(scenario_tool_error(format!(
+                "Tessera market {market_address} references a mint that was not found"
+            )));
+        };
+
+        let market = match TesseraMarket::validate(
+            market_address,
+            market_account,
+            base_account,
+            quote_account,
+        ) {
+            Ok(market) => market,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        let preparation = match build_tessera_fair_value_scenario(&market, &params.price) {
+            Ok(preparation) => preparation,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        self.stage_scenario(preparation.scenario).await
+    }
+
+    #[tool(
         description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
@@ -1313,6 +1397,24 @@ mod tests {
             constant: constant.map(str::to_string),
             query: query.to_string(),
         })
+    }
+
+    #[tokio::test]
+    async fn tessera_fair_value_rejects_a_bad_market_before_any_rpc() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .create_tessera_fair_value_scenario(Parameters(CreateTesseraFairValueScenarioParams {
+                surfnet_port: None,
+                market: Some("not-a-pubkey".to_string()),
+                price: "100.25".to_string(),
+            }))
+            .await
+            .expect("the tool reports input errors in its payload, not as a protocol error");
+        let text = format!("{:?}", result.content);
+        assert!(
+            text.contains("Invalid Tessera market pubkey"),
+            "unexpected payload: {text}"
+        );
     }
 
     #[tokio::test]

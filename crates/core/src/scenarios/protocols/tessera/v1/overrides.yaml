@@ -1,0 +1,874 @@
+protocol: Tessera
+version: deployed-438800691
+account_type: MarketState
+
+raw_layout:
+  account_size: 1264
+  magic:
+    offset: 96
+    bytes: [5, 0, 0, 0, 0, 0, 0, 0]
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+constants:
+  # Every live Tessera market, captured 2026-08-31 by the documented refresh command in
+  # ../README.md. Tessera lists markets continuously: a new one reaches this catalog on the
+  # next refresh, and until then the raw scenario API still accepts its address directly.
+  #
+  # freshness_limit_slots is the age at which the deployed program rejects a quote. It picks
+  # the matching tessera-stale-quote template, which is why it travels with the address.
+  market:
+    label: Tessera Market
+    description: Select a live Tessera market account
+    options:
+      - id: sol_usdc
+        label: SOL/USDC
+        value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+        description: >-
+          Default market. Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: So11111111111111111111111111111111111111112
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: 2z_usdc
+        label: 2Z/USDC
+        value: ETZYG4pXscxNchSobJHnN4aDrVNL45gscnzcxM7sEDKe
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: J6pQQ3FAcJQeWPPGppWRb4nM8jU3wLyYbRrLh7feMfvd
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: bonk_usdc
+        label: Bonk/USDC
+        value: 8B8KYcFPMjZyDtJ1BENsqhW3fEmMrB4ekoEQJiM6z3SC
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 5
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: cbbtc_usdc
+        label: cbBTC/USDC
+        value: 9NkuAWB4LgCVFV77omEkJEjXqgV5PGupwMTu3B3pBRhc
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: fartcoin_sol
+        label: Fartcoin/SOL
+        value: rJ554NghHHwuUXL2mGJJviGrpYk7P2qSGTruwwD5KKb
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump
+          quote_mint: So11111111111111111111111111111111111111112
+          base_decimals: 6
+          quote_decimals: 9
+          freshness_limit_slots: 20
+      - id: fartcoin_usdc
+        label: Fartcoin/USDC
+        value: F45HLDGN3mYBaJAKB1UGkx8Y7o2ruS5hgBox1Us6AZF9
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: hype_usdc
+        label: HYPE/USDC
+        value: FvQds9kfSi7opoW7Lf3KcsgcuKfJZB2HdrVNkdLSLQbi
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: 98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: jlp_sol
+        label: JLP/SOL
+        value: H3chk8rgniKXnToGTdPUFieuHGLQQfBMXVbGp6bR1uMD
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: 27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4
+          quote_mint: So11111111111111111111111111111111111111112
+          base_decimals: 6
+          quote_decimals: 9
+          freshness_limit_slots: 25
+      - id: jto_usdc
+        label: JTO/USDC
+        value: DoKKUBzWcv6TYg3vr6kvVzvadnibieYctse6oD6d7Hxs
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: jup_usdc
+        label: JUP/USDC
+        value: Drx7X5bUajSPY6m5f2QhD2CK8c3RBMKgueSpZgCgUzkP
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: launchcoin_usdc
+        label: LAUNCHCOIN/USDC
+        value: ESaTtQcbtqk3eLNUQvND9uuMKjqfEtgmzwCspr5EbALo
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: Ey59PH7Z4BFU4HjyKnyMdWt5GGN76KazTAwQihoUXRnk
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: met_usdc
+        label: MET/USDC
+        value: 9WSspMLnTfaec7whu4kG3peCCn4gWGBvKayamxDEndqR
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: mon_usdc
+        label: MON/USDC
+        value: E5Zmb4JQbHd4ThBXj1Fix9dMGsdszEGQ17txAHLWPwvS
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: CrAr4RRJMBVwRsZtT62pEhfA9H5utymC2mVx8e7FreP2
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: mu_usdc
+        label: MU/USDC
+        value: FCVmVJbiwiHc1ndWvwshFyjPYSzyRN12YNKRQn3AirHA
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: MUxEsUKSMACyw5fZf68wxf5FLnZVhtU9CwH8uNNGay1
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: pengu_usdc
+        label: PENGU/USDC
+        value: 9nyLnejbWhNvzhg6c4RvFW5ei9DT1G3X8MhNXCkYj2hQ
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: pump_sol
+        label: PUMP/SOL
+        value: AbfkmuyTqhGJkPLKM5tmAeUdthbyLqAh8bNwR8AumPpE
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn
+          quote_mint: So11111111111111111111111111111111111111112
+          base_decimals: 6
+          quote_decimals: 9
+          freshness_limit_slots: 20
+      - id: pump_usdc
+        label: PUMP/USDC
+        value: DNhfyh75AApg1L1Yig3fErvERKutYRqfWLGb496iViSZ
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: sol_usdt
+        label: SOL/USDT
+        value: 7sJf1SmKDDAFtBmMtg253rTbjG7zVFm3zTNounSgSNc9
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: So11111111111111111111111111111111111111112
+          quote_mint: Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: spcx_usdc
+        label: SPCX/USDC
+        value: 5X9A6PpFQEsc9D5VdTGfgVyfVn8HnsArQpMMUZZfFg1a
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: spyx_usdc
+        label: SPYx/USDC
+        value: 8fseq2pHJCG1W4JFDAwgZp42BnaTWEDBVMYXwWBkGNY8
+        description: >-
+          Rejects a quote at age 25; pass lead -25 to tessera-stale-quote.
+        metadata:
+          base_mint: XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: trump_usdc
+        label: TRUMP/USDC
+        value: FwxwM23qYD8qNR6LRVFSUX7eDfeFF3xK9NbpSmRCQy8f
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: usd1_usdc
+        label: USD1/USDC
+        value: CtPSM9bhrCz1RQrRVTpwXQLcdo82eX1nahSfq1fo4qwF
+        description: >-
+          Rejects a quote at age 55; pass lead -55 to tessera-stale-quote.
+        metadata:
+          base_mint: USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 55
+      - id: useless_usdc
+        label: USELESS/USDC
+        value: BDqQBspbipXxnTX2kw4FPM9pzfcf9kwieGCy4yUZ9tCC
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: wbtc_usdc
+        label: WBTC/USDC
+        value: 2qHQyHwugThrRBYAFxV3ANuRWEWHskSjGhwr73Ua6heb
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: weth_usdc
+        label: WETH/USDC
+        value: Ce8WKGKeNPrtk85inFtkpskekaNibZiogSZBrcP7yhTN
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: 7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: wlfi_usdc
+        label: WLFI/USDC
+        value: 8G6QssZGNGpc54bH59pWn621xgCP1GzWmWV39NpvrhAH
+        description: >-
+          Rejects a quote at age 20; pass lead -20 to tessera-stale-quote.
+        metadata:
+          base_mint: WLFinEv6ypjkczcS83FZqFpgFZYwQXutRbxGe7oC16g
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+
+templates:
+  - id: tessera-fair-value
+    name: Override Tessera Fair Value
+    description: Move a Tessera market's reference price atomically in both directions
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: quote_atoms_per_base_atom_x1e15
+        offset: 128
+        encoding: u64
+        label: Quote per base
+        description: "Quote atomic units per base atomic unit multiplied by 10^15. Use the builder to derive this from mint decimals."
+      - path: base_atoms_per_quote_atom_x1e15
+        offset: 144
+        encoding: u64
+        label: Base per quote
+        description: "Base atomic units per quote atomic unit multiplied by 10^15. Use the builder to derive the reciprocal atomically."
+    llm_context: |
+      SET BOTH FIELDS AS ONE INVARIANT. Their product is approximately 10^30, with integer-floor
+      rounding in the reciprocal field. Changing only offset 128 moves base-to-quote sells but
+      leaves quote-to-base buys unchanged; changing only offset 144 does the opposite.
+
+      Use the Tessera fair-value builder when starting from a human price. It calculates both exact
+      integer fields from the selected market's mint decimals and rejects zero or overflow. If
+      composing the raw template directly, use decimal integer strings rather than JSON numbers.
+
+      Tessera rejects a quote once it reaches the market's freshness limit, with program error
+      0xffff. Pair long-running scenarios with tessera-freshness.
+
+      EXAMPLE - WSOL/USDC at 100 quote tokens per base token:
+      quote_atoms_per_base_atom_x1e15: "100000000000000"
+      base_atoms_per_quote_atom_x1e15: "10000000000000000"
+
+  - id: tessera-depth
+    name: Override Tessera Depth
+    description: Change the directional capacities of Tessera's sell and buy ladders
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_levels.0.amount
+        offset: 160
+        encoding: u64
+        label: Sell level 1 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.1.amount
+        offset: 184
+        encoding: u64
+        label: Sell level 2 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.2.amount
+        offset: 208
+        encoding: u64
+        label: Sell level 3 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.3.amount
+        offset: 232
+        encoding: u64
+        label: Sell level 4 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.4.amount
+        offset: 256
+        encoding: u64
+        label: Sell level 5 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.5.amount
+        offset: 280
+        encoding: u64
+        label: Sell level 6 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.6.amount
+        offset: 304
+        encoding: u64
+        label: Sell level 7 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.7.amount
+        offset: 328
+        encoding: u64
+        label: Sell level 8 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.8.amount
+        offset: 352
+        encoding: u64
+        label: Sell level 9 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.9.amount
+        offset: 376
+        encoding: u64
+        label: Sell level 10 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.10.amount
+        offset: 400
+        encoding: u64
+        label: Sell level 11 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.11.amount
+        offset: 424
+        encoding: u64
+        label: Sell level 12 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.12.amount
+        offset: 448
+        encoding: u64
+        label: Sell level 13 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.13.amount
+        offset: 472
+        encoding: u64
+        label: Sell level 14 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.14.amount
+        offset: 496
+        encoding: u64
+        label: Sell level 15 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.15.amount
+        offset: 520
+        encoding: u64
+        label: Sell level 16 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.16.amount
+        offset: 544
+        encoding: u64
+        label: Sell level 17 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.17.amount
+        offset: 568
+        encoding: u64
+        label: Sell level 18 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.18.amount
+        offset: 592
+        encoding: u64
+        label: Sell level 19 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.19.amount
+        offset: 616
+        encoding: u64
+        label: Sell level 20 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: buy_levels.0.amount
+        offset: 640
+        encoding: u64
+        label: Buy level 1 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.1.amount
+        offset: 664
+        encoding: u64
+        label: Buy level 2 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.2.amount
+        offset: 688
+        encoding: u64
+        label: Buy level 3 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.3.amount
+        offset: 712
+        encoding: u64
+        label: Buy level 4 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.4.amount
+        offset: 736
+        encoding: u64
+        label: Buy level 5 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.5.amount
+        offset: 760
+        encoding: u64
+        label: Buy level 6 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.6.amount
+        offset: 784
+        encoding: u64
+        label: Buy level 7 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.7.amount
+        offset: 808
+        encoding: u64
+        label: Buy level 8 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.8.amount
+        offset: 832
+        encoding: u64
+        label: Buy level 9 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.9.amount
+        offset: 856
+        encoding: u64
+        label: Buy level 10 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.10.amount
+        offset: 880
+        encoding: u64
+        label: Buy level 11 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.11.amount
+        offset: 904
+        encoding: u64
+        label: Buy level 12 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.12.amount
+        offset: 928
+        encoding: u64
+        label: Buy level 13 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.13.amount
+        offset: 952
+        encoding: u64
+        label: Buy level 14 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.14.amount
+        offset: 976
+        encoding: u64
+        label: Buy level 15 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.15.amount
+        offset: 1000
+        encoding: u64
+        label: Buy level 16 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.16.amount
+        offset: 1024
+        encoding: u64
+        label: Buy level 17 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.17.amount
+        offset: 1048
+        encoding: u64
+        label: Buy level 18 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.18.amount
+        offset: 1072
+        encoding: u64
+        label: Buy level 19 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.19.amount
+        offset: 1096
+        encoding: u64
+        label: Buy level 20 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+    llm_context: |
+      These are twenty directional capacity fields, not token vault balances. Do not assume they
+      are monotonic cumulative breakpoints. To make one direction shallower, scale the currently
+      enabled amount fields for that direction by the same ratio. Lower sell_levels for a large
+      base-to-quote sell and buy_levels for a large quote-to-base buy. The opposite ladder is
+      behaviorally inactive for that direction.
+
+      Small trades may not reveal a depth change. The live-fork proof uses large trades and shows
+      that dividing all active-side capacities by ten worsens the fill, while changing the
+      inactive-side capacities leaves it unchanged.
+
+      Do not invent missing levels or enable disabled levels. Fetch the live account first and copy
+      all twenty current values before applying a uniform ratio only to enabled levels. A ratio that
+      rounds a live nonzero capacity down to zero leaves the level flagged enabled with nothing
+      behind it, which is not a state the market produces on its own; raise the ratio instead.
+
+  - id: tessera-curve
+    name: Override Tessera Curve
+    description: Scale the directional output factors while preserving the live ladder ordering
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_levels.0.factor
+        offset: 168
+        encoding: u64
+        label: Sell level 1 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.1.factor
+        offset: 192
+        encoding: u64
+        label: Sell level 2 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.2.factor
+        offset: 216
+        encoding: u64
+        label: Sell level 3 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.3.factor
+        offset: 240
+        encoding: u64
+        label: Sell level 4 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.4.factor
+        offset: 264
+        encoding: u64
+        label: Sell level 5 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.5.factor
+        offset: 288
+        encoding: u64
+        label: Sell level 6 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.6.factor
+        offset: 312
+        encoding: u64
+        label: Sell level 7 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.7.factor
+        offset: 336
+        encoding: u64
+        label: Sell level 8 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.8.factor
+        offset: 360
+        encoding: u64
+        label: Sell level 9 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.9.factor
+        offset: 384
+        encoding: u64
+        label: Sell level 10 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.10.factor
+        offset: 408
+        encoding: u64
+        label: Sell level 11 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.11.factor
+        offset: 432
+        encoding: u64
+        label: Sell level 12 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.12.factor
+        offset: 456
+        encoding: u64
+        label: Sell level 13 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.13.factor
+        offset: 480
+        encoding: u64
+        label: Sell level 14 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.14.factor
+        offset: 504
+        encoding: u64
+        label: Sell level 15 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.15.factor
+        offset: 528
+        encoding: u64
+        label: Sell level 16 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.16.factor
+        offset: 552
+        encoding: u64
+        label: Sell level 17 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.17.factor
+        offset: 576
+        encoding: u64
+        label: Sell level 18 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.18.factor
+        offset: 600
+        encoding: u64
+        label: Sell level 19 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.19.factor
+        offset: 624
+        encoding: u64
+        label: Sell level 20 output factor
+        description: Base-to-quote directional output factor.
+      - path: buy_levels.0.factor
+        offset: 648
+        encoding: u64
+        label: Buy level 1 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.1.factor
+        offset: 672
+        encoding: u64
+        label: Buy level 2 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.2.factor
+        offset: 696
+        encoding: u64
+        label: Buy level 3 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.3.factor
+        offset: 720
+        encoding: u64
+        label: Buy level 4 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.4.factor
+        offset: 744
+        encoding: u64
+        label: Buy level 5 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.5.factor
+        offset: 768
+        encoding: u64
+        label: Buy level 6 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.6.factor
+        offset: 792
+        encoding: u64
+        label: Buy level 7 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.7.factor
+        offset: 816
+        encoding: u64
+        label: Buy level 8 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.8.factor
+        offset: 840
+        encoding: u64
+        label: Buy level 9 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.9.factor
+        offset: 864
+        encoding: u64
+        label: Buy level 10 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.10.factor
+        offset: 888
+        encoding: u64
+        label: Buy level 11 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.11.factor
+        offset: 912
+        encoding: u64
+        label: Buy level 12 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.12.factor
+        offset: 936
+        encoding: u64
+        label: Buy level 13 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.13.factor
+        offset: 960
+        encoding: u64
+        label: Buy level 14 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.14.factor
+        offset: 984
+        encoding: u64
+        label: Buy level 15 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.15.factor
+        offset: 1008
+        encoding: u64
+        label: Buy level 16 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.16.factor
+        offset: 1032
+        encoding: u64
+        label: Buy level 17 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.17.factor
+        offset: 1056
+        encoding: u64
+        label: Buy level 18 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.18.factor
+        offset: 1080
+        encoding: u64
+        label: Buy level 19 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.19.factor
+        offset: 1104
+        encoding: u64
+        label: Buy level 20 output factor
+        description: Quote-to-base directional output factor.
+    llm_context: |
+      These forty fields control the directional output curve. Scaling every nonzero factor on the
+      active side by one half produces approximately one half of the baseline output on six live
+      markets, while scaling the inactive side leaves output unchanged.
+
+      Read the live account first and copy all twenty current factors per direction, then apply one
+      ratio to every nonzero factor on the side you are stressing. Two rules are not optional. The
+      factors descend across the ladder, and a single factor that breaks that order is rejected by
+      the deployed program with custom error 8. A ratio that rounds a live nonzero factor down to
+      zero disables a level that the market has enabled. Check both before you write, and do not
+      edit one factor independently.
+
+  - id: tessera-halt
+    name: Halt Tessera Liquidity
+    description: Disable the first required level on both directional ladders
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_level_0_enabled
+        offset: 176
+        encoding: u8
+        label: Sell liquidity enabled
+        description: Set to zero to make base-to-quote quotes fail deterministically.
+      - path: buy_level_0_enabled
+        offset: 656
+        encoding: u8
+        label: Buy liquidity enabled
+        description: Set to zero to make quote-to-base quotes fail deterministically.
+    llm_context: |
+      SET BOTH FIELDS TO ZERO AS ONE INVARIANT. The current deployed program rejects either quote
+      direction with custom error 0xffff when its required first level is disabled. Use this as a
+      deterministic liquidity-outage scenario, not as a depth or price scenario. Do not persist it.
+
+  - id: tessera-stale-quote
+    name: Make Tessera Quote Stale
+    description: Age a Tessera quote to its market's rejection boundary
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding:
+          slot:
+            lead: -20
+        label: Slot lead
+        description: >-
+          How far behind the materialization slot to place the quote, as a negative integer.
+          Pass null to use -20, the limit of most markets and of the default one.
+    llm_context: |
+      The value you pass IS the lead: Surfpool writes the materialization slot plus it, clamped at
+      zero. Pass null to take the -20 default. This is one template for every market, not one per
+      limit.
+
+      Rejection is at age greater than or equal to the market's own limit, so the lead must be at
+      most minus that limit. Read freshness_limit_slots for the chosen address in the market
+      constant and negate it; offset 88 on the live account is the same number. As of the catalog's
+      capture date fourteen markets are at 20, eleven at 25 and one at 55, but pass whatever the
+      catalog says rather than assuming one of those three.
+
+      At the boundary the current deployed program rejects the swap with custom error 65535, while
+      one slot younger succeeds. Do not persist this override: the quote should stay stale.
+
+      Set fetchBeforeUse: true so the live market is forked first. Keep override labels short
+      ("SOL/USDC stale quote").
+
+  - id: tessera-freshness
+    name: Refresh Tessera Quote
+    description: Publish the materialization slot into Tessera's freshness field
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding:
+          slot:
+            lead: 0
+        label: Current materialization slot
+        description: Slot lead, as an integer. Pass null to take the lead of zero and write the materialization slot itself.
+    llm_context: |
+      Tessera accepts a quote up to 19 slots old. At age 20 the current deployed program rejects the
+      swap with custom error 0xffff. This differs from BisonFi, which can silently return zero.
+
+      Pass null for last_update_slot to take this template's lead of zero, which writes the exact
+      materialization slot. A number would be read as the lead instead, so passing 0 happens to mean
+      the same thing here and -5 would quietly age the quote by five slots.
+
+      Use persist: true when the prepared state must remain executable beyond the market's freshness
+      window; each application then writes its own slot rather than repeating the first one.
