@@ -24,6 +24,8 @@ pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
 pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+pub const TESSERA_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/tessera/v1/overrides.yaml");
 
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
@@ -79,6 +81,7 @@ impl TemplateRegistry {
         default.load_meteora_overrides();
         default.load_kamino_overrides();
         default.load_bisonfi_overrides();
+        default.load_tessera_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -121,6 +124,10 @@ impl TemplateRegistry {
 
     pub fn load_bisonfi_overrides(&mut self) {
         self.load_protocol_overrides_without_idl(BISONFI_OVERRIDES_CONTENT, "bisonfi");
+    }
+
+    pub fn load_tessera_overrides(&mut self) {
+        self.load_protocol_overrides_without_idl(TESSERA_V1_OVERRIDES_CONTENT, "tessera");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -505,11 +512,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (4) = 66
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (4) + Tessera (6) = 72
         assert_eq!(
             registry.count(),
-            66,
-            "Registry should load 66 templates total"
+            72,
+            "Registry should load 72 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
