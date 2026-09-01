@@ -74,7 +74,18 @@ templates:
       NEW CURVES START FROM Global's initial values: 1,073,000,000,000,000 virtual tokens,
       30,000,000,000 virtual quote lamports, 793,100,000,000,000 real tokens, 0 real quote,
       and a 1,000,000,000,000,000 total supply. Override a curve to exactly these (with
-      complete: false) to reopen an already-migrated coin for trading on its curve.
+      complete: false) to reopen an already-migrated coin for trading on its curve — and
+      set its vault back to the full 1,000,000,000,000,000 total supply (real reserves
+      plus migration reserve; see below), because migration drained it.
+
+      THE CURVE VAULT IS COUPLED STATE. Whenever an override changes real_token_reserves —
+      lowering it toward graduation or raising it to reopen a curve — also override the
+      curve's token vault (the curve PDA's associated token account under the mint's
+      token program) with spl-token-account-balance: buys pay tokens out of the vault, and
+      its amount must equal the new real_token_reserves plus the coin's migration reserve
+      (206,900,000,000,000 with today's Global defaults), never real_token_reserves alone —
+      migration then has nothing to seed the PumpSwap pool with and fails. The graduation
+      builder derives and sets it automatically.
 
       total_fee_bps = protocol fee + creator fee (0 when the curve has no creator).
       Trades read both from the fee program's FeeConfig market-cap fee tiers — a

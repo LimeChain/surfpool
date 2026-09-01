@@ -426,11 +426,11 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (3) + Pump (2) + PumpSwap (3) = 30 total
+        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 29 total
         assert_eq!(
             registry.count(),
-            30,
-            "Registry should load 30 templates total"
+            29,
+            "Registry should load 29 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));

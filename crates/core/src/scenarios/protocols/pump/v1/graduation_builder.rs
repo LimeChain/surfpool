@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use solana_account::Account;
 use solana_pubkey::Pubkey;
-use surfpool_types::{OverrideInstance, Scenario};
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -61,9 +62,14 @@ pub fn pump_graduation_addresses(token_mint: &Pubkey) -> SurfpoolResult<PumpGrad
         })
     };
 
+    let bonding_curve = resolve("pump-bonding-curve-custom", Some("token_mint"))?;
     Ok(PumpGraduationAddresses {
-        bonding_curve: resolve("pump-bonding-curve-custom", Some("token_mint"))?,
-        curve_vault: resolve("pump-token-2022-curve-balance", Some("token_mint"))?,
+        bonding_curve,
+        curve_vault: get_associated_token_address_with_program_id(
+            &bonding_curve,
+            token_mint,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
         canonical_pool: resolve("pump-amm-canonical-pool", Some("base_mint"))?,
         global: resolve("pump-global", None)?,
     })
@@ -158,8 +164,8 @@ pub fn build_pump_graduation_scenario(
         .get("pump-bonding-curve-custom")
         .ok_or_else(|| SurfpoolError::internal("pump bonding curve template is unavailable"))?;
     let vault_template = registry
-        .get("pump-token-2022-curve-balance")
-        .ok_or_else(|| SurfpoolError::internal("pump Token-2022 vault template is unavailable"))?;
+        .get("spl-token-account-balance")
+        .ok_or_else(|| SurfpoolError::internal("SPL token balance template is unavailable"))?;
     let global_template = registry
         .get("pump-global")
         .ok_or_else(|| SurfpoolError::internal("pump Global template is unavailable"))?;
@@ -185,13 +191,10 @@ pub fn build_pump_graduation_scenario(
         ),
         ("complete".to_string(), serde_json::json!(false)),
     ]);
-    let vault_values = HashMap::from([
-        ("token_mint".to_string(), serde_json::json!(mint)),
-        (
-            "amount".to_string(),
-            serde_json::json!(prepared_vault_amount),
-        ),
-    ]);
+    let vault_values = HashMap::from([(
+        "amount".to_string(),
+        serde_json::json!(prepared_vault_amount),
+    )]);
     let global_values = HashMap::from([("enable_migrate".to_string(), serde_json::json!(true))]);
     let curve_override = OverrideInstance::new(
         curve_template.id.clone(),
@@ -200,10 +203,12 @@ pub fn build_pump_graduation_scenario(
     )
     .with_values(curve_values)
     .with_label("Near-complete bonding curve".to_string());
+    // The generic template takes an explicit address, so the derived vault is filled in here.
+    let addresses = pump_graduation_addresses(&token_mint)?;
     let vault_override = OverrideInstance::new(
         vault_template.id.clone(),
         GRADUATION_PREPARATION_SLOT,
-        vault_template.address.clone(),
+        AccountAddress::Pubkey(addresses.curve_vault.to_string()),
     )
     .with_values(vault_values)
     .with_label("Migration-safe curve vault".to_string());
@@ -228,7 +233,7 @@ pub fn build_pump_graduation_scenario(
     Ok(PumpGraduationPreparation {
         scenario,
         token_mint,
-        addresses: pump_graduation_addresses(&token_mint)?,
+        addresses,
         completing_buy_amount,
         migration_reserve,
     })

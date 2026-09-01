@@ -124,6 +124,10 @@ pub struct CreatePumpGraduationScenarioParams {
         description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
     )]
     pub token_mint: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -379,9 +383,11 @@ impl Surfpool {
     /// accounts fall back to its remote source.
     async fn fetch_surfnet_accounts(
         &self,
+        surfnet_port: Option<u16>,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>, String> {
-        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{DEFAULT_RPC_PORT}"));
+        let port = surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{port}"));
         let accounts = client
             .get_multiple_accounts(pubkeys, CommitmentConfig::confirmed())
             .await
@@ -956,7 +962,10 @@ impl Surfpool {
             addresses.canonical_pool,
             addresses.global,
         ];
-        let accounts = match self.fetch_surfnet_accounts(&pubkeys).await {
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &pubkeys)
+            .await
+        {
             Ok(accounts) => accounts,
             Err(error) => return Ok(scenario_tool_error(error)),
         };
@@ -1277,6 +1286,7 @@ mod tests {
         let graduation = surfpool
             .create_pump_graduation_scenario(Parameters(CreatePumpGraduationScenarioParams {
                 token_mint: "not-a-mint".to_string(),
+                surfnet_port: None,
             }))
             .await
             .expect("tool result");
