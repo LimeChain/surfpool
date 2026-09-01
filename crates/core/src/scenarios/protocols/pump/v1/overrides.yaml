@@ -76,6 +76,12 @@ templates:
       and a 1,000,000,000,000,000 total supply. Override a curve to exactly these (with
       complete: false) to reopen an already-migrated coin for trading on its curve.
 
+      THE CURVE VAULT IS COUPLED STATE. When lowering real_token_reserves on a Token-2022
+      coin near graduation, also override the curve's token vault (the curve PDA's
+      Token-2022 associated token account) with spl-token-account-balance: its amount must
+      equal the new real_token_reserves plus the coin's existing migration reserve, never
+      real_token_reserves alone. The graduation builder derives and sets it automatically.
+
       total_fee_bps = protocol fee + creator fee (0 when the curve has no creator).
       Trades read both from the fee program's FeeConfig market-cap fee tiers — a
       required account of every buy and sell. Global.fee_basis_points and

@@ -147,8 +147,8 @@ _Pump Graduation_ preset card in Studio.
 The coin must have a **Token-2022 mint**, a SOL-quoted incomplete curve, and no canonical
 PumpSwap pool yet. Eligibility failures are returned in the MCP tool result. The preset
 does not cover coins with a classic SPL-Token mint or a non-SOL quote mint — their curve
-can still be overridden field by field with `pump-bonding-curve-custom`, but the vault
-template and this graduation flow are Token-2022 and SOL-quote only. A successful tool call
+can still be overridden field by field with `pump-bonding-curve-custom`, but this
+graduation flow is Token-2022 and SOL-quote only. A successful tool call
 returns the Studio editor URL, where the stored scenario contains three overrides:
 
 1. the curve one buy away from completion (`real_token_reserves` = the finishing buy,

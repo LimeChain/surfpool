@@ -1286,6 +1286,7 @@ mod tests {
         let graduation = surfpool
             .create_pump_graduation_scenario(Parameters(CreatePumpGraduationScenarioParams {
                 token_mint: "not-a-mint".to_string(),
+                surfnet_port: None,
             }))
             .await
             .expect("tool result");
