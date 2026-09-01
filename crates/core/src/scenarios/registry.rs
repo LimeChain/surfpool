@@ -32,9 +32,6 @@ pub const WHIRLPOOL_OVERRIDES_CONTENT: &str = include_str!("./protocols/whirlpoo
 pub const SPL_TOKEN_IDL_CONTENT: &str = include_str!("./protocols/spl-token/idl.json");
 pub const SPL_TOKEN_OVERRIDES_CONTENT: &str = include_str!("./protocols/spl-token/overrides.yaml");
 
-pub const PUMP_VAULT_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/pump/vault/v1/overrides.yaml");
-
 pub const PUMP_V1_IDL_CONTENT: &str = include_str!("./protocols/pump/v1/idl.json");
 pub const PUMP_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/pump/v1/overrides.yaml");
 
@@ -124,9 +121,6 @@ impl TemplateRegistry {
 
     pub fn load_pump_overrides(&mut self) {
         self.load_protocol_overrides(PUMP_V1_IDL_CONTENT, PUMP_V1_OVERRIDES_CONTENT, "pump");
-        // The curve vault manifest writes an SPL token account, so it pairs with the
-        // shared SPL Token IDL rather than the pump IDL.
-        self.load_protocol_overrides(SPL_TOKEN_IDL_CONTENT, PUMP_VAULT_OVERRIDES_CONTENT, "pump");
         self.load_protocol_overrides(
             PUMP_AMM_V1_IDL_CONTENT,
             PUMP_AMM_V1_OVERRIDES_CONTENT,
@@ -432,11 +426,11 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (3) + PumpSwap (3) = 30 total
+        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 29 total
         assert_eq!(
             registry.count(),
-            30,
-            "Registry should load 30 templates total"
+            29,
+            "Registry should load 29 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -530,7 +524,7 @@ mod tests {
         );
 
         let pump_templates = registry.by_protocol("Pump");
-        assert_eq!(pump_templates.len(), 3, "Should have 3 Pump templates");
+        assert_eq!(pump_templates.len(), 2, "Should have 2 Pump templates");
 
         let pump_swap_templates = registry.by_protocol("PumpSwap");
         assert_eq!(
