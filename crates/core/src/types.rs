@@ -1116,6 +1116,20 @@ impl TokenAccount {
         }
     }
 
+    pub fn pack_into_preserving_extensions(&self, original: &[u8]) -> SurfpoolResult<Vec<u8>> {
+        let base_len = spl_token_interface::state::Account::LEN;
+        if original.len() < base_len {
+            return Err(SurfpoolError::unpack_token_account());
+        }
+
+        let mut data = original.to_vec();
+        match self {
+            Self::SplToken2022(account) => account.pack_into_slice(&mut data[..base_len]),
+            Self::SplToken(account) => account.pack_into_slice(&mut data[..base_len]),
+        }
+        Ok(data)
+    }
+
     pub fn owner(&self) -> Pubkey {
         match self {
             Self::SplToken2022(account) => account.owner,
@@ -1204,6 +1218,76 @@ impl TokenAccount {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod token_account_packing_tests {
+    use super::*;
+
+    #[test]
+    fn packing_preserves_token_2022_extension_bytes() {
+        let mut token_account = TokenAccount::new(
+            &spl_token_2022_interface::id(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+        );
+        token_account.set_amount(42);
+        let mut original = vec![0u8; 170];
+        original[165..].copy_from_slice(&[1, 2, 3, 4, 5]);
+
+        let packed = token_account
+            .pack_into_preserving_extensions(&original)
+            .unwrap();
+
+        assert_eq!(packed.len(), 170);
+        assert_eq!(&packed[64..72], &42u64.to_le_bytes());
+        assert_eq!(&packed[165..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn packing_keeps_classic_token_accounts_at_165_bytes() {
+        let mut token_account = TokenAccount::new(
+            &spl_token_interface::id(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+        );
+        token_account.set_amount(42);
+
+        let packed = token_account
+            .pack_into_preserving_extensions(&[0u8; 165])
+            .unwrap();
+
+        assert_eq!(packed.len(), 165);
+        assert_eq!(&packed[64..72], &42u64.to_le_bytes());
+    }
+
+    #[test]
+    fn amount_only_repack_changes_only_the_amount_bytes() {
+        for token_program in [spl_token_interface::id(), spl_token_2022_interface::id()] {
+            let mut token_account = TokenAccount::new(
+                &token_program,
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                None,
+            );
+            let mut original = token_account.pack_into_vec();
+            if token_program == spl_token_2022_interface::id() {
+                original.extend_from_slice(&[1, 2, 3, 4, 5]);
+            }
+            token_account.set_amount(42);
+
+            let patched = token_account
+                .pack_into_preserving_extensions(&original)
+                .unwrap();
+
+            assert_eq!(patched.len(), original.len());
+            assert_eq!(&patched[64..72], &42u64.to_le_bytes());
+            assert_eq!(&patched[..64], &original[..64]);
+            assert_eq!(&patched[72..], &original[72..]);
+        }
     }
 }
 
