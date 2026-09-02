@@ -2756,8 +2756,10 @@ mod tests {
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{
-        MessageHeader, legacy::Message as LegacyMessage, v0::Message as V0Message,
-        v1::MAX_TRANSACTION_SIZE,
+        MessageHeader,
+        legacy::Message as LegacyMessage,
+        v0::Message as V0Message,
+        v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
     };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
@@ -2774,6 +2776,7 @@ mod tests {
         EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
+    use solana_transaction_status_client_types::UiTransactionConfig;
     use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
     use test_case::test_case;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2784,6 +2787,26 @@ mod tests {
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
+
+    fn build_v1_transaction(
+        payer: &Pubkey,
+        signers: &[&Keypair],
+        instructions: &[Instruction],
+        recent_blockhash: &Hash,
+    ) -> VersionedTransaction {
+        let msg = VersionedMessage::V1(
+            V1Message::try_compile_with_config(
+                &payer,
+                instructions,
+                *recent_blockhash,
+                TransactionConfig::empty()
+                    .with_compute_unit_limit(20_000)
+                    .with_loaded_accounts_data_size_limit(20_000),
+            )
+            .unwrap(),
+        );
+        VersionedTransaction::try_new(msg, signers).unwrap()
+    }
 
     fn build_v0_transaction(
         payer: &Pubkey,
@@ -2823,7 +2846,7 @@ mod tests {
                     .rpc
                     .send_transaction(
                         Some(setup_clone.context),
-                        bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                        bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                         None,
                     )
                     .unwrap();
@@ -3303,6 +3326,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_send_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3335,6 +3359,16 @@ mod tests {
                 )],
                 &recent_blockhash,
             ),
+            TransactionVersion::Number(1) => build_v1_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &pk,
+                    LAMPORTS_PER_SOL,
+                )],
+                &recent_blockhash,
+            ),
             _ => unimplemented!(),
         };
 
@@ -3356,6 +3390,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3390,6 +3425,12 @@ mod tests {
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
                 &recent_blockhash,
             ),
+            TransactionVersion::Number(1) => build_v1_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
             _ => unimplemented!(),
         };
 
@@ -3397,7 +3438,7 @@ mod tests {
             .rpc
             .simulate_transaction(
                 Some(setup.context),
-                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                 Some(RpcSimulateTransactionConfig {
                     sig_verify: true,
                     replace_recent_blockhash: false,
@@ -3425,7 +3466,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3522,7 +3563,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3590,6 +3631,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_replace_recent_blockhash(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3624,6 +3666,12 @@ mod tests {
                 &recent_blockhash,
             ),
             TransactionVersion::Number(0) => build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
+            TransactionVersion::Number(1) => build_v1_transaction(
                 &payer.pubkey(),
                 &[&payer.insecure_clone()],
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
@@ -3666,7 +3714,7 @@ mod tests {
             .rpc
             .simulate_transaction(
                 Some(setup.context),
-                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                 Some(valid_config),
             )
             .await
@@ -3761,6 +3809,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3790,6 +3839,12 @@ mod tests {
                 &recent_blockhash,
             ),
             TransactionVersion::Number(0) => build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
+            TransactionVersion::Number(1) => build_v1_transaction(
                 &payer.pubkey(),
                 &[&payer.insecure_clone()],
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
@@ -3853,7 +3908,15 @@ mod tests {
                                 VersionedMessage::V0(_) => Some(vec![]),
                                 VersionedMessage::V1(_) => None,
                             },
-                            transaction_config: None,
+                            transaction_config: match tx.message {
+                                VersionedMessage::Legacy(_) | VersionedMessage::V0(_) => None,
+                                VersionedMessage::V1(_) => Some(UiTransactionConfig {
+                                    priority_fee: None,
+                                    compute_unit_limit: Some(20_000),
+                                    loaded_accounts_data_size_limit: Some(20_000),
+                                    heap_size: None
+                                }),
+                            },
                         })
                     }),
                     meta: res.transaction.clone().meta, // Using the same values to avoid reintroducing processing logic errors
