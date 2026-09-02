@@ -682,12 +682,12 @@ mod tests {
     async fn a_missing_remote_transaction_remains_none_through_the_locker() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(
+            client: Arc::new(RpcClient::new_sender(
                 ReturnsNull {
                     requests: Arc::clone(&requests),
                 },
                 RpcClientConfig::default(),
-            ),
+            )),
         };
         let signature = Signature::new_unique();
         let config = RpcTransactionConfig {
@@ -719,7 +719,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_transaction_provider_failure_reaches_the_locker_caller() {
         let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()),
+            client: Arc::new(RpcClient::new_sender(ReturnsError, RpcClientConfig::default())),
         };
         let signature = Signature::new_unique();
         let (svm, _, _) = SurfnetSvm::default();
@@ -859,12 +859,12 @@ mod tests {
     async fn multiple_account_fetch_uses_the_requested_commitment() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(
+            client: Arc::new(RpcClient::new_sender(
                 RecordsRequests {
                     requests: Arc::clone(&requests),
                 },
                 RpcClientConfig::default(),
-            ),
+            )),
         };
 
         let pubkey = Pubkey::new_unique();
