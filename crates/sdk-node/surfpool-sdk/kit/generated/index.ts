@@ -15,6 +15,7 @@ export type * from "./GetStreamedAccountsResponse.js";
 export type * from "./GetSurfnetInfoResponse.js";
 export type * from "./OfflineAccountConfig.js";
 export type * from "./OverrideInstance.js";
+export type * from "./OverrideOutcome.js";
 export type * from "./ParsedAccount.js";
 export type * from "./PdaSeed.js";
 export type * from "./ResetAccountConfig.js";

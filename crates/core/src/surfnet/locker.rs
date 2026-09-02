@@ -55,9 +55,9 @@ use solana_transaction_status::{
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
-    SimnetCommand, SimnetEventsTx, StartupError, SurfnetStartupStatus, SurfnetStartupTask,
-    TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
-    VersionedIdl,
+    SimnetCommand, SimnetCommandError, SimnetEventsTx, StartupError, SurfnetStartupStatus,
+    SurfnetStartupTask, TransactionConfirmationStatus, TransactionStatusEvent,
+    UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -2681,11 +2681,11 @@ impl SurfnetSvmLocker {
         };
         epoch_info.transaction_count = None;
 
-        self.with_svm_writer(move |svm_writer| {
-            let _ = svm_writer.reset_network(epoch_info, epoch_schedule);
-            let _ = svm_writer.offline_accounts.clear();
-        });
-        Ok(())
+        self.with_svm_writer(move |svm_writer| -> SurfpoolResult<()> {
+            svm_writer.reset_network(epoch_info, epoch_schedule)?;
+            svm_writer.offline_accounts.clear()?;
+            Ok(())
+        })
     }
 
     /// Marks an account as offline, preventing it from being downloaded from the remote RPC.
@@ -2795,21 +2795,24 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(Self::offline_account_owners)
     }
 
-    /// Registers a scenario for execution
-    pub fn register_scenario(
+    pub async fn register_scenario_and_materialize(
         &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
-    ) -> SurfpoolResult<()> {
-        self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
+        let mut svm_writer = self.0.write().await;
+        let base_slot = slot.unwrap_or(svm_writer.latest_epoch_info.absolute_slot);
+        svm_writer
+            .register_scenario_and_materialize(remote_ctx, scenario, base_slot)
+            .await
     }
 
-    /// Materializes overrides for a specific slot (not necessarily the current slot)
     pub async fn materialize_overrides_for_slot(
         &self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         slot: Slot,
-    ) -> SurfpoolResult<()> {
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
         let mut svm_writer = self.0.write().await;
         svm_writer
             .materialize_overrides_for_slot(remote_ctx, slot)
@@ -3902,6 +3905,16 @@ impl SurfnetSvmLocker {
         simnet_command_tx: Sender<SimnetCommand>,
         config: TimeTravelConfig,
     ) -> SurfpoolResult<EpochInfo> {
+        self.time_travel_with_override_outcomes(key, simnet_command_tx, config)
+            .map(|(epoch_info, _)| epoch_info)
+    }
+
+    pub fn time_travel_with_override_outcomes(
+        &self,
+        key: Option<(blake3::Hash, String)>,
+        simnet_command_tx: Sender<SimnetCommand>,
+        config: TimeTravelConfig,
+    ) -> SurfpoolResult<(EpochInfo, Vec<surfpool_types::OverrideOutcome>)> {
         let (epoch_info, slot_time, updated_at) = self.with_svm_reader(|svm_reader| {
             (
                 svm_reader.latest_epoch_info.clone(),
@@ -3912,7 +3925,7 @@ impl SurfnetSvmLocker {
 
         let clock_update: Clock =
             calculate_time_travel_clock(&config, updated_at, slot_time, &epoch_info)
-                .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+                .map_err(|e| SurfpoolError::invalid_params(e.to_string()))?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
@@ -3923,17 +3936,22 @@ impl SurfnetSvmLocker {
         let (response_tx, response_rx) = crossbeam_channel::bounded(1);
 
         // Send the command with confirmation
-        let _ = simnet_command_tx.send(SimnetCommand::UpdateInternalClockWithConfirmation(
-            key,
-            clock_update,
-            response_tx,
-        ));
+        simnet_command_tx
+            .send(SimnetCommand::UpdateInternalClockWithConfirmation(
+                key,
+                clock_update,
+                response_tx,
+            ))
+            .map_err(|e| SurfpoolError::internal(format!("Failed to request clock update: {e}")))?;
 
-        // Wait for confirmation with timeout
-        let updated_epoch_info = response_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| {
-                SurfpoolError::internal(format!("Failed to confirm clock update: {}", e))
+        let (updated_epoch_info, outcomes) = response_rx
+            .recv()
+            .map_err(|e| SurfpoolError::internal(format!("Failed to confirm clock update: {}", e)))?
+            .map_err(|e| match e {
+                SimnetCommandError::InvalidParams(message) => {
+                    SurfpoolError::invalid_params(message)
+                }
+                SimnetCommandError::Internal(message) => SurfpoolError::internal_message(message),
             })?;
 
         self.simnet_events_tx().info(format!(
@@ -3941,7 +3959,7 @@ impl SurfnetSvmLocker {
             formated_time, updated_epoch_info.epoch, updated_epoch_info.absolute_slot
         ));
 
-        Ok(updated_epoch_info)
+        Ok((updated_epoch_info, outcomes))
     }
 
     /// Retrieves the latest absolute slot from the underlying SVM.
@@ -3993,7 +4011,10 @@ impl SurfnetSvmLocker {
         // This prevents lock contention and potential deadlocks from mixing blocking and async locks
         let mut svm_writer = self.0.write().await;
         svm_writer.confirm_current_block()?;
-        svm_writer.materialize_overrides(remote_ctx).await
+        // Clock-driven materialization has no RPC response for reporting skipped outcomes.
+        let outcomes = svm_writer.materialize_overrides(remote_ctx).await?;
+        svm_writer.emit_skipped_override_events(&outcomes);
+        Ok(())
     }
 
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
@@ -4617,9 +4638,12 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
+        time::{Duration, Instant},
     };
 
     use async_trait::async_trait;
+    use crossbeam_channel::unbounded;
     use solana_account::Account;
     use solana_account_decoder::UiAccountEncoding;
     use solana_client::{
@@ -4645,6 +4669,82 @@ mod tests {
             svm::{SurfnetSvmConfig, apply_override_to_decoded_account},
         },
     };
+
+    #[test]
+    fn time_travel_waits_for_delayed_confirmation() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let current_epoch_info = locker.get_epoch_info();
+        let current_slot = current_epoch_info.absolute_slot;
+        let (command_tx, command_rx) = unbounded::<SimnetCommand>();
+
+        let responder = thread::spawn(move || {
+            let SimnetCommand::UpdateInternalClockWithConfirmation(_, _, response_tx) =
+                command_rx.recv().unwrap()
+            else {
+                panic!("unexpected command");
+            };
+            thread::sleep(Duration::from_millis(2_100));
+            response_tx
+                .send(Ok((current_epoch_info, Vec::new())))
+                .unwrap();
+        });
+
+        let started_at = Instant::now();
+        let result = locker.time_travel_with_override_outcomes(
+            None,
+            command_tx,
+            TimeTravelConfig::AbsoluteSlot(current_slot),
+        );
+
+        assert!(result.is_ok());
+        assert!(started_at.elapsed() >= Duration::from_millis(2_100));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn time_travel_preserves_command_error_classification() {
+        let cases = [
+            (
+                SimnetCommandError::InvalidParams("bad target".to_string()),
+                jsonrpc_core::ErrorCode::InvalidParams,
+                "bad target",
+            ),
+            (
+                SimnetCommandError::Internal("storage unavailable".to_string()),
+                jsonrpc_core::ErrorCode::InternalError,
+                "storage unavailable",
+            ),
+        ];
+
+        for (command_error, expected_code, expected_message) in cases {
+            let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            let locker = SurfnetSvmLocker::new(svm);
+            let current_slot = locker.get_epoch_info().absolute_slot;
+            let (command_tx, command_rx) = unbounded::<SimnetCommand>();
+            let responder = thread::spawn(move || {
+                let SimnetCommand::UpdateInternalClockWithConfirmation(_, _, response_tx) =
+                    command_rx.recv().unwrap()
+                else {
+                    panic!("unexpected command");
+                };
+                response_tx.send(Err(command_error)).unwrap();
+            });
+
+            let error = locker
+                .time_travel_with_override_outcomes(
+                    None,
+                    command_tx,
+                    TimeTravelConfig::AbsoluteSlot(current_slot),
+                )
+                .unwrap_err();
+            let rpc_error: jsonrpc_core::Error = error.into();
+
+            assert_eq!(rpc_error.code, expected_code);
+            assert!(rpc_error.to_string().contains(expected_message));
+            responder.join().unwrap();
+        }
+    }
 
     /// A real `PriceUpdateV2` account. Its `VerificationLevel` is the one-byte `Full` variant and
     /// it ends in a padding byte, which is what fixes the offsets the tests below assert on.

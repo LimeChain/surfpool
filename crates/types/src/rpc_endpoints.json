@@ -812,7 +812,7 @@
         },
         {
           "method": "surfnet_timeTravel",
-          "description": "A cheat code to move the Surfnet clock forward. The clock only moves forward: a target in the past is rejected. Returns the epoch state after the jump.",
+          "description": "A cheat code to move the Surfnet clock forward. The clock only moves forward: a target in the past is rejected. Returns the epoch state and outcomes for overrides materialized at the target slot.",
           "params": [
             {
               "name": "config",
@@ -820,7 +820,7 @@
               "description": "One of {\"absoluteTimestamp\": <unix milliseconds>}, {\"absoluteSlot\": <slot>} or {\"absoluteEpoch\": <epoch>}. Note that absoluteTimestamp is in MILLISECONDS, while the Clock sysvar reports seconds. If omitted, jumps one hour ahead."
             }
           ],
-          "returns": "An `EpochInfo` object describing the clock after the jump."
+          "returns": "An `EpochInfo`-compatible object describing the clock after the jump, extended with `overrideOutcomes`, the outcomes materialized while reaching the target slot."
         },
         {
           "method": "surfnet_pauseClock",
@@ -860,7 +860,7 @@
                       "scenarioRelativeSlot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
-                      "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
+                      "fetchBeforeUse": "bool (Requires the latest remote account data before applying overrides. The override is skipped when no remote client is configured or the fetch fails.)",
                       "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }
@@ -873,7 +873,7 @@
               "description": "The base slot from which relative slot offsets are calculated. If omitted, uses the current slot."
             }
           ],
-          "returns": "A `RpcResponse<()>` indicating whether the write was successful."
+          "returns": "A `RpcResponse<Vec<OverrideOutcome>>` carrying the per-override outcomes for the base slot. Each `OverrideOutcome` is {overrideId, label?, applied, reason?}; applied=false with a reason means the override was skipped. Later-slot outcomes are returned by surfnet_timeTravel as each target slot is reached."
         }
       ]
     },

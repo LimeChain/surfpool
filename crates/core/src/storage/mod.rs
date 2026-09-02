@@ -65,6 +65,11 @@ pub enum StorageError {
     DeserializeValueError(String, serde_json::Error),
     #[error("Failed to acquire lock for database")]
     LockError,
+    #[error("Atomic cross-table batches are not supported by {backend} ({configuration})")]
+    AtomicCrossTableBatchUnsupported {
+        backend: String,
+        configuration: String,
+    },
     #[error("Query failed for table '{0}' in '{1}' database: {2}")]
     QueryError(String, String, #[source] QueryExecuteError),
 }
@@ -168,6 +173,16 @@ pub enum QueryExecuteError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+pub enum StorageOperation<K, V> {
+    Store(K, V),
+    Remove(K),
+}
+
+pub struct CrossTableRemove {
+    pub(crate) table_name: &'static str,
+    pub(crate) serialized_key: String,
+}
+
 impl From<StorageError> for jsonrpc_core::Error {
     fn from(err: StorageError) -> Self {
         SurfpoolError::from(err).into()
@@ -176,6 +191,24 @@ impl From<StorageError> for jsonrpc_core::Error {
 
 pub trait Storage<K, V>: Send + Sync {
     fn store(&mut self, key: K, value: V) -> StorageResult<()>;
+    fn apply_batch(&mut self, operations: Vec<StorageOperation<K, V>>) -> StorageResult<()>;
+    fn ensure_atomic_cross_table_batch_supported(&self) -> StorageResult<()> {
+        Err(StorageError::AtomicCrossTableBatchUnsupported {
+            backend: std::any::type_name::<Self>().to_string(),
+            configuration: "default storage implementation".to_string(),
+        })
+    }
+    fn apply_batch_with_cross_table_remove(
+        &mut self,
+        _operations: Vec<StorageOperation<K, V>>,
+        _cross_table_remove: CrossTableRemove,
+    ) -> StorageResult<()> {
+        self.ensure_atomic_cross_table_batch_supported()?;
+        Err(StorageError::AtomicCrossTableBatchUnsupported {
+            backend: std::any::type_name::<Self>().to_string(),
+            configuration: "atomic operation is not implemented".to_string(),
+        })
+    }
     fn clear(&mut self) -> StorageResult<()>;
     fn get(&self, key: &K) -> StorageResult<Option<V>>;
     fn take(&mut self, key: &K) -> StorageResult<Option<V>>;

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::TcpListener,
     str::FromStr,
@@ -74,11 +75,11 @@ use spl_token_2022_interface::{
     pod::PodMint,
 };
 use surfpool_types::{
-    AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
-    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
-    StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
-    SurfnetStartupTaskState, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
-    UiKeyedProfileResult,
+    AccountAddress, AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
+    DEFAULT_SLOT_TIME_MS, Idl, OverrideInstance, RpcProfileDepth, RpcProfileResultConfig, Scenario,
+    SimnetCommand, SimnetEvent, StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus,
+    SurfnetStartupTask, SurfnetStartupTaskState, SurfpoolConfig, TimeTravelResult, UiAccountChange,
+    UiAccountProfileState, UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -4787,7 +4788,7 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
 
     // Test time travel to absolute timestamp
     // Note: time_travel now uses confirmation mechanism, so it waits internally
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteTimestamp(target_timestamp)),
     );
@@ -4803,11 +4804,11 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
 
     // Verify the epoch info reflects the time travel
     assert_ne!(
-        new_epoch_info.epoch, initial_epoch_info.epoch,
+        new_epoch_info.epoch_info.epoch, initial_epoch_info.epoch,
         "Epoch should change after time travel"
     );
     assert_ne!(
-        new_epoch_info.absolute_slot, initial_epoch_info.absolute_slot,
+        new_epoch_info.epoch_info.absolute_slot, initial_epoch_info.absolute_slot,
         "Slot should change after time travel"
     );
 
@@ -4815,10 +4816,10 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
     let current_epoch_info = svm_locker.get_epoch_info();
     println!("Updated epoch info: {:?}", current_epoch_info);
 
-    assert_eq!(current_epoch_info.epoch, new_epoch_info.epoch);
+    assert_eq!(current_epoch_info.epoch, new_epoch_info.epoch_info.epoch);
     assert_eq!(
         current_epoch_info.absolute_slot,
-        new_epoch_info.absolute_slot
+        new_epoch_info.epoch_info.absolute_slot
     );
 
     println!("Time travel to absolute timestamp test passed successfully!");
@@ -4870,7 +4871,7 @@ fn test_time_travel_absolute_slot(test_type: TestType) {
 
     // Test time travel to absolute slot
     // Note: time_travel now uses confirmation mechanism, so it waits internally
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteSlot(target_slot)),
     );
@@ -4885,24 +4886,96 @@ fn test_time_travel_absolute_slot(test_type: TestType) {
 
     // Verify the epoch info reflects the time travel
     assert_eq!(
-        new_epoch_info.absolute_slot, target_slot,
+        new_epoch_info.epoch_info.absolute_slot, target_slot,
         "Slot should match target slot"
     );
     assert!(
-        new_epoch_info.epoch > initial_epoch_info.epoch,
+        new_epoch_info.epoch_info.epoch > initial_epoch_info.epoch,
         "Epoch should change after time travel"
     );
     assert!(
-        new_epoch_info.absolute_slot > initial_epoch_info.absolute_slot,
+        new_epoch_info.epoch_info.absolute_slot > initial_epoch_info.absolute_slot,
         "Epoch should change after time travel"
     );
 
     // Verify the current epoch info in SVM matches
     let current_epoch_info = svm_locker.get_epoch_info();
     assert_eq!(current_epoch_info.absolute_slot, target_slot);
-    assert_eq!(current_epoch_info.epoch, new_epoch_info.epoch);
+    assert_eq!(current_epoch_info.epoch, new_epoch_info.epoch_info.epoch);
 
     println!("Time travel to absolute slot test passed successfully!");
+}
+
+#[test]
+fn test_time_travel_reports_target_outcomes_and_rejects_skipped_pending_slot() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Manual, Some(400), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    let base_slot = simnet.locker.get_latest_absolute_slot();
+    let scenario = Scenario {
+        id: "sparse-scenario".to_string(),
+        name: "Sparse scenario".to_string(),
+        description: String::new(),
+        overrides: vec![OverrideInstance {
+            id: "slot-450".to_string(),
+            template_id: "test-template".to_string(),
+            values: HashMap::new(),
+            scenario_relative_slot: 450,
+            label: None,
+            enabled: true,
+            fetch_before_use: false,
+            account: AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        }],
+        tags: Vec::new(),
+    };
+
+    let register_response = jsonrpc_core::futures::executor::block_on(
+        rpc_server.register_scenario(Some(runloop_context.clone()), scenario, Some(base_slot)),
+    )
+    .unwrap();
+    assert!(register_response.value.is_empty());
+
+    let error = rpc_server
+        .time_travel(
+            Some(runloop_context.clone()),
+            Some(TimeTravelConfig::AbsoluteSlot(base_slot + 750)),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+    assert!(error.message.contains(&(base_slot + 450).to_string()));
+    assert_eq!(simnet.locker.get_latest_absolute_slot(), base_slot);
+
+    let time_travel_result = rpc_server
+        .time_travel(
+            Some(runloop_context.clone()),
+            Some(TimeTravelConfig::AbsoluteSlot(base_slot + 450)),
+        )
+        .unwrap();
+    assert_eq!(time_travel_result.epoch_info.absolute_slot, base_slot + 450);
+    assert_eq!(time_travel_result.override_outcomes.len(), 1);
+    assert_eq!(
+        time_travel_result.override_outcomes[0].override_id,
+        "slot-450"
+    );
+    assert!(time_travel_result.override_outcomes[0].applied);
+
+    let epoch_info = rpc_server
+        .time_travel(
+            Some(runloop_context),
+            Some(TimeTravelConfig::AbsoluteSlot(base_slot + 750)),
+        )
+        .unwrap();
+    assert_eq!(epoch_info.epoch_info.absolute_slot, base_slot + 750);
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -4951,7 +5024,7 @@ fn test_time_travel_absolute_epoch(test_type: TestType) {
 
     // Test time travel to absolute epoch
     // Note: time_travel now uses confirmation mechanism, so it waits internally
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteEpoch(target_epoch)),
     );
@@ -4966,15 +5039,15 @@ fn test_time_travel_absolute_epoch(test_type: TestType) {
 
     // Verify the epoch info reflects the time travel
     assert_eq!(
-        new_epoch_info.epoch, target_epoch,
+        new_epoch_info.epoch_info.epoch, target_epoch,
         "Epoch should match target epoch"
     );
     assert_ne!(
-        new_epoch_info.epoch, initial_epoch_info.epoch,
+        new_epoch_info.epoch_info.epoch, initial_epoch_info.epoch,
         "Epoch should change after time travel"
     );
     assert_ne!(
-        new_epoch_info.absolute_slot, initial_epoch_info.absolute_slot,
+        new_epoch_info.epoch_info.absolute_slot, initial_epoch_info.absolute_slot,
         "Slot should change after time travel"
     );
 
@@ -4983,7 +5056,7 @@ fn test_time_travel_absolute_epoch(test_type: TestType) {
     assert_eq!(current_epoch_info.epoch, target_epoch);
     assert_eq!(
         current_epoch_info.absolute_slot,
-        new_epoch_info.absolute_slot
+        new_epoch_info.epoch_info.absolute_slot
     );
 
     println!("Time travel to absolute epoch test passed successfully!");
@@ -5554,6 +5627,22 @@ async fn test_reset_streamed_account_cascade(test_type: TestType) {
         .with_svm_writer(|svm_writer| {
             svm_writer.set_account(&owner, owner_account).unwrap();
             svm_writer.set_account(&owned, owned_account).unwrap();
+            svm_writer
+                .scheduled_overrides
+                .store(
+                    svm_writer.latest_epoch_info.absolute_slot + 1,
+                    vec![OverrideInstance {
+                        id: "pending-reset".to_string(),
+                        template_id: "test-template".to_string(),
+                        values: HashMap::new(),
+                        scenario_relative_slot: 1,
+                        label: None,
+                        enabled: true,
+                        fetch_before_use: false,
+                        account: AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+                    }],
+                )
+                .unwrap();
             Ok::<(), SurfpoolError>(())
         })
         .unwrap();
@@ -5573,6 +5662,9 @@ async fn test_reset_streamed_account_cascade(test_type: TestType) {
     // Owner is deleted, owned account is deleted
     assert!(svm_locker.get_account_local(&owner).inner.is_none());
     assert!(svm_locker.get_account_local(&owned).inner.is_none());
+    svm_locker.with_svm_reader(|svm_reader| {
+        assert!(svm_reader.scheduled_overrides.keys().unwrap().is_empty());
+    });
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -5865,7 +5957,7 @@ fn test_reset_network_time_travel_timestamp(test_type: TestType) {
 
     // First time travel to target timestamp
     // Note: time_travel now uses confirmation mechanism, so it waits internally
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteTimestamp(target_timestamp)),
     );
@@ -5881,7 +5973,7 @@ fn test_reset_network_time_travel_timestamp(test_type: TestType) {
 
     // Second time travel to the same timestamp should now succeed after reset
     // because updated_at was reset to current time
-    let time_travel_response2: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response2: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteTimestamp(target_timestamp)),
     );
@@ -5924,7 +6016,7 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
 
     // First time travel to target slot
     // Note: time_travel now uses confirmation mechanism, so it waits internally
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteSlot(target_slot)),
     );
@@ -5940,7 +6032,7 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
 
     // Second time travel to the same slot should now succeed after reset
     // because latest_epoch_info.absolute_slot was reset to the offline baseline
-    let time_travel_response2: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response2: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteSlot(target_slot)),
     );
@@ -5982,7 +6074,7 @@ fn test_reset_network_time_travel_epoch(test_type: TestType) {
     let target_epoch = 5;
 
     // First time travel to target epoch
-    let time_travel_response: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteEpoch(target_epoch)),
     );
@@ -5999,7 +6091,7 @@ fn test_reset_network_time_travel_epoch(test_type: TestType) {
 
     // Second time travel to the same epoch should now succeed after reset
     // because latest_epoch_info.epoch was reset to 0
-    let time_travel_response2: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
+    let time_travel_response2: JsonRpcResult<TimeTravelResult> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteEpoch(target_epoch)),
     );

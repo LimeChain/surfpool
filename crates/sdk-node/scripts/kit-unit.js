@@ -58,6 +58,9 @@ test("cheatcodes RPC passes bare (non-enveloped) results through untouched", asy
       slotIndex: 42,
       slotsInEpoch: 432000,
       transactionCount: 5,
+      overrideOutcomes: [
+        { overrideId: "override-1", label: "Price shock", applied: true, reason: null },
+      ],
     },
   }));
   try {
@@ -66,6 +69,8 @@ test("cheatcodes RPC passes bare (non-enveloped) results through untouched", asy
     // Kit's default transport parses all JSON integers as bigint.
     assert.equal(result.absoluteSlot, 42n);
     assert.equal(result.transactionCount, 5n);
+    assert.equal(result.overrideOutcomes[0].overrideId, "override-1");
+    assert.equal(result.overrideOutcomes[0].applied, true);
   } finally {
     restore();
   }

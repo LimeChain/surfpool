@@ -476,27 +476,14 @@ pub async fn start_block_production_runloop(
                         });
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
-                        // Confirm the current block to materialize any scheduled overrides for this slot
-                        if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
-                            svm_locker.simnet_events_tx().error(format!(
-                                "Failed to confirm block after time travel: {}", e
-                            ));
-                        }
-
-                        let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.latest_epoch_info.clone()
-                        });
-
-                        // Send confirmation back
-                        let _ = response_tx.send(epoch_info);
+                        let result = {
+                            let mut svm_writer = svm_locker.0.write().await;
+                            svm_writer
+                                .time_travel_to_clock(&remote_client_with_commitment, clock)
+                                .await
+                                .map_err(crate::error::SurfpoolError::into_simnet_command_error)
+                        };
+                        let _ = response_tx.send(result);
                     }
                     SimnetCommand::UpdateBlockProductionMode(update) => {
                         block_production_mode = update;

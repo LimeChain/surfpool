@@ -846,11 +846,13 @@ async fn test_pump_token2022_graduation_lifecycle() {
     let global_data = rpc.get_account(&PUMP_GLOBAL).await.unwrap().data;
     let fixture = GraduationFixture::new(user.pubkey(), mint, &curve_account.data, &global_data);
 
+    let base_slot = locker.get_latest_absolute_slot();
     locker
-        .register_scenario(preparation.scenario, Some(0))
+        .register_scenario_and_materialize(&None, preparation.scenario, Some(base_slot))
+        .await
         .unwrap();
     locker
-        .materialize_overrides_for_slot(&None, 1)
+        .materialize_overrides_for_slot(&None, base_slot + 1)
         .await
         .unwrap();
     fund_user(&rpc, &fixture).await;
@@ -1074,16 +1076,20 @@ async fn price_shock_changes_a_live_pool_swap() {
     let mut pool_override = OverrideInstance::new(template.id.clone(), 0, template.address.clone())
         .with_values(values)
         .with_label("PumpSwap virtual quote reserve shock".to_string());
-    pool_override.fetch_before_use = true;
+    pool_override.fetch_before_use = false;
     let mut price_shock = Scenario::new(
         "PumpSwap Price Shock".to_string(),
         "Shift a canonical PumpSwap pool price through its virtual quote reserves.".to_string(),
     );
     price_shock.tags = vec!["pumpswap".to_string(), "price-shock".to_string()];
     price_shock.add_override(pool_override);
-    locker.register_scenario(price_shock, Some(100)).unwrap();
+    let base_slot = locker.get_latest_absolute_slot() + 1;
     locker
-        .materialize_overrides_for_slot(&None, 100)
+        .register_scenario_and_materialize(&None, price_shock, Some(base_slot))
+        .await
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, base_slot)
         .await
         .unwrap();
 

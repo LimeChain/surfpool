@@ -6,7 +6,7 @@ use std::{
 use log::debug;
 use serde::{Deserialize, Serialize};
 use surfpool_db::diesel::{
-    self, RunQueryDsl,
+    self, Connection, RunQueryDsl,
     connection::SimpleConnection,
     r2d2::{ConnectionManager, Pool},
     sql_query,
@@ -14,7 +14,7 @@ use surfpool_db::diesel::{
 };
 
 use crate::storage::{
-    Storage, StorageError, StorageResult,
+    CrossTableRemove, Storage, StorageError, StorageOperation, StorageResult,
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
@@ -116,6 +116,24 @@ where
     K: Serialize + for<'de> Deserialize<'de>,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
+    fn serialize_operations(
+        &self,
+        operations: Vec<StorageOperation<K, V>>,
+    ) -> StorageResult<Vec<(String, Option<String>)>> {
+        operations
+            .into_iter()
+            .map(|operation| match operation {
+                StorageOperation::Store(key, value) => Ok((
+                    serialize_key(NAME, &self.table_name, &key)?,
+                    Some(serialize_value(NAME, &self.table_name, &value)?),
+                )),
+                StorageOperation::Remove(key) => {
+                    Ok((serialize_key(NAME, &self.table_name, &key)?, None))
+                }
+            })
+            .collect()
+    }
+
     fn ensure_table_exists(&self) -> StorageResult<()> {
         debug!("Ensuring table '{}' exists", self.table_name);
         let create_table_sql = format!(
@@ -200,6 +218,89 @@ where
 
         debug!("Value stored successfully in table '{}'", self.table_name);
         Ok(())
+    }
+
+    fn apply_batch(&mut self, operations: Vec<StorageOperation<K, V>>) -> StorageResult<()> {
+        let serialized = self.serialize_operations(operations)?;
+
+        let upsert_sql = format!(
+            "INSERT INTO {} (surfnet_id, key, value, updated_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (surfnet_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP",
+            self.table_name
+        );
+        let delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = $1 AND key = $2",
+            self.table_name
+        );
+        let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
+
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            for (key, value) in &serialized {
+                if let Some(value) = value {
+                    sql_query(upsert_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .bind::<Text, _>(value)
+                        .execute(conn)?;
+                } else {
+                    sql_query(delete_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .execute(conn)?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| StorageError::store(&self.table_name, NAME, "*batch*", e))
+    }
+
+    fn ensure_atomic_cross_table_batch_supported(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn apply_batch_with_cross_table_remove(
+        &mut self,
+        operations: Vec<StorageOperation<K, V>>,
+        cross_table_remove: CrossTableRemove,
+    ) -> StorageResult<()> {
+        let serialized = self.serialize_operations(operations)?;
+        let upsert_sql = format!(
+            "INSERT INTO {} (surfnet_id, key, value, updated_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (surfnet_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP",
+            self.table_name
+        );
+        let delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = $1 AND key = $2",
+            self.table_name
+        );
+        let cross_table_delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = $1 AND key = $2",
+            cross_table_remove.table_name
+        );
+        let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
+
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            for (key, value) in &serialized {
+                if let Some(value) = value {
+                    sql_query(upsert_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .bind::<Text, _>(value)
+                        .execute(conn)?;
+                } else {
+                    sql_query(delete_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .execute(conn)?;
+                }
+            }
+            sql_query(cross_table_delete_sql.clone())
+                .bind::<Text, _>(&self.surfnet_id)
+                .bind::<Text, _>(&cross_table_remove.serialized_key)
+                .execute(conn)?;
+            Ok(())
+        })
+        .map_err(|e| StorageError::store(&self.table_name, NAME, "*atomic-batch*", e))
     }
 
     fn get(&self, key: &K) -> StorageResult<Option<V>> {
@@ -356,5 +457,43 @@ where
             self.table_name
         );
         Ok(Box::new(iter))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_cross_table_batch_rolls_back_postgres() {
+        let Ok(database_url) = std::env::var("SURFPOOL_TEST_POSTGRES_URL") else {
+            eprintln!("SURFPOOL_TEST_POSTGRES_URL is not set; skipping PostgreSQL fault test");
+            return;
+        };
+        let surfnet_id = uuid::Uuid::new_v4().to_string();
+        let backend = PostgresBackend::open(&database_url, &surfnet_id).unwrap();
+        let mut accounts: PostgresStorage<String, String> = backend.open_store("accounts").unwrap();
+        accounts
+            .store("account".to_string(), "old".to_string())
+            .unwrap();
+        let missing_table = Box::leak(
+            format!("missing_atomic_table_{}", uuid::Uuid::new_v4().simple()).into_boxed_str(),
+        );
+
+        let result = accounts.apply_batch_with_cross_table_remove(
+            vec![StorageOperation::Store(
+                "account".to_string(),
+                "new".to_string(),
+            )],
+            CrossTableRemove {
+                table_name: missing_table,
+                serialized_key: serde_json::to_string(&1_u64).unwrap(),
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            accounts.get(&"account".to_string()).unwrap().as_deref(),
+            Some("old")
+        );
     }
 }
