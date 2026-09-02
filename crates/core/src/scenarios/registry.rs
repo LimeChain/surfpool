@@ -53,6 +53,13 @@ pub const WHIRLPOOL_OVERRIDES_CONTENT: &str = include_str!("./protocols/whirlpoo
 pub const SPL_TOKEN_IDL_CONTENT: &str = include_str!("./protocols/spl-token/idl.json");
 pub const SPL_TOKEN_OVERRIDES_CONTENT: &str = include_str!("./protocols/spl-token/overrides.yaml");
 
+pub const PUMP_V1_IDL_CONTENT: &str = include_str!("./protocols/pump/v1/idl.json");
+pub const PUMP_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/pump/v1/overrides.yaml");
+
+pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/idl.json");
+pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pump-amm/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -72,6 +79,7 @@ impl TemplateRegistry {
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
+        default.load_pump_overrides();
         default
     }
 
@@ -159,6 +167,15 @@ impl TemplateRegistry {
             SPL_TOKEN_IDL_CONTENT,
             SPL_TOKEN_OVERRIDES_CONTENT,
             "spl-token",
+        );
+    }
+
+    pub fn load_pump_overrides(&mut self) {
+        self.load_protocol_overrides(PUMP_V1_IDL_CONTENT, PUMP_V1_OVERRIDES_CONTENT, "pump");
+        self.load_protocol_overrides(
+            PUMP_AMM_V1_IDL_CONTENT,
+            PUMP_AMM_V1_OVERRIDES_CONTENT,
+            "pump-amm",
         );
     }
 
@@ -377,15 +394,97 @@ mod tests {
         );
     }
 
+    /// Both singleton addresses are documented in pump-public-docs: the Pump Global
+    /// account at 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf and the PumpSwap
+    /// GlobalConfig at ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw.
+    #[test]
+    fn pump_singletons_derive_their_documented_addresses() {
+        let registry = TemplateRegistry::new();
+
+        let global = registry.get("pump-global").expect("template");
+        assert_eq!(
+            global.address.resolve(None).expect("resolves"),
+            Pubkey::from_str("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf").expect("address"),
+        );
+
+        let config = registry.get("pump-amm-global-config").expect("template");
+        assert_eq!(
+            config.address.resolve(None).expect("resolves"),
+            Pubkey::from_str("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw").expect("address"),
+        );
+    }
+
+    /// The expected addresses are not ours. pump-public-docs (PUMP_SWAP_README.md)
+    /// documents the canonical pool GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J of the
+    /// migrated coin 7LSsEoJG…pump, with the Pump pool-authority PDA 9XDYTfQK… as its
+    /// creator, so deriving both pins the whole canonical chain: index 0 as u16 LE, the
+    /// nested pool-authority PDA, the base mint, and wrapped SOL. The bonding curve
+    /// address was checked against mainnet on 2026-08-06: owner 6EF8rrec…, discriminator
+    /// 23 183 248 55 96 216 172 96 (BondingCurve), complete = true.
+    #[test]
+    fn pump_templates_derive_the_documented_migrated_coin_accounts() {
+        let registry = TemplateRegistry::new();
+        let mint = "7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump";
+
+        let curve = registry.get("pump-bonding-curve-custom").expect("template");
+        let values = HashMap::from([(
+            "token_mint".to_string(),
+            serde_json::Value::String(mint.to_string()),
+        )]);
+        assert_eq!(
+            curve.address.resolve(Some(&values)).expect("resolves"),
+            Pubkey::from_str("3MUkKMbuornHohtAtzrToSzqkj1gEEhQqYVz8sZnmQg1").expect("address"),
+        );
+
+        let pool = registry.get("pump-amm-canonical-pool").expect("template");
+        let values = HashMap::from([(
+            "base_mint".to_string(),
+            serde_json::Value::String(mint.to_string()),
+        )]);
+
+        let AccountAddress::Pda { seeds, .. } = &pool.address else {
+            panic!("the pool address is a PDA");
+        };
+        let pool_authority = seeds
+            .iter()
+            .find(|seed| matches!(seed, PdaSeed::DerivedPda { .. }))
+            .expect("the pool PDA derives the pool authority PDA")
+            .to_bytes(Some(&values))
+            .expect("the pool authority resolves");
+        assert_eq!(
+            Pubkey::try_from(pool_authority.as_slice()).expect("32 bytes"),
+            Pubkey::from_str("9XDYTfQKwW8sHPqnFdUreMmtmffmkHVPGTNV2e3LKxNW").expect("address"),
+        );
+
+        assert_eq!(
+            pool.address.resolve(Some(&values)).expect("resolves"),
+            Pubkey::from_str("GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J").expect("address"),
+        );
+    }
+
+    #[test]
+    fn pump_pool_address_needs_every_seed_to_resolve() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("pump-amm-canonical-pool").expect("template");
+
+        assert_eq!(
+            template.address.resolve(Some(&HashMap::new())),
+            None,
+            "a missing base mint must not derive a shorter address"
+        );
+    }
+
     #[test]
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) + Whirlpool(6) + SPL Token (2) = 57 total
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
         assert_eq!(
             registry.count(),
-            57,
-            "Registry should load 57 templates total"
+            62,
+            "Registry should load 62 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -449,6 +548,13 @@ mod tests {
 
         assert!(registry.contains("spl-token-account-balance"));
         assert!(registry.contains("spl-token-mint-supply"));
+
+        assert!(registry.contains("pump-bonding-curve-custom"));
+        assert!(registry.contains("pump-global"));
+
+        assert!(registry.contains("pump-amm-pool-state"));
+        assert!(registry.contains("pump-amm-canonical-pool"));
+        assert!(registry.contains("pump-amm-global-config"));
     }
 
     #[test]
@@ -561,6 +667,16 @@ mod tests {
             6,
             "Should have 6 Whirlpool templates"
         );
+
+        let pump_templates = registry.by_protocol("Pump");
+        assert_eq!(pump_templates.len(), 2, "Should have 2 Pump templates");
+
+        let pump_swap_templates = registry.by_protocol("PumpSwap");
+        assert_eq!(
+            pump_swap_templates.len(),
+            3,
+            "Should have 3 PumpSwap templates"
+        );
     }
 
     #[test]
@@ -658,25 +774,26 @@ mod tests {
             token_mint_constant.options.len()
         );
 
-        // Check that common tokens are present with correct addresses
+        // Check that common tokens are present, keyed by their mint address
         let sol_option = token_mint_constant
             .options
             .iter()
-            .find(|o| o.id == "sol")
+            .find(|o| o.value == "So11111111111111111111111111111111111111112")
             .expect("SOL token should be present");
         assert_eq!(
-            sol_option.value, "So11111111111111111111111111111111111111112",
-            "SOL address should match"
+            sol_option.id, sol_option.value,
+            "option ids are mint addresses so colliding symbols keep every mint"
         );
 
         let usdc_option = token_mint_constant
             .options
             .iter()
-            .find(|o| o.id == "usdc")
+            .find(|o| o.value == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             .expect("USDC token should be present");
         assert_eq!(
-            usdc_option.value, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "USDC address should match"
+            usdc_option.metadata.get("symbol").and_then(|v| v.as_str()),
+            Some("USDC"),
+            "USDC symbol should be in metadata"
         );
 
         // Check metadata is populated

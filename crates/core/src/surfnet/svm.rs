@@ -155,6 +155,24 @@ impl AccountUpdatePolicy {
     }
 }
 
+/// Token accounts carry no Anchor discriminator, so the IDL forge path cannot decode them.
+fn forge_token_account_data(
+    account: &Account,
+    mut token_account: TokenAccount,
+    account_values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<Vec<u8>> {
+    let amount = account_values
+        .get("amount")
+        .and_then(|amount| {
+            amount
+                .as_u64()
+                .or_else(|| amount.as_str().and_then(|amount| amount.parse().ok()))
+        })
+        .ok_or_else(|| SurfpoolError::internal("amount must be an unsigned 64-bit integer"))?;
+    token_account.set_amount(amount);
+    token_account.pack_into_preserving_extensions(&account.data)
+}
+
 /// Helper function to apply an override to a decoded account value using dot notation
 pub fn apply_override_to_decoded_account(
     decoded_value: &mut Value,
@@ -2906,13 +2924,27 @@ impl SurfnetSvm {
                             remote_account.data().len()
                         );
 
+                        // The coupled account was not asked for: fill a fork gap,
+                        // never clobber local state.
                         if let Some((coupled_pubkey, coupled_account)) = coupled {
-                            if let Err(e) = self.inner.set_account(coupled_pubkey, coupled_account)
-                            {
-                                warn!(
-                                    "Failed to set coupled account {} from remote: {}",
-                                    coupled_pubkey, e
-                                );
+                            match self.inner.get_account(&coupled_pubkey) {
+                                Ok(None) => {
+                                    if let Err(e) =
+                                        self.inner.set_account(coupled_pubkey, coupled_account)
+                                    {
+                                        warn!(
+                                            "Failed to set coupled account {} from remote: {}",
+                                            coupled_pubkey, e
+                                        );
+                                    }
+                                }
+                                Ok(Some(_)) => {}
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to read coupled account {}: {}",
+                                        coupled_pubkey, e
+                                    );
+                                }
                             }
                         }
 
@@ -2997,6 +3029,23 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
+
+                // Mints fail the token unpack and keep flowing through the IDL path.
+                if is_supported_token_program(account.owner()) {
+                    if let Ok(token_account) = TokenAccount::unpack(account.data()) {
+                        let new_account_data =
+                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let modified_account = Account {
+                            lamports: account.lamports(),
+                            data: new_account_data,
+                            owner: *account.owner(),
+                            executable: account.executable(),
+                            rent_epoch: account.rent_epoch(),
+                        };
+                        self.inner.set_account(account_pubkey, modified_account)?;
+                        continue;
+                    }
+                }
 
                 // Get the account owner (program ID)
                 let owner_program_id = account.owner();
@@ -4496,6 +4545,174 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    /// A Token-2022 vault with a fake extension tail. The forge helper never
+    /// unpacks the tail, so its bytes only need to be distinguishable.
+    fn token_2022_vault_with_tail(mint: Pubkey) -> (crate::types::TokenAccount, Account) {
+        let mut token_account = crate::types::TokenAccount::new(
+            &spl_token_2022_interface::id(),
+            Pubkey::new_unique(),
+            mint,
+            None,
+        );
+        token_account.set_amount(10);
+        let mut data = token_account.pack_into_vec();
+        data.extend_from_slice(&[2, 1, 2, 3, 4]);
+        let account = Account {
+            lamports: 2_039_280,
+            data,
+            owner: spl_token_2022_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        (token_account, account)
+    }
+
+    #[test]
+    fn token_account_override_patches_only_the_amount_bytes() {
+        let (token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
+        // Studio clients send u64 values as strings, so the parse path is the contract.
+        let account_values = HashMap::from([("amount".to_string(), serde_json::json!("42"))]);
+
+        let patched = forge_token_account_data(&account, token_account, &account_values).unwrap();
+
+        assert_eq!(patched.len(), account.data.len());
+        assert_eq!(&patched[64..72], &42u64.to_le_bytes());
+        assert_eq!(&patched[..64], &account.data[..64]);
+        assert_eq!(&patched[72..], &account.data[72..]);
+    }
+
+    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
+    /// the remote-fetch branches can be exercised without a network.
+    async fn canned_rpc(result_json: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind canned rpc");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
+    /// coupled-mint path. The canned server answers the mint lookup with the same body, and the
+    /// account's zeroed mint field makes the coupled mint land on the default pubkey.
+    const CANNED_TOKEN_ACCOUNT: &str = concat!(
+        r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        r#"","base64"],"executable":false,"lamports":2039280,"#,
+        r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
+    );
+
+    fn fetch_before_use_scenario(target: Pubkey) -> surfpool_types::Scenario {
+        let mut scenario = surfpool_types::Scenario::new(
+            "coupled fetch".to_string(),
+            "fetch_before_use must fork the target and its coupled account".to_string(),
+        );
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        );
+        instance.fetch_before_use = true;
+        scenario.add_override(instance);
+        scenario
+    }
+
+    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
+    /// a catch-all that logged and dropped the account, so the fetch reported success while the
+    /// target was never forked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_before_use_materializes_a_coupled_account() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let target = Pubkey::new_unique();
+
+        locker
+            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .unwrap();
+        locker
+            .materialize_overrides_for_slot(&Some(remote), 100)
+            .await
+            .unwrap();
+
+        let fetched = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
+            .unwrap();
+        assert!(
+            fetched.is_some(),
+            "the fetched token account must be forked"
+        );
+        let coupled_mint = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .unwrap();
+        assert!(
+            coupled_mint.is_some(),
+            "the coupled mint must fill the gap in the fork"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_before_use_keeps_a_locally_modified_coupled_account() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let target = Pubkey::new_unique();
+
+        let marker = vec![7u8; 82];
+        locker.with_svm_writer(|svm_writer| {
+            svm_writer
+                .set_account(
+                    &Pubkey::default(),
+                    Account {
+                        lamports: 1_000_000,
+                        data: marker.clone(),
+                        owner: spl_token_interface::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        });
+
+        locker
+            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .unwrap();
+        locker
+            .materialize_overrides_for_slot(&Some(remote), 100)
+            .await
+            .unwrap();
+
+        let mint = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mint.data, marker,
+            "only the explicitly refreshed target may be overwritten; the coupled account was \
+             not requested and must keep its local state"
+        );
     }
 
     fn build_transfer_transaction(
@@ -7529,34 +7746,6 @@ mod tests {
         }
     }
 
-    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
-    /// the remote-fetch branches can be exercised without a network.
-    async fn canned_rpc(result_json: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
-
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16 * 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-
-        format!("http://{addr}")
-    }
 
     /// The remote having no such account is only an answer about this slot - accounts get created
     /// later. While there is nothing local to work on, a persisted override must keep asking, or
@@ -7637,58 +7826,6 @@ mod tests {
         );
     }
 
-    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
-    /// a catch-all that logged and dropped the account, so the fetch reported success while the
-    /// target was never forked - every later write then failed with "not found in SVM".
-    #[tokio::test]
-    async fn test_fetch_before_use_materializes_a_coupled_account() {
-        const SLOT: u64 = 500;
-        // A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
-        // coupled-mint path. The canned server answers the mint lookup with the same body.
-        const TOKEN_ACCOUNT: &str = concat!(
-            r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            r#"","base64"],"executable":false,"lamports":2039280,"#,
-            r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
-        );
-
-        let url = canned_rpc(TOKEN_ACCOUNT).await;
-        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
-
-        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
-
-        let target = Pubkey::new_unique();
-        let mut instance = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(target.to_string()),
-        );
-        instance.fetch_before_use = true;
-
-        assert!(
-            svm.inner
-                .get_account(&target)
-                .expect("get_account")
-                .is_none(),
-            "the target must start absent so the fetch is what materializes it"
-        );
-
-        svm.scheduled_overrides
-            .store(SLOT, vec![instance])
-            .expect("schedule override");
-
-        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
-            .await
-            .expect("materialize");
-
-        let forked = svm
-            .inner
-            .get_account(&target)
-            .expect("get_account")
-            .expect("the coupled account must be written into the SVM");
-        assert_eq!(forked.data.len(), 165, "the token account data was forked");
-        assert_eq!(forked.lamports, 2_039_280, "lamports came from the remote");
-    }
 
     /// With no remote client there is nothing to fetch from, but the request is still unmet while
     /// the account is absent. `materialize_overrides_for_slot` is public, so a caller can pass a
