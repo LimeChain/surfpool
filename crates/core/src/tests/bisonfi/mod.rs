@@ -30,7 +30,6 @@ use crate::{
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
 };
 
-
 // ---------------------------------------------------------------- fetch/diff helpers
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -166,7 +165,6 @@ fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
 fn spl_amount(data: &[u8]) -> u64 {
     u64::from_le_bytes(data[64..72].try_into().unwrap())
 }
-
 
 /// Like [`fetch`] but keeps each account's lamports. A wrapped-SOL vault's lamports are part of its
 /// state, so overwriting them with a placeholder makes the runtime reject the transaction as
