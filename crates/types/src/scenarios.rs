@@ -1116,11 +1116,14 @@ impl RawEncoding {
                             .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
                     }
                 };
-                (target_slot as i64)
-                    .saturating_add(lead)
-                    .max(0)
-                    .to_le_bytes()
-                    .to_vec()
+                let slot = if lead >= 0 {
+                    target_slot.checked_add(lead as u64).ok_or_else(|| {
+                        format!("slot {target_slot} plus lead {lead} exceeds u64::MAX")
+                    })?
+                } else {
+                    target_slot.checked_sub(lead.unsigned_abs()).unwrap_or(0)
+                };
+                slot.to_le_bytes().to_vec()
             }
         })
     }
@@ -1580,6 +1583,28 @@ mod tests {
             .encode(&json!(-10), 3)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
+
+        // Slot is a u64. Values above i64::MAX must not wrap through a signed cast and become zero.
+        let large_slot = i64::MAX as u64 + 1;
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), large_slot)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), large_slot);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-1), u64::MAX)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX - 1);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), u64::MAX)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX);
+
+        let err = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(1), u64::MAX)
+            .expect_err("a positive lead must not wrap past u64::MAX");
+        assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
     }
 
     #[test]
