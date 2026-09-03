@@ -875,6 +875,33 @@
             }
           ],
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
+        },
+        {
+          "method": "surfnet_stopPersistingOverride",
+          "description": "Stops scheduler-generated continuations of one persisted scenario override without applying the override again. Independently authored future timeline entries are preserved.",
+          "params": [
+            {
+              "name": "id",
+              "type": "string",
+              "description": "The override instance identifier."
+            },
+            {
+              "name": "account",
+              "type": "AccountAddress",
+              "description": "The account identity as either a concrete pubkey or the original PDA recipe."
+            },
+            {
+              "name": "template_id",
+              "type": "string",
+              "description": "The override template identifier."
+            },
+            {
+              "name": "values",
+              "type": "Option<HashMap<String, serde_json::Value>>",
+              "description": "Values used to resolve property-backed PDA seeds. Optional when account is already a concrete pubkey or contains no property-reference seeds."
+            }
+          ],
+          "returns": "A `RpcResponse<usize>` containing the number of scheduler-generated continuations removed."
         }
       ]
     },

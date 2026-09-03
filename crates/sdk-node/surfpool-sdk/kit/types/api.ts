@@ -2,6 +2,7 @@ import type { Address, GetEpochInfoApi } from '@solana/kit';
 
 import type {
     AccountSnapshot,
+    AccountAddress,
     AccountUpdate,
     CheatcodeControlConfig,
     ConfidentialBalanceKeys,
@@ -184,6 +185,14 @@ export type SurfnetExportSnapshotApi = {
 export type SurfnetRegisterScenarioApi = {
     registerScenario(scenario: Scenario, slot?: number | bigint): null;
 };
+export type SurfnetStopPersistingOverrideApi = {
+    stopPersistingOverride(
+        id: string,
+        account: AccountAddress,
+        templateId: string,
+        values?: Readonly<Record<string, unknown>>
+    ): number;
+};
 
 // Local
 export type SurfnetGetLocalSignaturesApi = {
@@ -222,6 +231,7 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetSetTokenAccountApi &
     SurfnetStreamAccountApi &
     SurfnetStreamAccountsApi &
+    SurfnetStopPersistingOverrideApi &
     SurfnetTimeTravelApi &
     SurfnetWriteProgramApi;
 

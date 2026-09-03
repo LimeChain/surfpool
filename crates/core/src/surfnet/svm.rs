@@ -4763,7 +4763,14 @@ impl SurfnetSvm {
         id: &str,
         account: &surfpool_types::AccountAddress,
         template_id: &str,
+        values: Option<&HashMap<String, serde_json::Value>>,
     ) -> SurfpoolResult<usize> {
+        let target_account = account.resolve(values).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Cannot stop persisted override {id}: its account address cannot be resolved. \
+                 Supply the property-reference values used by the PDA, or pass the resolved pubkey."
+            ))
+        })?;
         let slots = self.scheduled_overrides.keys()?;
         let mut removed = 0;
 
@@ -4775,8 +4782,8 @@ impl SurfnetSvm {
             queued.retain(|other| {
                 !(other.re_armed
                     && other.id == id
-                    && &other.account == account
-                    && other.template_id == template_id)
+                    && other.template_id == template_id
+                    && other.account.resolve(Some(&other.values)) == Some(target_account))
             });
             removed += before - queued.len();
 
@@ -8738,7 +8745,12 @@ mod tests {
             .expect("schedule future one-shot transition");
 
         let removed = svm
-            .stop_persisting_override(&instance.id, &instance.account, &instance.template_id)
+            .stop_persisting_override(
+                &instance.id,
+                &instance.account,
+                &instance.template_id,
+                Some(&instance.values),
+            )
             .expect("stop persistence");
         assert_eq!(removed, 1, "only the generated continuation is removed");
         assert!(
@@ -8822,6 +8834,90 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the authored one-shot at the next slot supersedes re-arming"
+        );
+    }
+
+    #[test]
+    fn test_stop_persisting_distinguishes_property_backed_pdas() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut first) = scheduled_persist_fixture(true);
+        let recipe = surfpool_types::AccountAddress::Pda {
+            program_id: Pubkey::new_unique().to_string(),
+            seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+        };
+        first.id = "shared-pda-id".to_string();
+        first.account = recipe.clone();
+        first.re_armed = true;
+        first.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("first-market".to_string()),
+        );
+        let first_pubkey = first
+            .account
+            .resolve(Some(&first.values))
+            .expect("derive first PDA");
+
+        let mut second = first.clone();
+        second.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("second-market".to_string()),
+        );
+        let second_pubkey = second
+            .account
+            .resolve(Some(&second.values))
+            .expect("derive second PDA");
+        assert_ne!(first_pubkey, second_pubkey);
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![first.clone(), second.clone()])
+            .expect("schedule PDA continuations");
+
+        let unresolved = svm.stop_persisting_override(&first.id, &recipe, &first.template_id, None);
+        assert!(
+            unresolved.is_err(),
+            "an unresolved PDA recipe must fail safely rather than cancelling both accounts"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("read after rejected stop")
+                .expect("continuations remain")
+                .len(),
+            2
+        );
+
+        let removed = svm
+            .stop_persisting_override(&first.id, &recipe, &first.template_id, Some(&first.values))
+            .expect("stop first PDA by recipe and values");
+        assert_eq!(removed, 1);
+        let remaining = svm
+            .scheduled_overrides
+            .get(&SLOT)
+            .expect("read remaining continuation")
+            .expect("second continuation remains");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].account.resolve(Some(&remaining[0].values)),
+            Some(second_pubkey),
+            "stopping the first PDA must preserve the second PDA"
+        );
+
+        let removed = svm
+            .stop_persisting_override(
+                &second.id,
+                &surfpool_types::AccountAddress::Pubkey(second_pubkey.to_string()),
+                &second.template_id,
+                None,
+            )
+            .expect("stop second PDA by resolved pubkey");
+        assert_eq!(removed, 1);
+        assert!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("read final slot")
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 

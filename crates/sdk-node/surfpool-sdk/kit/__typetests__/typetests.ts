@@ -15,6 +15,23 @@ void (async () => {
     client.surfnet.stop();
     void client.payer.address;
     void client.cheatcodes.pauseClock();
+    void client.cheatcodes.stopPersistingOverride(
+        'override-id',
+        {
+            pda: {
+                programId: '11111111111111111111111111111111',
+                seeds: [{ propertyRef: 'market' }],
+            },
+        },
+        'template-id',
+        { market: 'SOL' },
+    );
+    // Concrete pubkeys do not require PDA seed values.
+    void client.cheatcodes.stopPersistingOverride(
+        'override-id',
+        { pubkey: '11111111111111111111111111111111' },
+        'template-id',
+    );
     void client.rpc.getSlot();
     void client.sendTransactions;
 });

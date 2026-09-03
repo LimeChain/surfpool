@@ -2810,9 +2810,10 @@ impl SurfnetSvmLocker {
         id: String,
         account: surfpool_types::AccountAddress,
         template_id: String,
+        values: Option<HashMap<String, serde_json::Value>>,
     ) -> SurfpoolResult<usize> {
         self.with_svm_writer(move |svm_writer| {
-            svm_writer.stop_persisting_override(&id, &account, &template_id)
+            svm_writer.stop_persisting_override(&id, &account, &template_id, values.as_ref())
         })
     }
 
