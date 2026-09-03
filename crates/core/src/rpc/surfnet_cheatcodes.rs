@@ -16,10 +16,10 @@ use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
-    GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
-    StreamAccountsEntry, UiKeyedProfileResult,
+    AccountAddress, AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand,
+    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
+    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{AccountUpdate, SetSomeAccount, SupplyUpdate, TokenAccountUpdate, UuidOrSignature},
 };
 
@@ -1375,6 +1375,17 @@ pub trait SurfnetCheatcodes {
         scenario: Scenario,
         slot: Option<Slot>,
     ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// Stops persisted copies of one override. This does not materialize the override again and
+    /// leaves independently scheduled one-shot scenario entries intact.
+    #[rpc(meta, name = "surfnet_stopPersistingOverride")]
+    fn stop_persisting_override(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+        account: AccountAddress,
+        template_id: String,
+    ) -> Result<RpcResponse<usize>>;
 }
 
 #[derive(Clone)]
@@ -2355,6 +2366,27 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
                 value: (),
             })
+        })
+    }
+
+    fn stop_persisting_override(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+        account: AccountAddress,
+        template_id: String,
+    ) -> Result<RpcResponse<usize>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let removed = svm_locker
+            .stop_persisting_override(id, account, template_id)
+            .map_err(|e| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("Failed to stop persisted override: {}", e),
+                data: None,
+            })?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: removed,
         })
     }
 }

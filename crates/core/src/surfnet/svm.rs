@@ -4668,6 +4668,41 @@ impl SurfnetSvm {
 
         Ok(())
     }
+
+    /// Stops persisted entries of an override without applying the override again.
+    pub fn stop_persisting_override(
+        &mut self,
+        id: &str,
+        account: &surfpool_types::AccountAddress,
+        template_id: &str,
+    ) -> SurfpoolResult<usize> {
+        let slots = self.scheduled_overrides.keys()?;
+        let mut removed = 0;
+
+        for slot in slots {
+            let Some(mut queued) = self.scheduled_overrides.get(&slot)? else {
+                continue;
+            };
+            let before = queued.len();
+            queued.retain(|other| {
+                !((other.re_armed || other.persist.is_enabled())
+                    && other.id == id
+                    && &other.account == account
+                    && other.template_id == template_id)
+            });
+            removed += before - queued.len();
+
+            if queued.len() != before {
+                if queued.is_empty() {
+                    self.scheduled_overrides.take(&slot)?;
+                } else {
+                    self.scheduled_overrides.store(slot, queued)?;
+                }
+            }
+        }
+
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -8372,6 +8407,79 @@ mod tests {
                 .is_empty(),
             "and it must not re-arm from there"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stop_persisting_removes_persistent_entries_without_reapplying() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule persisted override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize first application");
+
+        // Simulate a transaction updating the field after persistence was armed. Stopping must not
+        // replay the old override value over this newer state.
+        let mut account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+            .copy_from_slice(&9_999u128.to_le_bytes());
+        svm.inner
+            .set_account(account_pubkey, account)
+            .expect("update account after first application");
+
+        // A future persistent start must be cancelled even though it has not re-armed yet. An
+        // ordinary one-shot with the same identity is not persistence bookkeeping and survives.
+        let future_persistent = instance.clone();
+        let mut operator_scheduled = instance.clone();
+        operator_scheduled.persist = surfpool_types::Persist::Always(false);
+        operator_scheduled.re_armed = false;
+        svm.scheduled_overrides
+            .store(SLOT + 10, vec![future_persistent, operator_scheduled])
+            .expect("schedule explicit future overrides");
+
+        let removed = svm
+            .stop_persisting_override(&instance.id, &instance.account, &instance.template_id)
+            .expect("stop persistence");
+        assert_eq!(
+            removed, 2,
+            "the continuation and future persistent start are removed"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation slot")
+                .unwrap_or_default()
+                .is_empty(),
+            "the active continuation must be gone"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 10))
+                .expect("read operator slot")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "an independently scheduled override must remain"
+        );
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(unhealthy, 9_999, "cancellation must not write account data");
     }
 
     /// Cancelling at a FUTURE relative slot. The armed copy sits before the cancellation bucket, so

@@ -1715,7 +1715,7 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 26] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 27] = [
     "surfnet_cloneProgramAccount",
     "surfnet_disableCheatcode",
     "surfnet_enableCheatcode",
@@ -1740,6 +1740,7 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 26] = [
     "surfnet_setTokenAccount",
     "surfnet_streamAccount",
     "surfnet_streamAccounts",
+    "surfnet_stopPersistingOverride",
     "surfnet_timeTravel",
     "surfnet_writeProgram",
 ];
