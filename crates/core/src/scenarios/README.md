@@ -18,6 +18,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
+- **BisonFi v3** – Proprietary market maker (no published IDL, not Anchor), with price, depth, spread and freshness templates. See [protocols/bisonfi/README.md](./protocols/bisonfi/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 
@@ -44,17 +45,57 @@ itself after every swap. Only one entry is queued per override, so it is never a
 one slot, and `fetchBeforeUse` applies to the first slot only - once the account is forked, later
 slots re-pin the fields without re-fetching it.
 
-### Kamino integration tests
+### On-chain integration tests
 
-Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real
-accounts from mainnet, so they need a network connection and are compiled only behind a feature:
+Byte-level coverage that forks real mainnet state lives in two modules,
+`crates/core/src/tests/kamino/` and `crates/core/src/tests/bisonfi/`. Both fetch real accounts, so
+they need a network connection and are compiled only behind a feature:
 
 ```
+# both suites
+cargo test -p surfpool-core --features integration-tests
+
+# one at a time
 cargo test -p surfpool-core --features integration-tests kamino
+cargo test -p surfpool-core --features integration-tests bisonfi
 ```
+
+Note the per-suite filters are substring matches on the full test path, so `kamino` covers only the
+Kamino module. It used to sweep up the BisonFi tests as well, back when they lived inside
+`tests/kamino/` and were named `tests::kamino::bisonfi_*` - if you are following an older note that
+says the `kamino` filter is enough, it no longer is.
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
 run needs no network.
+
+### Programs with no IDL
+
+Some programs publish no IDL and are not Anchor at all, so there is no discriminator to resolve an
+account type. Those ship a byte layout in their `overrides.yaml` instead:
+
+```yaml
+raw_layout:
+  account_size: 2048
+  magic: { offset: 0, bytes: [80, 79, 79, 76, 83, 84, 65, 84] }   # optional
+
+templates:
+  - id: bisonfi-fair-value
+    properties:
+      - path: fair_value
+        offset: 832
+        encoding: u128        # u8/u16/u32/u64/u128/i64/i128/bytes32/slot
+```
+
+When a template carries a `raw_layout` the engine writes bytes at each property's offset instead of
+decoding through the IDL. `account_size` and `magic` replace the discriminator as the check that
+this is the right account - without them a raw write would silently corrupt an unrelated one.
+
+Make that guard as narrow as the layout actually is. Size and a magic prefix are often not enough:
+BisonFi has eighteen accounts that are all 2048 bytes with the same `POOLSTAT` prefix, but one of
+them is an older layout version, so the magic is extended to cover the version word that follows it.
+Any field the program itself validates before trusting the account is a candidate for the guard.
+Values are written little-endian and integer-exact; anything above `u64::MAX` must be passed as a
+decimal string, since a JSON number that large has already lost digits.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
