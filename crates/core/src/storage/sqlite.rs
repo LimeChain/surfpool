@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use surfpool_db::diesel::{
-    self, RunQueryDsl, SqliteConnection,
+    self, Connection, RunQueryDsl, SqliteConnection,
     connection::SimpleConnection,
     r2d2::{ConnectionManager, Pool},
     sql_query,
@@ -11,7 +11,7 @@ use surfpool_db::diesel::{
 };
 
 use crate::storage::{
-    Storage, StorageError, StorageResult,
+    CrossTableRemove, Storage, StorageError, StorageOperation, StorageResult,
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
@@ -192,6 +192,24 @@ where
     K: Serialize + for<'de> Deserialize<'de>,
     V: Serialize + for<'de> Deserialize<'de> + Clone,
 {
+    fn serialize_operations(
+        &self,
+        operations: Vec<StorageOperation<K, V>>,
+    ) -> StorageResult<Vec<(String, Option<String>)>> {
+        operations
+            .into_iter()
+            .map(|operation| match operation {
+                StorageOperation::Store(key, value) => Ok((
+                    serialize_key(NAME, &self.table_name, &key)?,
+                    Some(serialize_value(NAME, &self.table_name, &value)?),
+                )),
+                StorageOperation::Remove(key) => {
+                    Ok((serialize_key(NAME, &self.table_name, &key)?, None))
+                }
+            })
+            .collect()
+    }
+
     fn ensure_table_exists(&self) -> StorageResult<()> {
         debug!("Ensuring table '{}' exists", self.table_name);
         let create_table_sql = format!(
@@ -273,6 +291,88 @@ where
 
         debug!("Value stored successfully in table '{}'", self.table_name);
         Ok(())
+    }
+
+    fn apply_batch(&mut self, operations: Vec<StorageOperation<K, V>>) -> StorageResult<()> {
+        let serialized = self.serialize_operations(operations)?;
+
+        let upsert_sql = format!(
+            "INSERT OR REPLACE INTO {} (surfnet_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            self.table_name
+        );
+        let delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = ? AND key = ?",
+            self.table_name
+        );
+        let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
+
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            for (key, value) in &serialized {
+                if let Some(value) = value {
+                    sql_query(upsert_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .bind::<Text, _>(value)
+                        .execute(conn)?;
+                } else {
+                    sql_query(delete_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .execute(conn)?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| StorageError::store(&self.table_name, NAME, "*batch*", e))
+    }
+
+    fn ensure_atomic_cross_table_batch_supported(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    fn apply_batch_with_cross_table_remove(
+        &mut self,
+        operations: Vec<StorageOperation<K, V>>,
+        cross_table_remove: CrossTableRemove,
+    ) -> StorageResult<()> {
+        self.ensure_atomic_cross_table_batch_supported()?;
+        let serialized = self.serialize_operations(operations)?;
+        let upsert_sql = format!(
+            "INSERT OR REPLACE INTO {} (surfnet_id, key, value, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            self.table_name
+        );
+        let delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = ? AND key = ?",
+            self.table_name
+        );
+        let cross_table_delete_sql = format!(
+            "DELETE FROM {} WHERE surfnet_id = ? AND key = ?",
+            cross_table_remove.table_name
+        );
+        let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
+
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            for (key, value) in &serialized {
+                if let Some(value) = value {
+                    sql_query(upsert_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .bind::<Text, _>(value)
+                        .execute(conn)?;
+                } else {
+                    sql_query(delete_sql.clone())
+                        .bind::<Text, _>(&self.surfnet_id)
+                        .bind::<Text, _>(key)
+                        .execute(conn)?;
+                }
+            }
+            sql_query(cross_table_delete_sql.clone())
+                .bind::<Text, _>(&self.surfnet_id)
+                .bind::<Text, _>(&cross_table_remove.serialized_key)
+                .execute(conn)?;
+            Ok(())
+        })
+        .map_err(|e| StorageError::store(&self.table_name, NAME, "*atomic-batch*", e))
     }
 
     fn get(&self, key: &K) -> StorageResult<Option<V>> {
@@ -584,6 +684,111 @@ mod tests {
             result,
             Some("value1".to_string()),
             "stores on one backend should see each other's writes"
+        );
+    }
+
+    #[test]
+    fn test_apply_batch_rolls_back_every_operation_when_one_fails() {
+        let backend = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+        let mut storage: SqliteStorage<u64, String> = backend.open_store("batch_test").unwrap();
+        storage.store(1, "old".to_string()).unwrap();
+        {
+            let mut conn = storage.pool.get().unwrap();
+            conn.batch_execute(
+                "CREATE TRIGGER reject_batch_value BEFORE INSERT ON batch_test \
+                 WHEN NEW.key = '999' BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+            )
+            .unwrap();
+        }
+
+        let result = storage.apply_batch(vec![
+            StorageOperation::Remove(1),
+            StorageOperation::Store(2, "new".to_string()),
+            StorageOperation::Store(999, "rejected".to_string()),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(storage.get(&1).unwrap().as_deref(), Some("old"));
+        assert!(storage.get(&2).unwrap().is_none());
+        assert!(storage.get(&999).unwrap().is_none());
+    }
+
+    fn assert_atomic_cross_table_rollback(database_url: &str) {
+        let backend = SqliteBackend::open(database_url, "surfnet1").unwrap();
+        let mut accounts: SqliteStorage<String, String> = backend.open_store("accounts").unwrap();
+        let mut scheduled_overrides: SqliteStorage<u64, String> =
+            backend.open_store("scheduled_overrides").unwrap();
+        accounts
+            .store("account".to_string(), "old".to_string())
+            .unwrap();
+        scheduled_overrides.store(1, "pending".to_string()).unwrap();
+        {
+            let mut conn = scheduled_overrides.pool.get().unwrap();
+            conn.batch_execute(
+                "CREATE TRIGGER reject_schedule_delete BEFORE DELETE ON scheduled_overrides \
+                 WHEN OLD.key = '1' BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+            )
+            .unwrap();
+        }
+
+        let result = accounts.apply_batch_with_cross_table_remove(
+            vec![StorageOperation::Store(
+                "account".to_string(),
+                "new".to_string(),
+            )],
+            CrossTableRemove {
+                table_name: "scheduled_overrides",
+                serialized_key: serde_json::to_string(&1_u64).unwrap(),
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            accounts.get(&"account".to_string()).unwrap().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            scheduled_overrides.get(&1).unwrap().as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn test_atomic_cross_table_batch_rolls_back_file_sqlite() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        assert_atomic_cross_table_rollback(temp_file.path().to_str().unwrap());
+    }
+
+    #[test]
+    fn test_atomic_cross_table_batch_rolls_back_memory_sqlite() {
+        assert_atomic_cross_table_rollback(":memory:");
+    }
+
+    #[test]
+    fn test_memory_database_survives_one_storage_drop() {
+        let backend = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+        let accounts: SqliteStorage<String, String> = backend.open_store("accounts").unwrap();
+        let mut scheduled_overrides: SqliteStorage<u64, String> =
+            backend.open_store("scheduled_overrides").unwrap();
+        scheduled_overrides.store(1, "pending".to_string()).unwrap();
+
+        drop(accounts);
+
+        assert_eq!(
+            scheduled_overrides.get(&1).unwrap().as_deref(),
+            Some("pending")
+        );
+        let mut reconnected_accounts: SqliteStorage<String, String> =
+            backend.open_store("accounts").unwrap();
+        reconnected_accounts
+            .store("account".to_string(), "value".to_string())
+            .unwrap();
+        assert_eq!(
+            reconnected_accounts
+                .get(&"account".to_string())
+                .unwrap()
+                .as_deref(),
+            Some("value")
         );
     }
 }

@@ -532,6 +532,47 @@ impl OverrideInstance {
     }
 }
 
+/// Outcome of materializing a single override during scenario application.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct OverrideOutcome {
+    /// The id of the override this outcome refers to.
+    #[schemars(description = "The id of the override this outcome refers to")]
+    pub override_id: String,
+    /// Human-readable label copied from the override, when it had one.
+    #[schemars(description = "Human-readable label copied from the override, when set")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub label: Option<String>,
+    /// Whether the override's write landed. False means it was skipped.
+    #[schemars(description = "Whether the override was applied; false means it was skipped")]
+    pub applied: bool,
+    /// Why the override was skipped, present only when it was not applied.
+    #[schemars(description = "Why the override was skipped, present only when not applied")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub reason: Option<String>,
+}
+
+impl OverrideOutcome {
+    pub fn applied(override_id: String, label: Option<String>) -> Self {
+        Self {
+            override_id,
+            label,
+            applied: true,
+            reason: None,
+        }
+    }
+
+    pub fn skipped(override_id: String, label: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            override_id,
+            label,
+            applied: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 /// A scenario containing a timeline of overrides
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]

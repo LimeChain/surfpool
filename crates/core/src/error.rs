@@ -1,7 +1,7 @@
 use std::{fmt::Display, future::Future, pin::Pin};
 
 use crossbeam_channel::TrySendError;
-use jsonrpc_core::{Error, Result};
+use jsonrpc_core::{Error, ErrorCode, Result};
 use litesvm::error::LiteSVMError;
 use serde::Serialize;
 use serde_json::json;
@@ -11,6 +11,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::TransactionError;
 use solana_transaction_status::EncodeError;
+use surfpool_types::SimnetCommandError;
 
 use crate::storage::StorageError;
 
@@ -85,6 +86,14 @@ impl From<solana_client::client_error::ClientError> for SurfpoolError {
 }
 
 impl SurfpoolError {
+    pub fn into_simnet_command_error(self) -> SimnetCommandError {
+        let message = self.to_string();
+        match self.0.code {
+            ErrorCode::InvalidParams => SimnetCommandError::InvalidParams(message),
+            _ => SimnetCommandError::Internal(message),
+        }
+    }
+
     pub fn from_try_send_error<T>(e: TrySendError<T>) -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(
@@ -429,6 +438,15 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn internal_message<M>(message: M) -> Self
+    where
+        M: Into<String>,
+    {
+        let mut error = Error::internal_error();
+        error.message = message.into();
+        Self(error)
+    }
+
     pub fn sig_verify_replace_recent_blockhash_collision() -> Self {
         Self(Error::invalid_params(
             "sigVerify may not be used with replaceRecentBlockhash",
@@ -577,3 +595,20 @@ impl Display for AirdropError {
 }
 
 impl std::error::Error for AirdropError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simnet_command_errors_preserve_rpc_classification() {
+        assert!(matches!(
+            SurfpoolError::invalid_params("bad slot").into_simnet_command_error(),
+            SimnetCommandError::InvalidParams(message) if message.contains("bad slot")
+        ));
+        assert!(matches!(
+            SurfpoolError::from(StorageError::LockError).into_simnet_command_error(),
+            SimnetCommandError::Internal(message) if message.contains("Storage error")
+        ));
+    }
+}

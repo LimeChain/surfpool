@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{OverlayDelta, OverlayLike, Storage, StorageError, StorageResult};
+use super::{OverlayDelta, OverlayLike, Storage, StorageError, StorageOperation, StorageResult};
 
 /// Represents the state of a key in the overlay
 #[derive(Clone)]
@@ -70,6 +70,21 @@ where
         // Write only to overlay, never to base
         let mut overlay = self.overlay.write().map_err(|_| StorageError::LockError)?;
         overlay.insert(key, OverlayEntry::Written(value));
+        Ok(())
+    }
+
+    fn apply_batch(&mut self, operations: Vec<StorageOperation<K, V>>) -> StorageResult<()> {
+        let mut overlay = self.overlay.write().map_err(|_| StorageError::LockError)?;
+        for operation in operations {
+            match operation {
+                StorageOperation::Store(key, value) => {
+                    overlay.insert(key, OverlayEntry::Written(value));
+                }
+                StorageOperation::Remove(key) => {
+                    overlay.insert(key, OverlayEntry::Deleted);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -354,6 +369,27 @@ mod tests {
 
         // Base should still have the value
         assert_eq!(base.get(&"key1".into()).unwrap(), Some("base_value".into()));
+    }
+
+    #[test]
+    fn test_overlay_apply_batch_updates_all_entries() {
+        let mut base: Box<dyn Storage<String, String>> =
+            Box::new(StorageHashMap::<String, String>::new());
+        base.store("remove".into(), "base_value".into()).unwrap();
+        let mut overlay = OverlayStorage::new(base);
+
+        overlay
+            .apply_batch(vec![
+                StorageOperation::Remove("remove".into()),
+                StorageOperation::Store("store".into(), "overlay_value".into()),
+            ])
+            .unwrap();
+
+        assert_eq!(overlay.get(&"remove".into()).unwrap(), None);
+        assert_eq!(
+            overlay.get(&"store".into()).unwrap(),
+            Some("overlay_value".into())
+        );
     }
 
     #[test]

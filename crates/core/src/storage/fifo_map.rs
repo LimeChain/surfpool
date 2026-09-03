@@ -13,6 +13,23 @@ where
         Ok(())
     }
 
+    fn apply_batch(
+        &mut self,
+        operations: Vec<super::StorageOperation<K, V>>,
+    ) -> super::StorageResult<()> {
+        for operation in operations {
+            match operation {
+                super::StorageOperation::Store(key, value) => {
+                    self.insert(key, value);
+                }
+                super::StorageOperation::Remove(key) => {
+                    self.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn clear(&mut self) -> super::StorageResult<()> {
         self.clear();
         Ok(())

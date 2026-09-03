@@ -1,4 +1,5 @@
 import type { Address, GetEpochInfoApi } from '@solana/kit';
+import type { OverrideOutcome } from '../generated/OverrideOutcome.js';
 
 import type {
     AccountSnapshot,
@@ -35,6 +36,10 @@ import type {
  * the `{ context, value }` envelope.
  */
 export type EpochInfo = ReturnType<GetEpochInfoApi['getEpochInfo']>;
+
+export type TimeTravelResult = EpochInfo & {
+    overrideOutcomes: readonly OverrideOutcome[];
+};
 
 /**
  * Config for `timeTravel`. Mirrors `TimeTravelConfig` in
@@ -90,7 +95,7 @@ export type LocalSignatureEntry = Readonly<{
 
 // Clock
 export type SurfnetTimeTravelApi = {
-    timeTravel(config?: TimeTravelConfig): EpochInfo;
+    timeTravel(config?: TimeTravelConfig): TimeTravelResult;
 };
 export type SurfnetPauseClockApi = {
     pauseClock(): EpochInfo;
@@ -182,9 +187,8 @@ export type SurfnetExportSnapshotApi = {
 
 // Scenario
 export type SurfnetRegisterScenarioApi = {
-    registerScenario(scenario: Scenario, slot?: number | bigint): null;
+    registerScenario(scenario: Scenario, slot?: number | bigint): readonly OverrideOutcome[];
 };
-
 // Local
 export type SurfnetGetLocalSignaturesApi = {
     getLocalSignatures(limit?: number | bigint): readonly LocalSignatureEntry[];

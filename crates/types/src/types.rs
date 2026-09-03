@@ -27,8 +27,8 @@ use solana_transaction_error::TransactionError;
 use txtx_addon_kit::indexmap::IndexMap;
 use uuid::Uuid;
 
-use crate::DEFAULT_MAINNET_RPC_URL;
 pub use crate::startup::*;
+use crate::{DEFAULT_MAINNET_RPC_URL, OverrideOutcome};
 
 pub const DEFAULT_RPC_PORT: u16 = 8899;
 pub const DEFAULT_WS_PORT: u16 = 8900;
@@ -38,6 +38,14 @@ pub const DEFAULT_NETWORK_HOST: &str = "127.0.0.1";
 pub const DEFAULT_SLOT_TIME_MS: u64 = 400;
 pub type Idl = anchor_lang_idl::types::Idl;
 pub const DEFAULT_PROFILING_MAP_CAPACITY: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeTravelResult {
+    #[serde(flatten)]
+    pub epoch_info: EpochInfo,
+    pub override_outcomes: Vec<OverrideOutcome>,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransactionMetadata {
@@ -749,13 +757,23 @@ pub enum TransactionStatusEvent {
     VerificationFailure(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimnetCommandError {
+    InvalidParams(String),
+    Internal(String),
+}
+
 #[derive(Debug)]
 pub enum SimnetCommand {
     SlotForward(Option<Hash>),
     SlotBackward(Option<Hash>),
     CommandClock(Option<(Hash, String)>, ClockCommand),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
-    UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
+    UpdateInternalClockWithConfirmation(
+        Option<(Hash, String)>,
+        Clock,
+        Sender<Result<(EpochInfo, Vec<OverrideOutcome>), SimnetCommandError>>,
+    ),
     UpdateBlockProductionMode(BlockProductionMode),
     /// Executes a transaction. `sendTransaction` enqueues this on the same
     /// channel as the startup commands below, so channel order decides which
@@ -1893,6 +1911,34 @@ mod tests {
     use solana_account_decoder_client_types::{ParsedAccount, UiAccountData};
 
     use super::*;
+
+    #[test]
+    fn time_travel_result_extends_epoch_info_without_breaking_epoch_info_clients() {
+        let epoch_info = EpochInfo {
+            epoch: 2,
+            slot_index: 3,
+            slots_in_epoch: 432_000,
+            absolute_slot: 864_003,
+            block_height: 800_000,
+            transaction_count: Some(42),
+        };
+        let result = TimeTravelResult {
+            epoch_info: epoch_info.clone(),
+            override_outcomes: vec![OverrideOutcome {
+                override_id: "override-1".to_string(),
+                label: Some("Price shock".to_string()),
+                applied: true,
+                reason: None,
+            }],
+        };
+
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["absoluteSlot"], 864_003);
+        assert_eq!(json["overrideOutcomes"][0]["overrideId"], "override-1");
+
+        let legacy_epoch_info: EpochInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy_epoch_info, epoch_info);
+    }
 
     #[test]
     fn test_disable_cheatcode_with_lockout_allows_protected_methods() {

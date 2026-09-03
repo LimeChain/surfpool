@@ -89,7 +89,7 @@ use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::TemplateRegistry,
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{CrossTableRemove, OverlayStorage, Storage, StorageBackend, StorageOperation},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -484,6 +484,59 @@ fn commit_overlay_storage<K, V>(
     for (k, v) in delta.writes {
         target_storage.store(k, v)?;
     }
+    Ok(())
+}
+
+fn commit_overlay_storage_batch<K, V>(
+    sandbox_storage: &dyn Storage<K, V>,
+    target_storage: &mut dyn Storage<K, V>,
+    cross_table_remove: CrossTableRemove,
+) -> SurfpoolResult<()> {
+    let Some(overlay) = sandbox_storage.as_overlay() else {
+        return Ok(());
+    };
+    let delta = overlay.extract_overlay()?;
+    if delta.base_cleared {
+        return Err(SurfpoolError::internal(
+            "Cleared storage overlays cannot be committed as an atomic batch",
+        ));
+    }
+
+    let operations = delta
+        .deletes
+        .into_iter()
+        .map(StorageOperation::Remove)
+        .chain(
+            delta
+                .writes
+                .into_iter()
+                .map(|(key, value)| StorageOperation::Store(key, value)),
+        )
+        .collect();
+    target_storage.apply_batch_with_cross_table_remove(operations, cross_table_remove)?;
+    Ok(())
+}
+
+fn apply_scheduled_override_updates(
+    scheduled_overrides: &mut dyn Storage<u64, Vec<OverrideInstance>>,
+    updates: impl IntoIterator<Item = (Slot, Vec<OverrideInstance>)>,
+) -> SurfpoolResult<()> {
+    let operations = updates
+        .into_iter()
+        .map(|(slot, overrides)| {
+            if overrides.is_empty() {
+                StorageOperation::Remove(slot)
+            } else {
+                StorageOperation::Store(slot, overrides)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if operations.is_empty() {
+        return Ok(());
+    }
+
+    scheduled_overrides.apply_batch(operations)?;
     Ok(())
 }
 
@@ -913,7 +966,6 @@ impl SurfnetSvm {
         let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::channel(1024);
         let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
         let surfnet_id = config.surfnet_id;
-
         // Compose the final feature set up front (mainnet baseline +
         // config.enable - config.disable) so that the inner LiteSVM is
         // constructed exactly once, with the correct features and feature
@@ -2683,7 +2735,7 @@ impl SurfnetSvm {
     pub async fn materialize_overrides(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    ) -> SurfpoolResult<()> {
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         self.materialize_overrides_for_slot(remote_ctx, current_slot)
@@ -2695,12 +2747,15 @@ impl SurfnetSvm {
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         target_slot: Slot,
-    ) -> SurfpoolResult<()> {
-        // Remove and get overrides for this slot
-        let Some(overrides) = self.scheduled_overrides.take(&target_slot)? else {
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
+        let Some(overrides) = self.scheduled_overrides.get(&target_slot)? else {
             // No overrides for this slot
-            return Ok(());
+            return Ok(Vec::new());
         };
+
+        if let Some(target_db) = self.inner.db.as_ref() {
+            target_db.ensure_atomic_cross_table_batch_supported()?;
+        }
 
         debug!(
             "Materializing {} override(s) for slot {}",
@@ -2708,9 +2763,56 @@ impl SurfnetSvm {
             target_slot
         );
 
+        let mut staged_inner = self.inner.clone_for_profiling();
+        std::mem::swap(&mut self.inner, &mut staged_inner);
+        let materialization_result = self.materialize_override_batch(remote_ctx, overrides).await;
+        std::mem::swap(&mut self.inner, &mut staged_inner);
+
+        let outcomes = materialization_result?;
+
+        if let (Some(staged_db), Some(target_db)) =
+            (staged_inner.db.as_ref(), self.inner.db.as_mut())
+        {
+            let serialized_slot = serde_json::to_string(&target_slot).map_err(|error| {
+                SurfpoolError::internal(format!(
+                    "Failed to serialize scheduled override slot {target_slot}: {error}"
+                ))
+            })?;
+            commit_overlay_storage_batch(
+                staged_db.as_ref(),
+                target_db.as_mut(),
+                CrossTableRemove {
+                    table_name: "scheduled_overrides",
+                    serialized_key: serialized_slot,
+                },
+            )?;
+        } else {
+            self.scheduled_overrides.take(&target_slot)?;
+        }
+        self.inner.svm = staged_inner.svm;
+        Ok(outcomes)
+    }
+
+    pub async fn materialize_override_batch(
+        &mut self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        overrides: Vec<surfpool_types::OverrideInstance>,
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
+        use surfpool_types::OverrideOutcome;
+
+        let mut outcomes = Vec::new();
+
         for override_instance in overrides {
+            let outcome_id = override_instance.id.clone();
+            let outcome_label = override_instance.label.clone();
+
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
+                outcomes.push(OverrideOutcome::skipped(
+                    outcome_id,
+                    outcome_label,
+                    "override is disabled",
+                ));
                 continue;
             }
 
@@ -2736,6 +2838,11 @@ impl SurfnetSvm {
                         "Failed to resolve account address for override {}",
                         override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::skipped(
+                        outcome_id,
+                        outcome_label,
+                        "could not resolve the account address",
+                    ));
                     continue;
                 }
             };
@@ -2745,8 +2852,11 @@ impl SurfnetSvm {
                 override_instance.id, account_pubkey, override_instance.label
             );
 
-            // Fetch fresh account data from remote if requested
+            // Never apply values over stale data when fresh data was explicitly requested.
             if override_instance.fetch_before_use {
+                let mut fetched_fresh = false;
+                let mut fetch_error: Option<String> = None;
+
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -2782,6 +2892,7 @@ impl SurfnetSvm {
                                 "Failed to fetch account {} from remote: {}",
                                 account_pubkey, e
                             );
+                            fetch_error = Some(format!("fetchBeforeUse fetch failed: {e}"));
                             None
                         }
                     };
@@ -2819,11 +2930,16 @@ impl SurfnetSvm {
                         }
 
                         // Set the fresh account data in the SVM
-                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
-                            warn!(
-                                "Failed to set account {} from remote: {}",
-                                account_pubkey, e
-                            );
+                        match self.inner.set_account(account_pubkey, remote_account) {
+                            Ok(()) => fetched_fresh = true,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to set account {} from remote: {}",
+                                    account_pubkey, e
+                                );
+                                fetch_error =
+                                    Some(format!("failed to store fetched account data: {e}"));
+                            }
                         }
                     }
                 } else {
@@ -2831,6 +2947,14 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
+                }
+
+                if !fetched_fresh {
+                    let reason = fetch_error.unwrap_or_else(|| {
+                        "fetchBeforeUse requested but fresh data was unavailable".to_string()
+                    });
+                    outcomes.push(OverrideOutcome::skipped(outcome_id, outcome_label, reason));
+                    continue;
                 }
             }
 
@@ -2850,6 +2974,7 @@ impl SurfnetSvm {
                         "Override {} has no account data modifications (all values are PDA seeds)",
                         override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::applied(outcome_id, outcome_label));
                     continue;
                 }
 
@@ -2867,6 +2992,11 @@ impl SurfnetSvm {
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::skipped(
+                        outcome_id,
+                        outcome_label,
+                        "account not found in the local SVM (enable fetchBeforeUse to load it)",
+                    ));
                     continue;
                 };
 
@@ -2898,6 +3028,11 @@ impl SurfnetSvm {
                             "No IDL registered for program {} (owner of account {}), skipping override {}",
                             owner_program_id, account_pubkey, override_instance.id
                         );
+                        outcomes.push(OverrideOutcome::skipped(
+                            outcome_id,
+                            outcome_label,
+                            format!("no IDL registered for the owner program {owner_program_id}"),
+                        ));
                         continue;
                     }
                     Err(e) => {
@@ -2905,6 +3040,11 @@ impl SurfnetSvm {
                             "Failed to get IDL for program {}: {}, skipping override {}",
                             owner_program_id, e, override_instance.id
                         );
+                        outcomes.push(OverrideOutcome::skipped(
+                            outcome_id,
+                            outcome_label,
+                            format!("failed to load the IDL for program {owner_program_id}: {e}"),
+                        ));
                         continue;
                     }
                 };
@@ -2915,6 +3055,11 @@ impl SurfnetSvm {
                         "IDL versions empty for program {}, skipping override {}",
                         owner_program_id, override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::skipped(
+                        outcome_id,
+                        outcome_label,
+                        format!("no IDL version available for program {owner_program_id}"),
+                    ));
                     continue;
                 };
 
@@ -2932,6 +3077,11 @@ impl SurfnetSvm {
                         account_data.len(),
                         override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::skipped(
+                        outcome_id,
+                        outcome_label,
+                        "account data too small to override (enable fetchBeforeUse to load it first)",
+                    ));
                     continue;
                 }
 
@@ -2949,6 +3099,11 @@ impl SurfnetSvm {
                             If the account doesn't exist locally, enable fetchBeforeUse: true.",
                             account_pubkey, override_instance.id, e
                         );
+                        outcomes.push(OverrideOutcome::skipped(
+                            outcome_id,
+                            outcome_label,
+                            format!("failed to apply the overrides to the account data: {e}"),
+                        ));
                         continue;
                     }
                 };
@@ -2968,6 +3123,11 @@ impl SurfnetSvm {
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
                     );
+                    outcomes.push(OverrideOutcome::skipped(
+                        outcome_id,
+                        outcome_label,
+                        format!("failed to store the modified account: {e}"),
+                    ));
                 } else {
                     debug!(
                         "Successfully applied {} override(s) to account {} (override {})",
@@ -2975,11 +3135,15 @@ impl SurfnetSvm {
                         account_pubkey,
                         override_instance.id
                     );
+                    outcomes.push(OverrideOutcome::applied(outcome_id, outcome_label));
                 }
+            } else {
+                // Reaching this branch completes an address-only or fetch-only override.
+                outcomes.push(OverrideOutcome::applied(outcome_id, outcome_label));
             }
         }
 
-        Ok(())
+        Ok(outcomes)
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -4244,17 +4408,106 @@ impl SurfnetSvm {
         Ok(fixtures)
     }
 
-    /// Registers a scenario for execution by scheduling its overrides
-    ///
-    /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
-    /// If not provided, uses the current slot.
-    pub fn register_scenario(
+    fn validate_scenario_registration(
+        &self,
+        scenario: &surfpool_types::Scenario,
+        base_slot: Slot,
+    ) -> SurfpoolResult<HashSet<String>> {
+        let current_slot = self.latest_epoch_info.absolute_slot;
+        if base_slot < current_slot {
+            return Err(SurfpoolError::invalid_params(format!(
+                "Scenario base slot {base_slot} is behind current slot {current_slot}"
+            )));
+        }
+
+        let mut override_ids = HashSet::new();
+        for override_instance in &scenario.overrides {
+            if override_instance.id.trim().is_empty() {
+                return Err(SurfpoolError::invalid_params(
+                    "Scenario override ids cannot be empty",
+                ));
+            }
+            if !override_ids.insert(override_instance.id.clone()) {
+                return Err(SurfpoolError::invalid_params(format!(
+                    "Duplicate scenario override id: {}",
+                    override_instance.id
+                )));
+            }
+            base_slot
+                .checked_add(override_instance.scenario_relative_slot)
+                .ok_or_else(|| {
+                    SurfpoolError::invalid_params(format!(
+                        "Scenario override {} exceeds the maximum slot",
+                        override_instance.id
+                    ))
+                })?;
+        }
+
+        Ok(override_ids)
+    }
+
+    fn replace_scheduled_overrides(
         &mut self,
-        scenario: surfpool_types::Scenario,
-        slot: Option<Slot>,
+        base_slot: Slot,
+        override_ids: &HashSet<String>,
+        overrides: Vec<OverrideInstance>,
     ) -> SurfpoolResult<()> {
-        // Use provided slot or current slot as the base for relative slot heights
-        let base_slot = slot.unwrap_or(self.latest_epoch_info.absolute_slot);
+        let mut replacements = BTreeMap::new();
+
+        for slot in self.scheduled_overrides.keys()? {
+            let Some(slot_overrides) = self.scheduled_overrides.get(&slot)? else {
+                continue;
+            };
+            if slot_overrides
+                .iter()
+                .any(|override_instance| override_ids.contains(&override_instance.id))
+            {
+                replacements.insert(
+                    slot,
+                    slot_overrides
+                        .into_iter()
+                        .filter(|override_instance| !override_ids.contains(&override_instance.id))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        for override_instance in overrides {
+            let absolute_slot = base_slot
+                .checked_add(override_instance.scenario_relative_slot)
+                .ok_or_else(|| {
+                    SurfpoolError::invalid_params(format!(
+                        "Scenario override {} exceeds the maximum slot",
+                        override_instance.id
+                    ))
+                })?;
+            if !replacements.contains_key(&absolute_slot) {
+                let slot_overrides = self
+                    .scheduled_overrides
+                    .get(&absolute_slot)?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|scheduled| !override_ids.contains(&scheduled.id))
+                    .collect();
+                replacements.insert(absolute_slot, slot_overrides);
+            }
+            replacements
+                .get_mut(&absolute_slot)
+                .expect("replacement slot was inserted")
+                .push(override_instance);
+        }
+
+        apply_scheduled_override_updates(self.scheduled_overrides.as_mut(), replacements)
+    }
+
+    pub async fn register_scenario_and_materialize(
+        &mut self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        scenario: surfpool_types::Scenario,
+        base_slot: Slot,
+    ) -> SurfpoolResult<Vec<surfpool_types::OverrideOutcome>> {
+        let override_ids = self.validate_scenario_registration(&scenario, base_slot)?;
+        let current_slot = self.latest_epoch_info.absolute_slot;
 
         info!(
             "Registering scenario: {} ({}) with {} overrides at base slot {}",
@@ -4264,28 +4517,100 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
-        for override_instance in scenario.overrides {
-            let scenario_relative_slot = override_instance.scenario_relative_slot;
-            let absolute_slot = base_slot + scenario_relative_slot;
+        let (initial_overrides, future_overrides): (Vec<_>, Vec<_>) = scenario
+            .overrides
+            .into_iter()
+            .partition(|override_instance| {
+                base_slot == current_slot && override_instance.scenario_relative_slot == 0
+            });
 
-            debug!(
-                "Scheduling override at absolute slot {} (base {} + relative {})",
-                absolute_slot, base_slot, scenario_relative_slot
-            );
+        self.replace_scheduled_overrides(base_slot, &override_ids, future_overrides)?;
+        self.materialize_override_batch(remote_ctx, initial_overrides)
+            .await
+    }
 
-            let mut slot_overrides = self
-                .scheduled_overrides
-                .get(&absolute_slot)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            slot_overrides.push(override_instance);
-            self.scheduled_overrides
-                .store(absolute_slot, slot_overrides)?;
+    pub fn next_pending_override_slot_between(
+        &self,
+        current_slot: Slot,
+        target_slot: Slot,
+    ) -> SurfpoolResult<Option<Slot>> {
+        Ok(self
+            .scheduled_overrides
+            .keys()?
+            .into_iter()
+            .filter(|slot| current_slot.saturating_add(1) < *slot && *slot < target_slot)
+            .min())
+    }
+
+    pub async fn time_travel_to_clock(
+        &mut self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        clock: Clock,
+    ) -> SurfpoolResult<(EpochInfo, Vec<surfpool_types::OverrideOutcome>)> {
+        let slots_in_epoch = self.latest_epoch_info.slots_in_epoch;
+        let target_slot = clock
+            .epoch
+            .checked_mul(slots_in_epoch)
+            .and_then(|epoch_start| epoch_start.checked_add(clock.slot))
+            .ok_or_else(|| SurfpoolError::invalid_params("Time travel target slot overflowed"))?;
+        let current_slot = self.latest_epoch_info.absolute_slot;
+
+        if target_slot < current_slot {
+            return Err(SurfpoolError::invalid_params(format!(
+                "Time travel target slot {target_slot} is behind current slot {current_slot}"
+            )));
         }
 
-        Ok(())
+        if let Some(next_pending_slot) =
+            self.next_pending_override_slot_between(current_slot, target_slot)?
+        {
+            return Err(SurfpoolError::invalid_params(format!(
+                "Time travel from slot {current_slot} to {target_slot} would skip pending scenario overrides at slot {next_pending_slot}"
+            )));
+        }
+
+        let mut outcomes = self
+            .materialize_overrides_for_slot(remote_ctx, current_slot)
+            .await?;
+        if target_slot != current_slot {
+            self.confirm_current_block()?;
+            outcomes.extend(self.materialize_overrides(remote_ctx).await?);
+        }
+
+        if target_slot > current_slot.saturating_add(1) {
+            outcomes.extend(
+                self.materialize_overrides_for_slot(remote_ctx, target_slot)
+                    .await?,
+            );
+        }
+
+        self.inner.set_sysvar(&clock);
+        self.updated_at = clock.unix_timestamp as u64 * 1_000;
+        self.latest_epoch_info.slot_index = clock.slot;
+        self.latest_epoch_info.epoch = clock.epoch;
+        self.latest_epoch_info.absolute_slot = target_slot;
+        self.simnet_events_tx.system_clock_updated(clock);
+
+        self.emit_skipped_override_events(&outcomes);
+        Ok((self.latest_epoch_info.clone(), outcomes))
+    }
+
+    pub(crate) fn emit_skipped_override_events(
+        &self,
+        outcomes: &[surfpool_types::OverrideOutcome],
+    ) {
+        for outcome in outcomes {
+            if !outcome.applied {
+                self.simnet_events_tx.warn(format!(
+                    "Override {} was skipped: {}",
+                    outcome
+                        .label
+                        .as_deref()
+                        .unwrap_or(outcome.override_id.as_str()),
+                    outcome.reason.as_deref().unwrap_or("unknown reason"),
+                ));
+            }
+        }
     }
 }
 
@@ -4301,7 +4626,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose};
     use borsh::BorshSerialize;
     // use test_log::test; // uncomment to get logs from litesvm
-    use solana_account::Account;
+    use solana_account::{Account, AccountSharedData};
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_loader_v3_interface::get_program_data_address;
@@ -4312,11 +4637,758 @@ mod tests {
     use solana_transaction::Transaction;
     use solana_transaction_error::TransactionError;
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
-    use surfpool_types::ExportSnapshotFilter;
+    use surfpool_types::{AccountAddress, ExportSnapshotFilter};
     use test_case::test_case;
 
     use super::*;
-    use crate::storage::tests::TestType;
+    use crate::storage::{Storage, StorageError, StorageOperation, StorageResult, tests::TestType};
+
+    #[derive(Clone)]
+    struct FailOnceTakeStorage {
+        slot: u64,
+        overrides: Option<Vec<OverrideInstance>>,
+        fail_next_take: bool,
+    }
+
+    impl Storage<u64, Vec<OverrideInstance>> for FailOnceTakeStorage {
+        fn store(&mut self, _key: u64, _value: Vec<OverrideInstance>) -> StorageResult<()> {
+            Ok(())
+        }
+
+        fn apply_batch(
+            &mut self,
+            _operations: Vec<StorageOperation<u64, Vec<OverrideInstance>>>,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) -> StorageResult<()> {
+            Ok(())
+        }
+
+        fn get(&self, key: &u64) -> StorageResult<Option<Vec<OverrideInstance>>> {
+            if *key == self.slot {
+                Ok(self.overrides.clone())
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn take(&mut self, key: &u64) -> StorageResult<Option<Vec<OverrideInstance>>> {
+            if *key != self.slot {
+                return Ok(None);
+            }
+            if self.fail_next_take {
+                self.fail_next_take = false;
+                return Err(StorageError::LockError);
+            }
+            Ok(self.overrides.take())
+        }
+
+        fn keys(&self) -> StorageResult<Vec<u64>> {
+            Ok(self
+                .overrides
+                .as_ref()
+                .map(|_| vec![self.slot])
+                .unwrap_or_default())
+        }
+
+        fn into_iter(
+            &self,
+        ) -> StorageResult<Box<dyn Iterator<Item = (u64, Vec<OverrideInstance>)> + '_>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn count(&self) -> StorageResult<u64> {
+            Ok(u64::from(self.overrides.is_some()))
+        }
+
+        fn clone_box(&self) -> Box<dyn Storage<u64, Vec<OverrideInstance>>> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RejectingBatchStorage {
+        entries: HashMap<u64, Vec<OverrideInstance>>,
+    }
+
+    impl Storage<u64, Vec<OverrideInstance>> for RejectingBatchStorage {
+        fn store(&mut self, key: u64, value: Vec<OverrideInstance>) -> StorageResult<()> {
+            self.entries.insert(key, value);
+            Ok(())
+        }
+
+        fn apply_batch(
+            &mut self,
+            _operations: Vec<StorageOperation<u64, Vec<OverrideInstance>>>,
+        ) -> StorageResult<()> {
+            Err(StorageError::LockError)
+        }
+
+        fn clear(&mut self) -> StorageResult<()> {
+            self.entries.clear();
+            Ok(())
+        }
+
+        fn get(&self, key: &u64) -> StorageResult<Option<Vec<OverrideInstance>>> {
+            Ok(self.entries.get(key).cloned())
+        }
+
+        fn take(&mut self, key: &u64) -> StorageResult<Option<Vec<OverrideInstance>>> {
+            Ok(self.entries.remove(key))
+        }
+
+        fn keys(&self) -> StorageResult<Vec<u64>> {
+            Ok(self.entries.keys().copied().collect())
+        }
+
+        fn into_iter(
+            &self,
+        ) -> StorageResult<Box<dyn Iterator<Item = (u64, Vec<OverrideInstance>)> + '_>> {
+            Ok(Box::new(self.entries.clone().into_iter()))
+        }
+
+        fn count(&self) -> StorageResult<u64> {
+            Ok(self.entries.len() as u64)
+        }
+
+        fn clone_box(&self) -> Box<dyn Storage<u64, Vec<OverrideInstance>>> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RejectingAccountBatchStorage {
+        entries: HashMap<String, AccountSharedData>,
+        atomic_supported: bool,
+        panic_on_clone: bool,
+    }
+
+    impl Storage<String, AccountSharedData> for RejectingAccountBatchStorage {
+        fn store(&mut self, key: String, value: AccountSharedData) -> StorageResult<()> {
+            self.entries.insert(key, value);
+            Ok(())
+        }
+
+        fn apply_batch(
+            &mut self,
+            _operations: Vec<StorageOperation<String, AccountSharedData>>,
+        ) -> StorageResult<()> {
+            Err(StorageError::LockError)
+        }
+
+        fn ensure_atomic_cross_table_batch_supported(&self) -> StorageResult<()> {
+            if self.atomic_supported {
+                Ok(())
+            } else {
+                Err(StorageError::AtomicCrossTableBatchUnsupported {
+                    backend: "test-account-storage".to_string(),
+                    configuration: "atomic batches disabled".to_string(),
+                })
+            }
+        }
+
+        fn apply_batch_with_cross_table_remove(
+            &mut self,
+            _operations: Vec<StorageOperation<String, AccountSharedData>>,
+            _cross_table_remove: CrossTableRemove,
+        ) -> StorageResult<()> {
+            self.ensure_atomic_cross_table_batch_supported()?;
+            Err(StorageError::LockError)
+        }
+
+        fn clear(&mut self) -> StorageResult<()> {
+            self.entries.clear();
+            Ok(())
+        }
+
+        fn get(&self, key: &String) -> StorageResult<Option<AccountSharedData>> {
+            Ok(self.entries.get(key).cloned())
+        }
+
+        fn take(&mut self, key: &String) -> StorageResult<Option<AccountSharedData>> {
+            Ok(self.entries.remove(key))
+        }
+
+        fn keys(&self) -> StorageResult<Vec<String>> {
+            Ok(self.entries.keys().cloned().collect())
+        }
+
+        fn into_iter(
+            &self,
+        ) -> StorageResult<Box<dyn Iterator<Item = (String, AccountSharedData)> + '_>> {
+            Ok(Box::new(self.entries.clone().into_iter()))
+        }
+
+        fn count(&self) -> StorageResult<u64> {
+            Ok(self.entries.len() as u64)
+        }
+
+        fn clone_box(&self) -> Box<dyn Storage<String, AccountSharedData>> {
+            assert!(!self.panic_on_clone, "unsupported storage was cloned");
+            Box::new(self.clone())
+        }
+    }
+
+    fn test_override(id: &str, relative_slot: Slot) -> OverrideInstance {
+        OverrideInstance {
+            id: id.to_string(),
+            template_id: "test-template".to_string(),
+            values: HashMap::new(),
+            scenario_relative_slot: relative_slot,
+            label: None,
+            enabled: true,
+            fetch_before_use: false,
+            account: AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        }
+    }
+
+    fn test_account_override(
+        svm: &mut SurfnetSvm,
+        id: &str,
+        relative_slot: Slot,
+    ) -> (Pubkey, Vec<u8>, OverrideInstance) {
+        let idl: Idl =
+            serde_json::from_slice(&include_bytes!("../tests/assets/idl_v1.json").to_vec())
+                .unwrap();
+        svm.register_idl(idl.clone(), None).unwrap();
+
+        #[derive(BorshSerialize)]
+        struct CustomAccount {
+            my_custom_data: u64,
+            another_field: String,
+            bool: bool,
+            pubkey: Pubkey,
+        }
+
+        let account_pubkey = Pubkey::new_unique();
+        let mut original_data = idl.accounts[0].discriminator.clone();
+        CustomAccount {
+            my_custom_data: 42,
+            another_field: "original".to_string(),
+            bool: true,
+            pubkey: Pubkey::new_unique(),
+        }
+        .serialize(&mut original_data)
+        .unwrap();
+        svm.inner
+            .set_account(
+                account_pubkey,
+                Account {
+                    lamports: 1_000,
+                    data: original_data.clone(),
+                    owner: idl.address.parse().unwrap(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        let mut override_instance = test_override(id, relative_slot);
+        override_instance.account = AccountAddress::Pubkey(account_pubkey.to_string());
+        override_instance
+            .values
+            .insert("my_custom_data".to_string(), serde_json::json!(99));
+        (account_pubkey, original_data, override_instance)
+    }
+
+    fn clock_for_absolute_slot(svm: &SurfnetSvm, target_slot: Slot) -> Clock {
+        let slots_in_epoch = svm.latest_epoch_info.slots_in_epoch;
+        let epoch = target_slot / slots_in_epoch;
+        let slot = target_slot % slots_in_epoch;
+        let elapsed_slots = target_slot.saturating_sub(svm.latest_epoch_info.absolute_slot);
+        let unix_timestamp = svm
+            .updated_at
+            .saturating_add(elapsed_slots.saturating_mul(svm.slot_time))
+            / 1_000;
+
+        Clock {
+            slot,
+            epoch_start_timestamp: unix_timestamp as i64,
+            epoch,
+            leader_schedule_epoch: 0,
+            unix_timestamp: unix_timestamp as i64,
+        }
+    }
+
+    #[tokio::test]
+    async fn materialize_override_batch_returns_exactly_one_outcome_per_override() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let mut disabled = test_override("disabled", 0);
+        disabled.enabled = false;
+        let mut absent = test_override("absent", 0);
+        absent
+            .values
+            .insert("account.value".to_string(), serde_json::json!(1));
+        let applied = test_override("applied", 0);
+
+        let outcomes = svm
+            .materialize_override_batch(&None, vec![disabled, absent, applied])
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].override_id, "disabled");
+        assert!(!outcomes[0].applied);
+        assert!(outcomes[0].reason.is_some());
+        assert_eq!(outcomes[1].override_id, "absent");
+        assert!(!outcomes[1].applied);
+        assert!(outcomes[1].reason.is_some());
+        assert_eq!(outcomes[2].override_id, "applied");
+        assert!(outcomes[2].applied);
+        assert!(outcomes[2].reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_before_use_without_remote_context_skips_the_override() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let mut override_instance = test_override("fresh", 0);
+        override_instance.fetch_before_use = true;
+
+        let outcomes = svm
+            .materialize_override_batch(&None, vec![override_instance])
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(!outcomes[0].applied);
+        assert_eq!(
+            outcomes[0].reason.as_deref(),
+            Some("fetchBeforeUse requested but fresh data was unavailable")
+        );
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn pending_override_helper_preserves_boundaries(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        svm.scheduled_overrides
+            .store(450, vec![test_override("cancel", 450)])
+            .unwrap();
+        svm.scheduled_overrides
+            .store(
+                750,
+                vec![test_override("cancel", 750), test_override("keep", 750)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            svm.next_pending_override_slot_between(0, 750).unwrap(),
+            Some(450)
+        );
+        assert_eq!(
+            svm.next_pending_override_slot_between(450, 750).unwrap(),
+            None
+        );
+        assert_eq!(
+            svm.next_pending_override_slot_between(750, 750).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn register_scenario_materializes_only_initial_overrides_and_replaces_pending_ids() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let base_slot = svm.latest_epoch_info.absolute_slot;
+        let scenario = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("initial", 0), test_override("future", 450)],
+            tags: Vec::new(),
+        };
+
+        let outcomes = svm
+            .register_scenario_and_materialize(&None, scenario, base_slot)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].override_id, "initial");
+        assert!(outcomes[0].applied);
+        assert!(svm.scheduled_overrides.get(&base_slot).unwrap().is_none());
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(base_slot + 450))
+                .unwrap()
+                .unwrap()[0]
+                .id,
+            "future"
+        );
+
+        let replacement = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("future", 750)],
+            tags: Vec::new(),
+        };
+        svm.register_scenario_and_materialize(&None, replacement, base_slot)
+            .await
+            .unwrap();
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(base_slot + 450))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(base_slot + 750))
+                .unwrap()
+                .unwrap()[0]
+                .id,
+            "future"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_scenario_keeps_previous_schedule_when_replacement_batch_fails() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let base_slot = svm.latest_epoch_info.absolute_slot;
+        let previous_slot = base_slot + 450;
+        let replacement_slot = base_slot + 750;
+        svm.scheduled_overrides = Box::new(RejectingBatchStorage {
+            entries: HashMap::from([(previous_slot, vec![test_override("future", 450)])]),
+        });
+        let replacement = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("future", 750)],
+            tags: Vec::new(),
+        };
+
+        svm.register_scenario_and_materialize(&None, replacement, base_slot)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&previous_slot)
+                .unwrap()
+                .unwrap()[0]
+                .scenario_relative_slot,
+            450
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&replacement_slot)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn register_scenario_rejects_invalid_input_before_mutation() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.latest_epoch_info.absolute_slot = 10;
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        let duplicate_scenario = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("duplicate", 1), test_override("duplicate", 2)],
+            tags: Vec::new(),
+        };
+
+        assert!(
+            svm.register_scenario_and_materialize(&None, duplicate_scenario, current_slot)
+                .await
+                .is_err()
+        );
+        assert_eq!(svm.scheduled_overrides.count().unwrap(), 0);
+
+        let past_scenario = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("past", 0)],
+            tags: Vec::new(),
+        };
+        assert!(
+            svm.register_scenario_and_materialize(&None, past_scenario, current_slot - 1)
+                .await
+                .is_err()
+        );
+
+        let overflow_scenario = surfpool_types::Scenario {
+            id: "scenario".to_string(),
+            name: "Scenario".to_string(),
+            description: String::new(),
+            overrides: vec![test_override("overflow", u64::MAX)],
+            tags: Vec::new(),
+        };
+        assert!(
+            svm.register_scenario_and_materialize(&None, overflow_scenario, current_slot)
+                .await
+                .is_err()
+        );
+        assert_eq!(svm.scheduled_overrides.count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn time_travel_same_slot_materializes_once_without_advancing() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        svm.scheduled_overrides
+            .store(current_slot, vec![test_override("current", 0)])
+            .unwrap();
+        let clock = clock_for_absolute_slot(&svm, current_slot);
+
+        let (epoch_info, outcomes) = svm
+            .time_travel_to_clock(&None, clock.clone())
+            .await
+            .unwrap();
+        assert_eq!(epoch_info.absolute_slot, current_slot);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].override_id, "current");
+
+        let (_, retry_outcomes) = svm.time_travel_to_clock(&None, clock).await.unwrap();
+        assert!(retry_outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn time_travel_materializes_next_and_sparse_target_slots_once() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let base_slot = svm.latest_epoch_info.absolute_slot;
+        svm.scheduled_overrides
+            .store(base_slot + 1, vec![test_override("next", 1)])
+            .unwrap();
+
+        let next_clock = clock_for_absolute_slot(&svm, base_slot + 1);
+        let (_, next_outcomes) = svm.time_travel_to_clock(&None, next_clock).await.unwrap();
+        assert_eq!(next_outcomes.len(), 1);
+        assert_eq!(next_outcomes[0].override_id, "next");
+
+        svm.scheduled_overrides
+            .store(base_slot + 450, vec![test_override("sparse", 450)])
+            .unwrap();
+        let sparse_clock = clock_for_absolute_slot(&svm, base_slot + 450);
+        let (epoch_info, sparse_outcomes) =
+            svm.time_travel_to_clock(&None, sparse_clock).await.unwrap();
+        assert_eq!(epoch_info.absolute_slot, base_slot + 450);
+        assert_eq!(sparse_outcomes.len(), 1);
+        assert_eq!(sparse_outcomes[0].override_id, "sparse");
+
+        let retry_clock = clock_for_absolute_slot(&svm, base_slot + 450);
+        let (_, retry_outcomes) = svm.time_travel_to_clock(&None, retry_clock).await.unwrap();
+        assert!(retry_outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn time_travel_to_sparse_target_materializes_pending_next_slot() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let base_slot = svm.latest_epoch_info.absolute_slot;
+        svm.scheduled_overrides
+            .store(base_slot + 1, vec![test_override("next", 1)])
+            .unwrap();
+        let target_slot = base_slot + 450;
+        let target_clock = clock_for_absolute_slot(&svm, target_slot);
+
+        let (epoch_info, outcomes) = svm.time_travel_to_clock(&None, target_clock).await.unwrap();
+
+        assert_eq!(epoch_info.absolute_slot, target_slot);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].override_id, "next");
+        assert!(
+            svm.scheduled_overrides
+                .get(&(base_slot + 1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn time_travel_rejects_skipping_pending_slot_before_mutation() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let base_slot = svm.latest_epoch_info.absolute_slot;
+        svm.scheduled_overrides
+            .store(base_slot + 450, vec![test_override("pending", 450)])
+            .unwrap();
+        let target_clock = clock_for_absolute_slot(&svm, base_slot + 750);
+
+        let error = svm
+            .time_travel_to_clock(&None, target_clock)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains(&(base_slot + 450).to_string()));
+        assert_eq!(svm.latest_epoch_info.absolute_slot, base_slot);
+        assert!(
+            svm.scheduled_overrides
+                .get(&(base_slot + 450))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn time_travel_retries_failed_current_slot_before_advancing() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        let next_slot = current_slot + 1;
+        let target_slot = current_slot + 450;
+        let target_clock = clock_for_absolute_slot(&svm, target_slot);
+
+        let (account_pubkey, original_data, next_override) =
+            test_account_override(&mut svm, "next", 1);
+        svm.scheduled_overrides = Box::new(FailOnceTakeStorage {
+            slot: next_slot,
+            overrides: Some(vec![next_override]),
+            fail_next_take: true,
+        });
+
+        let error = svm
+            .time_travel_to_clock(&None, target_clock.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Storage error"));
+        assert_eq!(svm.latest_epoch_info.absolute_slot, next_slot);
+        let stored_clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(
+            stored_clock.slot,
+            next_slot % svm.latest_epoch_info.slots_in_epoch
+        );
+        assert!(svm.scheduled_overrides.get(&next_slot).unwrap().is_some());
+        assert_eq!(
+            svm.inner
+                .get_account(&account_pubkey)
+                .unwrap()
+                .unwrap()
+                .data(),
+            original_data
+        );
+
+        let (epoch_info, outcomes) = svm.time_travel_to_clock(&None, target_clock).await.unwrap();
+
+        assert_eq!(epoch_info.absolute_slot, target_slot);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].override_id, "next");
+        assert!(outcomes[0].applied);
+        assert!(svm.scheduled_overrides.get(&next_slot).unwrap().is_none());
+        assert_ne!(
+            svm.inner
+                .get_account(&account_pubkey)
+                .unwrap()
+                .unwrap()
+                .data(),
+            original_data
+        );
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[tokio::test]
+    async fn materialization_atomically_commits_account_and_schedule(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        let (account_pubkey, original_data, override_instance) =
+            test_account_override(&mut svm, "current", 0);
+        svm.scheduled_overrides
+            .store(current_slot, vec![override_instance])
+            .unwrap();
+
+        let outcomes = svm
+            .materialize_overrides_for_slot(&None, current_slot)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].applied);
+        assert!(
+            svm.scheduled_overrides
+                .get(&current_slot)
+                .unwrap()
+                .is_none()
+        );
+        let stored_account = svm
+            .inner
+            .db
+            .as_ref()
+            .unwrap()
+            .get(&account_pubkey.to_string())
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored_account.data(), original_data);
+    }
+
+    #[tokio::test]
+    async fn materialization_atomic_commit_failure_preserves_schedule_and_account_state() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        let (account_pubkey, original_data, override_instance) =
+            test_account_override(&mut svm, "current", 0);
+        svm.scheduled_overrides
+            .store(current_slot, vec![override_instance])
+            .unwrap();
+        svm.inner.db = Some(Box::new(RejectingAccountBatchStorage {
+            atomic_supported: true,
+            ..RejectingAccountBatchStorage::default()
+        }));
+
+        let error = svm
+            .materialize_overrides_for_slot(&None, current_slot)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Storage error"));
+        assert!(
+            svm.scheduled_overrides
+                .get(&current_slot)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            svm.inner
+                .get_account(&account_pubkey)
+                .unwrap()
+                .unwrap()
+                .data(),
+            original_data
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_unsupported_storage_before_mutation() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let current_slot = svm.latest_epoch_info.absolute_slot;
+        let (account_pubkey, original_data, override_instance) =
+            test_account_override(&mut svm, "current", 0);
+        svm.scheduled_overrides
+            .store(current_slot, vec![override_instance])
+            .unwrap();
+        svm.inner.db = Some(Box::new(RejectingAccountBatchStorage {
+            panic_on_clone: true,
+            ..RejectingAccountBatchStorage::default()
+        }));
+
+        let error = svm
+            .materialize_overrides_for_slot(&None, current_slot)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("test-account-storage"));
+        assert!(error.to_string().contains("atomic batches disabled"));
+        assert!(
+            svm.scheduled_overrides
+                .get(&current_slot)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            svm.inner
+                .get_account(&account_pubkey)
+                .unwrap()
+                .unwrap()
+                .data(),
+            original_data
+        );
+    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -4450,7 +5522,8 @@ mod tests {
         let target = Pubkey::new_unique();
 
         locker
-            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .register_scenario_and_materialize(&None, fetch_before_use_scenario(target), Some(100))
+            .await
             .unwrap();
         locker
             .materialize_overrides_for_slot(&Some(remote), 100)
@@ -4498,7 +5571,8 @@ mod tests {
         });
 
         locker
-            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .register_scenario_and_materialize(&None, fetch_before_use_scenario(target), Some(100))
+            .await
             .unwrap();
         locker
             .materialize_overrides_for_slot(&Some(remote), 100)
@@ -5438,6 +6512,23 @@ mod tests {
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
         assert!(svm.inner.db.is_some());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_in_memory_materialization_domains_are_isolated_per_surfnet() {
+        let (mut first, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
+        let (second, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
+        let slot = first.latest_epoch_info.absolute_slot;
+        first
+            .scheduled_overrides
+            .store(slot, vec![test_override("first", 0)])
+            .unwrap();
+
+        assert!(first.scheduled_overrides.get(&slot).unwrap().is_some());
+        assert!(second.scheduled_overrides.get(&slot).unwrap().is_none());
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

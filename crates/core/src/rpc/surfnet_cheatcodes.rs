@@ -18,8 +18,8 @@ use spl_associated_token_account_interface::address::get_associated_token_addres
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
     GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
-    StreamAccountsEntry, UiKeyedProfileResult,
+    OverrideOutcome, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    StreamAccountConfig, StreamAccountsEntry, TimeTravelResult, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
         GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
@@ -754,7 +754,7 @@ pub trait SurfnetCheatcodes {
     ///   - `absoluteEpoch(u64)`: Advances time to the specified epoch (each epoch = 432,000 slots).
     ///
     /// ## Returns
-    /// An `EpochInfo` object reflecting the updated clock state.
+    /// The updated epoch state and outcomes for overrides materialized at the target slot.
     ///
     /// ## Example Request
     /// ```json
@@ -776,7 +776,8 @@ pub trait SurfnetCheatcodes {
     ///     "slotsInEpoch": 432000,
     ///     "absoluteSlot": 221184000,
     ///     "blockHeight": 650000000,
-    ///     "transactionCount": 923472834
+    ///     "transactionCount": 923472834,
+    ///     "overrideOutcomes": []
     ///   },
     ///   "id": 1
     /// }
@@ -785,7 +786,7 @@ pub trait SurfnetCheatcodes {
         &self,
         meta: Self::Metadata,
         config: Option<TimeTravelConfig>,
-    ) -> Result<EpochInfo>;
+    ) -> Result<TimeTravelResult>;
 
     /// A cheat code to freeze the Surfnet clock on the local network.
     /// All time progression halts until resumed.
@@ -1421,13 +1422,13 @@ pub trait SurfnetCheatcodes {
     ///     - `scenarioRelativeSlot`: The relative slot offset (from base slot) when this override should be applied
     ///     - `label`: Optional label for this override
     ///     - `enabled`: Whether this override is active
-    ///     - `fetchBeforeUse`: If true, fetch fresh account data just before transaction execution (useful for price feeds, oracle updates, and dynamic balances)
+    ///     - `fetchBeforeUse`: If true, require fresh remote account data before applying the override. The override is skipped when no remote client is configured or the fetch fails.
     ///     - `account`: Account address (either `{ "pubkey": "..." }` or `{ "pda": { "programId": "...", "seeds": [...] } }`)
     ///   - `tags`: Array of tags for categorization
     /// - `slot` (optional): The base slot from which relative slot offsets are calculated. If omitted, uses the current slot.
     ///
     /// ## Returns
-    /// A `RpcResponse<()>` indicating whether the Scenario registration was successful.
+    /// A `RpcResponse<Vec<OverrideOutcome>>` for overrides at the base slot.
     ///
     /// ## Example Request (with slot)
     /// ```json
@@ -1505,7 +1506,13 @@ pub trait SurfnetCheatcodes {
     ///     "slot": 355684457,
     ///     "apiVersion": "2.2.2"
     ///   },
-    ///   "value": null,
+    ///   "value": [
+    ///     {
+    ///       "overrideId": "override-1",
+    ///       "label": "Set BTC price",
+    ///       "applied": true
+    ///     }
+    ///   ],
     ///   "id": 1
     /// }
     /// ```
@@ -1515,7 +1522,7 @@ pub trait SurfnetCheatcodes {
         meta: Self::Metadata,
         scenario: Scenario,
         slot: Option<Slot>,
-    ) -> BoxFuture<Result<RpcResponse<()>>>;
+    ) -> BoxFuture<Result<RpcResponse<Vec<OverrideOutcome>>>>;
 }
 
 #[derive(Clone)]
@@ -2236,15 +2243,22 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         &self,
         meta: Self::Metadata,
         config: Option<TimeTravelConfig>,
-    ) -> Result<EpochInfo> {
+    ) -> Result<TimeTravelResult> {
         let key = meta.as_ref().map(|ctx| ctx.id.clone()).unwrap_or_default();
         let time_travel_config = config.unwrap_or_default();
         let simnet_command_tx = meta.get_surfnet_command_tx()?;
         let svm_locker = meta.get_svm_locker()?;
 
-        let epoch_info = svm_locker.time_travel(key, simnet_command_tx, time_travel_config)?;
+        let (epoch_info, outcomes) = svm_locker.time_travel_with_override_outcomes(
+            key,
+            simnet_command_tx,
+            time_travel_config,
+        )?;
 
-        Ok(epoch_info)
+        Ok(TimeTravelResult {
+            epoch_info,
+            override_outcomes: outcomes,
+        })
     }
 
     fn reset_account(
@@ -2541,7 +2555,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         meta: Self::Metadata,
         scenario: Scenario,
         slot: Option<Slot>,
-    ) -> BoxFuture<Result<RpcResponse<()>>> {
+    ) -> BoxFuture<Result<RpcResponse<Vec<OverrideOutcome>>>> {
         let SurfnetRpcContext {
             svm_locker,
             remote_ctx,
@@ -2551,32 +2565,14 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         };
 
         Box::pin(async move {
-            // Get the base slot for registration (either provided or current)
-            let base_slot = slot.unwrap_or_else(|| svm_locker.get_latest_absolute_slot());
-
-            // Register the scenario with explicit base slot
-            svm_locker
-                .register_scenario(scenario, Some(base_slot))
-                .map_err(|e| jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to register scenario: {}", e),
-                    data: None,
-                })?;
-
-            // Immediately materialize overrides for the BASE slot (not current slot)
-            // This ensures slot 0's override is applied right away
-            svm_locker
-                .materialize_overrides_for_slot(&remote_ctx, base_slot)
+            let outcomes = svm_locker
+                .register_scenario_and_materialize(&remote_ctx, scenario, slot)
                 .await
-                .map_err(|e| jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to materialize initial overrides: {}", e),
-                    data: None,
-                })?;
+                .map_err(jsonrpc_core::Error::from)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-                value: (),
+                value: outcomes,
             })
         })
     }
