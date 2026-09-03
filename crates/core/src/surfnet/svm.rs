@@ -545,6 +545,23 @@ pub struct SurfnetSvm {
     storage_backend: StorageBackend,
 }
 
+/// Whether two scheduled entries describe the same logical override on the same concrete account.
+fn same_override_target(left: &OverrideInstance, right: &OverrideInstance) -> bool {
+    if left.id != right.id || left.template_id != right.template_id {
+        return false;
+    }
+
+    match (
+        left.account.resolve(Some(&left.values)),
+        right.account.resolve(Some(&right.values)),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        // An entry whose target cannot be resolved will be skipped during materialization. Do not
+        // let it suppress or replace another entry merely because their recipes look alike.
+        _ => false,
+    }
+}
+
 /// Add `pubkey_str` to the pubkey-list at `key`, creating the entry when absent
 /// and deduplicating on insert. The shared-pubkey indexes (`accounts_by_owner`,
 /// `token_accounts_by_owner`, `token_accounts_by_mint`,
@@ -2878,12 +2895,9 @@ impl SurfnetSvm {
         let mut deduped: Vec<OverrideInstance> = Vec::with_capacity(overrides.len());
         for instance in overrides.into_iter().rev() {
             if instance.re_armed
-                && deduped.iter().any(|kept| {
-                    kept.re_armed
-                        && kept.id == instance.id
-                        && kept.account == instance.account
-                        && kept.template_id == instance.template_id
-                })
+                && deduped
+                    .iter()
+                    .any(|kept| kept.re_armed && same_override_target(kept, &instance))
             {
                 debug!(
                     "Dropping a superseded continuation of override {} claimed from an earlier slot",
@@ -3075,12 +3089,9 @@ impl SurfnetSvm {
             // scheduler's own collision check cannot see it: claiming several overdue buckets at
             // once already took it out of its slot, so re-arming here would outlive it and restore
             // the superseded value on the following slot.
-            let superseded_later = overrides[index + 1..].iter().any(|later| {
-                !later.re_armed
-                    && later.id == override_instance.id
-                    && later.account == override_instance.account
-                    && later.template_id == override_instance.template_id
-            });
+            let superseded_later = overrides[index + 1..]
+                .iter()
+                .any(|later| !later.re_armed && same_override_target(later, override_instance));
 
             if override_instance.persist.is_enabled() && !superseded_later {
                 let mut requeued = override_instance.clone();
@@ -3317,11 +3328,7 @@ impl SurfnetSvm {
             .get(&next_slot)?
             .unwrap_or_default();
 
-        let same_override = |queued: &OverrideInstance| {
-            queued.id == instance.id
-                && queued.account == instance.account
-                && queued.template_id == instance.template_id
-        };
+        let same_override = |queued: &OverrideInstance| same_override_target(queued, instance);
 
         match next
             .iter()
@@ -4683,11 +4690,10 @@ impl SurfnetSvm {
                 .get(&absolute_slot)?
                 .unwrap_or_default();
 
-            if let Some(existing) = slot_overrides.iter_mut().find(|queued| {
-                queued.id == override_instance.id
-                    && queued.account == override_instance.account
-                    && queued.template_id == override_instance.template_id
-            }) {
+            if let Some(existing) = slot_overrides
+                .iter_mut()
+                .find(|queued| same_override_target(queued, &override_instance))
+            {
                 debug!(
                     "Replacing already-scheduled override {} at slot {}",
                     override_instance.id, absolute_slot
@@ -4727,12 +4733,7 @@ impl SurfnetSvm {
                 continue;
             };
             let before = queued.len();
-            queued.retain(|other| {
-                !(other.re_armed
-                    && other.id == instance.id
-                    && other.account == instance.account
-                    && other.template_id == instance.template_id)
-            });
+            queued.retain(|other| !(other.re_armed && same_override_target(other, instance)));
             if queued.len() != before {
                 debug!(
                     "Removed {} superseded copy(ies) of override {} at slot {}",
@@ -8360,6 +8361,114 @@ mod tests {
             queued.len(),
             2,
             "re-arming an override must replace its own queued copy, not append a duplicate"
+        );
+    }
+
+    /// Structurally identical PDA recipes can still identify different accounts when their seeds
+    /// come from override values.
+    #[tokio::test]
+    async fn test_overdue_pda_overrides_compare_resolved_accounts() {
+        const SLOT: u64 = 500;
+        const LATER_SLOT: u64 = SLOT + 5;
+
+        let (mut svm, fixture_pubkey, mut first) = scheduled_persist_fixture(true);
+        let fixture_account = svm
+            .inner
+            .get_account(&fixture_pubkey)
+            .expect("get fixture account")
+            .expect("fixture account present");
+
+        let program_id = Pubkey::new_unique();
+        let recipe = surfpool_types::AccountAddress::Pda {
+            program_id: program_id.to_string(),
+            seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+        };
+
+        first.id = "shared-pda-id".to_string();
+        first.account = recipe.clone();
+        first.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("first-market".to_string()),
+        );
+        let first_pubkey = first
+            .account
+            .resolve(Some(&first.values))
+            .expect("derive first PDA");
+
+        let mut later = first.clone();
+        later.scenario_relative_slot = LATER_SLOT - SLOT;
+        later.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("second-market".to_string()),
+        );
+        later.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        );
+        let later_pubkey = later
+            .account
+            .resolve(Some(&later.values))
+            .expect("derive later PDA");
+        assert_ne!(
+            first_pubkey, later_pubkey,
+            "different seeds must derive different PDAs"
+        );
+
+        svm.inner
+            .set_account(first_pubkey, fixture_account.clone())
+            .expect("set first PDA account");
+        svm.inner
+            .set_account(later_pubkey, fixture_account)
+            .expect("set later PDA account");
+        svm.scheduled_overrides
+            .store(SLOT, vec![first])
+            .expect("schedule first override");
+        svm.scheduled_overrides
+            .store(LATER_SLOT, vec![later])
+            .expect("schedule later override");
+
+        // Claim both buckets together, reproducing the overdue-slot batch from the report.
+        svm.materialize_overrides_for_slot(&None, LATER_SLOT)
+            .await
+            .expect("materialize overdue batch");
+
+        let queued = svm
+            .scheduled_overrides
+            .get(&(LATER_SLOT + 1))
+            .expect("read continuations")
+            .expect("continuations queued");
+        assert_eq!(
+            queued.len(),
+            2,
+            "the later PDA must not suppress the first PDA's continuation"
+        );
+        let queued_accounts: HashSet<Pubkey> = queued
+            .iter()
+            .map(|entry| {
+                entry
+                    .account
+                    .resolve(Some(&entry.values))
+                    .expect("resolve queued PDA")
+            })
+            .collect();
+        assert_eq!(
+            queued_accounts,
+            HashSet::from([first_pubkey, later_pubkey]),
+            "each concrete PDA must retain its own continuation"
+        );
+
+        // The overdue deduplication path must distinguish the same two resolved accounts too.
+        svm.materialize_overrides_for_slot(&None, LATER_SLOT + 1)
+            .await
+            .expect("materialize continuations");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(LATER_SLOT + 2))
+                .expect("read next continuations")
+                .unwrap_or_default()
+                .len(),
+            2,
+            "re-armed PDA overrides must not be deduplicated by recipe alone"
         );
     }
 
