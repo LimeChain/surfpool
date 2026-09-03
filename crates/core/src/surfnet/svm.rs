@@ -447,6 +447,12 @@ pub struct SurfnetSvm {
     pub chain_tip: BlockIdentifier,
     pub blocks: Box<dyn Storage<u64, BlockHeader>>,
     pub transactions: Box<dyn Storage<String, SurfnetTransactionStatus>>,
+    /// Signatures accepted by `sendTransaction` that have not finished processing yet.
+    ///
+    /// Counts are used because clients may submit the same signed transaction concurrently.
+    /// Keeping this next to `transactions` lets readers atomically distinguish a genuinely
+    /// unknown signature from one that is waiting in the runloop queue.
+    pending_transaction_signatures: HashMap<Signature, usize>,
     pub jito_bundles: Box<dyn Storage<String, Vec<String>>>,
     pub transactions_queued_for_confirmation: VecDeque<(
         VersionedTransaction,
@@ -492,6 +498,8 @@ pub struct SurfnetSvm {
     pub non_circulating_supply: u64,
     pub non_circulating_accounts: Vec<String>,
     pub genesis_config: GenesisConfig,
+    /// Genesis hash fetched from the remote RPC during startup, when configured.
+    pub cached_genesis_hash: Option<Hash>,
     pub inflation: Inflation,
     /// A global monotonically increasing atomic number, which can be used to tell the order of the account update.
     /// For example, when an account is updated in the same slot multiple times,
@@ -669,6 +677,28 @@ enum FetchOutcome {
 }
 
 impl SurfnetSvm {
+    pub(crate) fn mark_transaction_pending(&mut self, signature: Signature) {
+        *self
+            .pending_transaction_signatures
+            .entry(signature)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn mark_transaction_complete(&mut self, signature: &Signature) {
+        let Some(pending_count) = self.pending_transaction_signatures.get_mut(signature) else {
+            return;
+        };
+
+        *pending_count -= 1;
+        if *pending_count == 0 {
+            self.pending_transaction_signatures.remove(signature);
+        }
+    }
+
+    pub(crate) fn is_transaction_pending(&self, signature: &Signature) -> bool {
+        self.pending_transaction_signatures.contains_key(signature)
+    }
+
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
     }
@@ -720,6 +750,8 @@ impl SurfnetSvm {
             // Wrap all storage fields with OverlayStorage
             blocks: OverlayStorage::wrap(self.blocks.clone_box()),
             transactions: OverlayStorage::wrap(self.transactions.clone_box()),
+            // Profiling sandboxes do not consume the live transaction command queue.
+            pending_transaction_signatures: HashMap::new(),
             jito_bundles: OverlayStorage::wrap(self.jito_bundles.clone_box()),
             profile_tag_map: OverlayStorage::wrap(self.profile_tag_map.clone_box()),
             simulated_transaction_profiles: OverlayStorage::wrap(
@@ -774,6 +806,7 @@ impl SurfnetSvm {
             non_circulating_supply: self.non_circulating_supply,
             non_circulating_accounts: self.non_circulating_accounts.clone(),
             genesis_config: self.genesis_config.clone(),
+            cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
             feature_set: self.feature_set.clone(),
@@ -1202,6 +1235,7 @@ impl SurfnetSvm {
             chain_tip,
             blocks: blocks_db,
             transactions: transactions_db,
+            pending_transaction_signatures: HashMap::new(),
             jito_bundles: jito_bundles_db,
             perf_samples: VecDeque::new(),
             transactions_processed,
@@ -1235,6 +1269,7 @@ impl SurfnetSvm {
             non_circulating_supply: 0,
             non_circulating_accounts: Vec::new(),
             genesis_config: GenesisConfig::default(),
+            cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
             registered_idls: registered_idls_db,
