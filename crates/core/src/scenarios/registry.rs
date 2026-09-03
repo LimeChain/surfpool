@@ -251,7 +251,7 @@ impl TemplateRegistry {
 #[cfg(test)]
 mod tests {
     use anchor_lang_idl::types::IdlType;
-    use std::{collections::HashMap, collections::BTreeSet, str::FromStr};
+    use std::{collections::BTreeSet, collections::HashMap, str::FromStr};
 
     use solana_pubkey::Pubkey;
     use surfpool_types::{AccountAddress, PdaSeed};

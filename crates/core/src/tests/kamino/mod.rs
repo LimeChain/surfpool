@@ -332,7 +332,11 @@ const LIVE_ACCOUNTS: &[(&str, &str, &str)] = &[
     ("kamino-swap", "Order", SWAP_ORDER),
     ("kamino-swap", "GlobalConfig", SWAP_GLOBAL_CONFIG),
     ("kamino-vault", "VaultState", VAULT_STATE),
-    ("kamino-vault", "ReserveWhitelistEntry", VAULT_WHITELIST_ENTRY),
+    (
+        "kamino-vault",
+        "ReserveWhitelistEntry",
+        VAULT_WHITELIST_ENTRY,
+    ),
     ("kamino-liquidity", "WhirlpoolStrategy", STRATEGY),
 ];
 
@@ -357,7 +361,10 @@ async fn every_template_round_trips_over_a_live_account() {
             let identity = surfnet_svm
                 .get_forged_account_data(&pubkey, data, &template.idl, &HashMap::new())
                 .unwrap_or_else(|e| {
-                    panic!("identity round-trip failed for {} ({address}): {e}", template.id)
+                    panic!(
+                        "identity round-trip failed for {} ({address}): {e}",
+                        template.id
+                    )
                 });
             // A live account may be allocated larger than the struct needs, so the re-encode is
             // a prefix rather than the whole buffer.
@@ -584,8 +591,14 @@ async fn farms_reward_override_writes_both_halves() {
             "rewards_issued_unclaimed.0".to_string(),
             serde_json::json!(777_000u64),
         ),
-        ("rewards_tally_scaled.0".to_string(), serde_json::json!(0u64)),
-        ("active_stake_scaled".to_string(), serde_json::json!(1_000u64)),
+        (
+            "rewards_tally_scaled.0".to_string(),
+            serde_json::json!(0u64),
+        ),
+        (
+            "active_stake_scaled".to_string(),
+            serde_json::json!(1_000u64),
+        ),
     ]);
     let forged_user = surfnet_svm
         .get_forged_account_data(&pubkey, user_data, &user.idl, &user_overrides)
