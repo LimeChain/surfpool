@@ -48,6 +48,7 @@ use solana_keypair::Keypair;
 use solana_message::{
     AddressLookupTableAccount, Message, MessageHeader, VersionedMessage, legacy,
     v0::{self, MessageAddressTableLookup},
+    v1::{self, TransactionConfig},
 };
 use solana_pubkey::Pubkey;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
@@ -86,6 +87,7 @@ use surfpool_types::{
 use test_case::test_case;
 use tokio::{sync::RwLock, task};
 use uuid::Uuid;
+
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 use crate::{
@@ -127,7 +129,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(15);
 /// never starts and a runloop that never stops present the same way: a test
 /// that does not finish.
 #[derive(Debug)]
-enum RunloopError {
+pub(crate) enum RunloopError {
     /// The OS refused a thread. This is the shape thread exhaustion arrives
     /// in, so it is the first thing to fail if the guards below stop working.
     Spawn(std::io::Error),
@@ -170,7 +172,7 @@ impl std::fmt::Display for RunloopError {
 impl std::error::Error for RunloopError {}
 
 /// A running surfnet and the thread it runs on. Dropping it stops the runloop.
-struct RunloopGuard {
+pub(crate) struct RunloopGuard {
     commands: Sender<SimnetCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -238,7 +240,7 @@ impl Drop for RunloopGuard {
 /// Bind the guard for as long as the test needs the surfnet, conventionally
 /// `let _runloop = spawn_runloop(...)`. A plain `let _ =` drops it there and
 /// then, which stops the runloop before the test has used it.
-fn spawn_runloop(
+pub(crate) fn spawn_runloop(
     svm_locker: SurfnetSvmLocker,
     config: SurfpoolConfig,
     commands: (
@@ -273,7 +275,7 @@ fn spawn_runloop(
 
 /// Waits for the surfnet to say it is ready and that it reached its
 /// datasource.
-fn wait_for_ready_and_connected(
+pub(crate) fn wait_for_ready_and_connected(
     simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>,
 ) -> Result<(), RunloopError> {
     wait_for_startup(simnet_events_rx, Connection::Required)
@@ -7423,6 +7425,7 @@ async fn test_ws_signature_subscribe_does_not_miss_local_commit_during_remote_lo
                         "firstNormalSlot": 0,
                     }),
                     "getTransaction" => serde_json::Value::Null,
+                    "getGenesisHash" => serde_json::Value::String(Hash::default().to_string()),
                     unexpected => panic!("unexpected datasource method: {unexpected}"),
                 };
                 let response = serde_json::json!({
@@ -10750,6 +10753,378 @@ async fn test_token2022_metadata_realloc(test_type: TestType) {
     println!("✓ Regression test #530: Token-2022 metadata CPI realloc works correctly");
 }
 
+/// Round trip: derive the keys, deposit into the confidential balance, read it back.
+///
+/// The pending balance is seeded with a real ElGamal ciphertext before the deposit
+/// lands on it; without that step the assertions below would hold under any secret
+/// key. The mechanism is documented at the seeding site.
+///
+/// The remaining assertions are weaker, and labelled as such. The plaintext
+/// fields the program itself computes (public token balance down by exactly the
+/// deposited amount, pending credit counter to 1 and back to 0) only catch a
+/// deposit that silently did nothing. The decrypted available balance round-trips
+/// this test's own AES ciphertext: it shows that `AeKey` encryption and
+/// decryption agree and that the cheatcode reads the right field, but it does not
+/// bind to the ElGamal key. The post-apply pending read of 0 is a shape check,
+/// not a key check: `ApplyPendingBalance` resets that ciphertext to all-zero,
+/// which decodes to 0 under any key.
+///
+/// The account reaches its configured state via `surfnet_setTokenAccount` rather
+/// than an on-chain `ConfigureAccount`, which is proof-gated; nothing here
+/// establishes whether that instruction would succeed under this harness.
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
+    use solana_zk_sdk::encryption::{
+        auth_encryption::AeKey,
+        elgamal::{ElGamalKeypair, ElGamalPubkey},
+    };
+    use solana_zk_sdk_pod::encryption::auth_encryption::PodAeCiphertext;
+    use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+    use spl_token_2022_interface::extension::{
+        BaseStateWithExtensionsMut, StateWithExtensionsMut,
+        confidential_transfer::{
+            ConfidentialTransferAccount, instruction as confidential_instruction,
+        },
+    };
+    use surfpool_types::types::{
+        ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, TokenAccountUpdate,
+    };
+
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let (simnet_cmd_tx, _simnet_cmd_rx) = crossbeam_unbounded::<SimnetCommand>();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet_cmd_tx,
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+
+    let token_program = spl_token_2022_interface::id();
+    let owner = Keypair::new();
+    let mint = Keypair::new();
+    let decimals = 2u8;
+
+    svm_locker
+        .airdrop(&owner.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+
+    let token_account = get_associated_token_address_with_program_id(
+        &owner.pubkey(),
+        &mint.pubkey(),
+        &token_program,
+    );
+
+    // Leg 1: derive the owner's confidential keys from a signature scoped to
+    // this token account, using the SDK's canonical derivation message.
+    let signature = crate::types::confidential_key_signature(&owner, &token_account);
+    let keys = rpc_server
+        .derive_confidential_keys(Some(runloop_context.clone()), signature)
+        .expect("deriveConfidentialKeys should succeed")
+        .value;
+
+    // A mint carrying the confidential-transfer extension, so the Token-2022
+    // program will accept confidential instructions against its accounts.
+    let mint_len =
+        spl_token_2022_interface::extension::ExtensionType::try_calculate_account_len::<
+            spl_token_2022_interface::state::Mint,
+        >(&[spl_token_2022_interface::extension::ExtensionType::ConfidentialTransferMint])
+        .unwrap();
+    let mint_rent =
+        svm_locker.with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(mint_len));
+
+    let setup_instructions = vec![
+        system_instruction::create_account(
+            &owner.pubkey(),
+            &mint.pubkey(),
+            mint_rent,
+            mint_len as u64,
+            &token_program,
+        ),
+        confidential_instruction::initialize_mint(
+            &token_program,
+            &mint.pubkey(),
+            Some(owner.pubkey()),
+            true,
+            None,
+        )
+        .unwrap(),
+        spl_token_2022_interface::instruction::initialize_mint2(
+            &token_program,
+            &mint.pubkey(),
+            &owner.pubkey(),
+            None,
+            decimals,
+        )
+        .unwrap(),
+    ];
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let setup_message = Message::new_with_blockhash(
+        &setup_instructions,
+        Some(&owner.pubkey()),
+        &recent_blockhash,
+    );
+    let setup_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(setup_message), &[&owner, &mint])
+            .unwrap();
+    let (setup_status_tx, setup_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, setup_tx, setup_status_tx, false, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            setup_status_rx.recv().unwrap(),
+            TransactionStatusEvent::Success(_)
+        ),
+        "mint setup should succeed"
+    );
+
+    let public_amount = 10_000u64;
+    rpc_server
+        .set_token_account(
+            Some(runloop_context.clone()),
+            owner.pubkey().to_string(),
+            mint.pubkey().to_string(),
+            TokenAccountUpdate {
+                amount: Some(public_amount),
+                confidential: Some(ConfidentialTransferAccountUpdate {
+                    elgamal_pubkey: keys.elgamal_pubkey.clone(),
+                    aes_key: Some(keys.aes_key.clone()),
+                    amount: Some(0),
+                    approved: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(token_program.to_string()),
+        )
+        .await
+        .expect("setTokenAccount should succeed");
+
+    // Give the pending balance a real ElGamal ciphertext before the deposit
+    // lands on it. `Deposit` adds the amount to the commitment and passes the
+    // decrypt handle through untouched, so a deposit onto the all-zero pending
+    // ciphertext a configured account starts with produces an identity handle,
+    // and that opens to the same value under any secret key. Encrypting under
+    // the derived public key first gives the ciphertext a handle only the
+    // derived secret key cancels. On-chain the same state arrives via a
+    // party-to-party `Transfer`, which is proof-gated and blocked here by the
+    // SDK skew, so the account is seeded directly instead.
+    let seeded_pending = 1_500u64;
+    let elgamal_pubkey_bytes = bs58::decode(&keys.elgamal_pubkey).into_vec().unwrap();
+    let elgamal_pubkey = ElGamalPubkey::try_from(elgamal_pubkey_bytes.as_slice())
+        .expect("derived elgamalPubkey should parse");
+    let mut seeded_account = svm_locker
+        .with_svm_reader(|svm| svm.inner.get_account(&token_account).unwrap())
+        .expect("token account should exist");
+    {
+        let mut state = StateWithExtensionsMut::<spl_token_2022_interface::state::Account>::unpack(
+            &mut seeded_account.data,
+        )
+        .expect("token account should unpack with extensions");
+        let ext = state
+            .get_extension_mut::<ConfidentialTransferAccount>()
+            .expect("confidential extension should be present");
+        ext.pending_balance_lo = elgamal_pubkey.encrypt_u64(seeded_pending).into();
+    }
+    svm_locker
+        .with_svm_writer(|svm| svm.set_account(&token_account, seeded_account))
+        .expect("seeding the pending balance should succeed");
+
+    // Leg 2: a real confidential-transfer deposit, executed by Token-2022.
+    let deposit_amount = 4_000u64;
+    let deposit_ix = confidential_instruction::deposit(
+        &token_program,
+        &token_account,
+        &mint.pubkey(),
+        deposit_amount,
+        decimals,
+        &owner.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let deposit_message =
+        Message::new_with_blockhash(&[deposit_ix], Some(&owner.pubkey()), &recent_blockhash);
+    let deposit_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(deposit_message), &[&owner])
+            .unwrap();
+    let (deposit_status_tx, deposit_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, deposit_tx, deposit_status_tx, false, true)
+        .await
+        .unwrap();
+    let deposit_status = deposit_status_rx.recv().unwrap();
+    assert!(
+        matches!(deposit_status, TransactionStatusEvent::Success(_)),
+        "confidential deposit should succeed, got {:?}",
+        deposit_status
+    );
+
+    // Leg 3: read the balance back. The deposit credits the pending balance,
+    // which only the derived ElGamal secret key can open.
+    let owner_elgamal_secret_key = keys.elgamal_secret_key.clone();
+    let expected_pending = seeded_pending + deposit_amount;
+
+    // The pending balance is bound to the derived key: the owner's secret key
+    // recovers the seeded amount plus the deposit, and a stranger's recovers
+    // nothing.
+    let pending_under_owner = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .map(|response| response.value.pending)
+        .unwrap_or(None);
+    assert_eq!(
+        pending_under_owner,
+        Some(expected_pending),
+        "the derived ElGamal secret key should recover the seeded pending balance plus the deposit"
+    );
+
+    let foreign_elgamal = ElGamalKeypair::new_rand();
+    let pending_under_foreign = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: None,
+                elgamal_secret_key: Some(
+                    bs58::encode(<[u8; 32]>::from(foreign_elgamal.secret())).into_string(),
+                ),
+            },
+        )
+        .await
+        .map(|response| response.value.pending)
+        .unwrap_or(None);
+    assert_eq!(
+        pending_under_foreign, None,
+        "a foreign ElGamal secret key must fail to recover the pending balance"
+    );
+
+    let after_deposit = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(keys.aes_key.clone()),
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .expect("getConfidentialBalance should succeed")
+        .value;
+    assert_eq!(
+        after_deposit.pending,
+        Some(expected_pending),
+        "the deposited amount should decrypt out of the pending balance"
+    );
+    assert_eq!(
+        after_deposit.available,
+        Some(0),
+        "a deposit credits the pending balance, not the available one"
+    );
+    assert_eq!(
+        after_deposit.pending_balance_credit_counter, 1,
+        "the deposit should register one pending credit"
+    );
+
+    // The public balance funded the deposit, so it drops by the same amount.
+    let account = svm_locker
+        .with_svm_reader(|svm| svm.inner.get_account(&token_account).unwrap())
+        .expect("token account should exist");
+    let state =
+        StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&account.data)
+            .expect("token account should unpack with extensions");
+    assert_eq!(
+        state.base.amount,
+        public_amount - deposit_amount,
+        "the public balance should fall by the deposited amount"
+    );
+
+    // Applying the pending balance moves it into the available balance, which
+    // the owner reads with the AES key.
+    let aes_bytes: [u8; 16] = bs58::decode(&keys.aes_key)
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let new_available = PodAeCiphertext::from(AeKey::from(aes_bytes).encrypt(expected_pending));
+    let apply_ix = confidential_instruction::apply_pending_balance(
+        &token_program,
+        &token_account,
+        after_deposit.pending_balance_credit_counter,
+        &new_available,
+        &owner.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let apply_message =
+        Message::new_with_blockhash(&[apply_ix], Some(&owner.pubkey()), &recent_blockhash);
+    let apply_tx =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(apply_message), &[&owner]).unwrap();
+    let (apply_status_tx, apply_status_rx) = crossbeam_channel::unbounded();
+    svm_locker
+        .process_transaction(&None, apply_tx, apply_status_tx, false, true)
+        .await
+        .unwrap();
+    let apply_status = apply_status_rx.recv().unwrap();
+    assert!(
+        matches!(apply_status, TransactionStatusEvent::Success(_)),
+        "applying the pending balance should succeed, got {:?}",
+        apply_status
+    );
+
+    let after_apply = rpc_server
+        .get_confidential_balance(
+            Some(runloop_context.clone()),
+            token_account.to_string(),
+            ConfidentialBalanceKeys {
+                aes_key: Some(keys.aes_key.clone()),
+                elgamal_secret_key: Some(owner_elgamal_secret_key.clone()),
+            },
+        )
+        .await
+        .expect("getConfidentialBalance should succeed")
+        .value;
+    assert_eq!(
+        after_apply.available,
+        Some(expected_pending),
+        "the applied amount should decrypt out of the available balance"
+    );
+    assert_eq!(
+        after_apply.pending,
+        Some(0),
+        "the pending balance should be drained by the apply"
+    );
+    assert_eq!(
+        after_apply.pending_balance_credit_counter, 0,
+        "applying the pending balance resets the credit counter"
+    );
+}
+
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_duplicate_transaction_rejected(test_type: TestType) {
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
@@ -11073,7 +11448,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
 
     let _runloop = spawn_runloop(
-        svm_locker,
+        svm_locker.clone(),
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
@@ -11146,6 +11521,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         },
         skip_sig_verify: Some(true),
     };
+    let signature = tx.signatures[0];
     let _sig = full_client
         .send_transaction(data, Some(send_config))
         .await
@@ -11161,6 +11537,13 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         }
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while svm_locker.0.read().await.is_transaction_pending(&signature) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the runloop should clear the pending signature after processing");
 
     // Assert recipient received the transfer
     let final_recipient_balance = minimal_client
@@ -11485,4 +11868,486 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
         .expect_err("requestAirdrop below rent exemption must return an RPC error");
     assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
     assert!(err.message.contains("rent-exempt minimum"));
+}
+
+fn build_v1_transaction(
+    payer: &Keypair,
+    instructions: &[Instruction],
+    recent_blockhash: Hash,
+    config: TransactionConfig,
+) -> VersionedTransaction {
+    let message = v1::Message::try_compile_with_config(
+        &payer.pubkey(),
+        instructions,
+        recent_blockhash,
+        config,
+    )
+    .expect("v1 message should compile");
+    VersionedTransaction::try_new(VersionedMessage::V1(message), &[payer])
+        .expect("v1 transaction should sign")
+}
+
+async fn process_v1_transaction_and_get_fee_and_cus(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+) -> (u64, u64) {
+    let signature = transaction.signatures[0];
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, transaction, status_tx, false, true)
+        .await
+        .expect("v1 transaction processing should complete");
+
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        other => panic!("expected v1 transaction success, got {other:?}"),
+    }
+
+    svm_locker.with_svm_reader(|svm| {
+        let tx_status = svm
+            .transactions
+            .get(&signature.to_string())
+            .expect("transaction lookup should not fail")
+            .expect("processed transaction should be stored");
+        let (tx_with_status_meta, _) = tx_status.expect_processed();
+        (
+            tx_with_status_meta.meta.fee,
+            tx_with_status_meta
+                .meta
+                .compute_units_consumed
+                .unwrap_or_default(),
+        )
+    })
+}
+
+async fn process_v1_transaction_and_get_fee(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+) -> u64 {
+    process_v1_transaction_and_get_fee_and_cus(svm_locker, transaction)
+        .await
+        .0
+}
+
+async fn process_v1_transaction_and_get_rejection_message(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+    sigverify: bool,
+) -> String {
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    let result = svm_locker
+        .process_transaction(&None, transaction, status_tx, false, sigverify)
+        .await;
+
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::SimulationFailure((error, _)))
+        | Ok(TransactionStatusEvent::ExecutionFailure((error, _))) => {
+            assert!(
+                result.is_ok(),
+                "runtime transaction failures should be reported on the status channel"
+            );
+            error.to_string()
+        }
+        Ok(TransactionStatusEvent::VerificationFailure(error)) => {
+            assert!(
+                result.is_err(),
+                "verification failures should also be returned from process_transaction"
+            );
+            error
+        }
+        other => panic!("expected v1 transaction rejection, got {other:?}"),
+    }
+}
+
+fn funded_v1_test_svm(payer: &Keypair) -> SurfnetSvmLocker {
+    let (mut svm_instance, _simnet_events_rx, _geyser_events_rx) =
+        TestType::no_db().initialize_svm();
+    svm_instance
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .expect("airdrop should not fail")
+        .expect("airdrop should fund payer");
+    SurfnetSvmLocker::new(svm_instance)
+}
+
+/// [TransactionConfig] that will work with a transfer ix with a default system account
+fn default_transaction_config() -> TransactionConfig {
+    TransactionConfig::empty()
+        // transfer ix consumes 150 CUs
+        .with_compute_unit_limit(150)
+        .with_loaded_accounts_data_size_limit(149)
+}
+
+/// Fetch account and assert that it does not exist. Panics if the account exists.
+fn assert_account_does_not_exist(svm_locker: &SurfnetSvmLocker, pubkey: &Pubkey, fail_msg: &str) {
+    let account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(pubkey))
+        .expect("account lookup should not fail");
+    assert!(account.is_none(), "{}", fail_msg);
+}
+
+/// Fetch account and assert that it has the expected lamports. Panics if the account does not exist.
+fn assert_account_lamports(
+    svm_locker: &SurfnetSvmLocker,
+    pubkey: &Pubkey,
+    expected_lamports: u64,
+    fail_msg: &str,
+) {
+    let account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(pubkey))
+        .expect("account lookup should not fail")
+        .expect("account should exist");
+    assert_eq!(account.lamports, expected_lamports, "{}", fail_msg);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_sigverify_accepts_valid_signature() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+
+    process_v1_transaction_and_get_fee(&svm_locker, transaction).await;
+
+    assert_account_lamports(
+        &svm_locker,
+        &recipient,
+        1_000_000,
+        "valid v1 transaction should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_sigverify_rejects_signed_config_mutation() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let mut transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config().with_priority_fee(42_000),
+    );
+    let VersionedMessage::V1(message) = &mut transaction.message else {
+        panic!("expected v1 transaction");
+    };
+    message.config = message.config.with_priority_fee(42_001);
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert!(
+        error.contains("Transaction did not pass signature verification"),
+        "mutating a signed v1 config field should fail signature verification, got: {error}"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "signature verification failure should not execute the transfer",
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_send_transaction_respects_sigverify_flag() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let mut invalid_signature_tx = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    invalid_signature_tx.signatures[0] = solana_signature::Signature::new_unique();
+
+    let error = process_v1_transaction_and_get_rejection_message(
+        &svm_locker,
+        invalid_signature_tx.clone(),
+        true,
+    )
+    .await;
+    assert!(
+        error.contains("Transaction did not pass signature verification"),
+        "v1 transaction with invalid signature should be rejected, got: {error}"
+    );
+
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, invalid_signature_tx, status_tx, false, false)
+        .await
+        .expect("skip signature verification should allow the v1 transaction to process");
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        other => panic!("expected v1 transaction success with sigverify disabled, got {other:?}"),
+    }
+
+    assert_account_lamports(
+        &svm_locker,
+        &recipient,
+        1_000_000,
+        "v1 transaction with sigverify disabled should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_priority_fee_config_is_charged() {
+    let payer_without_priority_fee = Keypair::new();
+    let payer_with_priority_fee = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let priority_fee = 42_000;
+
+    let no_priority_fee_svm = funded_v1_test_svm(&payer_without_priority_fee);
+    let no_priority_fee_blockhash =
+        no_priority_fee_svm.with_svm_reader(|svm| svm.latest_blockhash());
+    let no_priority_fee_tx = build_v1_transaction(
+        &payer_without_priority_fee,
+        &[transfer(
+            &payer_without_priority_fee.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        no_priority_fee_blockhash,
+        default_transaction_config(),
+    );
+    let no_priority_fee =
+        process_v1_transaction_and_get_fee(&no_priority_fee_svm, no_priority_fee_tx).await;
+
+    let priority_fee_svm = funded_v1_test_svm(&payer_with_priority_fee);
+    let priority_fee_blockhash = priority_fee_svm.with_svm_reader(|svm| svm.latest_blockhash());
+    let priority_fee_tx = build_v1_transaction(
+        &payer_with_priority_fee,
+        &[transfer(
+            &payer_with_priority_fee.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        priority_fee_blockhash,
+        default_transaction_config().with_priority_fee(priority_fee),
+    );
+    let fee_with_priority_fee =
+        process_v1_transaction_and_get_fee(&priority_fee_svm, priority_fee_tx).await;
+
+    assert_eq!(fee_with_priority_fee - no_priority_fee, priority_fee);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_heap_size_config_bounds_are_rejected_by_surfpool() {
+    const MIN_HEAP_FRAME_BYTES: u32 = 32 * 1024;
+    const MAX_HEAP_FRAME_BYTES: u32 = 256 * 1024;
+    const TRANSFER_LAMPORTS: u64 = 1_000_000;
+
+    let payer = Keypair::new();
+    let svm_locker = funded_v1_test_svm(&payer);
+
+    for heap_size in [MIN_HEAP_FRAME_BYTES, MAX_HEAP_FRAME_BYTES] {
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = build_v1_transaction(
+            &payer,
+            &[transfer(&payer.pubkey(), &recipient, TRANSFER_LAMPORTS)],
+            recent_blockhash,
+            default_transaction_config().with_heap_size(heap_size),
+        );
+        process_v1_transaction_and_get_fee(&svm_locker, transaction).await;
+
+        assert_account_lamports(
+            &svm_locker,
+            &recipient,
+            TRANSFER_LAMPORTS,
+            "v1 transaction with valid heap size should execute transfer",
+        );
+    }
+
+    for heap_size in [
+        MIN_HEAP_FRAME_BYTES - 1,
+        MIN_HEAP_FRAME_BYTES + 1,
+        MAX_HEAP_FRAME_BYTES + 1,
+    ] {
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = build_v1_transaction(
+            &payer,
+            &[transfer(&payer.pubkey(), &recipient, TRANSFER_LAMPORTS)],
+            recent_blockhash,
+            default_transaction_config().with_heap_size(heap_size),
+        );
+        let error =
+            process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+        assert!(
+            error.to_ascii_lowercase().contains("sanitize")
+                || error.to_ascii_lowercase().contains("invalid"),
+            "invalid v1 heap size {heap_size} should be rejected by Surfpool, got: {error}"
+        );
+
+        assert_account_does_not_exist(
+            &svm_locker,
+            &recipient,
+            &format!("invalid heap size {heap_size} should not execute the transfer"),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_ignores_invalid_compute_budget_instruction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let baseline_transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    let (_, baseline_cus) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, baseline_transaction).await;
+
+    let second_recipient = Pubkey::new_unique();
+    let second_recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let invalid_compute_budget_ix = Instruction {
+        program_id: solana_compute_budget_interface::id(),
+        accounts: vec![],
+        data: vec![u8::MAX],
+    };
+    let transaction = build_v1_transaction(
+        &payer,
+        &[
+            invalid_compute_budget_ix,
+            transfer(&payer.pubkey(), &second_recipient, 1_000_000),
+        ],
+        second_recent_blockhash,
+        // Extra and compute limit account data size is needed to load compute budget account
+        default_transaction_config()
+            .with_loaded_accounts_data_size_limit(298)
+            .with_compute_unit_limit(3_000),
+    );
+
+    let (_, cus_with_noop_compute_budget_ix) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, transaction).await;
+    assert!(
+        cus_with_noop_compute_budget_ix > baseline_cus,
+        "v1 compute-budget instruction should consume compute units as a successful no-op"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_ignores_duplicate_compute_budget_configuration_instructions() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let baseline_transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    let (baseline_fee, baseline_cus) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, baseline_transaction).await;
+
+    let second_recipient = Pubkey::new_unique();
+    let second_recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            ComputeBudgetInstruction::set_compute_unit_price(1_000),
+            ComputeBudgetInstruction::set_compute_unit_price(2_000),
+            transfer(&payer.pubkey(), &second_recipient, 1_000_000),
+        ],
+        second_recent_blockhash,
+        // Extra compute limit and account data size is needed to load compute budget account
+        default_transaction_config()
+            .with_loaded_accounts_data_size_limit(298)
+            .with_compute_unit_limit(3_000),
+    );
+
+    let (fee_with_ignored_compute_budget_ixs, cus_with_noop_compute_budget_ixs) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, transaction).await;
+
+    assert_eq!(
+        fee_with_ignored_compute_budget_ixs, baseline_fee,
+        "v1 compute-budget price instructions should not configure prioritization fees"
+    );
+    assert!(
+        cus_with_noop_compute_budget_ixs > baseline_cus,
+        "v1 compute-budget instructions should consume compute units as successful no-ops"
+    );
+
+    assert_account_lamports(
+        &svm_locker,
+        &second_recipient,
+        1_000_000,
+        "v1 transaction with duplicate compute-budget instructions should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_insufficient_loaded_account_data_size_limit_rejects_transaction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        TransactionConfig::empty()
+            // sufficient compute unit limit
+            .with_compute_unit_limit(150)
+            // insufficient loaded accounts data size limit
+            .with_loaded_accounts_data_size_limit(148),
+    );
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert_eq!(
+        error,
+        "Transaction exceeded max loaded accounts data size cap"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "invalid v1 transaction should not execute the transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_insufficient_compute_unit_limit_rejects_transaction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        TransactionConfig::empty()
+            // insufficient compute unit limit
+            .with_compute_unit_limit(149)
+            // sufficient loaded accounts data size limit
+            .with_loaded_accounts_data_size_limit(149),
+    );
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert_eq!(
+        error,
+        "Error processing Instruction 0: Computational budget exceeded"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "invalid v1 transaction should not execute the transfer",
+    );
 }

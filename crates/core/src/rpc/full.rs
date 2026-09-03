@@ -1637,8 +1637,11 @@ impl Full for SurfpoolFullRpc {
         &self,
         meta: Self::Metadata,
         signature_strs: Vec<String>,
-        _config: Option<RpcSignatureStatusConfig>,
+        config: Option<RpcSignatureStatusConfig>,
     ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+        let search_transaction_history = config
+            .map(|config| config.search_transaction_history)
+            .unwrap_or(false);
         let signatures = match signature_strs
             .iter()
             .map(|s| {
@@ -1658,7 +1661,11 @@ impl Full for SurfpoolFullRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
-        let remote_client = remote_ctx.map(|(r, _)| r);
+        let remote_client = if search_transaction_history {
+            remote_ctx.map(|(remote_client, _)| remote_client)
+        } else {
+            None
+        };
 
         Box::pin(async move {
             // Capture the context slot once at the beginning to ensure consistency
@@ -1748,7 +1755,9 @@ impl Full for SurfpoolFullRpc {
         };
 
         let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
-        ctx.simnet_commands_tx
+        ctx.svm_locker.mark_transaction_pending(signature);
+        if ctx
+            .simnet_commands_tx
             .send(SimnetCommand::ProcessTransaction(
                 ctx.id,
                 unsanitized_tx,
@@ -1756,9 +1765,14 @@ impl Full for SurfpoolFullRpc {
                 config.base.skip_preflight,
                 config.skip_sig_verify,
             ))
-            .map_err(|_| RpcCustomError::NodeUnhealthy {
+            .is_err()
+        {
+            ctx.svm_locker.mark_transaction_complete(&signature);
+            return Err(RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
-            })?;
+            }
+            .into());
+        }
 
         match status_update_rx.recv() {
             Ok(TransactionStatusEvent::SimulationFailure((error, metadata))) => {
@@ -2742,8 +2756,10 @@ mod tests {
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{
-        MessageHeader, legacy::Message as LegacyMessage, v0::Message as V0Message,
-        v1::MAX_TRANSACTION_SIZE,
+        MessageHeader,
+        legacy::Message as LegacyMessage,
+        v0::Message as V0Message,
+        v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
     };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
@@ -2760,8 +2776,10 @@ mod tests {
         EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
+    use solana_transaction_status_client_types::UiTransactionConfig;
     use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
     use test_case::test_case;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
@@ -2769,6 +2787,26 @@ mod tests {
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
+
+    fn build_v1_transaction(
+        payer: &Pubkey,
+        signers: &[&Keypair],
+        instructions: &[Instruction],
+        recent_blockhash: &Hash,
+    ) -> VersionedTransaction {
+        let msg = VersionedMessage::V1(
+            V1Message::try_compile_with_config(
+                &payer,
+                instructions,
+                *recent_blockhash,
+                TransactionConfig::empty()
+                    .with_compute_unit_limit(20_000)
+                    .with_loaded_accounts_data_size_limit(20_000),
+            )
+            .unwrap(),
+        );
+        VersionedTransaction::try_new(msg, signers).unwrap()
+    }
 
     fn build_v0_transaction(
         payer: &Pubkey,
@@ -2808,7 +2846,7 @@ mod tests {
                     .rpc
                     .send_transaction(
                         Some(setup_clone.context),
-                        bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                        bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                         None,
                     )
                     .unwrap();
@@ -2819,6 +2857,11 @@ mod tests {
         loop {
             match mempool_rx.recv() {
                 Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    let sig = tx.signatures[0];
+                    assert!(
+                        setup.context.svm_locker.is_transaction_pending(&sig),
+                        "sendTransaction should mark the signature before enqueueing it"
+                    );
                     let mut writer = setup.context.svm_locker.0.write().await;
                     let slot = writer.get_latest_absolute_slot();
                     writer.transactions_queued_for_confirmation.push_back((
@@ -2826,7 +2869,6 @@ mod tests {
                         status_tx.clone(),
                         None,
                     ));
-                    let sig = tx.signatures[0];
                     let tx_with_status_meta = TransactionWithStatusMeta {
                         slot,
                         transaction: tx,
@@ -2848,6 +2890,9 @@ mod tests {
                             TransactionConfirmationStatus::Confirmed,
                         ))
                         .unwrap();
+                    drop(writer);
+                    setup.context.svm_locker.mark_transaction_complete(&sig);
+                    assert!(!setup.context.svm_locker.is_transaction_pending(&sig));
                     break;
                 }
                 Ok(SimnetCommand::AirdropProcessed) => continue,
@@ -3113,6 +3158,137 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signature_statuses_respects_search_transaction_history() {
+        let missing_signature = Signature::new_unique();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test datasource should bind");
+        let address = listener
+            .local_addr()
+            .expect("test datasource should have an address");
+        let datasource_request = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("history lookup should reach the datasource");
+            let mut request = [0; 4096];
+            let bytes_read = stream
+                .read(&mut request)
+                .await
+                .expect("test datasource should read the request");
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.contains("getTransaction"));
+
+            let body = r#"{"jsonrpc":"2.0","result":null,"id":0}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test datasource should write the response");
+        });
+
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        setup.context.remote_rpc_client =
+            Some(SurfnetRemoteClient::new(format!("http://{address}")));
+
+        for config in [
+            None,
+            Some(RpcSignatureStatusConfig {
+                search_transaction_history: false,
+            }),
+        ] {
+            let response = setup
+                .rpc
+                .get_signature_statuses(
+                    Some(setup.context.clone()),
+                    vec![missing_signature.to_string()],
+                    config,
+                )
+                .await
+                .expect("recent-status lookups must not query the datasource");
+
+            assert_eq!(response.value.len(), 1);
+            assert!(response.value[0].is_none());
+        }
+
+        setup
+            .context
+            .svm_locker
+            .mark_transaction_pending(missing_signature);
+        setup
+            .context
+            .svm_locker
+            .mark_transaction_pending(missing_signature);
+
+        for _ in 0..2 {
+            let response = setup
+                .rpc
+                .get_signature_statuses(
+                    Some(setup.context.clone()),
+                    vec![missing_signature.to_string()],
+                    Some(RpcSignatureStatusConfig {
+                        search_transaction_history: true,
+                    }),
+                )
+                .await
+                .expect("pending local transactions must not query the datasource");
+
+            assert_eq!(response.value.len(), 1);
+            assert!(response.value[0].is_none());
+            setup
+                .context
+                .svm_locker
+                .mark_transaction_complete(&missing_signature);
+        }
+
+        let result = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context),
+                vec![missing_signature.to_string()],
+                Some(RpcSignatureStatusConfig {
+                    search_transaction_history: true,
+                }),
+            )
+            .await
+            .expect("history lookup should accept a missing upstream transaction");
+
+        assert_eq!(result.value.len(), 1);
+        assert!(result.value[0].is_none());
+        datasource_request
+            .await
+            .expect("test datasource should receive the history lookup");
+    }
+
+    #[test]
+    fn test_send_transaction_clears_pending_signature_when_enqueue_fails() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        drop(mempool_rx);
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let payer = Keypair::new();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let transaction =
+            build_legacy_transaction(&payer.pubkey(), &[&payer], &[], &recent_blockhash);
+        let signature = transaction.signatures[0];
+
+        let result = setup.rpc.send_transaction(
+            Some(setup.context.clone()),
+            bs58::encode(bincode::serialize(&transaction).unwrap()).into_string(),
+            None,
+        );
+
+        assert!(result.is_err());
+        assert!(!setup.context.svm_locker.is_transaction_pending(&signature));
+    }
+
     #[test]
     fn test_request_airdrop() {
         let pk = Pubkey::new_unique();
@@ -3150,6 +3326,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_send_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3182,6 +3359,16 @@ mod tests {
                 )],
                 &recent_blockhash,
             ),
+            TransactionVersion::Number(1) => build_v1_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &pk,
+                    LAMPORTS_PER_SOL,
+                )],
+                &recent_blockhash,
+            ),
             _ => unimplemented!(),
         };
 
@@ -3203,6 +3390,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3237,6 +3425,12 @@ mod tests {
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
                 &recent_blockhash,
             ),
+            TransactionVersion::Number(1) => build_v1_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
             _ => unimplemented!(),
         };
 
@@ -3244,7 +3438,7 @@ mod tests {
             .rpc
             .simulate_transaction(
                 Some(setup.context),
-                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                 Some(RpcSimulateTransactionConfig {
                     sig_verify: true,
                     replace_recent_blockhash: false,
@@ -3272,7 +3466,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3369,7 +3563,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3437,6 +3631,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_replace_recent_blockhash(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3471,6 +3666,12 @@ mod tests {
                 &recent_blockhash,
             ),
             TransactionVersion::Number(0) => build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
+            TransactionVersion::Number(1) => build_v1_transaction(
                 &payer.pubkey(),
                 &[&payer.insecure_clone()],
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
@@ -3513,7 +3714,7 @@ mod tests {
             .rpc
             .simulate_transaction(
                 Some(setup.context),
-                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
                 Some(valid_config),
             )
             .await
@@ -3608,6 +3809,7 @@ mod tests {
 
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_transaction(version: TransactionVersion) {
         let payer = Keypair::new();
@@ -3637,6 +3839,12 @@ mod tests {
                 &recent_blockhash,
             ),
             TransactionVersion::Number(0) => build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+                &recent_blockhash,
+            ),
+            TransactionVersion::Number(1) => build_v1_transaction(
                 &payer.pubkey(),
                 &[&payer.insecure_clone()],
                 &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
@@ -3700,7 +3908,15 @@ mod tests {
                                 VersionedMessage::V0(_) => Some(vec![]),
                                 VersionedMessage::V1(_) => None,
                             },
-                            transaction_config: None,
+                            transaction_config: match tx.message {
+                                VersionedMessage::Legacy(_) | VersionedMessage::V0(_) => None,
+                                VersionedMessage::V1(_) => Some(UiTransactionConfig {
+                                    priority_fee: None,
+                                    compute_unit_limit: Some(20_000),
+                                    loaded_accounts_data_size_limit: Some(20_000),
+                                    heap_size: None
+                                }),
+                            },
                         })
                     }),
                     meta: res.transaction.clone().meta, // Using the same values to avoid reintroducing processing logic errors

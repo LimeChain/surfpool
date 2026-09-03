@@ -15,7 +15,7 @@ use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
     parse_account_data::AccountAdditionalDataV3,
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
-    parse_token::UiTokenAmount,
+    parse_token::{UiTokenAmount, real_number_string_trimmed},
 };
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
@@ -92,6 +92,12 @@ enum ProcessTransactionResult {
     Success(TransactionMetadata),
     SimulationFailure(FailedTransactionMetadata),
     ExecutionFailure(FailedTransactionMetadata),
+}
+
+struct LocalTransactionLookup {
+    result: GetTransactionResult,
+    is_pending: bool,
+    latest_absolute_slot: Slot,
 }
 
 pub struct SvmAccessContext<T> {
@@ -260,14 +266,16 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule) = {
+        let (mut epoch_info, epoch_schedule, some_genesis_hash) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
-            (epoch_info, epoch_schedule)
+            let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
+            (epoch_info, epoch_schedule, some_genesis_hash)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
+            svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
         });
         Ok(())
@@ -1604,6 +1612,19 @@ impl SurfnetSvmLocker {
 
 /// Functions for getting transactions from the underlying SurfnetSvm instance or remote client
 impl SurfnetSvmLocker {
+    pub(crate) fn mark_transaction_pending(&self, signature: Signature) {
+        self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_pending(signature));
+    }
+
+    pub(crate) fn mark_transaction_complete(&self, signature: &Signature) {
+        self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_complete(signature));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_transaction_pending(&self, signature: &Signature) -> bool {
+        self.with_svm_reader(|svm_reader| svm_reader.is_transaction_pending(signature))
+    }
+
     /// Retrieves a transaction by signature, using local or remote based on context.
     pub async fn get_transaction(
         &self,
@@ -1645,11 +1666,26 @@ impl SurfnetSvmLocker {
         signature: &Signature,
         config: &RpcTransactionConfig,
     ) -> SurfpoolResult<GetTransactionResult> {
+        Ok(self
+            .get_transaction_local_with_pending(signature, config)?
+            .result)
+    }
+
+    fn get_transaction_local_with_pending(
+        &self,
+        signature: &Signature,
+        config: &RpcTransactionConfig,
+    ) -> SurfpoolResult<LocalTransactionLookup> {
         self.with_svm_reader(|svm_reader| {
             let latest_absolute_slot = svm_reader.get_latest_absolute_slot();
+            let is_pending = svm_reader.is_transaction_pending(signature);
 
             let Some(entry) = svm_reader.transactions.get(&signature.to_string())? else {
-                return Ok(GetTransactionResult::None(*signature));
+                return Ok(LocalTransactionLookup {
+                    result: GetTransactionResult::None(*signature),
+                    is_pending,
+                    latest_absolute_slot,
+                });
             };
 
             let (transaction_with_status_meta, _) = entry.expect_processed();
@@ -1664,16 +1700,20 @@ impl SurfnetSvmLocker {
                 config.max_supported_transaction_version,
                 true,
             )?;
-            Ok(GetTransactionResult::found_transaction(
-                *signature,
-                EncodedConfirmedTransactionWithStatusMeta {
-                    slot,
-                    transaction: encoded,
-                    block_time,
-                    transaction_index: None,
-                },
+            Ok(LocalTransactionLookup {
+                result: GetTransactionResult::found_transaction(
+                    *signature,
+                    EncodedConfirmedTransactionWithStatusMeta {
+                        slot,
+                        transaction: encoded,
+                        block_time,
+                        transaction_index: None,
+                    },
+                    latest_absolute_slot,
+                ),
+                is_pending,
                 latest_absolute_slot,
-            ))
+            })
         })
     }
 
@@ -1684,14 +1724,14 @@ impl SurfnetSvmLocker {
         signature: &Signature,
         config: RpcTransactionConfig,
     ) -> SurfpoolResult<GetTransactionResult> {
-        let local_result = self.get_transaction_local(signature, &config)?;
-        let latest_absolute_slot = self.get_latest_absolute_slot();
-        if local_result.is_none() {
+        let local_lookup = self.get_transaction_local_with_pending(signature, &config)?;
+
+        if local_lookup.result.is_none() && !local_lookup.is_pending {
             client
-                .try_get_transaction(*signature, config, latest_absolute_slot)
+                .try_get_transaction(*signature, config, local_lookup.latest_absolute_slot)
                 .await
         } else {
-            Ok(local_result)
+            Ok(local_lookup.result)
         }
     }
 }
@@ -3049,8 +3089,8 @@ impl SurfnetSvmLocker {
                     amount: UiTokenAmount {
                         amount: token_account.amount().to_string(),
                         decimals: mint_decimals,
-                        ui_amount: Some(format_ui_amount(token_account.amount(), mint_decimals)),
-                        ui_amount_string: format_ui_amount_string(
+                        ui_amount: format_ui_amount(token_account.amount(), mint_decimals),
+                        ui_amount_string: real_number_string_trimmed(
                             token_account.amount(),
                             mint_decimals,
                         ),
@@ -3828,19 +3868,31 @@ impl SurfnetSvmLocker {
     }
 
     pub fn get_genesis_hash_local(&self) -> SvmAccessContext<Hash> {
-        self.with_contextualized_svm_reader(|svm_reader| svm_reader.genesis_config.hash())
+        self.with_contextualized_svm_reader(|svm_reader| {
+            svm_reader
+                .cached_genesis_hash
+                .unwrap_or_else(|| svm_reader.genesis_config.hash())
+        })
     }
 
     pub async fn get_genesis_hash(
         &self,
         remote_ctx: &Option<SurfnetRemoteClient>,
     ) -> SurfpoolContextualizedResult<Hash> {
-        if let Some(client) = remote_ctx {
+        if self.with_svm_reader(|svm_reader| svm_reader.cached_genesis_hash.is_none())
+            && let Some(client) = remote_ctx
+        {
             let remote_hash = client.get_genesis_hash().await?;
-            Ok(self.with_contextualized_svm_reader(|_| remote_hash))
-        } else {
-            Ok(self.get_genesis_hash_local())
+            self.with_svm_writer(|svm_writer| {
+                // Startup normally populates this first. Keep the check so a concurrent
+                // cache-miss request cannot replace a value that another request just stored.
+                if svm_writer.cached_genesis_hash.is_none() {
+                    svm_writer.cached_genesis_hash = Some(remote_hash);
+                }
+            });
         }
+
+        Ok(self.get_genesis_hash_local())
     }
 }
 
@@ -4560,37 +4612,36 @@ fn update_programdata_account(
     }
 }
 
-pub fn format_ui_amount_string(amount: u64, decimals: u8) -> String {
-    if decimals > 0 {
-        let divisor = 10u64.pow(decimals as u32);
-        format!(
-            "{:.decimals$}",
-            amount as f64 / divisor as f64,
-            decimals = decimals as usize
-        )
-    } else {
-        amount.to_string()
-    }
-}
-
-pub fn format_ui_amount(amount: u64, decimals: u8) -> f64 {
-    if decimals > 0 {
-        let divisor = 10u64.pow(decimals as u32);
-        amount as f64 / divisor as f64
-    } else {
-        amount as f64
-    }
+/// Scales a raw token amount by its mint's decimals for `UiTokenAmount::ui_amount`.
+///
+/// `None` when `decimals` is too large for `10^decimals` to fit a `usize`.
+pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
+    10_usize
+        .checked_pow(decimals as u32)
+        .map(|divisor| amount as f64 / divisor as f64)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use async_trait::async_trait;
     use solana_account::Account;
     use solana_account_decoder::UiAccountEncoding;
+    use solana_client::{
+        nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig, rpc_request::RpcRequest,
+    };
     use solana_epoch_schedule::EpochSchedule;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
+    use solana_rpc_client::rpc_sender::{RpcSender, RpcTransportStats};
+    use solana_rpc_client_api::client_error::Result as ClientResult;
     use solana_sdk_ids::system_program;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
@@ -4622,6 +4673,88 @@ mod tests {
             0x00, 0x00, 0x00, 0xa0, 0x7c, 0x1a, 0x38, 0x63, 0x0a, 0x00, 0x00, 0x94, 0xa6, 0xb9,
             0xb5, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x5e, 0x6d, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]
+    }
+
+    struct StartupRpcSender {
+        genesis_hash: Hash,
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RpcSender for StartupRpcSender {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+
+            Ok(match request {
+                RpcRequest::GetEpochInfo => serde_json::json!({
+                    "epoch": 1,
+                    "slotIndex": 2,
+                    "slotsInEpoch": 432000,
+                    "absoluteSlot": 2,
+                    "blockHeight": 2,
+                    "transactionCount": null,
+                }),
+                RpcRequest::GetEpochSchedule => {
+                    serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
+                }
+                RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
+                _ => panic!("unexpected startup RPC request: {request:?}"),
+            })
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://startup.example".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_fetches_and_caches_genesis_hash() {
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let expected_hash = Hash::new_from_array([8; 32]);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let remote_client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                StartupRpcSender {
+                    genesis_hash: expected_hash,
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        };
+        let remote_ctx = Some(remote_client);
+
+        svm_locker
+            .initialize(&remote_ctx)
+            .await
+            .expect("startup RPC calls should succeed");
+
+        assert_eq!(
+            svm_locker
+                .get_genesis_hash(&remote_ctx)
+                .await
+                .expect("cached genesis hash should be available")
+                .inner,
+            expected_hash
+        );
+        assert_eq!(
+            svm_locker
+                .get_genesis_hash(&remote_ctx)
+                .await
+                .expect("cached genesis hash should remain available")
+                .inner,
+            expected_hash
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
     }
 
     #[cfg(feature = "sqlite")]
@@ -7038,5 +7171,35 @@ mod tests {
             886_u64 * 432_000,
             "first slot should align with mainnet epoch boundaries when warmup is disabled"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_genesis_hash_uses_cached_hash_when_remote_is_configured() {
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let expected_hash = Hash::new_from_array([7; 32]);
+
+        svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.cached_genesis_hash = Some(expected_hash);
+        });
+
+        // If the cache were ignored, this deliberately unreachable endpoint would be queried.
+        let remote_client = SurfnetRemoteClient::new("http://127.0.0.1:1");
+        let result = svm_locker
+            .get_genesis_hash(&Some(remote_client))
+            .await
+            .expect("cached genesis hash should not require the remote RPC");
+
+        assert_eq!(result.inner, expected_hash);
+    }
+
+    #[test]
+    fn test_format_ui_amount_scales_by_decimals() {
+        assert_eq!(format_ui_amount(0, 0), Some(0.0));
+        assert_eq!(format_ui_amount(1_500_000, 6), Some(1.5));
+        assert_eq!(format_ui_amount(42, 0), Some(42.0));
+        // `Mint::decimals` is an unvalidated u8; 10^decimals stops fitting a usize well
+        // before 255, and the field is Option<f64> so those mints have somewhere to land.
+        assert_eq!(format_ui_amount(1, 255), None);
     }
 }

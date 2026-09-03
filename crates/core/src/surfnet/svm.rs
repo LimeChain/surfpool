@@ -155,6 +155,24 @@ impl AccountUpdatePolicy {
     }
 }
 
+/// Token accounts carry no Anchor discriminator, so the IDL forge path cannot decode them.
+fn forge_token_account_data(
+    account: &Account,
+    mut token_account: TokenAccount,
+    account_values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<Vec<u8>> {
+    let amount = account_values
+        .get("amount")
+        .and_then(|amount| {
+            amount
+                .as_u64()
+                .or_else(|| amount.as_str().and_then(|amount| amount.parse().ok()))
+        })
+        .ok_or_else(|| SurfpoolError::internal("amount must be an unsigned 64-bit integer"))?;
+    token_account.set_amount(amount);
+    token_account.pack_into_preserving_extensions(&account.data)
+}
+
 /// Helper function to apply an override to a decoded account value using dot notation
 pub fn apply_override_to_decoded_account(
     decoded_value: &mut Value,
@@ -429,6 +447,12 @@ pub struct SurfnetSvm {
     pub chain_tip: BlockIdentifier,
     pub blocks: Box<dyn Storage<u64, BlockHeader>>,
     pub transactions: Box<dyn Storage<String, SurfnetTransactionStatus>>,
+    /// Signatures accepted by `sendTransaction` that have not finished processing yet.
+    ///
+    /// Counts are used because clients may submit the same signed transaction concurrently.
+    /// Keeping this next to `transactions` lets readers atomically distinguish a genuinely
+    /// unknown signature from one that is waiting in the runloop queue.
+    pending_transaction_signatures: HashMap<Signature, usize>,
     pub jito_bundles: Box<dyn Storage<String, Vec<String>>>,
     pub transactions_queued_for_confirmation: VecDeque<(
         VersionedTransaction,
@@ -474,6 +498,8 @@ pub struct SurfnetSvm {
     pub non_circulating_supply: u64,
     pub non_circulating_accounts: Vec<String>,
     pub genesis_config: GenesisConfig,
+    /// Genesis hash fetched from the remote RPC during startup, when configured.
+    pub cached_genesis_hash: Option<Hash>,
     pub inflation: Inflation,
     /// A global monotonically increasing atomic number, which can be used to tell the order of the account update.
     /// For example, when an account is updated in the same slot multiple times,
@@ -651,6 +677,28 @@ enum FetchOutcome {
 }
 
 impl SurfnetSvm {
+    pub(crate) fn mark_transaction_pending(&mut self, signature: Signature) {
+        *self
+            .pending_transaction_signatures
+            .entry(signature)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn mark_transaction_complete(&mut self, signature: &Signature) {
+        let Some(pending_count) = self.pending_transaction_signatures.get_mut(signature) else {
+            return;
+        };
+
+        *pending_count -= 1;
+        if *pending_count == 0 {
+            self.pending_transaction_signatures.remove(signature);
+        }
+    }
+
+    pub(crate) fn is_transaction_pending(&self, signature: &Signature) -> bool {
+        self.pending_transaction_signatures.contains_key(signature)
+    }
+
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
     }
@@ -702,6 +750,8 @@ impl SurfnetSvm {
             // Wrap all storage fields with OverlayStorage
             blocks: OverlayStorage::wrap(self.blocks.clone_box()),
             transactions: OverlayStorage::wrap(self.transactions.clone_box()),
+            // Profiling sandboxes do not consume the live transaction command queue.
+            pending_transaction_signatures: HashMap::new(),
             jito_bundles: OverlayStorage::wrap(self.jito_bundles.clone_box()),
             profile_tag_map: OverlayStorage::wrap(self.profile_tag_map.clone_box()),
             simulated_transaction_profiles: OverlayStorage::wrap(
@@ -756,6 +806,7 @@ impl SurfnetSvm {
             non_circulating_supply: self.non_circulating_supply,
             non_circulating_accounts: self.non_circulating_accounts.clone(),
             genesis_config: self.genesis_config.clone(),
+            cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
             feature_set: self.feature_set.clone(),
@@ -1184,6 +1235,7 @@ impl SurfnetSvm {
             chain_tip,
             blocks: blocks_db,
             transactions: transactions_db,
+            pending_transaction_signatures: HashMap::new(),
             jito_bundles: jito_bundles_db,
             perf_samples: VecDeque::new(),
             transactions_processed,
@@ -1217,6 +1269,7 @@ impl SurfnetSvm {
             non_circulating_supply: 0,
             non_circulating_accounts: Vec::new(),
             genesis_config: GenesisConfig::default(),
+            cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
             registered_idls: registered_idls_db,
@@ -2959,13 +3012,27 @@ impl SurfnetSvm {
                             remote_account.data().len()
                         );
 
+                        // The coupled account was not asked for: fill a fork gap,
+                        // never clobber local state.
                         if let Some((coupled_pubkey, coupled_account)) = coupled {
-                            if let Err(e) = self.inner.set_account(coupled_pubkey, coupled_account)
-                            {
-                                warn!(
-                                    "Failed to set coupled account {} from remote: {}",
-                                    coupled_pubkey, e
-                                );
+                            match self.inner.get_account(&coupled_pubkey) {
+                                Ok(None) => {
+                                    if let Err(e) =
+                                        self.inner.set_account(coupled_pubkey, coupled_account)
+                                    {
+                                        warn!(
+                                            "Failed to set coupled account {} from remote: {}",
+                                            coupled_pubkey, e
+                                        );
+                                    }
+                                }
+                                Ok(Some(_)) => {}
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to read coupled account {}: {}",
+                                        coupled_pubkey, e
+                                    );
+                                }
                             }
                         }
 
@@ -3104,6 +3171,23 @@ impl SurfnetSvm {
                         ),
                     }
                     continue;
+                }
+
+                // Mints fail the token unpack and keep flowing through the IDL path.
+                if is_supported_token_program(account.owner()) {
+                    if let Ok(token_account) = TokenAccount::unpack(account.data()) {
+                        let new_account_data =
+                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let modified_account = Account {
+                            lamports: account.lamports(),
+                            data: new_account_data,
+                            owner: *account.owner(),
+                            executable: account.executable(),
+                            rent_epoch: account.rent_epoch(),
+                        };
+                        self.inner.set_account(account_pubkey, modified_account)?;
+                        continue;
+                    }
                 }
 
                 // Get the account owner (program ID)
@@ -4669,7 +4753,10 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Stops persisted entries of an override without applying the override again.
+    /// Stops scheduler-generated continuations of an override without applying it again.
+    ///
+    /// Authored timeline entries are deliberately preserved, even when they enable persistence:
+    /// they are future instructions, not copies of the currently active value.
     pub fn stop_persisting_override(
         &mut self,
         id: &str,
@@ -4685,7 +4772,7 @@ impl SurfnetSvm {
             };
             let before = queued.len();
             queued.retain(|other| {
-                !((other.re_armed || other.persist.is_enabled())
+                !(other.re_armed
                     && other.id == id
                     && &other.account == account
                     && other.template_id == template_id)
@@ -4762,6 +4849,174 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    /// A Token-2022 vault with a fake extension tail. The forge helper never
+    /// unpacks the tail, so its bytes only need to be distinguishable.
+    fn token_2022_vault_with_tail(mint: Pubkey) -> (crate::types::TokenAccount, Account) {
+        let mut token_account = crate::types::TokenAccount::new(
+            &spl_token_2022_interface::id(),
+            Pubkey::new_unique(),
+            mint,
+            None,
+        );
+        token_account.set_amount(10);
+        let mut data = token_account.pack_into_vec();
+        data.extend_from_slice(&[2, 1, 2, 3, 4]);
+        let account = Account {
+            lamports: 2_039_280,
+            data,
+            owner: spl_token_2022_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        (token_account, account)
+    }
+
+    #[test]
+    fn token_account_override_patches_only_the_amount_bytes() {
+        let (token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
+        // Studio clients send u64 values as strings, so the parse path is the contract.
+        let account_values = HashMap::from([("amount".to_string(), serde_json::json!("42"))]);
+
+        let patched = forge_token_account_data(&account, token_account, &account_values).unwrap();
+
+        assert_eq!(patched.len(), account.data.len());
+        assert_eq!(&patched[64..72], &42u64.to_le_bytes());
+        assert_eq!(&patched[..64], &account.data[..64]);
+        assert_eq!(&patched[72..], &account.data[72..]);
+    }
+
+    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
+    /// the remote-fetch branches can be exercised without a network.
+    async fn canned_rpc(result_json: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind canned rpc");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
+    /// coupled-mint path. The canned server answers the mint lookup with the same body, and the
+    /// account's zeroed mint field makes the coupled mint land on the default pubkey.
+    const CANNED_TOKEN_ACCOUNT: &str = concat!(
+        r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        r#"","base64"],"executable":false,"lamports":2039280,"#,
+        r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
+    );
+
+    fn fetch_before_use_scenario(target: Pubkey) -> surfpool_types::Scenario {
+        let mut scenario = surfpool_types::Scenario::new(
+            "coupled fetch".to_string(),
+            "fetch_before_use must fork the target and its coupled account".to_string(),
+        );
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(target.to_string()),
+        );
+        instance.fetch_before_use = true;
+        scenario.add_override(instance);
+        scenario
+    }
+
+    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
+    /// a catch-all that logged and dropped the account, so the fetch reported success while the
+    /// target was never forked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_before_use_materializes_a_coupled_account() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let target = Pubkey::new_unique();
+
+        locker
+            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .unwrap();
+        locker
+            .materialize_overrides_for_slot(&Some(remote), 100)
+            .await
+            .unwrap();
+
+        let fetched = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
+            .unwrap();
+        assert!(
+            fetched.is_some(),
+            "the fetched token account must be forked"
+        );
+        let coupled_mint = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .unwrap();
+        assert!(
+            coupled_mint.is_some(),
+            "the coupled mint must fill the gap in the fork"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fetch_before_use_keeps_a_locally_modified_coupled_account() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let target = Pubkey::new_unique();
+
+        let marker = vec![7u8; 82];
+        locker.with_svm_writer(|svm_writer| {
+            svm_writer
+                .set_account(
+                    &Pubkey::default(),
+                    Account {
+                        lamports: 1_000_000,
+                        data: marker.clone(),
+                        owner: spl_token_interface::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        });
+
+        locker
+            .register_scenario(fetch_before_use_scenario(target), Some(100))
+            .unwrap();
+        locker
+            .materialize_overrides_for_slot(&Some(remote), 100)
+            .await
+            .unwrap();
+
+        let mint = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mint.data, marker,
+            "only the explicitly refreshed target may be overwritten; the coupled account was \
+             not requested and must keep its local state"
+        );
     }
 
     fn build_transfer_transaction(
@@ -7812,35 +8067,6 @@ mod tests {
         }
     }
 
-    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
-    /// the remote-fetch branches can be exercised without a network.
-    async fn canned_rpc(result_json: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
-
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16 * 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-
-        format!("http://{addr}")
-    }
-
     /// The remote having no such account is only an answer about this slot - accounts get created
     /// later. While there is nothing local to work on, a persisted override must keep asking, or
     /// it stays inert for the rest of the run.
@@ -7918,59 +8144,6 @@ mod tests {
             !next[0].fetch_before_use,
             "the local account is usable, so later fetches must not overwrite it"
         );
-    }
-
-    /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
-    /// a catch-all that logged and dropped the account, so the fetch reported success while the
-    /// target was never forked - every later write then failed with "not found in SVM".
-    #[tokio::test]
-    async fn test_fetch_before_use_materializes_a_coupled_account() {
-        const SLOT: u64 = 500;
-        // A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
-        // coupled-mint path. The canned server answers the mint lookup with the same body.
-        const TOKEN_ACCOUNT: &str = concat!(
-            r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            r#"","base64"],"executable":false,"lamports":2039280,"#,
-            r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
-        );
-
-        let url = canned_rpc(TOKEN_ACCOUNT).await;
-        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
-
-        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
-
-        let target = Pubkey::new_unique();
-        let mut instance = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(target.to_string()),
-        );
-        instance.fetch_before_use = true;
-
-        assert!(
-            svm.inner
-                .get_account(&target)
-                .expect("get_account")
-                .is_none(),
-            "the target must start absent so the fetch is what materializes it"
-        );
-
-        svm.scheduled_overrides
-            .store(SLOT, vec![instance])
-            .expect("schedule override");
-
-        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
-            .await
-            .expect("materialize");
-
-        let forked = svm
-            .inner
-            .get_account(&target)
-            .expect("get_account")
-            .expect("the coupled account must be written into the SVM");
-        assert_eq!(forked.data.len(), 165, "the token account data was forked");
-        assert_eq!(forked.lamports, 2_039_280, "lamports came from the remote");
     }
 
     /// With no remote client there is nothing to fetch from, but the request is still unmet while
@@ -8410,7 +8583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stop_persisting_removes_persistent_entries_without_reapplying() {
+    async fn test_stop_persisting_removes_only_continuations_without_reapplying() {
         const SLOT: u64 = 500;
 
         let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
@@ -8434,23 +8607,31 @@ mod tests {
             .set_account(account_pubkey, account)
             .expect("update account after first application");
 
-        // A future persistent start must be cancelled even though it has not re-armed yet. An
-        // ordinary one-shot with the same identity is not persistence bookkeeping and survives.
-        let future_persistent = instance.clone();
+        // Future authored entries with this identity describe later value transitions. They are
+        // not persistence bookkeeping, regardless of whether they begin a new persistence window.
+        let mut future_persistent = instance.clone();
+        future_persistent.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(2_222u64),
+        );
         let mut operator_scheduled = instance.clone();
         operator_scheduled.persist = surfpool_types::Persist::Always(false);
         operator_scheduled.re_armed = false;
+        operator_scheduled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(3_333u64),
+        );
         svm.scheduled_overrides
-            .store(SLOT + 10, vec![future_persistent, operator_scheduled])
-            .expect("schedule explicit future overrides");
+            .store(SLOT + 10, vec![future_persistent])
+            .expect("schedule future persistent transition");
+        svm.scheduled_overrides
+            .store(SLOT + 11, vec![operator_scheduled])
+            .expect("schedule future one-shot transition");
 
         let removed = svm
             .stop_persisting_override(&instance.id, &instance.account, &instance.template_id)
             .expect("stop persistence");
-        assert_eq!(
-            removed, 2,
-            "the continuation and future persistent start are removed"
-        );
+        assert_eq!(removed, 1, "only the generated continuation is removed");
         assert!(
             svm.scheduled_overrides
                 .get(&(SLOT + 1))
@@ -8466,7 +8647,16 @@ mod tests {
                 .unwrap_or_default()
                 .len(),
             1,
-            "an independently scheduled override must remain"
+            "an authored persistent transition must remain"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 11))
+                .expect("read one-shot slot")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "an authored one-shot transition must remain"
         );
 
         let account = svm
@@ -8480,6 +8670,50 @@ mod tests {
                 .expect("16 bytes"),
         );
         assert_eq!(unhealthy, 9_999, "cancellation must not write account data");
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 10)
+            .await
+            .expect("materialize persistent transition");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(
+            unhealthy, 2_222,
+            "stopping the earlier value must not delete the future persistent transition"
+        );
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 11)
+            .await
+            .expect("materialize one-shot transition");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(
+            unhealthy, 3_333,
+            "the next authored transition must also run"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 12))
+                .expect("read post-timeline slot")
+                .unwrap_or_default()
+                .is_empty(),
+            "the authored one-shot at the next slot supersedes re-arming"
+        );
     }
 
     /// Cancelling at a FUTURE relative slot. The armed copy sits before the cancellation bucket, so

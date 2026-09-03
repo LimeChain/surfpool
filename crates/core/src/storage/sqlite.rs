@@ -30,10 +30,13 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
     for SqlitePragmaCustomizer
 {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        // busy_timeout comes first: until it is set, the connection runs with
+        // SQLite's default timeout of zero, so setup against a locked database
+        // fails immediately and r2d2 discards and replaces the connection.
         let pragmas = if self.is_file_based {
-            "PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;"
+            "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000;"
         } else {
-            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;"
+            "PRAGMA busy_timeout=5000; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-64000;"
         };
         conn.batch_execute(pragmas)
             .map_err(diesel::r2d2::Error::QueryError)
@@ -81,7 +84,12 @@ impl SqliteBackend {
         let is_file_based = database_url != ":memory:";
         let manager = ConnectionManager::new(&connection_string);
         let pool = Pool::builder()
+            .thread_pool(crate::storage::pool_scheduler())
             .max_size(10)
+            // r2d2's `min_idle` defaults to `max_size`, so the pool would open
+            // all ten connections (and their descriptors) the moment the
+            // backend is built. Start at one and grow on demand
+            .min_idle(Some(1))
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)
             .map_err(|e| StorageError::PooledConnectionError(NAME.into(), e))?;
@@ -432,6 +440,31 @@ mod tests {
     struct PragmaInt {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         value: i64,
+    }
+
+    /// Every pool's housekeeping runs on the one process-wide scheduler.
+    /// r2d2's fallback is a private three-thread scheduler per pool, under
+    /// the same `r2d2-worker-{}` thread name, so a pool builder that loses
+    /// its `thread_pool(...)` call shows up here as a count above three.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pools_share_one_scheduler() {
+        let _backend1 = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+        let _backend2 = SqliteBackend::open(":memory:", "surfnet2").unwrap();
+
+        let workers = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .map(|name| name.starts_with("r2d2-worker"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            workers <= 3,
+            "expected at most 3 r2d2 housekeeping threads process-wide, found {workers}"
+        );
     }
 
     /// Stores opened on one backend share its connection pool.

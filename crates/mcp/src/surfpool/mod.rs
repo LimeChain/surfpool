@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
@@ -13,10 +14,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use set_token_account::{SeededAccount, SetAccountSuccess, SetTokenAccountsResponse};
+use solana_pubkey::Pubkey;
 use start_surfnet::StartSurfnetResponse;
-use surfpool_core::scenarios::TemplateRegistry;
+use surfpool_core::{
+    scenarios::{
+        TemplateRegistry,
+        protocols::pump::v1::graduation_builder::{
+            build_pump_graduation_scenario, pump_graduation_addresses,
+        },
+    },
+    solana_account::Account,
+    solana_commitment_config::CommitmentConfig,
+    surfnet::remote::SurfnetRemoteClient,
+};
 use surfpool_types::{
-    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, Scenario, VERIFIED_TOKENS_BY_SYMBOL,
+    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, DEFAULT_RPC_PORT, Scenario,
+    VERIFIED_TOKENS_BY_SYMBOL,
 };
 
 use crate::helpers::find_next_available_surfnet_port;
@@ -102,6 +115,19 @@ pub struct SearchConstantOptionsParams {
         description = "Case-insensitive text matched against option id, label, description and value (e.g., \"SOL/USD\"). An empty string returns the first options."
     )]
     pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePumpGraduationScenarioParams {
+    #[schemars(
+        description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
+    )]
+    pub token_mint: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -306,6 +332,13 @@ impl RegisterScenarioResponse {
     }
 }
 
+fn scenario_tool_error(message: String) -> CallToolResult {
+    let response = RegisterScenarioResponse::error(message);
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string(&response).unwrap_or_default(),
+    )])
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetTokenAddressParams {
     #[schemars(description = "The token symbol to look up (e.g., 'USDC', 'SOL', 'JUP')")]
@@ -342,6 +375,97 @@ impl TokenAddressResponse {
                 symbol
             )),
         }
+    }
+}
+
+impl Surfpool {
+    /// Reads through the surfnet's own RPC: local state wins, only missing
+    /// accounts fall back to its remote source.
+    async fn fetch_surfnet_accounts(
+        &self,
+        surfnet_port: Option<u16>,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, String> {
+        let port = surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{port}"));
+        let accounts = client
+            .get_multiple_accounts(pubkeys, CommitmentConfig::confirmed())
+            .await
+            .map_err(|error| format!("Failed to read accounts from Surfnet: {error}"))?;
+
+        Ok(accounts
+            .into_iter()
+            .map(|result| result.map_account().ok())
+            .collect())
+    }
+
+    async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/scenarios",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = match reqwest::Client::new()
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .json(&scenario)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to load scenarios at {endpoint}: {error}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to read response text: {error}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        let response: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(response) => response,
+            Err(error) => {
+                let response = RegisterScenarioResponse::error(format!(
+                    "Failed to parse JSON response: {error}. Response: {body}"
+                ));
+                let json = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        };
+        if status == reqwest::StatusCode::CONFLICT {
+            let response = RegisterScenarioResponse::error(format!(
+                "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
+                scenario.id
+            ));
+            let json = serde_json::to_string(&response).unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+        if let Some(error) = response.get("error") {
+            let response = RegisterScenarioResponse::error(format!("RPC error: {error}"));
+            let json = serde_json::to_string(&response).unwrap_or_default();
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        let scenario_id = response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&scenario.id);
+        let url = format!(
+            "http://127.0.0.1:{}/scenarios?id={scenario_id}&tab=editor",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let response = RegisterScenarioResponse::success(url);
+        let json = serde_json::to_string(&response).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 
@@ -724,10 +848,12 @@ impl Surfpool {
                                     // Check if the value exists in values map
                                     if let Some(value) = override_instance.values.get(&prop.path) {
                                         if let Some(value_str) = value.as_str() {
-                                            // Validate the value is one of the valid options
-                                            let is_valid = constant_def.options.iter().any(|opt| {
-                                                opt.value.to_lowercase() == value_str.to_lowercase()
-                                            });
+                                            // Base58 is case-sensitive: a case-folded match would
+                                            // accept a value that derives a different PDA.
+                                            let is_valid = constant_def
+                                                .options
+                                                .iter()
+                                                .any(|opt| opt.value == value_str);
                                             if !is_valid {
                                                 // Show only first 10 options to avoid overwhelming error messages
                                                 let sample_options: Vec<String> = constant_def
@@ -755,6 +881,15 @@ impl Surfpool {
                                                 sample_options.join("\n  ")
                                             ));
                                             }
+                                        } else {
+                                            validation_errors.push(format!(
+                                                "Override '{}' (template '{}'): Value for '{}' (constant: '{}') must be a base-58 mint address string, got: {}",
+                                                override_instance.id,
+                                                override_instance.template_id,
+                                                prop.path,
+                                                constant_name,
+                                                value
+                                            ));
                                         }
                                     } else {
                                         // Value is missing - required for PDA derivation
@@ -802,85 +937,68 @@ impl Surfpool {
             return Ok(CallToolResult::success(vec![Content::text(json_str)]));
         }
 
-        let load_scenarios_endpoint = format!(
-            "http://127.0.0.1:{}/v1/scenarios",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let payload = serde_json::json!(scenario);
+        self.stage_scenario(scenario).await
+    }
 
-        let client = reqwest::Client::new();
-        let http_response = match client
-            .post(&load_scenarios_endpoint)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
+    #[tool(
+        description = "Creates an editable Pump Graduation state-preparation scenario for the required tokenMint. If validation fails, report that error and do not retry. The backend validates the mint, incomplete bonding curve, curve vault, and absent canonical PumpSwap pool."
+    )]
+    async fn create_pump_graduation_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePumpGraduationScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let token_mint = match Pubkey::from_str(params.token_mint.trim()) {
+            Ok(token_mint) => token_mint,
+            Err(error) => return Ok(scenario_tool_error(format!("Invalid token mint: {error}"))),
+        };
+        let addresses = match pump_graduation_addresses(&token_mint) {
+            Ok(addresses) => addresses,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        let pubkeys = [
+            token_mint,
+            addresses.bonding_curve,
+            addresses.curve_vault,
+            addresses.canonical_pool,
+            addresses.global,
+        ];
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &pubkeys)
             .await
         {
-            Ok(resp) => resp,
-            Err(e) => {
-                let response = RegisterScenarioResponse::error(format!(
-                    "Failed to load scenarios at {}: {}",
-                    load_scenarios_endpoint, e
-                ));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let required = |index: usize, name: &str| {
+            accounts[index]
+                .as_ref()
+                .ok_or_else(|| format!("Pump {name} account not found"))
+        };
+        let preparation = match build_pump_graduation_scenario(
+            token_mint,
+            match required(0, "mint") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            match required(1, "bonding curve") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            match required(2, "curve vault") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+            accounts[3].as_ref(),
+            match required(4, "global") {
+                Ok(account) => account,
+                Err(error) => return Ok(scenario_tool_error(error)),
+            },
+        ) {
+            Ok(preparation) => preparation,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
         };
 
-        let status = http_response.status();
-
-        let response_text = match http_response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                let response =
-                    RegisterScenarioResponse::error(format!("Failed to read response text: {}", e));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
-        };
-
-        let rpc_response: serde_json::Value = match serde_json::from_str(&response_text) {
-            Ok(json) => json,
-            Err(e) => {
-                let response = RegisterScenarioResponse::error(format!(
-                    "Failed to parse JSON response: {}. Response: {}",
-                    e, response_text
-                ));
-                let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-            }
-        };
-
-        // A different scenario already occupies this id: say so instead of
-        // reporting a success the model would trust
-        if status == reqwest::StatusCode::CONFLICT {
-            let response = RegisterScenarioResponse::error(format!(
-                "A different scenario is already stored under id {:?}. Pick another id, or delete the existing one first.",
-                scenario.id
-            ));
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-        }
-
-        if let Some(error) = rpc_response.get("error") {
-            let response = RegisterScenarioResponse::error(format!("RPC error: {}", error));
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
-        }
-
-        // Extract the scenario id from the response
-        let scenario_id = rpc_response
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&scenario.id);
-
-        let url = format!(
-            "http://127.0.0.1:{}/scenarios?id={}&tab=editor",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, scenario_id
-        );
-        let response = RegisterScenarioResponse::success(url);
-        let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        self.stage_scenario(preparation.scenario).await
     }
 
     #[tool(
@@ -1153,6 +1271,33 @@ mod tests {
         assert_eq!(parsed.template_id, "pyth-price-feed-v2");
     }
 
+    #[test]
+    fn pump_graduation_mint_is_required() {
+        assert!(
+            serde_json::from_value::<CreatePumpGraduationScenarioParams>(serde_json::json!({}))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_graduation_rejects_invalid_inputs_before_rpc() {
+        let surfpool = Surfpool::new();
+
+        let graduation = surfpool
+            .create_pump_graduation_scenario(Parameters(CreatePumpGraduationScenarioParams {
+                token_mint: "not-a-mint".to_string(),
+                surfnet_port: None,
+            }))
+            .await
+            .expect("tool result");
+        assert!(
+            json_of(&graduation)["error"]
+                .as_str()
+                .expect("error")
+                .contains("Invalid token mint")
+        );
+    }
+
     fn json_of(result: &CallToolResult) -> serde_json::Value {
         let text = &result.content[0].as_text().expect("text content").text;
         serde_json::from_str(text).expect("valid JSON payload")
@@ -1272,5 +1417,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unknown_constant.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_override_templates_lists_the_pump_templates_compactly() {
+        let surfpool = Surfpool::new();
+        let result = surfpool.get_override_templates().await.unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let templates = json_of(&result);
+        let templates = templates.as_array().unwrap();
+        for id in [
+            "pump-bonding-curve-custom",
+            "pump-global",
+            "pump-amm-pool-state",
+            "pump-amm-canonical-pool",
+            "pump-amm-global-config",
+        ] {
+            let template = templates
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap_or_else(|| panic!("template {id} missing from the model's view"));
+            assert!(
+                template.get("idl").is_none(),
+                "{id} must not inline the ~160KB IDL into the LLM context"
+            );
+        }
+
+        let curve = templates
+            .iter()
+            .find(|t| t["id"] == "pump-bonding-curve-custom")
+            .unwrap();
+        let token_mint = &curve["constants"]["token_mint"];
+        assert!(
+            token_mint["optionsCount"].as_u64().unwrap() > 0,
+            "the verified-tokens catalog must be visible as a summary"
+        );
+        assert!(token_mint.get("options").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_resolves_pump_coin_mints_for_both_programs() {
+        let surfpool = Surfpool::new();
+
+        let result = surfpool
+            .search_constant_options(search("pump-bonding-curve-custom", None, "pump"))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        let results = payload["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "a pump coin must be findable");
+        assert!(
+            results
+                .iter()
+                .all(|r| !r["value"].as_str().unwrap().is_empty()),
+            "every result must carry the mint create_scenario expects"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r["value"].as_str().unwrap().ends_with("pump")),
+            "pump.fun mints are recognizable by their suffix"
+        );
+
+        let result = surfpool
+            .search_constant_options(search("pump-amm-canonical-pool", Some("token_mint"), ""))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload = json_of(&result);
+        assert!(
+            payload["totalMatches"].as_u64().unwrap() > 0,
+            "the canonical pool template must expose base mints to search"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_token_catalogs_offer_only_pump_mints() {
+        let registry = TemplateRegistry::new();
+        for template_id in ["pump-bonding-curve-custom", "pump-amm-canonical-pool"] {
+            let template = registry.get(template_id).expect("template");
+            let constant = template.constants.get("token_mint").expect("constant");
+            assert_eq!(
+                constant.options.len(),
+                976,
+                "{template_id} must offer every pump-suffixed catalog mint (976 in the CSV)"
+            );
+            assert!(
+                constant.options.iter().all(|o| o.value.ends_with("pump")),
+                "{template_id} must offer only pump.fun mints"
+            );
+        }
+
+        let surfpool = Surfpool::new();
+        for mint in [
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        ] {
+            let result = surfpool
+                .search_constant_options(search("pump-bonding-curve-custom", None, mint))
+                .await
+                .unwrap();
+            let payload = json_of(&result);
+            assert_eq!(
+                payload["totalMatches"].as_u64().unwrap(),
+                0,
+                "{mint} must not be offered for a bonding curve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_bad_pump_overrides_before_any_http_call() {
+        let surfpool = Surfpool::new();
+        let registry = TemplateRegistry::new();
+        let curve_address = registry
+            .get("pump-bonding-curve-custom")
+            .expect("template")
+            .address
+            .clone();
+
+        let mut unknown = surfpool_types::Scenario::new(
+            "bad template".to_string(),
+            "unknown templateId must be rejected".to_string(),
+        );
+        unknown.add_override(surfpool_types::OverrideInstance::new(
+            "pump-bonding-curve".to_string(),
+            0,
+            curve_address.clone(),
+        ));
+        let result = surfpool.create_scenario(Parameters(unknown)).await.unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid templateId"),
+            "a misremembered id must be named, got: {text}"
+        );
+
+        let mut incomplete = surfpool_types::Scenario::new(
+            "missing mint".to_string(),
+            "a PDA constant without a value must be rejected".to_string(),
+        );
+        incomplete.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                curve_address,
+            )
+            .with_values(HashMap::from([(
+                "complete".to_string(),
+                serde_json::json!(true),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(incomplete))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Missing required value") && text.contains("token_mint"),
+            "the missing PDA seed value must be named, got: {text}"
+        );
+
+        let mut wrong_type = surfpool_types::Scenario::new(
+            "numeric mint".to_string(),
+            "a non-string mint must be rejected, not silently skipped".to_string(),
+        );
+        wrong_type.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!(12345),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(wrong_type))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("must be a base-58 mint address string") && text.contains("token_mint"),
+            "the wrong-typed mint must be named, got: {text}"
+        );
+
+        let mut tampered = surfpool_types::Scenario::new(
+            "tampered mint".to_string(),
+            "base58 is case-sensitive; a case-folded match targets another PDA".to_string(),
+        );
+        tampered.add_override(
+            surfpool_types::OverrideInstance::new(
+                "pump-bonding-curve-custom".to_string(),
+                0,
+                registry
+                    .get("pump-bonding-curve-custom")
+                    .expect("template")
+                    .address
+                    .clone(),
+            )
+            .with_values(HashMap::from([(
+                "token_mint".to_string(),
+                serde_json::json!("9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgPUMP"),
+            )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(tampered))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Invalid value"),
+            "a case-flipped mint must be rejected, got: {text}"
+        );
     }
 }
