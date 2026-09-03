@@ -1,0 +1,114 @@
+protocol: SolFi
+version: v2-oracle
+account_type: XorPriceOracle
+
+raw_layout:
+  account_size: 168
+  magic:
+    offset: 72
+    # Two repetitions of the oracle's fixed 0xf0debc9a78563412 word.
+    bytes: [18, 52, 86, 120, 154, 188, 222, 240, 18, 52, 86, 120, 154, 188, 222, 240]
+
+tags:
+  - pmm
+  - prop-amm
+  - oracle
+
+templates:
+  - id: solfi-price
+    name: Override SolFi Price
+    description: Override the external price coefficient consumed by a SolFi market
+    idl_account_name: XorPriceOracle
+    address:
+      type: pubkey
+      value: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
+    properties:
+      - path: price_exponent
+        offset: 0
+        encoding:
+          i64_xor:
+            mask: 11029298117715798783
+        label: Decimal exponent
+        description: Signed base-10 exponent applied to the coefficient; set it explicitly with price_coefficient.
+      - path: price_coefficient
+        offset: 8
+        encoding:
+          u64_xor:
+            mask: 4962160333955141990
+        label: Price coefficient
+        description: >-
+          Unsigned coefficient before SolFi's fixed XOR encoding. Human price is coefficient times
+          10^exponent times 10^(base_decimals - quote_decimals).
+    llm_context: |
+      PRECONDITION - SET BOTH PRICE FIELDS. The exponent is live operator state and changed during
+      validation, so changing only the coefficient can produce a different human price later.
+
+      This is SolFi's authoritative price input. The 1728-byte market account contains a cached,
+      XOR-looking word at offset 712, but changing that word alone does not move a fill. The program
+      decodes this 168-byte oracle and prices from its coefficient at decoded offset 8.
+
+      CONVERSION:
+        human_price = coefficient * 10^exponent * 10^(base_decimals - quote_decimals)
+
+      Set price_exponent and price_coefficient together so a live exponent change cannot alter the
+      meaning of the scenario. For example, at exponent -10, WSOL/USDC (9/6 decimals) at $50 has
+      coefficient 500000000, while USDT/USDC (6/6) at $1 has coefficient 10000000000.
+
+      Set fetchBeforeUse: true. The oracle address is embedded in the market account at bytes 24..56;
+      do not apply a market's price to a different oracle by assumption.
+
+      Price and liveness are independent: changing the coefficient alone reprices immediately, while
+      an expired validity horizon rejects the swap before the new price can be used. For scenarios
+      that run for many slots, also apply solfi-freshness with persist: true.
+
+      DIRECTION: raising the price increases base-to-quote output and reduces the amount of base paid
+      by quote-to-base. The deployed-program test confirms the reciprocal response in both directions.
+
+      EXAMPLE - "SOL is worth $50" on the default 9/6 WSOL/USDC market at exponent -10:
+        price_exponent: -10
+        price_coefficient: 500000000
+
+  - id: solfi-freshness
+    name: Override SolFi Oracle Freshness
+    description: Keep SolFi's oracle current or make the market stop quoting
+    idl_account_name: XorPriceOracle
+    address:
+      type: pubkey
+      value: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
+    properties:
+      - path: publication_slot
+        offset: 16
+        encoding:
+          slot_xor:
+            lead: 0
+            mask: 7407351566499993019
+        label: Publication-slot offset
+        description: Relative to the slot where the override materializes; 0 means published now.
+      - path: validity_horizon
+        offset: 40
+        encoding:
+          slot_xor:
+            lead: 200
+            mask: 11053579286710561365
+        label: Valid-until offset
+        description: Relative validity horizon; 200 keeps the oracle valid for 200 slots.
+    llm_context: |
+      This is one freshness template, covering both fields SolFi requires for a genuinely current
+      oracle. Use it as a prerequisite for price and spread scenarios that span multiple slots.
+
+      Both fields are relative slot offsets even though the stored words are absolute slots hidden by
+      XOR masks. Set publication_slot to 0 and validity_horizon to 200 with persist: true to emulate a
+      continuously publishing maker.
+
+      The boundary is inclusive: validity_horizon 0 is valid in the materialization slot, while -1
+      is expired and both swap directions revert with SolFi error 23. Unlike BisonFi's stale path,
+      this is a transaction error, not a successful zero-output return.
+
+      Publication age is also a pricing input. SolFi's third market spline widens quotes as
+      current_slot - publication_slot grows, so extending validity_horizon alone keeps the market
+      executable but does not keep its spread unchanged. Re-stamp both fields for a truly fresh quote.
+
+      HOW TO USE:
+      1. Set publication_slot to 0
+      2. Set validity_horizon to 200
+      3. Set persist: true so both relative offsets are rematerialized each slot

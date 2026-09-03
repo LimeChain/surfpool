@@ -1,0 +1,161 @@
+protocol: SolFi
+version: v2-market
+account_type: Market
+
+raw_layout:
+  account_size: 1728
+  magic:
+    offset: 704
+    # The initialized/version word at the start of the serialized MarketConfig.
+    bytes: [1, 0, 0, 0, 0, 0, 0, 0]
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: solfi-spread
+    name: Override SolFi Spread
+    description: Replace SolFi's size and age dependent widening with a deterministic spread
+    idl_account_name: Market
+    address:
+      type: pubkey
+      value: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+    properties:
+      - path: quote_to_base_curve_y
+        offset: 792
+        encoding:
+          u64_strided:
+            count: 8
+            stride: 8
+        label: Buy-base widening
+        description: Uniform y value for all eight quote-to-base size knots.
+      - path: base_to_quote_curve_y
+        offset: 928
+        encoding:
+          u64_strided:
+            count: 8
+            stride: 8
+        label: Sell-base widening
+        description: Uniform y value for all eight base-to-quote size knots.
+      - path: age_multiplier_curve_y
+        offset: 1064
+        encoding:
+          u64_strided:
+            count: 8
+            stride: 8
+        label: Oracle-age multiplier
+        description: Set every knot to 1000 for a neutral, age-independent multiplier.
+      - path: additional_widening_curve_y
+        offset: 1200
+        encoding:
+          u64_strided:
+            count: 8
+            stride: 8
+        label: Additional widening
+        description: Set every knot to 0 to remove the secondary dynamic widening term.
+      - path: max_widening
+        offset: 1328
+        encoding: u64
+        label: Maximum effective widening
+        description: Final clamp in tenths of a ppm; 100000 is 1% and 10000 is 0.1%.
+    llm_context: |
+      PRECONDITION - THE ORACLE MUST BE CURRENT. SolFi rejects an expired oracle before pricing, so
+      an otherwise correct spread can appear to do nothing. For a multi-slot scenario apply
+      solfi-freshness with publication_slot 0, validity_horizon 200 and persist: true.
+
+      This template deliberately writes all coupled inputs needed for deterministic widening. Tables
+      1 and 2 are direction-specific and keyed by quote-token notional. Quote-to-base uses raw quote
+      input; base-to-quote converts base input at the oracle price first. Table 3 multiplies them
+      according to oracle age. Table 4 adds another dynamic term. Writing only one visually
+      directional table can therefore produce a tiny or timing-dependent response.
+
+      FINAL UNIT: the effective widening is divided by 10000000, so one final unit is 0.1 ppm;
+      max_widening 100000 is 1%.
+
+      For a constant spread, set all eight knots of each desired direction to one value by using the
+      corresponding property, set age_multiplier_curve_y to 1000, set
+      additional_widening_curve_y to 0, and set max_widening to at least the desired final widening.
+
+      The directional curve is scaled by decoded oracle offset 32:
+        final_widening = curve_y * oracle_scale / 1000
+      when the age multiplier is neutral. The verified WSOL/USDC oracle has oracle_scale 10000, so
+      curve_y 10000 plus max_widening 100000 produces exactly 1%. The verified USDT/USDC oracle has
+      oracle_scale 1000, so curve_y 100000 produces exactly 1%.
+
+      EXAMPLE - deterministic 1% spread on the default WSOL/USDC market:
+        quote_to_base_curve_y: 10000
+        base_to_quote_curve_y: 10000
+        age_multiplier_curve_y: 1000
+        additional_widening_curve_y: 0
+        max_widening: 100000
+
+      This controls configured widening, not inventory. Vault balances are separate live inputs and
+      may still introduce bounded inventory effects or an insufficient-liquidity refusal.
+
+      DIRECTIONAL RISK-OFF: raise quote_to_base_curve_y when the maker does not want to sell more
+      base; raise base_to_quote_curve_y when it does not want to buy more base. Set both for a
+      symmetric spread. These are configuration inputs and may be persisted.
+
+  - id: solfi-size-impact
+    name: Override SolFi Size Impact
+    description: Shape SolFi widening across the market's eight live trade-size breakpoints
+    idl_account_name: Market
+    address:
+      type: pubkey
+      value: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+    properties:
+      - { path: quote_to_base_y_0, offset: 792, encoding: u64, label: "Buy-base knot 1", description: "Widening at the first live quote-notional breakpoint; set all eight buy-base knots together." }
+      - { path: quote_to_base_y_1, offset: 800, encoding: u64, label: "Buy-base knot 2", description: "Widening at the second live quote-notional breakpoint; interpolation begins from adjacent values." }
+      - { path: quote_to_base_y_2, offset: 808, encoding: u64, label: "Buy-base knot 3", description: "Widening at the third live quote-notional breakpoint." }
+      - { path: quote_to_base_y_3, offset: 816, encoding: u64, label: "Buy-base knot 4", description: "Widening at the fourth live quote-notional breakpoint." }
+      - { path: quote_to_base_y_4, offset: 824, encoding: u64, label: "Buy-base knot 5", description: "Widening at the fifth live quote-notional breakpoint." }
+      - { path: quote_to_base_y_5, offset: 832, encoding: u64, label: "Buy-base knot 6", description: "Widening at the sixth live quote-notional breakpoint." }
+      - { path: quote_to_base_y_6, offset: 840, encoding: u64, label: "Buy-base knot 7", description: "Widening at the seventh live quote-notional breakpoint." }
+      - { path: quote_to_base_y_7, offset: 848, encoding: u64, label: "Buy-base knot 8", description: "Widening at and above the final live quote-notional breakpoint." }
+      - { path: base_to_quote_y_0, offset: 928, encoding: u64, label: "Sell-base knot 1", description: "Widening at the first live quote-notional breakpoint; set all eight sell-base knots together." }
+      - { path: base_to_quote_y_1, offset: 936, encoding: u64, label: "Sell-base knot 2", description: "Widening at the second live quote-notional breakpoint; interpolation begins from adjacent values." }
+      - { path: base_to_quote_y_2, offset: 944, encoding: u64, label: "Sell-base knot 3", description: "Widening at the third live quote-notional breakpoint." }
+      - { path: base_to_quote_y_3, offset: 952, encoding: u64, label: "Sell-base knot 4", description: "Widening at the fourth live quote-notional breakpoint." }
+      - { path: base_to_quote_y_4, offset: 960, encoding: u64, label: "Sell-base knot 5", description: "Widening at the fifth live quote-notional breakpoint." }
+      - { path: base_to_quote_y_5, offset: 968, encoding: u64, label: "Sell-base knot 6", description: "Widening at the sixth live quote-notional breakpoint." }
+      - { path: base_to_quote_y_6, offset: 976, encoding: u64, label: "Sell-base knot 7", description: "Widening at the seventh live quote-notional breakpoint." }
+      - { path: base_to_quote_y_7, offset: 984, encoding: u64, label: "Sell-base knot 8", description: "Widening at and above the final live quote-notional breakpoint." }
+      - path: age_multiplier_curve_y
+        offset: 1064
+        encoding: { u64_strided: { count: 8, stride: 8 } }
+        label: Oracle-age multiplier
+        description: Set every knot to 1000 for a neutral, age-independent multiplier.
+      - path: additional_widening_curve_y
+        offset: 1200
+        encoding: { u64_strided: { count: 8, stride: 8 } }
+        label: Additional widening
+        description: Set every knot to 0 to isolate trade-size impact.
+      - path: max_widening
+        offset: 1328
+        encoding: u64
+        label: Maximum effective widening
+        description: Final clamp in tenths of a ppm; 100000 is 1%.
+    llm_context: |
+      PRECONDITION - THE ORACLE MUST BE CURRENT. Apply and persist solfi-freshness when setup spans
+      multiple slots, otherwise expiry can hide a correctly materialized size curve.
+
+      This is the advanced form of SolFi spread control. It preserves the eight x breakpoints that
+      are already configured on the live market and replaces their y values. The deployed program
+      linearly interpolates between adjacent points and clamps to the endpoint outside the populated
+      range. The x axis is raw quote-token notional: quote-to-base uses the quote input directly,
+      while base-to-quote converts the base input at the oracle price before lookup. Do not assume
+      that different markets use the same x values.
+
+      Direction 1 (quote to base / buy base) reads quote_to_base_y_0 through _7. Direction 0 (base
+      to quote / sell base) reads base_to_quote_y_0 through _7. Values should normally be
+      non-decreasing when simulating execution that deteriorates with trade size.
+
+      Set age_multiplier_curve_y to 1000 and additional_widening_curve_y to 0 when the goal is to
+      isolate size impact. The same oracle scale and 1/10000000 final unit described by
+      solfi-spread apply here. Set max_widening high enough not to flatten the requested curve.
+
+      HOW TO USE: set all eight y values for each direction you care about. A conventional
+      large-trade deterioration uses non-decreasing values. Do not copy x assumptions between
+      markets: this template deliberately leaves the operator's live x breakpoints untouched.

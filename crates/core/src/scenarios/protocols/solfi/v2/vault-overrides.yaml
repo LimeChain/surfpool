@@ -1,0 +1,48 @@
+protocol: SolFi
+version: v2-vault
+account_type: TokenAccount
+
+raw_layout:
+  account_size: 165
+  magic:
+    offset: 108
+    # Classic SPL Token AccountState::Initialized.
+    bytes: [1]
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+templates:
+  - id: solfi-vault-balance
+    name: Override SolFi Vault Balance
+    description: Change one SolFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+      value: CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+    llm_context: |
+      PRECONDITION - SELECT A VAULT FROM THE MARKET. The base vault is stored at market bytes
+      120..152 and the quote vault at 152..184. Do not apply this to the market or oracle account.
+
+      Apply this to the actual base or quote SPL-token vault referenced by the SolFi market, never to
+      the 1728-byte market itself. The base vault pays quote-to-base swaps; the quote vault pays
+      base-to-quote swaps. Reducing a payout vault far enough makes SolFi reject with error 18.
+
+      Vault balances also enter SolFi's nonlinear inventory policy, so changing the input-side vault
+      can move a quote even though that vault is not paying out. This does not set SolFi's mid-price.
+
+      Do not persist this override across swaps unless undoing transaction-owned balance changes is
+      explicitly intended. A persistent vault override can manufacture or erase inventory after each
+      transaction.
+
+      LOWER FOR STRESS TESTS. A moderate reduction can move nonlinear inventory policy; a severe
+      reduction of the payout vault produces error 18. Raising a wrapped-native vault amount without
+      matching lamports can create an impossible token account, so lowering is the safe default.

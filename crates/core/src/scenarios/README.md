@@ -19,6 +19,9 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
 - **BisonFi v3** – Proprietary market maker (no published IDL, not Anchor), with price, depth, spread and freshness templates. See [protocols/bisonfi/README.md](./protocols/bisonfi/README.md)
+- **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, freshness,
+  directional spread, size-impact and vault-inventory templates. See
+  [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 

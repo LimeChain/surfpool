@@ -24,6 +24,12 @@ pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
 pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+pub const SOLFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/oracle-overrides.yaml");
+pub const SOLFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/market-overrides.yaml");
+pub const SOLFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/vault-overrides.yaml");
 
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
@@ -72,6 +78,7 @@ impl TemplateRegistry {
         default.load_meteora_overrides();
         default.load_kamino_overrides();
         default.load_bisonfi_overrides();
+        default.load_solfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -113,6 +120,12 @@ impl TemplateRegistry {
 
     pub fn load_bisonfi_overrides(&mut self) {
         self.load_protocol_overrides_without_idl(BISONFI_OVERRIDES_CONTENT, "bisonfi");
+    }
+
+    pub fn load_solfi_overrides(&mut self) {
+        self.load_protocol_overrides_without_idl(SOLFI_ORACLE_OVERRIDES_CONTENT, "solfi-oracle");
+        self.load_protocol_overrides_without_idl(SOLFI_MARKET_OVERRIDES_CONTENT, "solfi-market");
+        self.load_protocol_overrides_without_idl(SOLFI_VAULT_OVERRIDES_CONTENT, "solfi-vault");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -406,11 +419,13 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) + Whirlpool(6) + SPL Token (2) + BisonFi (4) = 61 total
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) +
+        // Meteora (2) + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4) +
+        // Whirlpool (6) + SPL Token (2) + BisonFi (4) + SolFi (5) = 66 total.
         assert_eq!(
             registry.count(),
-            61,
-            "Registry should load 61 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -474,6 +489,12 @@ mod tests {
 
         assert!(registry.contains("spl-token-account-balance"));
         assert!(registry.contains("spl-token-mint-supply"));
+
+        assert!(registry.contains("solfi-price"));
+        assert!(registry.contains("solfi-freshness"));
+        assert!(registry.contains("solfi-spread"));
+        assert!(registry.contains("solfi-size-impact"));
+        assert!(registry.contains("solfi-vault-balance"));
     }
 
     #[test]
@@ -595,8 +616,8 @@ mod tests {
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            6,
+            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 2 SolFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1313,5 +1334,42 @@ mod tests {
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn test_every_solfi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "solfi-price",
+            "solfi-freshness",
+            "solfi-spread",
+            "solfi-size-impact",
+            "solfi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing SolFi template {id}"));
+            assert!(template.raw_layout.is_some(), "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6),
+                "{id} needs substantive LLM guidance"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 29, "every shipped SolFi property must be checked");
     }
 }
