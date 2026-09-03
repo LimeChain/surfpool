@@ -112,6 +112,8 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 
 [dev-dependencies]
 ed25519-dalek = "1.0.1"
+# Only the Tessera live suite uses it, to host the CPI wrapper that drives the deployed program.
+solana-program-runtime = "4.1.2"
 libsecp256k1 = "0.7.2"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 test-case = { workspace = true }
