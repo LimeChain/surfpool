@@ -2865,17 +2865,23 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
-        let mut due: Vec<Slot> = self
-            .scheduled_overrides
-            .keys()?
-            .into_iter()
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut due: Vec<Slot> = original_queue
+            .keys()
+            .copied()
             .filter(|slot| *slot <= target_slot)
             .collect();
         due.sort_unstable();
 
+        if due.is_empty() {
+            return Ok(());
+        }
+
+        let mut staged_queue = original_queue.clone();
         let mut overrides = Vec::new();
         for slot in due {
-            if let Some(queued) = self.scheduled_overrides.take(&slot)? {
+            if let Some(queued) = staged_queue.remove(&slot) {
                 if slot != target_slot && !queued.is_empty() {
                     debug!(
                         "Materializing {} override(s) left behind at slot {} at slot {}",
@@ -2887,6 +2893,7 @@ impl SurfnetSvm {
                 overrides.extend(queued);
             }
         }
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)?;
 
         if overrides.is_empty() {
             return Ok(());
@@ -2918,8 +2925,8 @@ impl SurfnetSvm {
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
 
-        // `take` already emptied the slot, so bailing out mid-loop would drop every override that
-        // has not been reached yet. Put the unprocessed tail back before returning the error.
+        // The atomic claim already emptied every due slot, so bailing out mid-loop would drop every
+        // override that has not been reached yet. Put the unprocessed tail back before returning.
         let restore_unprocessed = |svm: &mut Self, from: usize| {
             if let Err(e) = svm
                 .scheduled_overrides
@@ -7930,6 +7937,71 @@ mod tests {
         (surfnet_svm, account_pubkey, instance)
     }
 
+    #[derive(Clone)]
+    struct FailOnceOnScheduledMutation {
+        inner: BTreeMap<Slot, Vec<OverrideInstance>>,
+        mutations: usize,
+        fail_on: usize,
+    }
+
+    impl crate::storage::Storage<Slot, Vec<OverrideInstance>> for FailOnceOnScheduledMutation {
+        fn store(
+            &mut self,
+            key: Slot,
+            value: Vec<OverrideInstance>,
+        ) -> crate::storage::StorageResult<()> {
+            self.mutations += 1;
+            self.inner.insert(key, value);
+            if self.mutations == self.fail_on {
+                Err(crate::storage::StorageError::SqliteNotEnabled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn clear(&mut self) -> crate::storage::StorageResult<()> {
+            self.inner.clear();
+            Ok(())
+        }
+
+        fn get(&self, key: &Slot) -> crate::storage::StorageResult<Option<Vec<OverrideInstance>>> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn take(
+            &mut self,
+            key: &Slot,
+        ) -> crate::storage::StorageResult<Option<Vec<OverrideInstance>>> {
+            self.mutations += 1;
+            let removed = self.inner.remove(key);
+            if self.mutations == self.fail_on {
+                Err(crate::storage::StorageError::SqliteNotEnabled)
+            } else {
+                Ok(removed)
+            }
+        }
+
+        fn keys(&self) -> crate::storage::StorageResult<Vec<Slot>> {
+            Ok(self.inner.keys().copied().collect())
+        }
+
+        fn into_iter(
+            &self,
+        ) -> crate::storage::StorageResult<
+            Box<dyn Iterator<Item = (Slot, Vec<OverrideInstance>)> + '_>,
+        > {
+            Ok(Box::new(self.inner.clone().into_iter()))
+        }
+
+        fn count(&self) -> crate::storage::StorageResult<u64> {
+            Ok(self.inner.len() as u64)
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::storage::Storage<Slot, Vec<OverrideInstance>>> {
+            Box::new(self.clone())
+        }
+    }
+
     #[tokio::test]
     async fn test_persisted_override_is_rescheduled_for_the_next_slot() {
         const SLOT: u64 = 500;
@@ -9323,65 +9395,6 @@ mod tests {
 
     #[test]
     fn test_scheduled_override_queue_rolls_back_after_a_storage_failure() {
-        use crate::storage::{Storage, StorageError, StorageResult};
-
-        #[derive(Clone)]
-        struct FailOnceOnMutation {
-            inner: BTreeMap<Slot, Vec<OverrideInstance>>,
-            mutations: usize,
-            fail_on: usize,
-        }
-
-        impl Storage<Slot, Vec<OverrideInstance>> for FailOnceOnMutation {
-            fn store(&mut self, key: Slot, value: Vec<OverrideInstance>) -> StorageResult<()> {
-                self.mutations += 1;
-                self.inner.insert(key, value);
-                if self.mutations == self.fail_on {
-                    Err(StorageError::SqliteNotEnabled)
-                } else {
-                    Ok(())
-                }
-            }
-
-            fn clear(&mut self) -> StorageResult<()> {
-                self.inner.clear();
-                Ok(())
-            }
-
-            fn get(&self, key: &Slot) -> StorageResult<Option<Vec<OverrideInstance>>> {
-                Ok(self.inner.get(key).cloned())
-            }
-
-            fn take(&mut self, key: &Slot) -> StorageResult<Option<Vec<OverrideInstance>>> {
-                self.mutations += 1;
-                let removed = self.inner.remove(key);
-                if self.mutations == self.fail_on {
-                    Err(StorageError::SqliteNotEnabled)
-                } else {
-                    Ok(removed)
-                }
-            }
-
-            fn keys(&self) -> StorageResult<Vec<Slot>> {
-                Ok(self.inner.keys().copied().collect())
-            }
-
-            fn into_iter(
-                &self,
-            ) -> StorageResult<Box<dyn Iterator<Item = (Slot, Vec<OverrideInstance>)> + '_>>
-            {
-                Ok(Box::new(self.inner.clone().into_iter()))
-            }
-
-            fn count(&self) -> StorageResult<u64> {
-                Ok(self.inner.len() as u64)
-            }
-
-            fn clone_box(&self) -> Box<dyn Storage<Slot, Vec<OverrideInstance>>> {
-                Box::new(self.clone())
-            }
-        }
-
         const SLOT: Slot = 500;
         let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
         let mut continuation = instance.clone();
@@ -9390,7 +9403,7 @@ mod tests {
             (SLOT + 10, vec![continuation.clone()]),
             (SLOT + 11, vec![continuation]),
         ]);
-        svm.scheduled_overrides = Box::new(FailOnceOnMutation {
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
             inner: original.clone(),
             mutations: 0,
             // The authored bucket is stored, the first continuation is deleted, then this failure
@@ -9418,7 +9431,7 @@ mod tests {
             "a failed registration must restore every added and removed bucket"
         );
 
-        svm.scheduled_overrides = Box::new(FailOnceOnMutation {
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
             inner: original.clone(),
             mutations: 0,
             // Both continuations are deleted before the second deletion reports failure.
@@ -9439,6 +9452,49 @@ mod tests {
         assert_eq!(
             after, original,
             "a failed cancellation must restore every removed continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overdue_bucket_claim_rolls_back_after_a_storage_failure() {
+        const FIRST_SLOT: Slot = 500;
+        const SECOND_SLOT: Slot = 501;
+        const TARGET_SLOT: Slot = 510;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        let mut first = instance.clone();
+        first.re_armed = true;
+        let mut second = first.clone();
+        second.id = "second-persisted-override".to_string();
+        let original = BTreeMap::from([(FIRST_SLOT, vec![first]), (SECOND_SLOT, vec![second])]);
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // Both due buckets are removed before the second removal reports failure.
+            fail_on: 2,
+        });
+
+        svm.materialize_overrides_for_slot(&None, TARGET_SLOT)
+            .await
+            .expect_err("the injected second removal must fail the atomic claim");
+
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after claim rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed overdue claim must restore every due bucket"
+        );
+        let account = svm
+            .get_account(&account_pubkey)
+            .expect("read fixture account")
+            .expect("fixture account exists");
+        assert_eq!(
+            &account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16],
+            &[0; 16],
+            "no claimed override may be materialized after an atomic claim failure"
         );
     }
 
