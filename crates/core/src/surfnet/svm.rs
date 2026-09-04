@@ -2928,10 +2928,17 @@ impl SurfnetSvm {
         // The atomic claim already emptied every due slot, so bailing out mid-loop would drop every
         // override that has not been reached yet. Put the unprocessed tail back before returning.
         let restore_unprocessed = |svm: &mut Self, from: usize| {
-            if let Err(e) = svm
-                .scheduled_overrides
-                .store(target_slot, overrides[from..].to_vec())
-            {
+            let restore = (|| -> SurfpoolResult<()> {
+                let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+                    svm.scheduled_overrides.into_iter()?.collect();
+                let mut staged_queue = original_queue.clone();
+                staged_queue
+                    .entry(target_slot)
+                    .or_default()
+                    .extend_from_slice(&overrides[from..]);
+                svm.commit_scheduled_override_plan(&original_queue, &staged_queue)
+            })();
+            if let Err(e) = restore {
                 error!(
                     "Failed to restore {} unprocessed override(s) for slot {}: {}",
                     overrides.len() - from,
@@ -3100,19 +3107,12 @@ impl SurfnetSvm {
                 later.enabled && !later.re_armed && same_override_target(later, override_instance)
             });
 
-            if override_instance.persist.is_enabled() && !superseded_later {
-                let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && fetch_retired {
-                    requeued.fetch_before_use = false;
-                }
-                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
-                    restore_unprocessed(self, index);
-                    return Err(e);
-                }
-            }
-
             // Apply the override values to the account data
-            if !override_instance.values.is_empty() {
+            'apply_override: {
+                if override_instance.values.is_empty() {
+                    break 'apply_override;
+                }
+
                 // Filter out values that are only used for PDA derivation (not account data)
                 let pda_refs = override_instance.account.get_pda_seed_references();
                 let account_values: HashMap<String, serde_json::Value> = override_instance
@@ -3127,7 +3127,7 @@ impl SurfnetSvm {
                         "Override {} has no account data modifications (all values are PDA seeds)",
                         override_instance.id
                     );
-                    continue;
+                    break 'apply_override;
                 }
 
                 debug!(
@@ -3144,7 +3144,7 @@ impl SurfnetSvm {
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
                     );
-                    continue;
+                    break 'apply_override;
                 };
 
                 // Programs with no usable IDL carry a byte layout instead, and this MUST come
@@ -3188,14 +3188,23 @@ impl SurfnetSvm {
                             override_instance.id, account_pubkey, e
                         ),
                     }
-                    continue;
+                    break 'apply_override;
                 }
 
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                restore_unprocessed(self, index);
+                                return Err(e);
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3203,8 +3212,11 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.inner.set_account(account_pubkey, modified_account)?;
-                        continue;
+                        if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
+                        break 'apply_override;
                     }
                 }
 
@@ -3219,14 +3231,14 @@ impl SurfnetSvm {
                             "No IDL registered for program {} (owner of account {}), skipping override {}",
                             owner_program_id, account_pubkey, override_instance.id
                         );
-                        continue;
+                        break 'apply_override;
                     }
                     Err(e) => {
                         warn!(
                             "Failed to get IDL for program {}: {}, skipping override {}",
                             owner_program_id, e, override_instance.id
                         );
-                        continue;
+                        break 'apply_override;
                     }
                 };
 
@@ -3236,7 +3248,7 @@ impl SurfnetSvm {
                         "IDL versions empty for program {}, skipping override {}",
                         owner_program_id, override_instance.id
                     );
-                    continue;
+                    break 'apply_override;
                 };
 
                 let idl = &versioned_idl.1;
@@ -3253,7 +3265,7 @@ impl SurfnetSvm {
                         account_data.len(),
                         override_instance.id
                     );
-                    continue;
+                    break 'apply_override;
                 }
 
                 // Use get_forged_account_data to apply the overrides (with PDA refs filtered out)
@@ -3270,7 +3282,7 @@ impl SurfnetSvm {
                             If the account doesn't exist locally, enable fetchBeforeUse: true.",
                             account_pubkey, override_instance.id, e
                         );
-                        continue;
+                        break 'apply_override;
                     }
                 };
 
@@ -3297,6 +3309,20 @@ impl SurfnetSvm {
                         override_instance.id
                     );
                     settled_this_slot.insert(account_pubkey);
+                }
+            }
+
+            // Only queue the continuation after this application attempt has completed. A hard
+            // failure above restores the current and remaining entries without leaving a future
+            // continuation for work that never applied.
+            if override_instance.persist.is_enabled() && !superseded_later {
+                let mut requeued = override_instance.clone();
+                if requeued.fetch_before_use && fetch_retired {
+                    requeued.fetch_before_use = false;
+                }
+                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                    restore_unprocessed(self, index);
+                    return Err(e);
                 }
             }
         }
@@ -3330,10 +3356,10 @@ impl SurfnetSvm {
         instance.re_armed = true;
         let instance = &instance;
 
-        let mut next = self
-            .scheduled_overrides
-            .get(&next_slot)?
-            .unwrap_or_default();
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
+        let next = staged_queue.entry(next_slot).or_default();
 
         let same_override = |queued: &OverrideInstance| same_override_target(queued, instance);
 
@@ -3359,8 +3385,7 @@ impl SurfnetSvm {
             }
             None => next.push(instance.clone()),
         }
-        self.scheduled_overrides.store(next_slot, next)?;
-        Ok(())
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -9499,6 +9524,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_persisted_token_forge_failure_restores_current_without_continuation() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let account_pubkey = Pubkey::new_unique();
+        let (_token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
+        svm.inner
+            .set_account(account_pubkey, account)
+            .expect("set token account");
+
+        let mut instance = OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!("not-a-u64"),
+        )]));
+        instance.persist = surfpool_types::Persist::Always(true);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule persisted token override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect_err("invalid token amount must fail materialization");
+
+        assert_eq!(
+            svm.scheduled_overrides.get(&SLOT).expect("read current"),
+            Some(vec![instance]),
+            "the failed current entry must be restored"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .is_none(),
+            "a failed application must not leave a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_rearm_failure_restores_current_without_continuation() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: BTreeMap::from([(SLOT, vec![instance.clone()])]),
+            mutations: 0,
+            // Claiming the current slot succeeds. Storing its continuation mutates and then fails.
+            fail_on: 2,
+        });
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect_err("the injected continuation write must fail");
+
+        assert_eq!(
+            svm.scheduled_overrides.get(&SLOT).expect("read current"),
+            Some(vec![instance]),
+            "the current entry must be restored after a failed re-arm"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .is_none(),
+            "a failed re-arm must roll back a continuation even if storage mutated before erroring"
+        );
+    }
+
+    #[tokio::test]
     async fn test_failed_read_does_not_overwrite_the_next_slots_overrides() {
         use crate::storage::{Storage, StorageError, StorageResult};
 
@@ -9543,7 +9641,7 @@ mod tests {
             ) -> StorageResult<
                 Box<dyn Iterator<Item = (u64, Vec<surfpool_types::OverrideInstance>)> + '_>,
             > {
-                Ok(Box::new(self.inner.iter().map(|(k, v)| (*k, v.clone()))))
+                Err(StorageError::SqliteNotEnabled)
             }
             fn count(&self) -> StorageResult<u64> {
                 Ok(self.inner.len() as u64)
