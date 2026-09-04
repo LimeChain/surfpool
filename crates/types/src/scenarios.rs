@@ -493,6 +493,42 @@ impl OverrideTemplate {
     }
 }
 
+/// How long an override keeps re-applying itself.
+///
+/// persist: false          // apply once (default)
+/// persist: true           // re-apply every following slot, indefinitely
+/// persist: { slots: 10 }  // apply in 10 slots in total, counting the first
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+pub enum Persist {
+    Always(bool),
+    Slots { slots: Slot },
+}
+
+impl Default for Persist {
+    fn default() -> Self {
+        Persist::Always(false)
+    }
+}
+
+impl Persist {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Persist::Always(false))
+    }
+
+    pub fn next_arming(&self) -> Option<Self> {
+        match self {
+            Persist::Always(false) => None,
+            Persist::Always(true) => Some(Persist::Always(true)),
+            Persist::Slots { slots } => match slots.checked_sub(1) {
+                None | Some(0) => None,
+                Some(remaining) => Some(Persist::Slots { slots: remaining }),
+            },
+        }
+    }
+}
+
 /// A concrete instance of an override template with specific values
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -532,18 +568,28 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
-    /// Whether to re-apply this override on every subsequent slot, rather than only once
+    /// How long to keep re-applying this override: `false` applies it once, `true` re-applies it
+    /// on every following slot, and `{ slots: N }` applies it N times in total, counting the first
     #[schemars(
-        description = "If true, re-applies this override every following slot. Use only for values no transaction writes: it reverts transaction writes to the same fields."
+        description = "false applies once; true re-applies every following slot; {\"slots\": N} re-applies until N applications have happened, counting the first. Use only for values no transaction writes: re-applying reverts transaction writes to the same fields."
     )]
     #[serde(default)]
-    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
-    pub persist: bool,
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(type = "boolean | { slots: number | bigint }", optional)
+    )]
+    pub persist: Persist,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
     )]
     pub account: AccountAddress,
+    /// Set by the scheduler, not by callers: marks a copy this override queued for itself to
+    /// continue persisting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(skip)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub re_armed: bool,
 }
 
 impl OverrideInstance {
@@ -556,8 +602,9 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
-            persist: false,
+            persist: Persist::default(),
             account,
+            re_armed: false,
         }
     }
 
@@ -572,7 +619,12 @@ impl OverrideInstance {
     }
 
     pub fn with_persist(mut self, persist: bool) -> Self {
-        self.persist = persist;
+        self.persist = Persist::Always(persist);
+        self
+    }
+
+    pub fn with_persist_for_slots(mut self, slots: Slot) -> Self {
+        self.persist = Persist::Slots { slots };
         self
     }
 }
@@ -1605,6 +1657,57 @@ mod tests {
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn persist_accepts_the_legacy_boolean_and_the_bounded_forms() {
+        use super::Persist;
+
+        let cases = [
+            ("false", Persist::Always(false)),
+            ("true", Persist::Always(true)),
+            (r#"{"slots":10}"#, Persist::Slots { slots: 10 }),
+            (r#"{"slots":1}"#, Persist::Slots { slots: 1 }),
+        ];
+
+        for (json, expected) in cases {
+            let parsed: Persist = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{json} should deserialize: {e}"));
+            assert_eq!(parsed, expected, "{json} deserialized wrongly");
+        }
+
+        assert_eq!(
+            serde_json::to_string(&Persist::Always(true)).expect("serialize"),
+            "true"
+        );
+    }
+
+    /// The window is a bound, not a countdown, and resolving is idempotent.
+    #[test]
+    fn persist_window_resolves_to_an_absolute_end_and_stops_there() {
+        use super::Persist;
+
+        // A window counts down one slot per re-arm and then stops.
+        assert_eq!(
+            Persist::Slots { slots: 3 }.next_arming(),
+            Some(Persist::Slots { slots: 2 })
+        );
+        assert_eq!(
+            Persist::Slots { slots: 1 }.next_arming(),
+            None,
+            "the last slot of the window must not re-arm"
+        );
+        assert_eq!(Persist::Slots { slots: 0 }.next_arming(), None);
+
+        assert_eq!(Persist::Always(false).next_arming(), None);
+        assert_eq!(
+            Persist::Always(true).next_arming(),
+            Some(Persist::Always(true)),
+            "an indefinite persist never runs out"
+        );
+
+        assert!(!Persist::Always(false).is_enabled());
+        assert!(Persist::Always(true).is_enabled());
     }
 
     #[test]

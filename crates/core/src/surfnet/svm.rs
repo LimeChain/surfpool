@@ -545,6 +545,23 @@ pub struct SurfnetSvm {
     storage_backend: StorageBackend,
 }
 
+/// Whether two scheduled entries describe the same logical override on the same concrete account.
+fn same_override_target(left: &OverrideInstance, right: &OverrideInstance) -> bool {
+    if left.id != right.id || left.template_id != right.template_id {
+        return false;
+    }
+
+    match (
+        left.account.resolve(Some(&left.values)),
+        right.account.resolve(Some(&right.values)),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        // An entry whose target cannot be resolved will be skipped during materialization. Do not
+        // let it suppress or replace another entry merely because their recipes look alike.
+        _ => false,
+    }
+}
+
 /// Add `pubkey_str` to the pubkey-list at `key`, creating the entry when absent
 /// and deduplicating on insert. The shared-pubkey indexes (`accounts_by_owner`,
 /// `token_accounts_by_owner`, `token_accounts_by_mint`,
@@ -2848,11 +2865,57 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
-        // Remove and get overrides for this slot
-        let Some(overrides) = self.scheduled_overrides.take(&target_slot)? else {
-            // No overrides for this slot
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut due: Vec<Slot> = original_queue
+            .keys()
+            .copied()
+            .filter(|slot| *slot <= target_slot)
+            .collect();
+        due.sort_unstable();
+
+        if due.is_empty() {
             return Ok(());
-        };
+        }
+
+        let mut staged_queue = original_queue.clone();
+        let mut overrides = Vec::new();
+        for slot in due {
+            if let Some(queued) = staged_queue.remove(&slot) {
+                if slot != target_slot && !queued.is_empty() {
+                    debug!(
+                        "Materializing {} override(s) left behind at slot {} at slot {}",
+                        queued.len(),
+                        slot,
+                        target_slot
+                    );
+                }
+                overrides.extend(queued);
+            }
+        }
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)?;
+
+        if overrides.is_empty() {
+            return Ok(());
+        }
+
+        let mut deduped: Vec<OverrideInstance> = Vec::with_capacity(overrides.len());
+        for instance in overrides.into_iter().rev() {
+            if instance.re_armed
+                && deduped
+                    .iter()
+                    .any(|kept| kept.re_armed && same_override_target(kept, &instance))
+            {
+                debug!(
+                    "Dropping a superseded continuation of override {} claimed from an earlier slot",
+                    instance.id
+                );
+                continue;
+            }
+            deduped.push(instance);
+        }
+        deduped.reverse();
+        let overrides = deduped;
 
         debug!(
             "Materializing {} override(s) for slot {}",
@@ -2862,13 +2925,20 @@ impl SurfnetSvm {
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
 
-        // `take` already emptied the slot, so bailing out mid-loop would drop every override that
-        // has not been reached yet. Put the unprocessed tail back before returning the error.
+        // The atomic claim already emptied every due slot, so bailing out mid-loop would drop every
+        // override that has not been reached yet. Put the unprocessed tail back before returning.
         let restore_unprocessed = |svm: &mut Self, from: usize| {
-            if let Err(e) = svm
-                .scheduled_overrides
-                .store(target_slot, overrides[from..].to_vec())
-            {
+            let restore = (|| -> SurfpoolResult<()> {
+                let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+                    svm.scheduled_overrides.into_iter()?.collect();
+                let mut staged_queue = original_queue.clone();
+                staged_queue
+                    .entry(target_slot)
+                    .or_default()
+                    .extend_from_slice(&overrides[from..]);
+                svm.commit_scheduled_override_plan(&original_queue, &staged_queue)
+            })();
+            if let Err(e) = restore {
                 error!(
                     "Failed to restore {} unprocessed override(s) for slot {}: {}",
                     overrides.len() - from,
@@ -2883,6 +2953,12 @@ impl SurfnetSvm {
                 debug!("Skipping disabled override: {}", override_instance.id);
                 continue;
             }
+
+            // A later authored entry replaces this value regardless of whether the current account
+            // can be resolved or written. Do not let a retry outlive that explicit transition.
+            let superseded_later = overrides[index + 1..].iter().any(|later| {
+                later.enabled && !later.re_armed && same_override_target(later, override_instance)
+            });
 
             // Resolve account address using the centralized method
             let account_pubkey = match override_instance
@@ -2906,6 +2982,16 @@ impl SurfnetSvm {
                         "Failed to resolve account address for override {}",
                         override_instance.id
                     );
+                    if override_instance.persist.is_enabled() && !superseded_later {
+                        if let Err(e) = self.reschedule_override_for_next_slot(
+                            override_instance,
+                            target_slot,
+                            false,
+                        ) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
+                    }
                     continue;
                 }
             };
@@ -3029,19 +3115,19 @@ impl SurfnetSvm {
                 FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
             };
 
-            if override_instance.persist {
-                let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && fetch_retired {
-                    requeued.fetch_before_use = false;
-                }
-                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
-                    restore_unprocessed(self, index);
-                    return Err(e);
-                }
-            }
+            // A bounded window counts successful applications, not scheduler attempts. No-value
+            // and PDA-seed-only overrides are successful no-ops only when their target exists;
+            // every path that expected an account write but could not complete it marks the attempt
+            // for a non-consuming retry.
+            let mut application_succeeded = true;
 
             // Apply the override values to the account data
-            if !override_instance.values.is_empty() {
+            'apply_override: {
+                if override_instance.values.is_empty() {
+                    application_succeeded = existing_account.is_some();
+                    break 'apply_override;
+                }
+
                 // Filter out values that are only used for PDA derivation (not account data)
                 let pda_refs = override_instance.account.get_pda_seed_references();
                 let account_values: HashMap<String, serde_json::Value> = override_instance
@@ -3056,7 +3142,8 @@ impl SurfnetSvm {
                         "Override {} has no account data modifications (all values are PDA seeds)",
                         override_instance.id
                     );
-                    continue;
+                    application_succeeded = existing_account.is_some();
+                    break 'apply_override;
                 }
 
                 debug!(
@@ -3073,7 +3160,8 @@ impl SurfnetSvm {
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
                     );
-                    continue;
+                    application_succeeded = false;
+                    break 'apply_override;
                 };
 
                 // Programs with no usable IDL carry a byte layout instead, and this MUST come
@@ -3102,6 +3190,7 @@ impl SurfnetSvm {
                             };
                             if let Err(e) = self.inner.set_account(account_pubkey, modified) {
                                 warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                                application_succeeded = false;
                             } else {
                                 debug!(
                                     "Raw-layout override {} applied {} field(s) to {}",
@@ -3112,19 +3201,31 @@ impl SurfnetSvm {
                                 settled_this_slot.insert(account_pubkey);
                             }
                         }
-                        Err(e) => warn!(
-                            "Raw-layout override {} failed on {}: {}",
-                            override_instance.id, account_pubkey, e
-                        ),
+                        Err(e) => {
+                            warn!(
+                                "Raw-layout override {} failed on {}: {}",
+                                override_instance.id, account_pubkey, e
+                            );
+                            application_succeeded = false;
+                        }
                     }
-                    continue;
+                    break 'apply_override;
                 }
 
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                restore_unprocessed(self, index);
+                                return Err(e);
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3132,8 +3233,11 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.inner.set_account(account_pubkey, modified_account)?;
-                        continue;
+                        if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
+                        break 'apply_override;
                     }
                 }
 
@@ -3148,14 +3252,16 @@ impl SurfnetSvm {
                             "No IDL registered for program {} (owner of account {}), skipping override {}",
                             owner_program_id, account_pubkey, override_instance.id
                         );
-                        continue;
+                        application_succeeded = false;
+                        break 'apply_override;
                     }
                     Err(e) => {
                         warn!(
                             "Failed to get IDL for program {}: {}, skipping override {}",
                             owner_program_id, e, override_instance.id
                         );
-                        continue;
+                        application_succeeded = false;
+                        break 'apply_override;
                     }
                 };
 
@@ -3165,7 +3271,8 @@ impl SurfnetSvm {
                         "IDL versions empty for program {}, skipping override {}",
                         owner_program_id, override_instance.id
                     );
-                    continue;
+                    application_succeeded = false;
+                    break 'apply_override;
                 };
 
                 let idl = &versioned_idl.1;
@@ -3182,7 +3289,8 @@ impl SurfnetSvm {
                         account_data.len(),
                         override_instance.id
                     );
-                    continue;
+                    application_succeeded = false;
+                    break 'apply_override;
                 }
 
                 // Use get_forged_account_data to apply the overrides (with PDA refs filtered out)
@@ -3199,7 +3307,8 @@ impl SurfnetSvm {
                             If the account doesn't exist locally, enable fetchBeforeUse: true.",
                             account_pubkey, override_instance.id, e
                         );
-                        continue;
+                        application_succeeded = false;
+                        break 'apply_override;
                     }
                 };
 
@@ -3218,6 +3327,7 @@ impl SurfnetSvm {
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
                     );
+                    application_succeeded = false;
                 } else {
                     debug!(
                         "Successfully applied {} override(s) to account {} (override {})",
@@ -3226,6 +3336,24 @@ impl SurfnetSvm {
                         override_instance.id
                     );
                     settled_this_slot.insert(account_pubkey);
+                }
+            }
+
+            // Only queue the continuation after this application attempt has completed. A hard
+            // failure above restores the current and remaining entries without leaving a future
+            // continuation for work that never applied.
+            if override_instance.persist.is_enabled() && !superseded_later {
+                let mut requeued = override_instance.clone();
+                if requeued.fetch_before_use && fetch_retired {
+                    requeued.fetch_before_use = false;
+                }
+                if let Err(e) = self.reschedule_override_for_next_slot(
+                    &requeued,
+                    target_slot,
+                    application_succeeded,
+                ) {
+                    restore_unprocessed(self, index);
+                    return Err(e);
                 }
             }
         }
@@ -3239,29 +3367,67 @@ impl SurfnetSvm {
         &mut self,
         instance: &OverrideInstance,
         target_slot: Slot,
+        application_succeeded: bool,
     ) -> SurfpoolResult<()> {
+        let next_persist = match (&instance.persist, application_succeeded) {
+            (surfpool_types::Persist::Always(false), _) => None,
+            (surfpool_types::Persist::Always(true), _) => {
+                Some(surfpool_types::Persist::Always(true))
+            }
+            (surfpool_types::Persist::Slots { slots: 0 }, _) => None,
+            (surfpool_types::Persist::Slots { .. }, true) => instance.persist.next_arming(),
+            (surfpool_types::Persist::Slots { slots }, false) => {
+                Some(surfpool_types::Persist::Slots { slots: *slots })
+            }
+        };
+        let Some(next_persist) = next_persist else {
+            debug!(
+                "Override {} has reached the end of its persist window at slot {}",
+                instance.id, target_slot
+            );
+            return Ok(());
+        };
         let next_slot = target_slot.checked_add(1).ok_or_else(|| {
             SurfpoolError::internal(format!(
                 "Override {} cannot persist past slot {}: there is no next slot",
                 instance.id, target_slot
             ))
         })?;
-        let mut next = self
-            .scheduled_overrides
-            .get(&next_slot)?
-            .unwrap_or_default();
+        let mut instance = instance.clone();
+        instance.persist = next_persist;
+        instance.re_armed = true;
+        let instance = &instance;
 
-        if let Some(existing) = next.iter_mut().find(|queued| {
-            queued.id == instance.id
-                && queued.account == instance.account
-                && queued.template_id == instance.template_id
-        }) {
-            *existing = instance.clone();
-        } else {
-            next.push(instance.clone());
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
+        let next = staged_queue.entry(next_slot).or_default();
+
+        let same_override = |queued: &OverrideInstance| same_override_target(queued, instance);
+
+        match next
+            .iter()
+            .position(|queued| queued.re_armed && same_override(queued))
+        {
+            // Replace our own previous continuation, so one slot never holds two.
+            Some(index) => next[index] = instance.clone(),
+            None if next
+                .iter()
+                .any(|queued| queued.enabled && same_override(queued)) =>
+            {
+                // The operator has scheduled this override for that slot themselves. Theirs is the
+                // newer instruction and carries its own `persist`, so a continuation would only
+                // overwrite it with the values being carried forward - which is the transition they
+                // asked for, undone. Appending would do the same, just later in the slot.
+                debug!(
+                    "Override {} is already scheduled for slot {}, so no continuation is queued",
+                    instance.id, next_slot
+                );
+                return Ok(());
+            }
+            None => next.push(instance.clone()),
         }
-        self.scheduled_overrides.store(next_slot, next)?;
-        Ok(())
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -4549,8 +4715,24 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Validate and resolve every override before touching storage, so a scenario that is
+        // rejected leaves nothing behind: the RPC returns an error and the caller can assume none
+        // of it was scheduled.
+        let mut planned: Vec<(Slot, surfpool_types::OverrideInstance)> =
+            Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
+            if matches!(
+                override_instance.persist,
+                surfpool_types::Persist::Slots { slots: 0 }
+            ) {
+                return Err(SurfpoolError::internal(format!(
+                    "Override {} sets persist.slots to 0, which asks for zero applications. An \
+                     override always applies on the slot it is scheduled for, so use \
+                     persist: false for a single application, or slots >= 1 for a window.",
+                    override_instance.id
+                )));
+            }
+
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
             let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
@@ -4560,21 +4742,145 @@ impl SurfnetSvm {
                 ))
             })?;
 
+            // Scheduler bookkeeping, never a caller input: it is hidden from the schema and the
+            // bindings but still deserializes, and a caller who set it would have their own entry
+            // swept as though the scheduler had queued it.
+            let mut override_instance = override_instance;
+            override_instance.re_armed = false;
+
+            planned.push((absolute_slot, override_instance));
+        }
+
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
+
+        // Schedule overrides by adding base slot to their scenario-relative slots.
+        for (absolute_slot, override_instance) in planned {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
+
+            if override_instance.enabled {
+                for queued in staged_queue
+                    .range_mut(absolute_slot..)
+                    .map(|(_, queued)| queued)
+                {
+                    queued.retain(|other| {
+                        !(other.re_armed && same_override_target(other, &override_instance))
+                    });
+                }
+                staged_queue.retain(|_, queued| !queued.is_empty());
+            }
+
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
                 absolute_slot, base_slot, scenario_relative_slot
             );
 
-            let mut slot_overrides = self
-                .scheduled_overrides
-                .get(&absolute_slot)?
-                .unwrap_or_default();
-            slot_overrides.push(override_instance);
-            self.scheduled_overrides
-                .store(absolute_slot, slot_overrides)?;
+            let slot_overrides = staged_queue.entry(absolute_slot).or_default();
+
+            if let Some(existing) = slot_overrides.iter_mut().find(|queued| {
+                same_override_target(queued, &override_instance)
+                    && (override_instance.enabled || !queued.re_armed)
+            }) {
+                debug!(
+                    "Replacing already-scheduled override {} at slot {}",
+                    override_instance.id, absolute_slot
+                );
+                *existing = override_instance;
+            } else {
+                slot_overrides.push(override_instance);
+            }
+        }
+
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)
+    }
+
+    /// Commits a staged scheduled-override queue and restores every attempted bucket if any
+    /// storage operation fails. The failed bucket is included in rollback because a storage
+    /// implementation is not required to guarantee that an error happened before mutation.
+    fn commit_scheduled_override_plan(
+        &mut self,
+        original: &BTreeMap<Slot, Vec<OverrideInstance>>,
+        staged: &BTreeMap<Slot, Vec<OverrideInstance>>,
+    ) -> SurfpoolResult<()> {
+        let mut changed_slots: Vec<Slot> = original.keys().chain(staged.keys()).copied().collect();
+        changed_slots.sort_unstable();
+        changed_slots.dedup();
+        changed_slots.retain(|slot| original.get(slot) != staged.get(slot));
+
+        let mut attempted = Vec::with_capacity(changed_slots.len());
+        for slot in changed_slots {
+            attempted.push(slot);
+            let commit = match staged.get(&slot) {
+                Some(queued) => self.scheduled_overrides.store(slot, queued.clone()),
+                None => self.scheduled_overrides.take(&slot).map(|_| ()),
+            };
+            let Err(commit_error) = commit else {
+                continue;
+            };
+
+            let mut rollback_errors = Vec::new();
+            for rollback_slot in attempted.into_iter().rev() {
+                let rollback = match original.get(&rollback_slot) {
+                    Some(queued) => self
+                        .scheduled_overrides
+                        .store(rollback_slot, queued.clone()),
+                    None => self.scheduled_overrides.take(&rollback_slot).map(|_| ()),
+                };
+                if let Err(error) = rollback {
+                    rollback_errors.push(format!("slot {rollback_slot}: {error}"));
+                }
+            }
+
+            if rollback_errors.is_empty() {
+                return Err(commit_error.into());
+            }
+
+            return Err(SurfpoolError::internal(format!(
+                "Failed to commit scheduled overrides ({commit_error}); rollback also failed for {}",
+                rollback_errors.join(", ")
+            )));
         }
 
         Ok(())
+    }
+
+    /// Stops scheduler-generated continuations of an override without applying it again.
+    ///
+    /// Authored timeline entries are deliberately preserved, even when they enable persistence:
+    /// they are future instructions, not copies of the currently active value.
+    pub fn stop_persisting_override(
+        &mut self,
+        id: &str,
+        account: &surfpool_types::AccountAddress,
+        template_id: &str,
+        values: Option<&HashMap<String, serde_json::Value>>,
+    ) -> SurfpoolResult<usize> {
+        let target_account = account.resolve(values).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Cannot stop persisted override {id}: its account address cannot be resolved. \
+                 Supply the property-reference values used by the PDA, or pass the resolved pubkey."
+            ))
+        })?;
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
+        let mut removed = 0;
+
+        for queued in staged_queue.values_mut() {
+            let before = queued.len();
+            queued.retain(|other| {
+                !(other.re_armed
+                    && other.id == id
+                    && other.template_id == template_id
+                    && other.account.resolve(Some(&other.values)) == Some(target_account))
+            });
+            removed += before - queued.len();
+        }
+        staged_queue.retain(|_, queued| !queued.is_empty());
+
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)?;
+        Ok(removed)
     }
 }
 
@@ -7693,9 +7999,74 @@ mod tests {
             "unhealthy_borrow_value_sf".to_string(),
             serde_json::json!(1_234u64),
         )]));
-        instance.persist = persist;
+        instance.persist = surfpool_types::Persist::Always(persist);
 
         (surfnet_svm, account_pubkey, instance)
+    }
+
+    #[derive(Clone)]
+    struct FailOnceOnScheduledMutation {
+        inner: BTreeMap<Slot, Vec<OverrideInstance>>,
+        mutations: usize,
+        fail_on: usize,
+    }
+
+    impl crate::storage::Storage<Slot, Vec<OverrideInstance>> for FailOnceOnScheduledMutation {
+        fn store(
+            &mut self,
+            key: Slot,
+            value: Vec<OverrideInstance>,
+        ) -> crate::storage::StorageResult<()> {
+            self.mutations += 1;
+            self.inner.insert(key, value);
+            if self.mutations == self.fail_on {
+                Err(crate::storage::StorageError::SqliteNotEnabled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn clear(&mut self) -> crate::storage::StorageResult<()> {
+            self.inner.clear();
+            Ok(())
+        }
+
+        fn get(&self, key: &Slot) -> crate::storage::StorageResult<Option<Vec<OverrideInstance>>> {
+            Ok(self.inner.get(key).cloned())
+        }
+
+        fn take(
+            &mut self,
+            key: &Slot,
+        ) -> crate::storage::StorageResult<Option<Vec<OverrideInstance>>> {
+            self.mutations += 1;
+            let removed = self.inner.remove(key);
+            if self.mutations == self.fail_on {
+                Err(crate::storage::StorageError::SqliteNotEnabled)
+            } else {
+                Ok(removed)
+            }
+        }
+
+        fn keys(&self) -> crate::storage::StorageResult<Vec<Slot>> {
+            Ok(self.inner.keys().copied().collect())
+        }
+
+        fn into_iter(
+            &self,
+        ) -> crate::storage::StorageResult<
+            Box<dyn Iterator<Item = (Slot, Vec<OverrideInstance>)> + '_>,
+        > {
+            Ok(Box::new(self.inner.clone().into_iter()))
+        }
+
+        fn count(&self) -> crate::storage::StorageResult<u64> {
+            Ok(self.inner.len() as u64)
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::storage::Storage<Slot, Vec<OverrideInstance>>> {
+            Box::new(self.clone())
+        }
     }
 
     #[tokio::test]
@@ -7735,7 +8106,10 @@ mod tests {
             "exactly one override queued for the next slot"
         );
         assert_eq!(next[0].id, instance_id);
-        assert!(next[0].persist, "persist flag must survive rescheduling");
+        assert!(
+            next[0].persist.is_enabled(),
+            "persist flag must survive rescheduling"
+        );
 
         assert!(
             svm.scheduled_overrides
@@ -7766,7 +8140,10 @@ mod tests {
             .expect("storage read")
             .expect("next slot should have queued overrides");
         assert_eq!(next.len(), 1, "one entry per override id");
-        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            next[0].persist.is_enabled(),
+            "persist must survive rescheduling"
+        );
         assert!(
             !next[0].fetch_before_use,
             "the account is forked, so later slots must not re-fetch it and discard local writes"
@@ -7813,11 +8190,11 @@ mod tests {
             0,
             surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
         );
-        no_values.persist = true;
+        no_values.persist = surfpool_types::Persist::Always(true);
         no_values.fetch_before_use = true;
 
         let mut seed_only = seed_only;
-        seed_only.persist = true;
+        seed_only.persist = surfpool_types::Persist::Always(true);
         seed_only.fetch_before_use = true;
 
         svm.scheduled_overrides
@@ -7835,7 +8212,10 @@ mod tests {
             .expect("next slot should have queued overrides");
         assert_eq!(next.len(), 2, "both overrides re-armed, one entry each");
         for queued in &next {
-            assert!(queued.persist, "persist must survive rescheduling");
+            assert!(
+                queued.persist.is_enabled(),
+                "persist must survive rescheduling"
+            );
             assert!(
                 !queued.fetch_before_use,
                 "override {} forked its account, so later slots must not re-fetch it",
@@ -7867,7 +8247,7 @@ mod tests {
             "unhealthy_borrow_value_sf".to_string(),
             serde_json::json!(1_234u64),
         )]));
-        absent.persist = true;
+        absent.persist = surfpool_types::Persist::Always(true);
         absent.fetch_before_use = true;
 
         svm.scheduled_overrides
@@ -7941,7 +8321,7 @@ mod tests {
             "unhealthy_borrow_value_sf".to_string(),
             serde_json::json!(1_234u64),
         )]));
-        absent.persist = true;
+        absent.persist = surfpool_types::Persist::Always(true);
         absent.fetch_before_use = true;
 
         svm.scheduled_overrides
@@ -7969,9 +8349,19 @@ mod tests {
         let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
 
         assert!(
-            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+            svm.reschedule_override_for_next_slot(&instance, u64::MAX, true)
                 .is_err(),
             "there is no slot after u64::MAX"
+        );
+
+        let mut final_bounded = instance.clone();
+        final_bounded.persist = surfpool_types::Persist::Slots { slots: 1 };
+        svm.reschedule_override_for_next_slot(&final_bounded, u64::MAX, true)
+            .expect("a successful final application needs no slot after u64::MAX");
+        assert!(
+            svm.reschedule_override_for_next_slot(&final_bounded, u64::MAX, false)
+                .is_err(),
+            "a failed final application still needs a retry slot and must report overflow"
         );
 
         let mut far = surfpool_types::OverrideInstance::new(
@@ -8023,7 +8413,10 @@ mod tests {
             .expect("storage read")
             .expect("next slot should have queued overrides");
         assert_eq!(next.len(), 1, "one entry per override id");
-        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            next[0].persist.is_enabled(),
+            "persist must survive rescheduling"
+        );
         assert!(
             next[0].fetch_before_use,
             "the fetch failed, so the next slot must retry it instead of pinning stale data"
@@ -8098,16 +8491,16 @@ mod tests {
         );
         // The collision this guards against: a hand-written scenario reusing a plain id.
         first.id = "ov-1".to_string();
-        first.persist = true;
+        first.persist = surfpool_types::Persist::Always(true);
 
         let mut second = first.clone();
         second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(&first, SLOT, true)
             .expect("reschedule");
         surfnet_svm
-            .reschedule_override_for_next_slot(&second, SLOT)
+            .reschedule_override_for_next_slot(&second, SLOT, true)
             .expect("reschedule");
 
         let queued = surfnet_svm
@@ -8123,7 +8516,7 @@ mod tests {
         );
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(&first, SLOT, true)
             .expect("reschedule");
         let queued = surfnet_svm
             .scheduled_overrides
@@ -8135,6 +8528,1333 @@ mod tests {
             2,
             "re-arming an override must replace its own queued copy, not append a duplicate"
         );
+    }
+
+    /// Structurally identical PDA recipes can still identify different accounts when their seeds
+    /// come from override values.
+    #[tokio::test]
+    async fn test_overdue_pda_overrides_compare_resolved_accounts() {
+        const SLOT: u64 = 500;
+        const LATER_SLOT: u64 = SLOT + 5;
+
+        let (mut svm, fixture_pubkey, mut first) = scheduled_persist_fixture(true);
+        let fixture_account = svm
+            .inner
+            .get_account(&fixture_pubkey)
+            .expect("get fixture account")
+            .expect("fixture account present");
+
+        let program_id = Pubkey::new_unique();
+        let recipe = surfpool_types::AccountAddress::Pda {
+            program_id: program_id.to_string(),
+            seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+        };
+
+        first.id = "shared-pda-id".to_string();
+        first.account = recipe.clone();
+        first.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("first-market".to_string()),
+        );
+        let first_pubkey = first
+            .account
+            .resolve(Some(&first.values))
+            .expect("derive first PDA");
+
+        let mut later = first.clone();
+        later.scenario_relative_slot = LATER_SLOT - SLOT;
+        later.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("second-market".to_string()),
+        );
+        later.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        );
+        let later_pubkey = later
+            .account
+            .resolve(Some(&later.values))
+            .expect("derive later PDA");
+        assert_ne!(
+            first_pubkey, later_pubkey,
+            "different seeds must derive different PDAs"
+        );
+
+        svm.inner
+            .set_account(first_pubkey, fixture_account.clone())
+            .expect("set first PDA account");
+        svm.inner
+            .set_account(later_pubkey, fixture_account)
+            .expect("set later PDA account");
+        svm.scheduled_overrides
+            .store(SLOT, vec![first])
+            .expect("schedule first override");
+        svm.scheduled_overrides
+            .store(LATER_SLOT, vec![later])
+            .expect("schedule later override");
+
+        // Claim both buckets together, reproducing the overdue-slot batch from the report.
+        svm.materialize_overrides_for_slot(&None, LATER_SLOT)
+            .await
+            .expect("materialize overdue batch");
+
+        let queued = svm
+            .scheduled_overrides
+            .get(&(LATER_SLOT + 1))
+            .expect("read continuations")
+            .expect("continuations queued");
+        assert_eq!(
+            queued.len(),
+            2,
+            "the later PDA must not suppress the first PDA's continuation"
+        );
+        let queued_accounts: HashSet<Pubkey> = queued
+            .iter()
+            .map(|entry| {
+                entry
+                    .account
+                    .resolve(Some(&entry.values))
+                    .expect("resolve queued PDA")
+            })
+            .collect();
+        assert_eq!(
+            queued_accounts,
+            HashSet::from([first_pubkey, later_pubkey]),
+            "each concrete PDA must retain its own continuation"
+        );
+
+        // The overdue deduplication path must distinguish the same two resolved accounts too.
+        svm.materialize_overrides_for_slot(&None, LATER_SLOT + 1)
+            .await
+            .expect("materialize continuations");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(LATER_SLOT + 2))
+                .expect("read next continuations")
+                .unwrap_or_default()
+                .len(),
+            2,
+            "re-armed PDA overrides must not be deduplicated by recipe alone"
+        );
+    }
+
+    /// A relative window re-arms for exactly the requested number of slots and then stops.
+    #[tokio::test]
+    async fn test_persist_for_slots_stops_after_the_window() {
+        const SLOT: u64 = 500;
+        const WINDOW: u64 = 3;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.persist = surfpool_types::Persist::Slots { slots: WINDOW };
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        // Walk the slots and record the last one the override was still queued for.
+        let mut last_queued = SLOT;
+        for slot in SLOT..=SLOT + WINDOW + 2 {
+            let queued = svm
+                .scheduled_overrides
+                .get(&slot)
+                .expect("read")
+                .unwrap_or_default();
+            if queued.is_empty() {
+                break;
+            }
+            last_queued = slot;
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize");
+        }
+
+        assert_eq!(
+            last_queued,
+            SLOT + WINDOW - 1,
+            "a window of {WINDOW} slots means {WINDOW} applications in total, so slots {SLOT} \
+             through {} and then stop",
+            SLOT + WINDOW - 1
+        );
+    }
+
+    /// Re-arming twice within one slot must burn exactly one slot of the window.
+    #[tokio::test]
+    async fn test_window_burns_one_slot_even_when_rearmed_twice() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.persist = surfpool_types::Persist::Slots { slots: 3 };
+
+        // Two reschedules for the same slot, exactly as the real flow does.
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
+            .expect("reschedule");
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
+            .expect("reschedule");
+
+        let queued = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read")
+            .expect("queued");
+        assert_eq!(
+            queued.len(),
+            1,
+            "re-arming twice must not duplicate the override"
+        );
+        assert_eq!(
+            queued[0].persist,
+            surfpool_types::Persist::Slots { slots: 2 },
+            "a window of 3 must have exactly 2 slots left after one slot, not 1"
+        );
+
+        // The last slot of the window does not re-arm.
+        let mut last = instance.clone();
+        last.persist = surfpool_types::Persist::Slots { slots: 1 };
+        svm.reschedule_override_for_next_slot(&last, SLOT + 5, true)
+            .expect("reschedule");
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 6))
+                .expect("read")
+                .unwrap_or_default()
+                .is_empty(),
+            "a spent window must not queue anything further"
+        );
+    }
+
+    /// Re-registering a scenario updates its overrides instead of queueing a second copy.
+    #[tokio::test]
+    async fn test_re_registering_a_scenario_replaces_rather_than_duplicates() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register once");
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register again");
+
+        let queued = svm
+            .scheduled_overrides
+            .get(&SLOT)
+            .expect("read")
+            .expect("queued");
+        assert_eq!(
+            queued.len(),
+            1,
+            "registering the same override twice must update it, not queue it twice"
+        );
+    }
+
+    /// A forward clock jump must not strand an armed copy. The override arms `slot + 1`; if the
+    /// clock then jumps past it, nothing would ever materialize that key again and the override
+    /// would silently stop persisting.
+    #[tokio::test]
+    async fn test_persist_survives_a_forward_time_jump() {
+        const SLOT: u64 = 500;
+        const JUMP_TO: u64 = 900;
+
+        let (mut svm, _pk, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize at the original slot");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "the override must arm the following slot"
+        );
+
+        // Time travel forward, then produce a block at the new slot.
+        svm.materialize_overrides_for_slot(&None, JUMP_TO)
+            .await
+            .expect("materialize after the jump");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .is_empty(),
+            "the stranded copy must be claimed, not left to fire if the clock travels back"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(JUMP_TO + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "persistence must continue from the slot actually reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_after_re_arming_stops_the_override() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _pk, mut instance) = scheduled_persist_fixture(true);
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register persisted");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "it must have armed the next slot before we cancel"
+        );
+
+        // Cancel it now, from the slot the caller is on.
+        instance.persist = surfpool_types::Persist::Always(false);
+        svm.register_scenario(scenario(instance), Some(SLOT))
+            .expect("register the cancelling one-shot");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .is_empty(),
+            "cancelling must remove the copy already armed for a later slot"
+        );
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 1)
+            .await
+            .expect("materialize the next slot");
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 2))
+                .expect("read")
+                .unwrap_or_default()
+                .is_empty(),
+            "and it must not re-arm from there"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_entries_do_not_stop_persistence() {
+        const SLOT: u64 = 500;
+
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        // A disabled entry that is already waiting in the next slot must not block the active
+        // override from arming that slot.
+        let (mut svm, _account_pubkey, persisted) = scheduled_persist_fixture(true);
+        let mut disabled = persisted.clone();
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 1;
+        disabled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(9_999u64),
+        );
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.register_scenario(scenario(disabled.clone()), Some(SLOT))
+            .expect("register disabled entry");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read next slot")
+            .expect("entries queued");
+        assert_eq!(
+            next.len(),
+            2,
+            "the disabled entry and continuation must coexist"
+        );
+        assert_eq!(next.iter().filter(|entry| entry.re_armed).count(), 1);
+
+        // Registering a disabled entry after the continuation exists must neither sweep it nor
+        // replace it at the same slot.
+        let (mut svm, account_pubkey, persisted) = scheduled_persist_fixture(true);
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let mut disabled = persisted.clone();
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 1;
+        disabled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(9_999u64),
+        );
+        svm.register_scenario(scenario(disabled), Some(SLOT))
+            .expect("register disabled entry after arming");
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read next slot")
+            .expect("entries queued");
+        assert_eq!(next.len(), 2, "registration must preserve the continuation");
+        assert_eq!(next.iter().filter(|entry| entry.re_armed).count(), 1);
+        svm.materialize_overrides_for_slot(&None, SLOT + 1)
+            .await
+            .expect("materialize continuation beside disabled entry");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        assert_eq!(
+            u128::from_le_bytes(
+                account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                    .try_into()
+                    .expect("16 bytes")
+            ),
+            1_234,
+            "the disabled entry must not write its distinct value"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 2))
+                .expect("read re-armed slot")
+                .unwrap_or_default()
+                .iter()
+                .filter(|entry| entry.re_armed)
+                .count(),
+            1,
+            "the enabled continuation must keep persisting"
+        );
+
+        // A clock jump claims the continuation and a later disabled entry in one batch. The later
+        // inert entry must not suppress re-arming from the overdue continuation.
+        let (mut svm, _account_pubkey, persisted) = scheduled_persist_fixture(true);
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let mut disabled = persisted;
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 3;
+        svm.register_scenario(scenario(disabled), Some(SLOT))
+            .expect("register later disabled entry");
+        svm.materialize_overrides_for_slot(&None, SLOT + 10)
+            .await
+            .expect("materialize overdue batch");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 11))
+                .expect("read post-jump slot")
+                .unwrap_or_default()
+                .iter()
+                .filter(|entry| entry.re_armed)
+                .count(),
+            1,
+            "a disabled later entry must not suppress overdue re-arming"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_persisting_removes_only_continuations_without_reapplying() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule persisted override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize first application");
+
+        // Simulate a transaction updating the field after persistence was armed. Stopping must not
+        // replay the old override value over this newer state.
+        let mut account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+            .copy_from_slice(&9_999u128.to_le_bytes());
+        svm.inner
+            .set_account(account_pubkey, account)
+            .expect("update account after first application");
+
+        // Future authored entries with this identity describe later value transitions. They are
+        // not persistence bookkeeping, regardless of whether they begin a new persistence window.
+        let mut future_persistent = instance.clone();
+        future_persistent.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(2_222u64),
+        );
+        let mut operator_scheduled = instance.clone();
+        operator_scheduled.persist = surfpool_types::Persist::Always(false);
+        operator_scheduled.re_armed = false;
+        operator_scheduled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(3_333u64),
+        );
+        svm.scheduled_overrides
+            .store(SLOT + 10, vec![future_persistent])
+            .expect("schedule future persistent transition");
+        svm.scheduled_overrides
+            .store(SLOT + 11, vec![operator_scheduled])
+            .expect("schedule future one-shot transition");
+
+        let removed = svm
+            .stop_persisting_override(
+                &instance.id,
+                &instance.account,
+                &instance.template_id,
+                Some(&instance.values),
+            )
+            .expect("stop persistence");
+        assert_eq!(removed, 1, "only the generated continuation is removed");
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation slot")
+                .unwrap_or_default()
+                .is_empty(),
+            "the active continuation must be gone"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 10))
+                .expect("read operator slot")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "an authored persistent transition must remain"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 11))
+                .expect("read one-shot slot")
+                .unwrap_or_default()
+                .len(),
+            1,
+            "an authored one-shot transition must remain"
+        );
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(unhealthy, 9_999, "cancellation must not write account data");
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 10)
+            .await
+            .expect("materialize persistent transition");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(
+            unhealthy, 2_222,
+            "stopping the earlier value must not delete the future persistent transition"
+        );
+
+        svm.materialize_overrides_for_slot(&None, SLOT + 11)
+            .await
+            .expect("materialize one-shot transition");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(
+            unhealthy, 3_333,
+            "the next authored transition must also run"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 12))
+                .expect("read post-timeline slot")
+                .unwrap_or_default()
+                .is_empty(),
+            "the authored one-shot at the next slot supersedes re-arming"
+        );
+    }
+
+    #[test]
+    fn test_stop_persisting_distinguishes_property_backed_pdas() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut first) = scheduled_persist_fixture(true);
+        let recipe = surfpool_types::AccountAddress::Pda {
+            program_id: Pubkey::new_unique().to_string(),
+            seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+        };
+        first.id = "shared-pda-id".to_string();
+        first.account = recipe.clone();
+        first.re_armed = true;
+        first.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("first-market".to_string()),
+        );
+        let first_pubkey = first
+            .account
+            .resolve(Some(&first.values))
+            .expect("derive first PDA");
+
+        let mut second = first.clone();
+        second.values.insert(
+            "market".to_string(),
+            serde_json::Value::String("second-market".to_string()),
+        );
+        let second_pubkey = second
+            .account
+            .resolve(Some(&second.values))
+            .expect("derive second PDA");
+        assert_ne!(first_pubkey, second_pubkey);
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![first.clone(), second.clone()])
+            .expect("schedule PDA continuations");
+
+        let unresolved = svm.stop_persisting_override(&first.id, &recipe, &first.template_id, None);
+        assert!(
+            unresolved.is_err(),
+            "an unresolved PDA recipe must fail safely rather than cancelling both accounts"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("read after rejected stop")
+                .expect("continuations remain")
+                .len(),
+            2
+        );
+
+        let removed = svm
+            .stop_persisting_override(&first.id, &recipe, &first.template_id, Some(&first.values))
+            .expect("stop first PDA by recipe and values");
+        assert_eq!(removed, 1);
+        let remaining = svm
+            .scheduled_overrides
+            .get(&SLOT)
+            .expect("read remaining continuation")
+            .expect("second continuation remains");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].account.resolve(Some(&remaining[0].values)),
+            Some(second_pubkey),
+            "stopping the first PDA must preserve the second PDA"
+        );
+
+        let removed = svm
+            .stop_persisting_override(
+                &second.id,
+                &surfpool_types::AccountAddress::Pubkey(second_pubkey.to_string()),
+                &second.template_id,
+                None,
+            )
+            .expect("stop second PDA by resolved pubkey");
+        assert_eq!(removed, 1);
+        assert!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("read final slot")
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    /// Cancelling at a FUTURE relative slot. The armed copy sits before the cancellation bucket, so
+    /// sweeping only later slots leaves it alive - and when it re-arms it lands on the cancellation
+    /// bucket and replaces the one-shot with itself, so the override never stops.
+    #[tokio::test]
+    async fn test_cancelling_at_a_future_slot_stops_the_override() {
+        const SLOT: u64 = 500;
+        const CANCEL_AT: u64 = 5;
+
+        let (mut svm, _pk, mut instance) = scheduled_persist_fixture(true);
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register persisted");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        // Cancel, but scheduled a few slots out rather than for the current slot.
+        instance.persist = surfpool_types::Persist::Always(false);
+        instance.scenario_relative_slot = CANCEL_AT;
+        svm.register_scenario(scenario(instance), Some(SLOT))
+            .expect("register the cancelling one-shot");
+
+        // Run past the cancellation slot.
+        for slot in (SLOT + 1)..=(SLOT + CANCEL_AT + 2) {
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize");
+        }
+
+        let leftover: Vec<u64> = svm
+            .scheduled_overrides
+            .keys()
+            .expect("keys")
+            .into_iter()
+            .filter(|slot| {
+                !svm.scheduled_overrides
+                    .get(slot)
+                    .expect("read")
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the override was cancelled, so nothing may still be queued; found {leftover:?}"
+        );
+    }
+
+    /// A future-dated one-shot schedules when the override stops, not an immediate stop: it keeps
+    /// re-applying until that slot, applies there, and does not re-arm. The armed continuation is
+    /// what carries it through the intervening slots, so this must hold whether the one-shot was
+    /// registered before or after the override armed itself - otherwise the same request behaves
+    /// differently depending on when it was made.
+    #[tokio::test]
+    async fn test_a_future_one_shot_persists_until_its_slot() {
+        const SLOT: u64 = 500;
+        const CANCEL_AT: u64 = 3;
+
+        for materialize_first in [true, false] {
+            let (mut svm, _pk, persisted) = scheduled_persist_fixture(true);
+            let mut one_shot = persisted.clone();
+            one_shot.persist = surfpool_types::Persist::Always(false);
+            one_shot.scenario_relative_slot = CANCEL_AT;
+
+            let scenario = |o: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+                id: "s-1".to_string(),
+                name: "s".to_string(),
+                description: String::new(),
+                tags: vec![],
+                overrides: vec![o],
+            };
+            svm.register_scenario(scenario(persisted), Some(SLOT))
+                .expect("register persisted");
+            if materialize_first {
+                svm.materialize_overrides_for_slot(&None, SLOT)
+                    .await
+                    .expect("materialize before cancelling");
+            }
+            svm.register_scenario(scenario(one_shot), Some(SLOT))
+                .expect("register the future one-shot");
+
+            // Run up to the slot before the one-shot: it must still be re-applying.
+            let start = if materialize_first { SLOT + 1 } else { SLOT };
+            for slot in start..(SLOT + CANCEL_AT) {
+                svm.materialize_overrides_for_slot(&None, slot)
+                    .await
+                    .expect("materialize an intervening slot");
+                assert_eq!(
+                    svm.scheduled_overrides
+                        .get(&(slot + 1))
+                        .expect("read")
+                        .unwrap_or_default()
+                        .len(),
+                    1,
+                    "materialize_first={materialize_first}: the override must still be armed after \
+                     slot {slot}, because the one-shot is not due until {}",
+                    SLOT + CANCEL_AT
+                );
+            }
+
+            // The one-shot's own slot: it applies, and nothing survives it.
+            svm.materialize_overrides_for_slot(&None, SLOT + CANCEL_AT)
+                .await
+                .expect("materialize the one-shot");
+            let leftover: Vec<u64> = svm
+                .scheduled_overrides
+                .keys()
+                .expect("keys")
+                .into_iter()
+                .filter(|slot| {
+                    !svm.scheduled_overrides
+                        .get(slot)
+                        .expect("read")
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "materialize_first={materialize_first}: the one-shot must end it; found {leftover:?}"
+            );
+        }
+    }
+
+    /// A clock jump that claims both a continuation and the one-shot meant to end it. Both buckets
+    /// are taken before either is processed, so the collision check in the scheduler cannot see the
+    /// one-shot any more - the continuation must be suppressed from the batch instead, or it survives
+    /// the one-shot and restores the old value on the next slot.
+    #[tokio::test]
+    async fn test_a_jump_over_a_one_shot_does_not_leave_a_continuation() {
+        const SLOT: u64 = 500;
+        const ONE_SHOT_AT: u64 = 3;
+        const JUMP_TO: u64 = 510;
+        const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
+
+        let (mut svm, account_pubkey, persisted) = scheduled_persist_fixture(true);
+        let mut one_shot = persisted.clone();
+        one_shot.persist = surfpool_types::Persist::Always(false);
+        one_shot.scenario_relative_slot = ONE_SHOT_AT;
+        one_shot.values = HashMap::from([(
+            "allowed_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        )]);
+
+        let scenario = |o: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![o],
+        };
+        svm.register_scenario(scenario(persisted), Some(SLOT))
+            .expect("register persisted");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize, arming the next slot");
+        svm.register_scenario(scenario(one_shot), Some(SLOT))
+            .expect("register the one-shot");
+
+        // Jump clean over both the continuation and the one-shot.
+        svm.materialize_overrides_for_slot(&None, JUMP_TO)
+            .await
+            .expect("materialize after the jump");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let read = |off: usize| {
+            u128::from_le_bytes(account.data[off..off + 16].try_into().expect("16 bytes"))
+        };
+        assert_eq!(
+            read(ALLOWED_OFFSET),
+            5_678,
+            "the one-shot must have applied"
+        );
+
+        let leftover: Vec<u64> = svm
+            .scheduled_overrides
+            .keys()
+            .expect("keys")
+            .into_iter()
+            .filter(|slot| {
+                !svm.scheduled_overrides
+                    .get(slot)
+                    .expect("read")
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the one-shot ended the override, so no continuation may outlive it; found {leftover:?}"
+        );
+    }
+
+    /// `slots: 0` asks for zero applications, which no override can honour - it always applies on
+    /// the slot it is scheduled for.
+    #[tokio::test]
+    async fn test_persist_slots_zero_is_rejected() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _pk, mut instance) = scheduled_persist_fixture(false);
+        instance.persist = surfpool_types::Persist::Slots { slots: 0 };
+
+        let err = svm
+            .register_scenario(
+                surfpool_types::Scenario {
+                    id: "s-1".to_string(),
+                    name: "s".to_string(),
+                    description: String::new(),
+                    tags: vec![],
+                    overrides: vec![instance],
+                },
+                Some(SLOT),
+            )
+            .expect_err("slots: 0 must be refused");
+        assert!(
+            err.to_string().contains("zero applications"),
+            "the error must say why: {err}"
+        );
+    }
+
+    /// A persisted override is stopped by re-registering it as a one-shot.
+    #[tokio::test]
+    async fn test_re_registering_with_persist_false_cancels_a_persisted_override() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        svm.register_scenario(scenario(instance.clone()), Some(SLOT))
+            .expect("register persisted");
+
+        // Cancel it: same id, same account, same template, but a one-shot.
+        instance.persist = surfpool_types::Persist::Always(false);
+        svm.register_scenario(scenario(instance), Some(SLOT))
+            .expect("register the cancelling one-shot");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read")
+                .unwrap_or_default()
+                .is_empty(),
+            "the override was cancelled, so it must not re-arm for the next slot"
+        );
+    }
+
+    #[test]
+    fn test_scheduled_override_queue_rolls_back_after_a_storage_failure() {
+        const SLOT: Slot = 500;
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        let mut continuation = instance.clone();
+        continuation.re_armed = true;
+        let original = BTreeMap::from([
+            (SLOT + 10, vec![continuation.clone()]),
+            (SLOT + 11, vec![continuation]),
+        ]);
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // The authored bucket is stored, the first continuation is deleted, then this failure
+            // occurs after deleting the second continuation. Rollback must restore all three.
+            fail_on: 3,
+        });
+
+        let scenario = surfpool_types::Scenario {
+            id: "atomic-registration".to_string(),
+            name: "atomic registration".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance.clone()],
+        };
+        svm.register_scenario(scenario, Some(SLOT))
+            .expect_err("the injected third mutation must fail registration");
+
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed registration must restore every added and removed bucket"
+        );
+
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // Both continuations are deleted before the second deletion reports failure.
+            fail_on: 2,
+        });
+        svm.stop_persisting_override(
+            &instance.id,
+            &instance.account,
+            &instance.template_id,
+            Some(&instance.values),
+        )
+        .expect_err("the injected second mutation must fail cancellation");
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after cancellation rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed cancellation must restore every removed continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overdue_bucket_claim_rolls_back_after_a_storage_failure() {
+        const FIRST_SLOT: Slot = 500;
+        const SECOND_SLOT: Slot = 501;
+        const TARGET_SLOT: Slot = 510;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        let mut first = instance.clone();
+        first.re_armed = true;
+        let mut second = first.clone();
+        second.id = "second-persisted-override".to_string();
+        let original = BTreeMap::from([(FIRST_SLOT, vec![first]), (SECOND_SLOT, vec![second])]);
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // Both due buckets are removed before the second removal reports failure.
+            fail_on: 2,
+        });
+
+        svm.materialize_overrides_for_slot(&None, TARGET_SLOT)
+            .await
+            .expect_err("the injected second removal must fail the atomic claim");
+
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after claim rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed overdue claim must restore every due bucket"
+        );
+        let account = svm
+            .get_account(&account_pubkey)
+            .expect("read fixture account")
+            .expect("fixture account exists");
+        assert_eq!(
+            &account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16],
+            &[0; 16],
+            "no claimed override may be materialized after an atomic claim failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_token_forge_failure_restores_current_without_continuation() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let account_pubkey = Pubkey::new_unique();
+        let (_token_account, account) = token_2022_vault_with_tail(Pubkey::new_unique());
+        svm.inner
+            .set_account(account_pubkey, account)
+            .expect("set token account");
+
+        let mut instance = OverrideInstance::new(
+            "spl-token-account-balance".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!("not-a-u64"),
+        )]));
+        instance.persist = surfpool_types::Persist::Slots { slots: 3 };
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule persisted token override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect_err("invalid token amount must fail materialization");
+
+        assert_eq!(
+            svm.scheduled_overrides.get(&SLOT).expect("read current"),
+            Some(vec![instance]),
+            "the failed current entry must be restored"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .is_none(),
+            "a failed application must not leave a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_persist_retries_skipped_writes_without_consuming_the_window() {
+        const SLOT: Slot = 500;
+        const WINDOW: Slot = 3;
+
+        async fn assert_window_is_unchanged(
+            mut svm: SurfnetSvm,
+            mut instance: OverrideInstance,
+            slot: Slot,
+            case: &str,
+        ) {
+            instance.persist = surfpool_types::Persist::Slots { slots: WINDOW };
+            svm.scheduled_overrides
+                .store(slot, vec![instance])
+                .expect("schedule bounded override");
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("a skipped write is a retryable materialization outcome");
+            let next = svm
+                .scheduled_overrides
+                .get(&(slot + 1))
+                .expect("read retry")
+                .expect("failed write must retry");
+            assert_eq!(next.len(), 1, "{case}: exactly one retry must be queued");
+            assert_eq!(
+                next[0].persist,
+                surfpool_types::Persist::Slots { slots: WINDOW },
+                "{case}: a failed or skipped write must not consume the bounded window"
+            );
+        }
+
+        let (missing_svm, _account_pubkey, mut missing) = scheduled_persist_fixture(true);
+        missing.account = surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string());
+        assert_window_is_unchanged(missing_svm, missing, SLOT, "missing account").await;
+
+        let (missing_noop_svm, _account_pubkey, mut missing_noop) = scheduled_persist_fixture(true);
+        missing_noop.account =
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string());
+        missing_noop.values.clear();
+        assert_window_is_unchanged(
+            missing_noop_svm,
+            missing_noop,
+            SLOT,
+            "missing account with no fields",
+        )
+        .await;
+
+        let (unresolved_svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+        let unresolved = OverrideInstance::new(
+            "unresolved-pda".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pda {
+                program_id: Pubkey::new_unique().to_string(),
+                seeds: vec![surfpool_types::PdaSeed::PropertyRef(
+                    "missing_seed".to_string(),
+                )],
+            },
+        );
+        assert_window_is_unchanged(unresolved_svm, unresolved, SLOT, "unresolved PDA").await;
+
+        let (mut absent_idl_svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let absent_idl_pubkey = Pubkey::new_unique();
+        absent_idl_svm
+            .inner
+            .set_account(
+                absent_idl_pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0; 16],
+                    owner: Pubkey::new_unique(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .expect("set account with no registered IDL");
+        let absent_idl = OverrideInstance::new(
+            "unknown-idl-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(absent_idl_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([("value".to_string(), serde_json::json!(1))]));
+        assert_window_is_unchanged(absent_idl_svm, absent_idl, SLOT, "absent IDL").await;
+
+        let (forge_svm, _account_pubkey, mut forge_failure) = scheduled_persist_fixture(true);
+        forge_failure.values = HashMap::from([(
+            "field_that_does_not_exist".to_string(),
+            serde_json::json!(1),
+        )]);
+        assert_window_is_unchanged(forge_svm, forge_failure, SLOT, "IDL forge failure").await;
+    }
+
+    #[test]
+    fn test_bounded_persist_transition_consumes_only_successful_applications() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.persist = surfpool_types::Persist::Slots { slots: 3 };
+        svm.reschedule_override_for_next_slot(&instance, SLOT, false)
+            .expect("queue retry after failed write");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read retry")
+                .expect("retry queued")[0]
+                .persist,
+            surfpool_types::Persist::Slots { slots: 3 },
+            "a failed write must retain all remaining successful applications"
+        );
+
+        svm.scheduled_overrides.clear().expect("clear retry");
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
+            .expect("queue continuation after successful write");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .expect("continuation queued")[0]
+                .persist,
+            surfpool_types::Persist::Slots { slots: 2 },
+            "a successful write must consume exactly one application"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_rearm_failure_restores_current_without_continuation() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides = Box::new(FailOnceOnScheduledMutation {
+            inner: BTreeMap::from([(SLOT, vec![instance.clone()])]),
+            mutations: 0,
+            // Claiming the current slot succeeds. Storing its continuation mutates and then fails.
+            fail_on: 2,
+        });
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect_err("the injected continuation write must fail");
+
+        assert_eq!(
+            svm.scheduled_overrides.get(&SLOT).expect("read current"),
+            Some(vec![instance]),
+            "the current entry must be restored after a failed re-arm"
+        );
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .is_none(),
+            "a failed re-arm must roll back a continuation even if storage mutated before erroring"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_read_does_not_overwrite_the_next_slots_overrides() {
+        use crate::storage::{Storage, StorageError, StorageResult};
+
+        #[derive(Clone)]
+        struct FailingReads {
+            inner: HashMap<u64, Vec<surfpool_types::OverrideInstance>>,
+            writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Storage<u64, Vec<surfpool_types::OverrideInstance>> for FailingReads {
+            fn store(
+                &mut self,
+                key: u64,
+                value: Vec<surfpool_types::OverrideInstance>,
+            ) -> StorageResult<()> {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.insert(key, value);
+                Ok(())
+            }
+            fn clear(&mut self) -> StorageResult<()> {
+                self.inner.clear();
+                Ok(())
+            }
+            fn get(
+                &self,
+                _key: &u64,
+            ) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Err(StorageError::SqliteNotEnabled)
+            }
+            fn take(
+                &mut self,
+                key: &u64,
+            ) -> StorageResult<Option<Vec<surfpool_types::OverrideInstance>>> {
+                Ok(self.inner.remove(key))
+            }
+            fn keys(&self) -> StorageResult<Vec<u64>> {
+                Ok(self.inner.keys().copied().collect())
+            }
+            fn into_iter(
+                &self,
+            ) -> StorageResult<
+                Box<dyn Iterator<Item = (u64, Vec<surfpool_types::OverrideInstance>)> + '_>,
+            > {
+                Err(StorageError::SqliteNotEnabled)
+            }
+            fn count(&self) -> StorageResult<u64> {
+                Ok(self.inner.len() as u64)
+            }
+            fn clone_box(&self) -> Box<dyn Storage<u64, Vec<surfpool_types::OverrideInstance>>> {
+                Box::new(self.clone())
+            }
+        }
+
+        const SLOT: u64 = 500;
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+
+        // Something else is already queued for the next slot.
+        let mut bystander = instance.clone();
+        bystander.id = "someone-elses-override".to_string();
+
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        svm.scheduled_overrides = Box::new(FailingReads {
+            inner: HashMap::from([(SLOT + 1, vec![bystander.clone()])]),
+            writes: writes.clone(),
+        });
+
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
+            .expect_err("a failed read must surface as an error, not a silent skip");
+
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed read must not be followed by a write; the queue would be replaced by a single \
+             entry and every other override for that slot lost"
+        );
+        let survivors = svm
+            .scheduled_overrides
+            .take(&(SLOT + 1))
+            .expect("take")
+            .expect("the bystander must still be queued");
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].id, "someone-elses-override");
     }
 
     #[tokio::test]

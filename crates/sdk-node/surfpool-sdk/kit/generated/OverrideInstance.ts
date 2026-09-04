@@ -34,11 +34,12 @@ enabled: boolean,
 /**
  * Whether to fetch fresh account data just before transaction execution
  */
-fetchBeforeUse?: boolean, 
+fetchBeforeUse?: boolean,
 /**
- * Whether to re-apply this override on every subsequent slot, rather than only once
+ * How long to keep re-applying this override: `false` applies it once, `true` re-applies it
+ * on every following slot, and `{ slots: N }` applies it N times in total, counting the first
  */
-persist?: boolean, 
+persist?: boolean | { slots: number | bigint },
 /**
  * Account address to override - use pubkey for known addresses or pda for derived addresses
  */

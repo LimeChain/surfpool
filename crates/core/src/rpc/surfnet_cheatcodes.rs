@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, RwLock},
 };
 
@@ -16,10 +16,10 @@ use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
-    GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
-    StreamAccountsEntry, UiKeyedProfileResult,
+    AccountAddress, AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand,
+    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
+    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
         GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
@@ -1516,6 +1516,21 @@ pub trait SurfnetCheatcodes {
         scenario: Scenario,
         slot: Option<Slot>,
     ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// Stops scheduler-generated persisted copies of one override. This does not materialize the
+    /// override again and leaves all independently authored timeline entries intact. `values`
+    /// supplies property-reference PDA seeds; callers may instead pass the resolved pubkey as
+    /// `account`. Omitting both forms of concrete identity is rejected rather than cancelling
+    /// every continuation that happens to share a PDA recipe.
+    #[rpc(meta, name = "surfnet_stopPersistingOverride")]
+    fn stop_persisting_override(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+        account: AccountAddress,
+        template_id: String,
+        values: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<RpcResponse<usize>>;
 }
 
 #[derive(Clone)]
@@ -2580,6 +2595,28 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             })
         })
     }
+
+    fn stop_persisting_override(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+        account: AccountAddress,
+        template_id: String,
+        values: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<RpcResponse<usize>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let removed = svm_locker
+            .stop_persisting_override(id, account, template_id, values)
+            .map_err(|e| jsonrpc_core::Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("Failed to stop persisted override: {}", e),
+                data: None,
+            })?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: removed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2627,6 +2664,67 @@ mod tests {
         let mut manifest = surfpool_types::SURFNET_CHEATCODE_METHODS;
         manifest.sort_unstable();
         assert_eq!(registered, manifest);
+    }
+
+    #[tokio::test]
+    async fn stop_persisting_wire_accepts_optional_pda_values() {
+        let mut io: jsonrpc_core::MetaIoHandler<Option<RunloopContext>> =
+            jsonrpc_core::MetaIoHandler::default();
+        io.extend_with(SurfnetCheatcodesRpc::empty().to_delegate());
+        let account = serde_json::json!({ "pubkey": Pubkey::new_unique().to_string() });
+
+        for params in [
+            serde_json::json!(["override", account.clone(), "template"]),
+            serde_json::json!(["override", account.clone(), "template", { "market": "SOL" }]),
+        ] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "surfnet_stopPersistingOverride",
+                "params": params,
+            })
+            .to_string();
+            let response = io
+                .handle_request(&request, None)
+                .await
+                .expect("request produces a response");
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("valid JSON-RPC response");
+            assert_ne!(
+                response
+                    .pointer("/error/code")
+                    .and_then(|code| code.as_i64()),
+                Some(-32602),
+                "both the legacy three-argument call and the PDA-aware four-argument call must deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_persisting_endpoint_metadata_matches_the_wire_contract() {
+        let metadata: serde_json::Value =
+            serde_json::from_str(include_str!("../../../types/src/rpc_endpoints.json"))
+                .expect("RPC endpoint metadata is valid JSON");
+        let endpoint = metadata["categories"]
+            .as_array()
+            .expect("categories array")
+            .iter()
+            .flat_map(|category| category["endpoints"].as_array().into_iter().flatten())
+            .find(|endpoint| endpoint["method"] == "surfnet_stopPersistingOverride")
+            .expect("stop-persistence endpoint is discoverable");
+        let parameter_names: Vec<&str> = endpoint["params"]
+            .as_array()
+            .expect("params array")
+            .iter()
+            .map(|parameter| parameter["name"].as_str().expect("parameter name"))
+            .collect();
+        assert_eq!(parameter_names, ["id", "account", "template_id", "values"]);
+        assert_eq!(
+            endpoint["returns"].as_str(),
+            Some(
+                "A `RpcResponse<usize>` containing the number of scheduler-generated continuations removed."
+            )
+        );
     }
 
     /// Pins the wire shape of `TimeTravelConfig`, which is hand-mirrored in
