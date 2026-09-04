@@ -2954,6 +2954,12 @@ impl SurfnetSvm {
                 continue;
             }
 
+            // A later authored entry replaces this value regardless of whether the current account
+            // can be resolved or written. Do not let a retry outlive that explicit transition.
+            let superseded_later = overrides[index + 1..].iter().any(|later| {
+                later.enabled && !later.re_armed && same_override_target(later, override_instance)
+            });
+
             // Resolve account address using the centralized method
             let account_pubkey = match override_instance
                 .account
@@ -2976,6 +2982,16 @@ impl SurfnetSvm {
                         "Failed to resolve account address for override {}",
                         override_instance.id
                     );
+                    if override_instance.persist.is_enabled() && !superseded_later {
+                        if let Err(e) = self.reschedule_override_for_next_slot(
+                            override_instance,
+                            target_slot,
+                            false,
+                        ) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
+                    }
                     continue;
                 }
             };
@@ -3099,17 +3115,16 @@ impl SurfnetSvm {
                 FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
             };
 
-            // A later entry in this batch that the operator scheduled supersedes this one. The
-            // scheduler's own collision check cannot see it: claiming several overdue buckets at
-            // once already took it out of its slot, so re-arming here would outlive it and restore
-            // the superseded value on the following slot.
-            let superseded_later = overrides[index + 1..].iter().any(|later| {
-                later.enabled && !later.re_armed && same_override_target(later, override_instance)
-            });
+            // A bounded window counts successful applications, not scheduler attempts. No-value
+            // and PDA-seed-only overrides are successful no-ops only when their target exists;
+            // every path that expected an account write but could not complete it marks the attempt
+            // for a non-consuming retry.
+            let mut application_succeeded = true;
 
             // Apply the override values to the account data
             'apply_override: {
                 if override_instance.values.is_empty() {
+                    application_succeeded = existing_account.is_some();
                     break 'apply_override;
                 }
 
@@ -3127,6 +3142,7 @@ impl SurfnetSvm {
                         "Override {} has no account data modifications (all values are PDA seeds)",
                         override_instance.id
                     );
+                    application_succeeded = existing_account.is_some();
                     break 'apply_override;
                 }
 
@@ -3144,6 +3160,7 @@ impl SurfnetSvm {
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
                     );
+                    application_succeeded = false;
                     break 'apply_override;
                 };
 
@@ -3173,6 +3190,7 @@ impl SurfnetSvm {
                             };
                             if let Err(e) = self.inner.set_account(account_pubkey, modified) {
                                 warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                                application_succeeded = false;
                             } else {
                                 debug!(
                                     "Raw-layout override {} applied {} field(s) to {}",
@@ -3183,10 +3201,13 @@ impl SurfnetSvm {
                                 settled_this_slot.insert(account_pubkey);
                             }
                         }
-                        Err(e) => warn!(
-                            "Raw-layout override {} failed on {}: {}",
-                            override_instance.id, account_pubkey, e
-                        ),
+                        Err(e) => {
+                            warn!(
+                                "Raw-layout override {} failed on {}: {}",
+                                override_instance.id, account_pubkey, e
+                            );
+                            application_succeeded = false;
+                        }
                     }
                     break 'apply_override;
                 }
@@ -3231,6 +3252,7 @@ impl SurfnetSvm {
                             "No IDL registered for program {} (owner of account {}), skipping override {}",
                             owner_program_id, account_pubkey, override_instance.id
                         );
+                        application_succeeded = false;
                         break 'apply_override;
                     }
                     Err(e) => {
@@ -3238,6 +3260,7 @@ impl SurfnetSvm {
                             "Failed to get IDL for program {}: {}, skipping override {}",
                             owner_program_id, e, override_instance.id
                         );
+                        application_succeeded = false;
                         break 'apply_override;
                     }
                 };
@@ -3248,6 +3271,7 @@ impl SurfnetSvm {
                         "IDL versions empty for program {}, skipping override {}",
                         owner_program_id, override_instance.id
                     );
+                    application_succeeded = false;
                     break 'apply_override;
                 };
 
@@ -3265,6 +3289,7 @@ impl SurfnetSvm {
                         account_data.len(),
                         override_instance.id
                     );
+                    application_succeeded = false;
                     break 'apply_override;
                 }
 
@@ -3282,6 +3307,7 @@ impl SurfnetSvm {
                             If the account doesn't exist locally, enable fetchBeforeUse: true.",
                             account_pubkey, override_instance.id, e
                         );
+                        application_succeeded = false;
                         break 'apply_override;
                     }
                 };
@@ -3301,6 +3327,7 @@ impl SurfnetSvm {
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
                     );
+                    application_succeeded = false;
                 } else {
                     debug!(
                         "Successfully applied {} override(s) to account {} (override {})",
@@ -3320,7 +3347,11 @@ impl SurfnetSvm {
                 if requeued.fetch_before_use && fetch_retired {
                     requeued.fetch_before_use = false;
                 }
-                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                if let Err(e) = self.reschedule_override_for_next_slot(
+                    &requeued,
+                    target_slot,
+                    application_succeeded,
+                ) {
                     restore_unprocessed(self, index);
                     return Err(e);
                 }
@@ -3336,21 +3367,32 @@ impl SurfnetSvm {
         &mut self,
         instance: &OverrideInstance,
         target_slot: Slot,
+        application_succeeded: bool,
     ) -> SurfpoolResult<()> {
-        let next_slot = target_slot.checked_add(1).ok_or_else(|| {
-            SurfpoolError::internal(format!(
-                "Override {} cannot persist past slot {}: there is no next slot",
-                instance.id, target_slot
-            ))
-        })?;
-
-        let Some(next_persist) = instance.persist.next_arming() else {
+        let next_persist = match (&instance.persist, application_succeeded) {
+            (surfpool_types::Persist::Always(false), _) => None,
+            (surfpool_types::Persist::Always(true), _) => {
+                Some(surfpool_types::Persist::Always(true))
+            }
+            (surfpool_types::Persist::Slots { slots: 0 }, _) => None,
+            (surfpool_types::Persist::Slots { .. }, true) => instance.persist.next_arming(),
+            (surfpool_types::Persist::Slots { slots }, false) => {
+                Some(surfpool_types::Persist::Slots { slots: *slots })
+            }
+        };
+        let Some(next_persist) = next_persist else {
             debug!(
                 "Override {} has reached the end of its persist window at slot {}",
                 instance.id, target_slot
             );
             return Ok(());
         };
+        let next_slot = target_slot.checked_add(1).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Override {} cannot persist past slot {}: there is no next slot",
+                instance.id, target_slot
+            ))
+        })?;
         let mut instance = instance.clone();
         instance.persist = next_persist;
         instance.re_armed = true;
@@ -8307,9 +8349,19 @@ mod tests {
         let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
 
         assert!(
-            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+            svm.reschedule_override_for_next_slot(&instance, u64::MAX, true)
                 .is_err(),
             "there is no slot after u64::MAX"
+        );
+
+        let mut final_bounded = instance.clone();
+        final_bounded.persist = surfpool_types::Persist::Slots { slots: 1 };
+        svm.reschedule_override_for_next_slot(&final_bounded, u64::MAX, true)
+            .expect("a successful final application needs no slot after u64::MAX");
+        assert!(
+            svm.reschedule_override_for_next_slot(&final_bounded, u64::MAX, false)
+                .is_err(),
+            "a failed final application still needs a retry slot and must report overflow"
         );
 
         let mut far = surfpool_types::OverrideInstance::new(
@@ -8445,10 +8497,10 @@ mod tests {
         second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(&first, SLOT, true)
             .expect("reschedule");
         surfnet_svm
-            .reschedule_override_for_next_slot(&second, SLOT)
+            .reschedule_override_for_next_slot(&second, SLOT, true)
             .expect("reschedule");
 
         let queued = surfnet_svm
@@ -8464,7 +8516,7 @@ mod tests {
         );
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(&first, SLOT, true)
             .expect("reschedule");
         let queued = surfnet_svm
             .scheduled_overrides
@@ -8633,9 +8685,9 @@ mod tests {
         instance.persist = surfpool_types::Persist::Slots { slots: 3 };
 
         // Two reschedules for the same slot, exactly as the real flow does.
-        svm.reschedule_override_for_next_slot(&instance, SLOT)
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
             .expect("reschedule");
-        svm.reschedule_override_for_next_slot(&instance, SLOT)
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
             .expect("reschedule");
 
         let queued = svm
@@ -8657,7 +8709,7 @@ mod tests {
         // The last slot of the window does not re-arm.
         let mut last = instance.clone();
         last.persist = surfpool_types::Persist::Slots { slots: 1 };
-        svm.reschedule_override_for_next_slot(&last, SLOT + 5)
+        svm.reschedule_override_for_next_slot(&last, SLOT + 5, true)
             .expect("reschedule");
         assert!(
             svm.scheduled_overrides
@@ -9543,7 +9595,7 @@ mod tests {
             "amount".to_string(),
             serde_json::json!("not-a-u64"),
         )]));
-        instance.persist = surfpool_types::Persist::Always(true);
+        instance.persist = surfpool_types::Persist::Slots { slots: 3 };
         svm.scheduled_overrides
             .store(SLOT, vec![instance.clone()])
             .expect("schedule persisted token override");
@@ -9563,6 +9615,129 @@ mod tests {
                 .expect("read continuation")
                 .is_none(),
             "a failed application must not leave a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_persist_retries_skipped_writes_without_consuming_the_window() {
+        const SLOT: Slot = 500;
+        const WINDOW: Slot = 3;
+
+        async fn assert_window_is_unchanged(
+            mut svm: SurfnetSvm,
+            mut instance: OverrideInstance,
+            slot: Slot,
+            case: &str,
+        ) {
+            instance.persist = surfpool_types::Persist::Slots { slots: WINDOW };
+            svm.scheduled_overrides
+                .store(slot, vec![instance])
+                .expect("schedule bounded override");
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("a skipped write is a retryable materialization outcome");
+            let next = svm
+                .scheduled_overrides
+                .get(&(slot + 1))
+                .expect("read retry")
+                .expect("failed write must retry");
+            assert_eq!(next.len(), 1, "{case}: exactly one retry must be queued");
+            assert_eq!(
+                next[0].persist,
+                surfpool_types::Persist::Slots { slots: WINDOW },
+                "{case}: a failed or skipped write must not consume the bounded window"
+            );
+        }
+
+        let (missing_svm, _account_pubkey, mut missing) = scheduled_persist_fixture(true);
+        missing.account = surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string());
+        assert_window_is_unchanged(missing_svm, missing, SLOT, "missing account").await;
+
+        let (missing_noop_svm, _account_pubkey, mut missing_noop) = scheduled_persist_fixture(true);
+        missing_noop.account =
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string());
+        missing_noop.values.clear();
+        assert_window_is_unchanged(
+            missing_noop_svm,
+            missing_noop,
+            SLOT,
+            "missing account with no fields",
+        )
+        .await;
+
+        let (unresolved_svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+        let unresolved = OverrideInstance::new(
+            "unresolved-pda".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pda {
+                program_id: Pubkey::new_unique().to_string(),
+                seeds: vec![surfpool_types::PdaSeed::PropertyRef(
+                    "missing_seed".to_string(),
+                )],
+            },
+        );
+        assert_window_is_unchanged(unresolved_svm, unresolved, SLOT, "unresolved PDA").await;
+
+        let (mut absent_idl_svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let absent_idl_pubkey = Pubkey::new_unique();
+        absent_idl_svm
+            .inner
+            .set_account(
+                absent_idl_pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0; 16],
+                    owner: Pubkey::new_unique(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .expect("set account with no registered IDL");
+        let absent_idl = OverrideInstance::new(
+            "unknown-idl-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(absent_idl_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([("value".to_string(), serde_json::json!(1))]));
+        assert_window_is_unchanged(absent_idl_svm, absent_idl, SLOT, "absent IDL").await;
+
+        let (forge_svm, _account_pubkey, mut forge_failure) = scheduled_persist_fixture(true);
+        forge_failure.values = HashMap::from([(
+            "field_that_does_not_exist".to_string(),
+            serde_json::json!(1),
+        )]);
+        assert_window_is_unchanged(forge_svm, forge_failure, SLOT, "IDL forge failure").await;
+    }
+
+    #[test]
+    fn test_bounded_persist_transition_consumes_only_successful_applications() {
+        const SLOT: Slot = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.persist = surfpool_types::Persist::Slots { slots: 3 };
+        svm.reschedule_override_for_next_slot(&instance, SLOT, false)
+            .expect("queue retry after failed write");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read retry")
+                .expect("retry queued")[0]
+                .persist,
+            surfpool_types::Persist::Slots { slots: 3 },
+            "a failed write must retain all remaining successful applications"
+        );
+
+        svm.scheduled_overrides.clear().expect("clear retry");
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
+            .expect("queue continuation after successful write");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("read continuation")
+                .expect("continuation queued")[0]
+                .persist,
+            surfpool_types::Persist::Slots { slots: 2 },
+            "a successful write must consume exactly one application"
         );
     }
 
@@ -9664,7 +9839,7 @@ mod tests {
             writes: writes.clone(),
         });
 
-        svm.reschedule_override_for_next_slot(&instance, SLOT)
+        svm.reschedule_override_for_next_slot(&instance, SLOT, true)
             .expect_err("a failed read must surface as an error, not a silent skip");
 
         assert_eq!(
