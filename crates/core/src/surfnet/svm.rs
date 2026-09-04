@@ -4677,12 +4677,24 @@ impl SurfnetSvm {
             planned.push((absolute_slot, override_instance));
         }
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
+
+        // Schedule overrides by adding base slot to their scenario-relative slots.
         for (absolute_slot, override_instance) in planned {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
 
             if override_instance.enabled {
-                self.remove_queued_copies_elsewhere(&override_instance, absolute_slot)?;
+                for queued in staged_queue
+                    .range_mut(absolute_slot..)
+                    .map(|(_, queued)| queued)
+                {
+                    queued.retain(|other| {
+                        !(other.re_armed && same_override_target(other, &override_instance))
+                    });
+                }
+                staged_queue.retain(|_, queued| !queued.is_empty());
             }
 
             debug!(
@@ -4690,10 +4702,7 @@ impl SurfnetSvm {
                 absolute_slot, base_slot, scenario_relative_slot
             );
 
-            let mut slot_overrides = self
-                .scheduled_overrides
-                .get(&absolute_slot)?
-                .unwrap_or_default();
+            let slot_overrides = staged_queue.entry(absolute_slot).or_default();
 
             if let Some(existing) = slot_overrides.iter_mut().find(|queued| {
                 same_override_target(queued, &override_instance)
@@ -4707,53 +4716,56 @@ impl SurfnetSvm {
             } else {
                 slot_overrides.push(override_instance);
             }
-            self.scheduled_overrides
-                .store(absolute_slot, slot_overrides)?;
         }
 
-        Ok(())
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)
     }
 
-    /// Drops the copies `instance` queued for itself to keep persisting, wherever they sit.
-    ///
-    /// Only re-armed copies are removed. Entries an operator scheduled are left alone at every
-    /// slot, because a scenario may place one id at several slots to walk a value over a timeline -
-    /// possibly across separate registrations - and those are not this sweep's business. Sweeping
-    /// every slot rather than only later ones matters because the armed copy sits *before* a
-    /// cancellation scheduled at a positive relative slot.
-    fn remove_queued_copies_elsewhere(
+    /// Commits a staged scheduled-override queue and restores every attempted bucket if any
+    /// storage operation fails. The failed bucket is included in rollback because a storage
+    /// implementation is not required to guarantee that an error happened before mutation.
+    fn commit_scheduled_override_plan(
         &mut self,
-        instance: &OverrideInstance,
-        from_slot: Slot,
+        original: &BTreeMap<Slot, Vec<OverrideInstance>>,
+        staged: &BTreeMap<Slot, Vec<OverrideInstance>>,
     ) -> SurfpoolResult<()> {
-        let slots: Vec<Slot> = self
-            .scheduled_overrides
-            .keys()?
-            .into_iter()
-            .filter(|slot| *slot >= from_slot)
-            .collect();
+        let mut changed_slots: Vec<Slot> = original.keys().chain(staged.keys()).copied().collect();
+        changed_slots.sort_unstable();
+        changed_slots.dedup();
+        changed_slots.retain(|slot| original.get(slot) != staged.get(slot));
 
-        for slot in slots {
-            let Some(mut queued) = self.scheduled_overrides.get(&slot)? else {
+        let mut attempted = Vec::with_capacity(changed_slots.len());
+        for slot in changed_slots {
+            attempted.push(slot);
+            let commit = match staged.get(&slot) {
+                Some(queued) => self.scheduled_overrides.store(slot, queued.clone()),
+                None => self.scheduled_overrides.take(&slot).map(|_| ()),
+            };
+            let Err(commit_error) = commit else {
                 continue;
             };
-            let before = queued.len();
-            queued.retain(|other| !(other.re_armed && same_override_target(other, instance)));
-            if queued.len() != before {
-                debug!(
-                    "Removed {} superseded copy(ies) of override {} at slot {}",
-                    before - queued.len(),
-                    instance.id,
-                    slot
-                );
-                // Drop the key rather than leaving an empty vec behind: a slot that holds nothing
-                // still shows up in `keys()`, so every sweep would walk more dead entries.
-                if queued.is_empty() {
-                    self.scheduled_overrides.take(&slot)?;
-                } else {
-                    self.scheduled_overrides.store(slot, queued)?;
+
+            let mut rollback_errors = Vec::new();
+            for rollback_slot in attempted.into_iter().rev() {
+                let rollback = match original.get(&rollback_slot) {
+                    Some(queued) => self
+                        .scheduled_overrides
+                        .store(rollback_slot, queued.clone()),
+                    None => self.scheduled_overrides.take(&rollback_slot).map(|_| ()),
+                };
+                if let Err(error) = rollback {
+                    rollback_errors.push(format!("slot {rollback_slot}: {error}"));
                 }
             }
+
+            if rollback_errors.is_empty() {
+                return Err(commit_error.into());
+            }
+
+            return Err(SurfpoolError::internal(format!(
+                "Failed to commit scheduled overrides ({commit_error}); rollback also failed for {}",
+                rollback_errors.join(", ")
+            )));
         }
 
         Ok(())
@@ -4776,13 +4788,12 @@ impl SurfnetSvm {
                  Supply the property-reference values used by the PDA, or pass the resolved pubkey."
             ))
         })?;
-        let slots = self.scheduled_overrides.keys()?;
+        let original_queue: BTreeMap<Slot, Vec<OverrideInstance>> =
+            self.scheduled_overrides.into_iter()?.collect();
+        let mut staged_queue = original_queue.clone();
         let mut removed = 0;
 
-        for slot in slots {
-            let Some(mut queued) = self.scheduled_overrides.get(&slot)? else {
-                continue;
-            };
+        for queued in staged_queue.values_mut() {
             let before = queued.len();
             queued.retain(|other| {
                 !(other.re_armed
@@ -4791,16 +4802,10 @@ impl SurfnetSvm {
                     && other.account.resolve(Some(&other.values)) == Some(target_account))
             });
             removed += before - queued.len();
-
-            if queued.len() != before {
-                if queued.is_empty() {
-                    self.scheduled_overrides.take(&slot)?;
-                } else {
-                    self.scheduled_overrides.store(slot, queued)?;
-                }
-            }
         }
+        staged_queue.retain(|_, queued| !queued.is_empty());
 
+        self.commit_scheduled_override_plan(&original_queue, &staged_queue)?;
         Ok(removed)
     }
 }
@@ -9313,6 +9318,127 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the override was cancelled, so it must not re-arm for the next slot"
+        );
+    }
+
+    #[test]
+    fn test_scheduled_override_queue_rolls_back_after_a_storage_failure() {
+        use crate::storage::{Storage, StorageError, StorageResult};
+
+        #[derive(Clone)]
+        struct FailOnceOnMutation {
+            inner: BTreeMap<Slot, Vec<OverrideInstance>>,
+            mutations: usize,
+            fail_on: usize,
+        }
+
+        impl Storage<Slot, Vec<OverrideInstance>> for FailOnceOnMutation {
+            fn store(&mut self, key: Slot, value: Vec<OverrideInstance>) -> StorageResult<()> {
+                self.mutations += 1;
+                self.inner.insert(key, value);
+                if self.mutations == self.fail_on {
+                    Err(StorageError::SqliteNotEnabled)
+                } else {
+                    Ok(())
+                }
+            }
+
+            fn clear(&mut self) -> StorageResult<()> {
+                self.inner.clear();
+                Ok(())
+            }
+
+            fn get(&self, key: &Slot) -> StorageResult<Option<Vec<OverrideInstance>>> {
+                Ok(self.inner.get(key).cloned())
+            }
+
+            fn take(&mut self, key: &Slot) -> StorageResult<Option<Vec<OverrideInstance>>> {
+                self.mutations += 1;
+                let removed = self.inner.remove(key);
+                if self.mutations == self.fail_on {
+                    Err(StorageError::SqliteNotEnabled)
+                } else {
+                    Ok(removed)
+                }
+            }
+
+            fn keys(&self) -> StorageResult<Vec<Slot>> {
+                Ok(self.inner.keys().copied().collect())
+            }
+
+            fn into_iter(
+                &self,
+            ) -> StorageResult<Box<dyn Iterator<Item = (Slot, Vec<OverrideInstance>)> + '_>>
+            {
+                Ok(Box::new(self.inner.clone().into_iter()))
+            }
+
+            fn count(&self) -> StorageResult<u64> {
+                Ok(self.inner.len() as u64)
+            }
+
+            fn clone_box(&self) -> Box<dyn Storage<Slot, Vec<OverrideInstance>>> {
+                Box::new(self.clone())
+            }
+        }
+
+        const SLOT: Slot = 500;
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        let mut continuation = instance.clone();
+        continuation.re_armed = true;
+        let original = BTreeMap::from([
+            (SLOT + 10, vec![continuation.clone()]),
+            (SLOT + 11, vec![continuation]),
+        ]);
+        svm.scheduled_overrides = Box::new(FailOnceOnMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // The authored bucket is stored, the first continuation is deleted, then this failure
+            // occurs after deleting the second continuation. Rollback must restore all three.
+            fail_on: 3,
+        });
+
+        let scenario = surfpool_types::Scenario {
+            id: "atomic-registration".to_string(),
+            name: "atomic registration".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance.clone()],
+        };
+        svm.register_scenario(scenario, Some(SLOT))
+            .expect_err("the injected third mutation must fail registration");
+
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed registration must restore every added and removed bucket"
+        );
+
+        svm.scheduled_overrides = Box::new(FailOnceOnMutation {
+            inner: original.clone(),
+            mutations: 0,
+            // Both continuations are deleted before the second deletion reports failure.
+            fail_on: 2,
+        });
+        svm.stop_persisting_override(
+            &instance.id,
+            &instance.account,
+            &instance.template_id,
+            Some(&instance.values),
+        )
+        .expect_err("the injected second mutation must fail cancellation");
+        let after: BTreeMap<Slot, Vec<OverrideInstance>> = svm
+            .scheduled_overrides
+            .into_iter()
+            .expect("read queue after cancellation rollback")
+            .collect();
+        assert_eq!(
+            after, original,
+            "a failed cancellation must restore every removed continuation"
         );
     }
 
