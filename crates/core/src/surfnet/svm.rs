@@ -3089,9 +3089,9 @@ impl SurfnetSvm {
             // scheduler's own collision check cannot see it: claiming several overdue buckets at
             // once already took it out of its slot, so re-arming here would outlive it and restore
             // the superseded value on the following slot.
-            let superseded_later = overrides[index + 1..]
-                .iter()
-                .any(|later| !later.re_armed && same_override_target(later, override_instance));
+            let superseded_later = overrides[index + 1..].iter().any(|later| {
+                later.enabled && !later.re_armed && same_override_target(later, override_instance)
+            });
 
             if override_instance.persist.is_enabled() && !superseded_later {
                 let mut requeued = override_instance.clone();
@@ -3336,7 +3336,10 @@ impl SurfnetSvm {
         {
             // Replace our own previous continuation, so one slot never holds two.
             Some(index) => next[index] = instance.clone(),
-            None if next.iter().any(same_override) => {
+            None if next
+                .iter()
+                .any(|queued| queued.enabled && same_override(queued)) =>
+            {
                 // The operator has scheduled this override for that slot themselves. Theirs is the
                 // newer instruction and carries its own `persist`, so a continuation would only
                 // overwrite it with the values being carried forward - which is the transition they
@@ -4678,7 +4681,9 @@ impl SurfnetSvm {
         for (absolute_slot, override_instance) in planned {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
 
-            self.remove_queued_copies_elsewhere(&override_instance, absolute_slot)?;
+            if override_instance.enabled {
+                self.remove_queued_copies_elsewhere(&override_instance, absolute_slot)?;
+            }
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4690,10 +4695,10 @@ impl SurfnetSvm {
                 .get(&absolute_slot)?
                 .unwrap_or_default();
 
-            if let Some(existing) = slot_overrides
-                .iter_mut()
-                .find(|queued| same_override_target(queued, &override_instance))
-            {
+            if let Some(existing) = slot_overrides.iter_mut().find(|queued| {
+                same_override_target(queued, &override_instance)
+                    && (override_instance.enabled || !queued.re_armed)
+            }) {
                 debug!(
                     "Replacing already-scheduled override {} at slot {}",
                     override_instance.id, absolute_slot
@@ -8695,6 +8700,129 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "and it must not re-arm from there"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disabled_entries_do_not_stop_persistence() {
+        const SLOT: u64 = 500;
+
+        let scenario = |instance: surfpool_types::OverrideInstance| surfpool_types::Scenario {
+            id: "s-1".to_string(),
+            name: "s".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![instance],
+        };
+
+        // A disabled entry that is already waiting in the next slot must not block the active
+        // override from arming that slot.
+        let (mut svm, _account_pubkey, persisted) = scheduled_persist_fixture(true);
+        let mut disabled = persisted.clone();
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 1;
+        disabled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(9_999u64),
+        );
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.register_scenario(scenario(disabled.clone()), Some(SLOT))
+            .expect("register disabled entry");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read next slot")
+            .expect("entries queued");
+        assert_eq!(
+            next.len(),
+            2,
+            "the disabled entry and continuation must coexist"
+        );
+        assert_eq!(next.iter().filter(|entry| entry.re_armed).count(), 1);
+
+        // Registering a disabled entry after the continuation exists must neither sweep it nor
+        // replace it at the same slot.
+        let (mut svm, account_pubkey, persisted) = scheduled_persist_fixture(true);
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let mut disabled = persisted.clone();
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 1;
+        disabled.values.insert(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(9_999u64),
+        );
+        svm.register_scenario(scenario(disabled), Some(SLOT))
+            .expect("register disabled entry after arming");
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read next slot")
+            .expect("entries queued");
+        assert_eq!(next.len(), 2, "registration must preserve the continuation");
+        assert_eq!(next.iter().filter(|entry| entry.re_armed).count(), 1);
+        svm.materialize_overrides_for_slot(&None, SLOT + 1)
+            .await
+            .expect("materialize continuation beside disabled entry");
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get account")
+            .expect("account present");
+        assert_eq!(
+            u128::from_le_bytes(
+                account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                    .try_into()
+                    .expect("16 bytes")
+            ),
+            1_234,
+            "the disabled entry must not write its distinct value"
+        );
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 2))
+                .expect("read re-armed slot")
+                .unwrap_or_default()
+                .iter()
+                .filter(|entry| entry.re_armed)
+                .count(),
+            1,
+            "the enabled continuation must keep persisting"
+        );
+
+        // A clock jump claims the continuation and a later disabled entry in one batch. The later
+        // inert entry must not suppress re-arming from the overdue continuation.
+        let (mut svm, _account_pubkey, persisted) = scheduled_persist_fixture(true);
+        svm.register_scenario(scenario(persisted.clone()), Some(SLOT))
+            .expect("register persistent override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize persistent override");
+        let mut disabled = persisted;
+        disabled.enabled = false;
+        disabled.scenario_relative_slot = 3;
+        svm.register_scenario(scenario(disabled), Some(SLOT))
+            .expect("register later disabled entry");
+        svm.materialize_overrides_for_slot(&None, SLOT + 10)
+            .await
+            .expect("materialize overdue batch");
+        assert_eq!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 11))
+                .expect("read post-jump slot")
+                .unwrap_or_default()
+                .iter()
+                .filter(|entry| entry.re_armed)
+                .count(),
+            1,
+            "a disabled later entry must not suppress overdue re-arming"
         );
     }
 

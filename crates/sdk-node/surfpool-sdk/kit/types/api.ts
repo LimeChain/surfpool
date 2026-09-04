@@ -191,7 +191,7 @@ export type SurfnetStopPersistingOverrideApi = {
         account: AccountAddress,
         templateId: string,
         values?: Readonly<Record<string, unknown>>
-    ): number;
+    ): bigint;
 };
 
 // Local
