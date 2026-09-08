@@ -22,7 +22,10 @@ use surfpool_core::{
         protocols::pump::v1::graduation_builder::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
-        protocols::tessera::v1::{TesseraMarket, build_tessera_fair_value_scenario},
+        protocols::tessera::v1::{
+            TesseraMarket, build_tessera_depth_scenario, build_tessera_fair_value_scenario,
+            discover_tessera_markets,
+        },
     },
     solana_account::Account,
     solana_commitment_config::CommitmentConfig,
@@ -48,7 +51,7 @@ fn scenario_tool_error(message: String) -> CallToolResult {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CreateTesseraFairValueScenarioParams {
     #[schemars(
-        description = "The Tessera market account. Resolve one through search_constant_options on the tessera-fair-value template's `market` constant; omit to use the default SOL/USDC market."
+        description = "The Tessera market account. Resolve an address through list_tessera_markets; omit to use the default SOL/USDC market."
     )]
     pub market: Option<String>,
     #[schemars(
@@ -58,6 +61,28 @@ pub struct CreateTesseraFairValueScenarioParams {
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ListTesseraMarketsParams {
+    #[schemars(description = "The target local Surfnet RPC port. Omit to use 8899.")]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CreateTesseraDepthScenarioParams {
+    #[schemars(description = "Market account address from list_tessera_markets.")]
+    pub market: String,
+    #[schemars(
+        description = "Remaining base-to-quote sell depth in basis points, 1..10000. Reducing by 90% means 1000; 10000 leaves sells unchanged."
+    )]
+    pub sell_remaining_bps: u16,
+    #[schemars(
+        description = "Remaining quote-to-base buy depth in basis points, 1..10000. Reducing by 90% means 1000; 10000 leaves buys unchanged."
+    )]
+    pub buy_remaining_bps: u16,
+    #[schemars(description = "Target local Surfnet RPC port. Omit to use 8899.")]
     pub surfnet_port: Option<u16>,
 }
 
@@ -1017,7 +1042,39 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates one editable Tessera fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet, derives the pair of reciprocal atomic ratios from their decimals, and keeps the quote fresh while the scenario runs. Prepares state; sends no swap. Resolve `market` through search_constant_options on the tessera-fair-value template's `market` constant."
+        description = "Lists Tessera markets discovered from program accounts on the target Surfnet. Returns market addresses, pair labels, base/quote mints and decimals, and each market's freshness limit. Use addresses to create scenarios; labels are display names and unknown symbols use mint addresses."
+    )]
+    async fn list_tessera_markets(
+        &self,
+        Parameters(params): Parameters<ListTesseraMarketsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let port = params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{port}"));
+        let markets = match discover_tessera_markets(&client).await {
+            Ok(markets) => markets,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        let markets = markets
+            .iter()
+            .map(|market| {
+                serde_json::json!({
+                    "address": market.address.to_string(),
+                    "label": market.label(),
+                    "baseMint": market.base_mint.to_string(),
+                    "quoteMint": market.quote_mint.to_string(),
+                    "baseDecimals": market.base_decimals,
+                    "quoteDecimals": market.quote_decimals,
+                    "freshnessLimitSlots": market.freshness_limit_slots,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({ "count": markets.len(), "markets": markets }).to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Creates one editable Tessera fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet, derives the pair of reciprocal atomic ratios from their decimals, and keeps the quote fresh while the scenario runs. Prepares state; sends no swap. Resolve `market` through list_tessera_markets."
     )]
     async fn create_tessera_fair_value_scenario(
         &self,
@@ -1083,6 +1140,45 @@ impl Surfpool {
         };
 
         self.stage_scenario(preparation.scenario).await
+    }
+
+    #[tool(
+        description = "Creates one editable Tessera depth-reduction scenario from the selected market's current Surfnet state. Scales only enabled capacities with exact integer arithmetic, preserving prices, factors, disabled levels and any unchanged direction. Keeps quotes fresh. A 90% reduction means 1000 remaining basis points. Prepares state; does not Play or send swaps. Report validation failures without substituting another market."
+    )]
+    async fn create_tessera_depth_scenario(
+        &self,
+        Parameters(params): Parameters<CreateTesseraDepthScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let market = match Pubkey::from_str(params.market.trim()) {
+            Ok(market) => market,
+            Err(error) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid Tessera market pubkey: {error}"
+                )));
+            }
+        };
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[market])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let Some(account) = accounts[0].as_ref() else {
+            return Ok(scenario_tool_error(format!(
+                "Tessera market account {market} was not found"
+            )));
+        };
+        let scenario = match build_tessera_depth_scenario(
+            market,
+            account,
+            params.sell_remaining_bps,
+            params.buy_remaining_bps,
+        ) {
+            Ok(scenario) => scenario,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        self.stage_scenario(scenario).await
     }
 
     #[tool(
@@ -1414,6 +1510,25 @@ mod tests {
         assert!(
             text.contains("Invalid Tessera market pubkey"),
             "unexpected payload: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tessera_depth_rejects_a_bad_market_before_any_rpc() {
+        let result = Surfpool::new()
+            .create_tessera_depth_scenario(Parameters(CreateTesseraDepthScenarioParams {
+                market: "not-a-pubkey".to_string(),
+                sell_remaining_bps: 1000,
+                buy_remaining_bps: 10000,
+                surfnet_port: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            json_of(&result)["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid Tessera market pubkey")
         );
     }
 

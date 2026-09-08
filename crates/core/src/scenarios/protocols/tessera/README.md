@@ -18,10 +18,9 @@ before trusting the templates again.
 
 ## The guard, and what it does not cover
 
-A market is 1264 bytes with the eight-byte layout tag `05 00 00 00 00 00 00 00` at offset 96. All
-26 live markets carry that tag, and no other Tessera account is 1264 bytes, so size alone already
-separates markets from the program's other accounts today. The tag is the version half of the
-guard: it is what rejects a future market layout that reuses the size.
+A market is 1264 bytes with the eight-byte layout tag `05 00 00 00 00 00 00 00` at offset 96.
+Discovery selects accounts with this size and tag, then validates the mint identities. The tag is
+the version half of the guard: it is what rejects a future market layout that reuses the size.
 
 The shared raw-layout schema has no owner predicate, so a foreign account of the same size carrying
 the same eight bytes would pass a raw template. `validate_tessera_market_layout` adds the ownership
@@ -57,39 +56,35 @@ with custom error 65535 on a market configured at 20.
 Both slot templates take the lead from the caller: the value supplied for `last_update_slot` is
 added to the materialization slot, and only `null` falls back to the template's own lead. One stale
 template therefore covers every market, including one configured at a limit nobody has seen yet.
-Each market's limit travels with its address in the catalog, so a caller reads it there and passes
-its negation. Passing a number where you meant the default is the one trap: `0` on the stale
+`list_tessera_markets` returns each market's limit alongside its address; callers pass its negation. Passing a number where you meant the default is the one trap: `0` on the stale
 template writes a perfectly fresh quote.
 
-## The market catalog
+## Live market discovery
 
-`v1/overrides.yaml` carries a `market` constant listing every live market with its mints, their
-decimals, and its freshness limit. The UI constrains the choice to it and `search_constant_options`
-resolves it for models. It is a snapshot, captured 2026-08-31 (26 markets:
-fourteen with freshness limit 20, eleven at 25, one at 55): Tessera lists markets continuously,
-a new one reaches the catalog on the next refresh, and until then the raw scenario API still
-accepts its address directly.
+`list_tessera_markets` queries Tessera program accounts through the selected Surfnet RPC.
+It filters by the manifest's account size and layout tag, validates ownership and mint identities,
+and reads decimals from the referenced mint accounts. The freshness limit comes from offset 88.
+The existing Surfnet account resolver merges remote discovery with local accounts, preferring local
+state. Discovery needs a datasource that supports `getProgramAccounts`; offline instances can list
+only their local accounts.
 
-Refresh it by reading the live set and rewriting the `options` block:
+Studio loads this list when opening the fair-value dialog. The model uses the same tool to select
+an override account and its freshness limit. There is no market list in `overrides.yaml`; the six
+shared templates retain the SOL/USDC default address for callers that omit an account.
 
-```bash
-curl -s -X POST "$RPC_URL" -H 'Content-Type: application/json' -d '{
-  "jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
-  "params":["TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",
-    {"encoding":"base64","commitment":"confirmed",
-     "filters":[{"dataSize":1264}],
-     "dataSlice":{"offset":24,"length":72}}]}'
-```
+Labels use mint symbols from Surfpool's existing token metadata. An unknown mint is displayed by
+its full address, so missing symbol metadata never hides a discovered market. Addresses are the
+identities; symbols are not unique. Market membership, decimals and freshness limits are not taken
+from the token metadata catalog.
 
-Each result yields the base mint at `+0`, the quote mint at `+32`, and the freshness limit at
-`+64`. Decimals come from the two mint accounts. `tessera_catalog_matches_live_markets` fails when
-the catalog and the chain disagree, so a stale catalog is caught rather than shipped.
+`tessera_discovers_live_markets` exercises the production discovery function and checks the returned
+mint identities, decimals and freshness limits against fetched accounts. It does not pin a market
+count, so newly listed markets are included without changing the test or templates.
 
-## Builder and tool
+## Builders and tools
 
-One builder exists, for the one thing a template cannot express: turning a human price into the
-pair of reciprocal atomic ratios, which needs both mints' decimals. It is a pure function over
-account data. `create_tessera_fair_value_scenario` reads the market and both mints through the
+The fair-value builder converts a human price into reciprocal atomic ratios using both mints'
+decimals. It is a pure function over account data. `create_tessera_fair_value_scenario` reads the market and both mints through the
 surfnet's own RPC, so local state wins and only missing accounts fall back to the datasource, then
 stages the scenario through the shared path.
 
@@ -100,8 +95,13 @@ Play-time refetch would reinstall remote bytes over any local edit and patch a d
 The paired freshness override is persisted. Its slot encoder writes the slot it materializes at,
 so the prepared price stays inside the market's freshness window however long the scenario runs.
 
-Depth and curve have no builder here. Their templates expose every field, and the scaling helpers
-that read a live ladder and preserve its ordering are parked until a product flow asks for them.
+The `Tessera Depth Stress` AI chip requests a 90% reduction in both directions. The
+`create_tessera_depth_scenario` tool reads current Surfnet state and takes remaining basis points
+per direction: 1000 retains 10%, 10000 leaves that direction unchanged. It scales only enabled
+capacities, with integer-floor rounding, and rejects zero capacities or increases. Prices, factors
+and disabled levels are preserved. The scenario combines `tessera-depth` with persisted freshness;
+depth itself is applied once. Creating another scenario reads the then-current state again.
+Curve changes remain available through the raw template.
 
 ## Behavioral evidence
 
@@ -111,7 +111,7 @@ matching direction, that active-side capacities and factors alter large fills wh
 side stays byte-for-byte identical, that first-level output in both directions equals the
 price-times-factor formula to the atom, that age 19 succeeds and age 20 fails with error 65535,
 that disabling both required first levels fails both directions, that an unordered single curve
-factor fails with error 8, and that the catalog matches the live market set.
+factor fails with error 8, and that live market discovery returns valid mint metadata.
 
 Run it serially. The public endpoint sheds queued requests right after a `getProgramAccounts` scan,
 sometimes as a 413 that looks like a request-size error:

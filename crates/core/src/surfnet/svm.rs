@@ -313,6 +313,13 @@ fn json_to_txtx_value_for_idl_type(
         (IdlType::Option(inner), _) if !json.is_null() => {
             json_to_txtx_value_for_idl_type(json, inner, idl_types)
         }
+        (IdlType::U64 | IdlType::I64, serde_json::Value::String(_)) => {
+            let digits = json_integer_digits(json, "64-bit integer")?;
+            digits
+                .parse::<i128>()
+                .map(Value::Integer)
+                .map_err(|e| SurfpoolError::internal(format!("Invalid integer '{digits}': {e}")))
+        }
         (IdlType::U128, _) => {
             let digits = json_integer_digits(json, "u128")?;
             let value = digits
@@ -4571,6 +4578,26 @@ mod tests {
 
     use super::*;
     use crate::storage::tests::TestType;
+
+    #[test_case("18446744073709551615", IdlType::U64, u64::MAX.to_le_bytes().to_vec(); "u64 max")]
+    #[test_case("-9223372036854775808", IdlType::I64, i64::MIN.to_le_bytes().to_vec(); "i64 min")]
+    fn decimal_integer_override_encodes_exactly(digits: &str, ty: IdlType, expected: Vec<u8>) {
+        let value = json_to_txtx_value_for_idl_type(&serde_json::json!(digits), &ty, &[]).unwrap();
+        let encoded = borsh_encode_value_to_idl_type(&value, &ty, &Vec::new(), None).unwrap();
+        assert_eq!(encoded, expected);
+    }
+
+    #[test_case("18446744073709551616", IdlType::U64; "u64 overflow")]
+    #[test_case("-1", IdlType::U64; "u64 negative")]
+    #[test_case("9223372036854775808", IdlType::I64; "i64 overflow")]
+    #[test_case("-9223372036854775809", IdlType::I64; "i64 underflow")]
+    #[test_case("1.5", IdlType::U64; "fraction")]
+    fn decimal_integer_override_rejects_invalid_values(digits: &str, ty: IdlType) {
+        let converted = json_to_txtx_value_for_idl_type(&serde_json::json!(digits), &ty, &[]);
+        if let Ok(value) = converted {
+            assert!(borsh_encode_value_to_idl_type(&value, &ty, &Vec::new(), None).is_err());
+        }
+    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
