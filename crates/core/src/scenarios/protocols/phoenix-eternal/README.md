@@ -19,7 +19,7 @@ values as decimal strings so values outside JavaScript's safe integer range rema
 
 1. Start an online Surfpool fork and open Studio.
 2. Open **Scenario presets**, choose **Phoenix state**, then select the state goal.
-3. For price scenarios, type the market symbol, such as `BTC`. For collateral stress, enter a
+3. For price scenarios, select a market from the live dropdown. For collateral stress, enter a
    Phoenix Eternal Trader account.
 4. Enter the target values and create the scenario.
 5. Inspect the generated override, then press **Play** to activate it.
@@ -34,7 +34,7 @@ remains empty until a client sends a transaction against the prepared state.
 Phoenix has no HTTP routes of its own. The perp asset map address is a GlobalConfig field rather
 than a PDA, but both market templates carry that address directly, so those two scenarios need no
 tool. Only the collateral scenario needs one, because it must read and validate the live Trader
-account first — the one tool listed below. Studio's preset calls that tool for collateral and posts
+account first. Studio's preset calls that tool for collateral and posts
 the market templates directly.
 
 Accounts are read through the Surfnet's own RPC, so local state wins and only missing accounts fall
@@ -43,24 +43,31 @@ accounts you changed locally.
 
 ## Use through MCP
 
-One tool, for the one scenario a template cannot express:
+The collateral builder and live market catalog are available through MCP:
 
 | Tool | Required parameters |
 | --- | --- |
 | `create_phoenix_collateral_scenario` | `trader`, `targetQuoteLots` |
+| `list_phoenix_markets` | None; optional `surfnetPort` |
 
-It returns a Studio editor URL. The backend reads the live Trader account and refuses a target
-the global vault does not back, which an LLM cannot bypass.
+The collateral tool returns a Studio editor URL. The backend reads the live Trader account and refuses a target
+above the trader’s effective collateral.
 
 The market scenarios need no tool: their templates carry the perp asset map address, so a client
 fills in the values and posts the scenario to `/v1/scenarios`, which is what the Studio preset
-does. The liquidation cascade is those two templates in one scenario at slots 0 and 1 —
-[`phoenix-eternal-liquidation-cascade.json`](../../examples/phoenix-eternal-liquidation-cascade.json)
-is a ready example to post or import.
+does. The liquidation cascade combines those two templates in one scenario at slots 0 and 1.
 
 ## What each preparation guarantees
 
-- Collateral stress changes only `quote_lot_collateral` in the selected Trader account.
+- Collateral stress uses the IDL for `Trader.traderState.quoteLotCollateral`. For a hot trader,
+  Phoenix reads its effective collateral from `GlobalTraderIndex`, so Play also locates the
+  reachable entry by the trader key and encodes its `TraderState.quoteLotCollateral` with the
+  same IDL. Both accounts retain their length and every unrelated byte. A cold trader needs
+  only its Trader account. The builder's increase guard uses effective index collateral for
+  hot traders, rather than the stale copy in their Trader account.
+- Hot collateral preparations currently support a single-arena `GlobalTraderIndex`. Missing,
+  corrupt, or multi-arena indexes fail before collateral writes. Node offsets are resolved
+  again at Play; no trader address or node offset is pinned in the scenario.
 - Direct mark shock changes only the selected market's mark-price ticks and the mark-price slot,
   which is stamped with the slot the override materializes at so the program reads the new mark
   as fresh.
@@ -93,6 +100,13 @@ or liquidates depends on the transaction, the selected account, and the rest of 
 | Scenario is green but the Transaction Inspector is empty | The state is active, but no client transaction has been sent yet. |
 | A transaction does not produce the expected economic result | Confirm its accounts and instruction path consume the field changed by the selected preparation. |
 
+Check the same market before applying an override. A cached `ActiveTraderBuffer` can lack positions
+referenced by a more recently fetched orderbook, causing BBO to fail even before price validation.
+Price-slot refreshes cannot repair those missing references. Behavioral tests fetch the account graph
+and Clock together with `getMultipleAccounts` after discovering the addresses; they do not rewrite
+oracle timestamps or fabricate trader positions. An old fork can also fail price-staleness guards
+independently of whether the override wrote the correct values.
+
 ## Layout drift
 
 Phoenix is zero-copy, so decoding an account built by these tests can never disagree with the
@@ -108,6 +122,12 @@ and prove an override on a live account changes only its target bytes. Set
 
 ## Behavioral verification
 
+To check reference prices independently on the live SOL and BTC markets:
+
+```sh
+cargo test -p surfpool-core --features integration-tests reference_prices_change_hawkeye_index_on_live_markets
+```
+
 The behavioral test runs with the rest of the integration suite; there is nothing to install by
 hand and no snapshots to keep current, since the deployed bytecode is fetched straight from the
 chain:
@@ -116,12 +136,17 @@ chain:
 cargo test -p surfpool-core --features integration-tests tests::phoenix
 ```
 
-It forks the live account graph, discovers a live Trader that carries collateral and a long
+It forks the live account graph, discovers a live hot Trader that carries collateral and a long
 position, and loads the deployed Phoenix Eternal and Hawkeye bytecode straight from their
 ProgramData accounts (`B5ayDaz9HegiNZqYeBtcFqfZBVSGwjB2CJgHshoSfMQg` and
 `Gv1WgG864CQqF5vedJVbpnhpRpRbTW1A7SyARzSw9B4Y`), cached under the system temp directory as
 `surfpool-phoenix-eternal.so` and `surfpool-phoenix-hawkeye.so`. Delete those files to pick up a
 program upgrade; the cached bytecode is otherwise reused as-is.
+
+The collateral check uses the production builder, verifies creation leaves the Trader and
+GlobalTraderIndex unchanged, and compares both complete accounts after Play: only their
+collateral fields may change. A real Hawkeye transaction must read collateral `1` and report
+the trader liquidatable. This runs in the isolated test VM, outside Studio's Transaction Inspector.
 
 The raw material is selected, not arbitrary: it walks the program's Trader accounts for one that
 carries collateral, and for the mark-shock and cascade tests, one that also holds a long position,
