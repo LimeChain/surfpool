@@ -49,8 +49,7 @@ use crate::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::state_builder::{
             PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
-            patch_direct_mark, patch_reference_prices, patch_trader_collateral,
-            phoenix_market_symbols, phoenix_perp_asset_map_address,
+            forge_phoenix_override, phoenix_market_symbols, phoenix_perp_asset_map_address,
         },
     },
     surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
@@ -147,31 +146,29 @@ async fn live_candidate(needs_position: bool) -> (Pubkey, Account) {
         Err(error) => panic!("failed to list live Phoenix traders: {error}"),
     };
 
-    // Addresses come back in pubkey order, so a handful from the front is not a
-    // representative sample; scan in batches until one qualifies.
-    for batch in candidates.chunks(100).take(4) {
-        let pubkeys = batch.iter().map(|(pubkey, _)| *pubkey).collect::<Vec<_>>();
-        for (pubkey, account) in pubkeys.iter().zip(fetch(&pubkeys).await) {
-            let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
-                continue;
-            };
-            let has_collateral = trader.header.trader_state.quote_lot_collateral.as_inner() > 0;
-            // A downward mark shock only threatens a long, so the risk scenarios need one:
-            // the shock direction is fixed, the trader is what we go looking for.
-            let holds_a_long = trader
-                .positions()
-                .any(|(_, position)| position.base_lot_position().as_inner() > 0);
-            if has_collateral && (!needs_position || holds_a_long) {
-                cache.insert(needs_position, (*pubkey, account.clone()));
-                return (*pubkey, account);
-            }
+    for (pubkey, account) in candidates {
+        let account = account.to_account().expect("live Trader account decodes");
+        let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
+            continue;
+        };
+        let has_collateral = trader.header.trader_state.quote_lot_collateral.as_inner() > 0;
+        // A downward mark shock only threatens a long, so the risk scenarios need one:
+        // the shock direction is fixed, the trader is what we go looking for.
+        let holds_a_long = trader
+            .positions()
+            .any(|(_, position)| position.base_lot_position().as_inner() > 0);
+        if has_collateral
+            && (!needs_position || (holds_a_long && trader.header.trader_state.is_hot()))
+        {
+            cache.insert(needs_position, (pubkey, account.clone()));
+            return (pubkey, account);
         }
     }
 
     panic!(
         "no eligible live candidate: no live Phoenix Trader read carries collateral{}",
         if needs_position {
-            " and a long position"
+            " and is hot with a long position"
         } else {
             ""
         }
@@ -251,11 +248,18 @@ async fn overrides_on_live_accounts_touch_only_their_target_bytes() {
         .ticks
         .as_inner();
 
-    let shocked = patch_direct_mark(
-        &map_account.owner,
-        &map_account.data,
-        &symbol,
-        live_mark / 2 + 1,
+    let materialization_slot = entry.metadata.oracle_price().mark_price.price.slot + 1;
+    let shocked = forge_phoenix_override(
+        &perp_asset_map,
+        &map_account,
+        &HashMap::from([
+            ("symbol".to_string(), serde_json::json!(symbol)),
+            (
+                "target_ticks".to_string(),
+                serde_json::json!((live_mark / 2 + 1).to_string()),
+            ),
+        ]),
+        materialization_slot,
     )
     .expect("direct mark patch on the live map");
     assert_eq!(
@@ -266,16 +270,25 @@ async fn overrides_on_live_accounts_touch_only_their_target_bytes() {
     let mark_diffs = diff_indices(&shocked, &map_account.data);
     assert!(
         !mark_diffs.is_empty() && mark_diffs.len() <= 16,
-        "a mark shock writes one tick field, got {} changed bytes",
+        "a mark shock writes its ticks and slot, got {} changed bytes",
         mark_diffs.len()
     );
 
-    let diverged = patch_reference_prices(
-        &map_account.owner,
-        &map_account.data,
-        &symbol,
-        live_mark * 2,
-        live_mark * 3,
+    let diverged = forge_phoenix_override(
+        &perp_asset_map,
+        &map_account,
+        &HashMap::from([
+            ("symbol".to_string(), serde_json::json!(symbol)),
+            (
+                "spot_ticks".to_string(),
+                serde_json::json!((live_mark * 2).to_string()),
+            ),
+            (
+                "perp_ticks".to_string(),
+                serde_json::json!((live_mark * 3).to_string()),
+            ),
+        ]),
+        materialization_slot,
     )
     .expect("reference price patch on the live map");
     assert_eq!(diverged.len(), map_account.data.len());
@@ -286,8 +299,40 @@ async fn overrides_on_live_accounts_touch_only_their_target_bytes() {
             .all(|index| !mark_diffs.contains(index)),
         "reference divergence must preserve the mark price it diverges from"
     );
+}
 
-    let _ = perp_asset_map;
+#[tokio::test(flavor = "multi_thread")]
+async fn collateral_idl_override_preserves_live_trader_layout() {
+    let (trader, account) = live_trader().await;
+
+    let idl: anchor_lang_idl::types::Idl =
+        serde_json::from_str(crate::scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT)
+            .expect("phoenix idl parses as an anchor idl");
+    let (svm, _events_rx, _geyser_rx) =
+        SurfnetSvm::new(crate::surfnet::svm::SurfnetSvmConfig::default()).unwrap();
+
+    let target: i64 = 12_345;
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "traderState.quoteLotCollateral".to_string(),
+        crate::scenarios::protocols::phoenix_eternal::v1::collateral::collateral_override_value(
+            &serde_json::Value::String(target.to_string()),
+        )
+        .unwrap(),
+    );
+
+    let forged = svm
+        .get_forged_account_data(&trader, &account.data, &idl, &overrides)
+        .expect("idl override path forges the trader account");
+
+    let header = TraderHeader::try_read_from_account_bytes(&forged).expect("forged header decodes");
+    assert_eq!(header.trader_state.quote_lot_collateral.as_inner(), target);
+    assert_eq!(forged.len(), account.data.len());
+    let diffs = diff_indices(&forged, &account.data);
+    assert!(
+        diffs.iter().all(|index| (88..96).contains(index)),
+        "collateral override changed bytes outside 88..96: {diffs:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -317,30 +362,34 @@ async fn the_market_templates_address_the_live_perp_asset_map() {
 #[tokio::test(flavor = "multi_thread")]
 async fn collateral_stress_refuses_to_outrun_the_live_vault() {
     let (trader, account) = live_trader().await;
-    let live_collateral = TraderHeader::try_read_from_account_bytes(&account.data)
-        .expect("a discovered trader decodes")
-        .trader_state
-        .quote_lot_collateral
-        .as_inner();
+    let global = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
+    let index_key = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::phoenix_global_trader_index_address(&global).unwrap();
+    let index = fetch(&[index_key]).await.remove(0);
+    let header = TraderHeader::try_read_from_account_bytes(&account.data).unwrap();
+    let live_collateral =
+        crate::scenarios::protocols::phoenix_eternal::v1::collateral::effective_collateral(
+            &header,
+            Some(&index),
+        )
+        .unwrap();
 
-    let lowered = build_phoenix_collateral_scenario(trader, &account, "1")
+    let lowered = build_phoenix_collateral_scenario(trader, &account, "1", Some(&index))
         .expect("lowering collateral is state preparation");
-    assert_eq!(lowered.target_quote_lots, 1);
+    assert_eq!(
+        lowered.overrides[0].values["traderState.quoteLotCollateral"],
+        "1"
+    );
 
-    let raised =
-        build_phoenix_collateral_scenario(trader, &account, &(live_collateral + 1).to_string())
-            .unwrap_err();
+    let raised = build_phoenix_collateral_scenario(
+        trader,
+        &account,
+        &(live_collateral + 1).to_string(),
+        Some(&index),
+    )
+    .unwrap_err();
     assert!(
         raised.to_string().contains("can only lower collateral"),
         "raising collateral past its vault backing must be refused, got: {raised}"
-    );
-
-    let patched = patch_trader_collateral(&account.owner, &account.data, 1)
-        .expect("collateral patch on a valid trader");
-    let diffs = diff_indices(&patched, &account.data);
-    assert!(
-        diffs.iter().all(|index| (88..96).contains(index)),
-        "only the collateral field may change, got {diffs:?}"
     );
 }
 
@@ -378,7 +427,24 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     // Collateral stress produces the risk condition: a trader with an open position and
     // almost no collateral is liquidatable whichever way the position points.
     let (collateral_locker, graph) = phoenix_behavior_locker().await;
+    use crate::scenarios::protocols::phoenix_eternal::v1::collateral::index_trader_state_range;
+
+    let account = |key: &Pubkey| {
+        collateral_locker
+            .with_svm_reader(|svm| svm.get_account(key))
+            .unwrap()
+            .unwrap()
+    };
+    let before_trader = account(&graph.trader);
+    let before_index = account(&graph.global_trader_index);
+    let header = TraderHeader::try_read_from_account_bytes(&before_trader.data).unwrap();
+    assert!(
+        header.trader_state.is_hot(),
+        "the regression requires a hot trader"
+    );
+    let range = index_trader_state_range(&before_index, &header.key).unwrap();
     let before = hawkeye_margin(&collateral_locker, &graph);
+    assert!(before.collateral_quote_lots > 1);
     assert!(
         before.position_count > 0,
         "the discovered trader must hold a position for margin to mean anything"
@@ -391,14 +457,16 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     );
     assert_eq!(before.is_liquidatable, 0, "the fork starts healthy");
 
+    let scenario =
+        build_phoenix_collateral_scenario(graph.trader, &before_trader, "1", Some(&before_index))
+            .unwrap();
     collateral_locker
-        .register_scenario(
-            phoenix_collateral_scenario(graph.trader, serde_json::json!("1"), false),
-            Some(100),
-        )
+        .register_scenario(scenario, Some(graph.clock.slot))
         .unwrap();
+    assert_eq!(account(&graph.trader), before_trader);
+    assert_eq!(account(&graph.global_trader_index), before_index);
     collateral_locker
-        .materialize_overrides_for_slot(&None, 100)
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
         .await
         .unwrap();
     let after_collateral = hawkeye_margin(&collateral_locker, &graph);
@@ -411,44 +479,47 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         "stressing collateral must lower what the risk engine can count on"
     );
 
+    assert_eq!(after_collateral.is_liquidatable, 1);
+    let mut expected_trader = before_trader;
+    expected_trader.data[88..96].copy_from_slice(&1_i64.to_le_bytes());
+    let mut expected_index = before_index;
+    expected_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
+    assert_eq!(account(&graph.trader), expected_trader);
+    assert_eq!(account(&graph.global_trader_index), expected_index);
+
     // The cascade prepares the same collateral at slot 0 and a mark shock at slot 1. What
     // the deployed program reads is asserted; whether this particular position liquidates
     // depends on its side, which the discovery does not choose.
     let (mark_locker, graph) = phoenix_behavior_locker().await;
     let (symbol, orderbook, spline) = graph.markets[0].clone();
-    let (trader_account, global_account, perp_asset_map_account) =
-        mark_locker.with_svm_reader(|svm_reader| {
-            (
-                svm_reader.get_account(&graph.trader).unwrap().unwrap(),
-                svm_reader
-                    .get_account(&crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_GLOBAL_CONFIG)
-                    .unwrap()
-                    .unwrap(),
-                svm_reader
-                    .get_account(&graph.perp_asset_map)
-                    .unwrap()
-                    .unwrap(),
-            )
-        });
+    let trader_account = mark_locker
+        .with_svm_reader(|svm| svm.get_account(&graph.trader))
+        .unwrap()
+        .unwrap();
     let prepared_collateral = hawkeye_margin(&mark_locker, &graph).collateral_quote_lots / 2;
+    let index_account = mark_locker
+        .with_svm_reader(|svm| svm.get_account(&graph.global_trader_index))
+        .unwrap()
+        .unwrap();
     // The cascade is the two templates across slots: the collateral tool's scenario at slot 0
     // and the mark shock at slot 1, which is what a user composes in the editor.
-    let mut cascade = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::build_phoenix_collateral_scenario(
+    let mut cascade = build_phoenix_collateral_scenario(
         graph.trader,
         &trader_account,
         &prepared_collateral.to_string(),
+        Some(&index_account),
     )
-    .unwrap()
-    .scenario;
+    .unwrap();
     let mut shock = phoenix_direct_mark_scenario(graph.perp_asset_map, &symbol, "1", false)
         .overrides
         .remove(0);
     shock.scenario_relative_slot = 1;
     cascade.add_override(shock);
-    let _ = (&global_account, &perp_asset_map_account);
-    mark_locker.register_scenario(cascade, Some(100)).unwrap();
     mark_locker
-        .materialize_overrides_for_slot(&None, 100)
+        .register_scenario(cascade, Some(graph.clock.slot))
+        .unwrap();
+    mark_locker
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
         .await
         .unwrap();
     let before_mark = hawkeye_bbo_for_market(&graph, &mark_locker, orderbook, spline);
@@ -458,48 +529,23 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         "stage 0 prepares the collateral the cascade was built with"
     );
     assert_ne!(before_mark.mark_price_ticks, 1);
+    mark_locker.with_svm_writer(|svm| {
+        let mut clock = graph.clock.clone();
+        clock.slot += 1;
+        svm.inner.set_sysvar(&clock);
+    });
     mark_locker
-        .materialize_overrides_for_slot(&None, 101)
+        .materialize_overrides_for_slot(&None, graph.clock.slot + 1)
         .await
         .unwrap();
     let after_mark = hawkeye_bbo_for_market(&graph, &mark_locker, orderbook, spline);
     assert_eq!(
+        after_mark.mark_price_last_updated_slot,
+        graph.clock.slot + 1
+    );
+    assert_eq!(
         after_mark.mark_price_ticks, 1,
         "stage 1 shocks the mark the program itself reads"
-    );
-
-    // Reference divergence moves the cached index away from the mark and leaves the mark.
-    let (reference_locker, graph) = phoenix_behavior_locker().await;
-    let (symbol, orderbook, spline) = graph.markets[0].clone();
-    let before_reference = hawkeye_bbo_for_market(&graph, &reference_locker, orderbook, spline);
-    reference_locker
-        .register_scenario(
-            phoenix_reference_price_scenario(
-                graph.perp_asset_map,
-                &symbol,
-                "80000",
-                "120000",
-                false,
-            ),
-            Some(100),
-        )
-        .unwrap();
-    reference_locker
-        .materialize_overrides_for_slot(&None, 100)
-        .await
-        .unwrap();
-    let after_reference = hawkeye_bbo_for_market(&graph, &reference_locker, orderbook, spline);
-    assert_eq!(
-        after_reference.mark_price_ticks, before_reference.mark_price_ticks,
-        "the divergence preserves the mark it diverges from"
-    );
-    assert_ne!(
-        after_reference.index_price_ticks, before_reference.index_price_ticks,
-        "the cached reference the program reads must move"
-    );
-    assert_ne!(
-        after_reference.index_price_ticks, after_reference.mark_price_ticks,
-        "spot and perp references diverging from the mark is the whole scenario"
     );
 
     // The second live market proves the preparations are not market-specific.
@@ -509,16 +555,51 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     second_locker
         .register_scenario(
             phoenix_direct_mark_scenario(graph.perp_asset_map, &symbol, "1", false),
-            Some(100),
+            Some(graph.clock.slot),
         )
         .unwrap();
     second_locker
-        .materialize_overrides_for_slot(&None, 100)
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
         .await
         .unwrap();
     let after_second = hawkeye_bbo_for_market(&graph, &second_locker, orderbook, spline);
     assert_ne!(before_second.mark_price_ticks, 1);
     assert_eq!(after_second.mark_price_ticks, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reference_prices_change_hawkeye_index_on_live_markets() {
+    let graph = phoenix_live_graph().await;
+    for (symbol, orderbook, spline) in &graph.markets {
+        let (locker, _) = phoenix_behavior_locker().await;
+        let before = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
+        locker
+            .register_scenario(
+                phoenix_reference_price_scenario(
+                    graph.perp_asset_map,
+                    symbol,
+                    "80000",
+                    "79000",
+                    false,
+                ),
+                Some(graph.clock.slot),
+            )
+            .unwrap();
+        locker
+            .materialize_overrides_for_slot(&None, graph.clock.slot)
+            .await
+            .unwrap();
+        let after = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
+        println!(
+            "{symbol}: mark {} -> {}, index {} -> {} (target spot 80000, perp 79000)",
+            before.mark_price_ticks,
+            after.mark_price_ticks,
+            before.index_price_ticks,
+            after.index_price_ticks
+        );
+        assert_eq!(after.mark_price_ticks, before.mark_price_ticks, "{symbol}");
+        assert_eq!(after.index_price_ticks, 80000, "{symbol}");
+    }
 }
 
 /// A surfnet holding the live Phoenix account graph and a discovered live trader, with the
@@ -532,13 +613,11 @@ async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
-        let mut clock = svm_writer.inner.get_sysvar::<Clock>();
-        clock.slot = 0;
-        svm_writer.inner.set_sysvar(&clock);
+        svm_writer.inner.set_sysvar(&graph.clock);
         svm_writer
             .inner
             .svm
-            .add_program(crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID, &eternal_program)
+            .add_program(PHOENIX_ETERNAL_PROGRAM_ID, &eternal_program)
             .unwrap();
         svm_writer
             .inner
@@ -559,65 +638,52 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         return cached.clone();
     }
 
-    let global_account = fetch(&[
-        crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_GLOBAL_CONFIG,
-    ])
-    .await
-    .remove(0);
-    let global = phoenix_rise_accounts::global_config::GlobalConfig::try_from_account_bytes(
-        &global_account.data,
-    )
-    .expect("live GlobalConfig decodes");
+    let global_account = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
+    let global = GlobalConfig::try_from_account_bytes(&global_account.data)
+        .expect("live GlobalConfig decodes");
     let perp_asset_map = Pubkey::new_from_array(global.perp_asset_map_key());
     let global_trader_index = Pubkey::new_from_array(global.global_trader_index_header_key());
     let active_trader_buffer = Pubkey::new_from_array(global.active_trader_buffer_header_key());
 
-    let supporting = fetch(&[perp_asset_map, global_trader_index, active_trader_buffer]).await;
-    let map = PerpAssetMap::try_from_account_bytes(&supporting[0].data)
-        .expect("live PerpAssetMap decodes");
-    let symbols =
-        crate::scenarios::protocols::phoenix_eternal::v1::state_builder::phoenix_market_symbols(
-            perp_asset_map,
-            &supporting[0],
-        )
-        .expect("live PerpAssetMap lists its markets");
-    assert!(
-        symbols.len() >= 2,
-        "no eligible live candidate: the preparations claim to work for any market, which \
-         needs two live ones to show, found {symbols:?}"
-    );
-
+    let map_account = fetch(&[perp_asset_map]).await.remove(0);
+    let map =
+        PerpAssetMap::try_from_account_bytes(&map_account.data).expect("live PerpAssetMap decodes");
     let mut markets = Vec::new();
-    let mut accounts = vec![
-        (
-            crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_GLOBAL_CONFIG,
-            global_account,
-        ),
-        (perp_asset_map, supporting[0].clone()),
-        (global_trader_index, supporting[1].clone()),
-        (active_trader_buffer, supporting[2].clone()),
+    let mut addresses = vec![
+        PHOENIX_GLOBAL_CONFIG,
+        perp_asset_map,
+        global_trader_index,
+        active_trader_buffer,
     ];
-    for symbol in symbols.into_iter().take(2) {
+    for symbol in ["SOL", "BTC"] {
         let entry = map
-            .find_by_symbol(&symbol)
+            .find_by_symbol(symbol)
             .expect("symbol lookup")
-            .expect("listed symbol");
+            .expect("live SOL/BTC market");
         let orderbook =
             Pubkey::new_from_array(entry.metadata.static_market_params().market_account);
-        let spline = phoenix_rise_accounts::pda::derive_spline_collection_address(
-            &crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
-            &orderbook,
-        );
-        let market_accounts = fetch(&[orderbook, spline]).await;
-        accounts.push((orderbook, market_accounts[0].clone()));
-        accounts.push((spline, market_accounts[1].clone()));
-        markets.push((symbol, orderbook, spline));
+        let spline = derive_spline_collection_address(&PHOENIX_ETERNAL_PROGRAM_ID, &orderbook);
+        addresses.extend([orderbook, spline]);
+        markets.push((symbol.to_string(), orderbook, spline));
     }
 
-    let (trader, trader_account) = crate::tests::phoenix::live_trader_with_position().await;
-    accounts.push((trader, trader_account));
+    let (trader, _) = live_trader_with_position().await;
+    addresses.push(trader);
+    addresses.push(Pubkey::from_str_const(
+        "SysvarC1ock11111111111111111111111111111111",
+    ));
+    // Read the clock and all dependencies from one bank, after address discovery.
+    let mut fresh = fetch(&addresses).await;
+    let clock: Clock = bincode::deserialize(&fresh.pop().unwrap().data).unwrap();
+    assert!(clock.slot > 0);
+    let accounts = addresses.into_iter().zip(fresh).collect();
+    println!(
+        "Phoenix live fork: slot={}, unix_timestamp={}",
+        clock.slot, clock.unix_timestamp
+    );
 
     let graph = PhoenixLiveGraph {
+        clock,
         accounts,
         global_trader_index,
         active_trader_buffer,
@@ -634,6 +700,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
 /// margin view expects to be passed alongside them.
 #[derive(Clone)]
 struct PhoenixLiveGraph {
+    clock: Clock,
     accounts: Vec<(Pubkey, Account)>,
     global_trader_index: Pubkey,
     active_trader_buffer: Pubkey,
@@ -644,48 +711,57 @@ struct PhoenixLiveGraph {
     markets: Vec<(String, Pubkey, Pubkey)>,
 }
 
-fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> HawkeyeMarginView {
+fn hawkeye_view(
+    locker: &SurfnetSvmLocker,
+    graph: &PhoenixLiveGraph,
+    discriminant: [u8; 8],
+    extra_accounts: &[Pubkey],
+) -> Vec<u8> {
     let payer = Keypair::new();
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .inner
-            .airdrop(&payer.pubkey(), 1_000_000_000)
-            .unwrap();
-        let instruction = Instruction {
-            program_id: HAWKEYE_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new_readonly(
-                    crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
-                    false,
-                ),
-                AccountMeta::new_readonly(
-                    crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_GLOBAL_CONFIG,
-                    false,
-                ),
-                AccountMeta::new_readonly(graph.global_trader_index, false),
-                AccountMeta::new_readonly(graph.active_trader_buffer, false),
-                AccountMeta::new_readonly(graph.perp_asset_map, false),
-                AccountMeta::new_readonly(graph.trader, false),
-            ],
-            data: HAWKEYE_VIEW_MARGIN_DISCRIMINANT.to_vec(),
-        };
+    let accounts = [
+        PHOENIX_ETERNAL_PROGRAM_ID,
+        PHOENIX_GLOBAL_CONFIG,
+        graph.global_trader_index,
+        graph.active_trader_buffer,
+        graph.perp_asset_map,
+    ]
+    .iter()
+    .chain(extra_accounts)
+    .map(|address| AccountMeta::new_readonly(*address, false))
+    .collect();
+    locker.with_svm_writer(|svm| {
+        svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
         let transaction = Transaction::new_signed_with_payer(
-            // A live trader carries more positions than the fixture did, and the margin view
-            // walks all of them.
             &[
                 ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                instruction,
+                Instruction {
+                    program_id: HAWKEYE_PROGRAM_ID,
+                    accounts,
+                    data: discriminant.to_vec(),
+                },
             ],
             Some(&payer.pubkey()),
             &[&payer],
-            svm_writer.inner.svm.latest_blockhash(),
+            svm.inner.svm.latest_blockhash(),
         );
-        let metadata = svm_writer.inner.send_transaction(transaction).unwrap();
-        let margin =
-            bytemuck::pod_read_unaligned::<HawkeyeMarginView>(&metadata.return_data.data);
-        assert_eq!(margin.magic, HAWKEYE_MARGIN_RETURN_MAGIC);
-        margin
+        svm.inner
+            .send_transaction(transaction)
+            .unwrap()
+            .return_data
+            .data
     })
+}
+
+fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> HawkeyeMarginView {
+    let data = hawkeye_view(
+        locker,
+        graph,
+        HAWKEYE_VIEW_MARGIN_DISCRIMINANT,
+        &[graph.trader],
+    );
+    let margin = bytemuck::pod_read_unaligned::<HawkeyeMarginView>(&data);
+    assert_eq!(margin.magic, HAWKEYE_MARGIN_RETURN_MAGIC);
+    margin
 }
 
 fn hawkeye_bbo_for_market(
@@ -694,47 +770,15 @@ fn hawkeye_bbo_for_market(
     orderbook: Pubkey,
     spline: Pubkey,
 ) -> HawkeyeBboView {
-    let payer = Keypair::new();
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .inner
-            .airdrop(&payer.pubkey(), 1_000_000_000)
-            .unwrap();
-        let instruction = Instruction {
-            program_id: HAWKEYE_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new_readonly(
-                    crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
-                    false,
-                ),
-                AccountMeta::new_readonly(
-                    crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_GLOBAL_CONFIG,
-                    false,
-                ),
-                AccountMeta::new_readonly(graph.global_trader_index, false),
-                AccountMeta::new_readonly(graph.active_trader_buffer, false),
-                AccountMeta::new_readonly(graph.perp_asset_map, false),
-                AccountMeta::new_readonly(orderbook, false),
-                AccountMeta::new_readonly(spline, false),
-            ],
-            data: HAWKEYE_VIEW_BBO_DISCRIMINANT.to_vec(),
-        };
-        let transaction = Transaction::new_signed_with_payer(
-            // A live trader carries more positions than the fixture did, and the margin view
-            // walks all of them.
-            &[
-                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                instruction,
-            ],
-            Some(&payer.pubkey()),
-            &[&payer],
-            svm_writer.inner.svm.latest_blockhash(),
-        );
-        let metadata = svm_writer.inner.send_transaction(transaction).unwrap();
-        let bbo = bytemuck::pod_read_unaligned::<HawkeyeBboView>(&metadata.return_data.data);
-        assert_eq!(bbo.magic, HAWKEYE_BBO_RETURN_MAGIC);
-        bbo
-    })
+    let data = hawkeye_view(
+        locker,
+        graph,
+        HAWKEYE_VIEW_BBO_DISCRIMINANT,
+        &[orderbook, spline],
+    );
+    let bbo = bytemuck::pod_read_unaligned::<HawkeyeBboView>(&data);
+    assert_eq!(bbo.magic, HAWKEYE_BBO_RETURN_MAGIC);
+    bbo
 }
 
 #[repr(C)]
@@ -798,7 +842,7 @@ fn phoenix_collateral_scenario(
         surfpool_types::AccountAddress::Pubkey(trader.to_string()),
     )
     .with_values(HashMap::from([(
-        "quote_lot_collateral".to_string(),
+        "traderState.quoteLotCollateral".to_string(),
         collateral,
     )]));
     instance.fetch_before_use = fetch_before_use;
@@ -870,7 +914,7 @@ async fn materialize_patches_only_phoenix_trader_collateral() {
                 Account {
                     lamports: 1,
                     data: base.clone(),
-                    owner: crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
+                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -904,62 +948,10 @@ async fn materialize_patches_only_phoenix_trader_collateral() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn materialize_applies_phoenix_collateral_without_fetch_before_use() {
-    let trader = Pubkey::new_unique();
-    let scenario = phoenix_collateral_scenario(trader, serde_json::json!("371499999"), false);
-    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-    let locker = SurfnetSvmLocker::new(svm);
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .set_account(
-                &trader,
-                Account {
-                    lamports: 1,
-                    data: phoenix_trader_fixture(6_996_825_500),
-                    owner: crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-    });
-
-    locker.register_scenario(scenario, Some(100)).unwrap();
-    locker
-        .materialize_overrides_for_slot(&None, 100)
-        .await
-        .unwrap();
-
-    let after = locker
-        .with_svm_reader(|svm_reader| svm_reader.get_account(&trader))
-        .unwrap()
-        .unwrap();
-    let header = TraderHeader::try_read_from_account_bytes(&after.data).unwrap();
-    assert_eq!(
-        header.trader_state.quote_lot_collateral.as_inner(),
-        371_499_999
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn materialize_applies_a_phoenix_direct_mark_override() {
     let perp_asset_map = Pubkey::new_unique();
     let base = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::tests::perp_asset_map_fixture();
-    let mut scenario = surfpool_types::Scenario::new(
-        "Phoenix direct mark risk shock".to_string(),
-        "Phoenix direct mark override".to_string(),
-    );
-    let mut instance = surfpool_types::OverrideInstance::new(
-        "phoenix-direct-mark-risk-shock".to_string(),
-        0,
-        surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
-    )
-    .with_values(HashMap::from([
-        ("symbol".to_string(), serde_json::json!("SOL")),
-        ("target_ticks".to_string(), serde_json::json!("1")),
-    ]));
-    instance.fetch_before_use = false;
-    scenario.add_override(instance);
+    let scenario = phoenix_direct_mark_scenario(perp_asset_map, "SOL", "1", false);
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
@@ -969,7 +961,7 @@ async fn materialize_applies_a_phoenix_direct_mark_override() {
                 Account {
                     lamports: 1,
                     data: base.clone(),
-                    owner: crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
+                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -1033,7 +1025,7 @@ async fn materialize_refreshes_phoenix_reference_price_slots() {
                 Account {
                     lamports: 1,
                     data: base,
-                    owner: crate::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
+                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -1041,12 +1033,6 @@ async fn materialize_refreshes_phoenix_reference_price_slots() {
             .unwrap();
     });
 
-    let mut scenario = scenario;
-    scenario.overrides[0].account =
-        surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string());
-    scenario.overrides[0]
-        .values
-        .insert("symbol".to_string(), serde_json::json!("SOL"));
     locker.register_scenario(scenario, Some(100)).unwrap();
     locker
         .materialize_overrides_for_slot(&None, 100)
