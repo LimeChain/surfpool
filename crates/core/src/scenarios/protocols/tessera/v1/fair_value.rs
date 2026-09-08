@@ -8,7 +8,10 @@ use std::{collections::HashMap, sync::LazyLock};
 
 use solana_account::Account;
 use solana_pubkey::Pubkey;
-use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, RawLayout, Scenario};
+use surfpool_types::{
+    AccountAddress, OverrideInstance, OverrideTemplate, RawLayout, Scenario,
+    VERIFIED_TOKENS_BY_SYMBOL,
+};
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -27,7 +30,7 @@ const QUOTE_MINT_OFFSET: usize = 56;
 
 /// The size and layout tag a Tessera market must have, taken from the manifest the raw templates
 /// are written against so there is one definition of them. Built once; the manifest is compiled in.
-static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| {
+pub(super) static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| {
     template(&TemplateRegistry::new(), FAIR_VALUE_TEMPLATE)
         .and_then(|template| {
             template.raw_layout.clone().ok_or_else(|| {
@@ -55,6 +58,7 @@ pub struct TesseraMarket {
     pub quote_mint: Pubkey,
     pub base_decimals: u8,
     pub quote_decimals: u8,
+    pub freshness_limit_slots: u64,
 }
 
 impl TesseraMarket {
@@ -94,7 +98,24 @@ impl TesseraMarket {
             quote_mint,
             base_decimals,
             quote_decimals,
+            freshness_limit_slots: u64::from_le_bytes(
+                market_account.data[88..96].try_into().unwrap(),
+            ),
         })
+    }
+
+    pub fn label(&self) -> String {
+        let symbol = |mint: &Pubkey| {
+            let address = mint.to_string();
+            VERIFIED_TOKENS_BY_SYMBOL
+                .values()
+                .filter(|token| token.address == address)
+                .map(|token| token.symbol.as_str())
+                .min()
+                .map(str::to_string)
+                .unwrap_or(address)
+        };
+        format!("{}/{}", symbol(&self.base_mint), symbol(&self.quote_mint))
     }
 }
 
@@ -131,7 +152,7 @@ pub fn build_tessera_fair_value_scenario(
     let registry = TemplateRegistry::new();
     let fair_value = template(&registry, FAIR_VALUE_TEMPLATE)?;
     let freshness = template(&registry, FRESHNESS_TEMPLATE)?;
-    let market_name = market_display_name(fair_value, &market.address);
+    let market_name = market.label();
     let target = AccountAddress::Pubkey(market.address.to_string());
 
     // No fetch_before_use: these values were derived from the market account this scenario was
@@ -254,22 +275,6 @@ fn checked_power_of_ten(exponent: u32) -> SurfpoolResult<u128> {
         .ok_or_else(|| invalid("price scale exceeds supported precision"))
 }
 
-/// The catalog pair for a listed market ("SOL/USDC"), a shortened address for one it does not list.
-fn market_display_name(template: &OverrideTemplate, market: &Pubkey) -> String {
-    let address = market.to_string();
-    template
-        .constants
-        .get("market")
-        .and_then(|constant| {
-            constant
-                .options
-                .iter()
-                .find(|option| option.value == address)
-        })
-        .map(|option| option.label.clone())
-        .unwrap_or_else(|| format!("{}…{}", &address[..4], &address[address.len() - 4..]))
-}
-
 fn template<'a>(registry: &'a TemplateRegistry, id: &str) -> SurfpoolResult<&'a OverrideTemplate> {
     registry
         .get(id)
@@ -324,6 +329,21 @@ mod tests {
             &mint_account(quote_decimals),
         )
         .expect("valid Tessera market")
+    }
+
+    #[test]
+    fn reads_metadata_for_a_market_outside_the_token_catalog() {
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let address = Pubkey::new_unique();
+        let mut account = market_account(&base, &quote);
+        account.data[88..96].copy_from_slice(&37u64.to_le_bytes());
+        let market =
+            TesseraMarket::validate(address, &account, &mint_account(8), &mint_account(6)).unwrap();
+        assert_eq!(market.address, address);
+        assert_eq!((market.base_decimals, market.quote_decimals), (8, 6));
+        assert_eq!(market.freshness_limit_slots, 37);
+        assert_eq!(market.label(), format!("{base}/{quote}"));
     }
 
     #[test]

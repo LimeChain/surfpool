@@ -13,7 +13,10 @@ use solana_pubkey::Pubkey;
 use crate::{
     scenarios::{
         TemplateRegistry,
-        protocols::tessera::v1::{TesseraMarket, build_tessera_fair_value_scenario},
+        protocols::tessera::v1::{
+            TesseraMarket, build_tessera_depth_scenario, build_tessera_fair_value_scenario,
+            discover_tessera_markets,
+        },
     },
     surfnet::svm::SurfnetSvm,
     tests::live,
@@ -768,7 +771,7 @@ async fn tessera_templates_guard_market_and_preserve_unwritten_bytes() {
 }
 
 #[tokio::test]
-async fn tessera_builder_scenario_materializes_atomically_and_keeps_quotes_fresh() {
+async fn tessera_builders_materialize_and_keep_quotes_fresh() {
     const BASE_SLOT: u64 = 1_000_000;
 
     let fork = tessera_fork().await;
@@ -829,6 +832,116 @@ async fn tessera_builder_scenario_materializes_atomically_and_keeps_quotes_fresh
         preparation.base_atoms_per_quote_atom_x1e15
     );
     assert_only_ranges_changed(&materialized, &next_slot, &[(120, 128)]);
+
+    let local = svm.inner.get_account(&market_key).unwrap().unwrap();
+    let depth = build_tessera_depth_scenario(market_key, &local, 1000, 10000).unwrap();
+    svm.register_scenario(depth, Some(BASE_SLOT + 2)).unwrap();
+    assert_eq!(
+        svm.inner.get_account(&market_key).unwrap().unwrap().data,
+        local.data
+    );
+    svm.materialize_overrides_for_slot(&None, BASE_SLOT + 2)
+        .await
+        .unwrap();
+    let reduced = svm.inner.get_account(&market_key).unwrap().unwrap().data;
+    let mut expected = local.data.clone();
+    for level in 0..20 {
+        let offset = 160 + level * 24;
+        if local.data[offset + 16] != 0 {
+            write_u64(&mut expected, offset, read_u64(&local.data, offset) / 10);
+        }
+    }
+    write_u64(&mut expected, 120, BASE_SLOT + 2);
+    assert_eq!(reduced, expected);
+    svm.materialize_overrides_for_slot(&None, BASE_SLOT + 3)
+        .await
+        .unwrap();
+    write_u64(&mut expected, 120, BASE_SLOT + 3);
+    assert_eq!(
+        svm.inner.get_account(&market_key).unwrap().unwrap().data,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn tessera_depth_builder_prepares_cbb_swaps_in_both_directions() {
+    let fork = tessera_fork().await;
+    let cbb = &fork.jupiter_markets[0];
+    let address = Pubkey::from_str_const(cbb.spec.address);
+    let slot = read_u64(&cbb.market.data, 120) + 1;
+    for (sell_bps, buy_bps) in [(1000, 10000), (10000, 1000), (5000, 2500)] {
+        let scenario =
+            build_tessera_depth_scenario(address, &cbb.market, sell_bps, buy_bps).unwrap();
+        let mut expected = cbb.market.data.clone();
+        for (start, bps) in [(160, sell_bps), (640, buy_bps)] {
+            for level in 0..20 {
+                let offset = start + level * 24;
+                if expected[offset + 16] != 0 {
+                    let capacity = read_u64(&cbb.market.data, offset);
+                    write_u64(
+                        &mut expected,
+                        offset,
+                        (u128::from(capacity) * u128::from(bps) / 10000) as u64,
+                    );
+                }
+            }
+        }
+        write_u64(&mut expected, 120, slot);
+        eprintln!(
+            "cbBTC depth sell_bps={sell_bps} buy_bps={buy_bps}: expected sell level 1 {} -> {}, buy level 1 {} -> {}",
+            read_u64(&cbb.market.data, 160),
+            read_u64(&expected, 160),
+            read_u64(&cbb.market.data, 640),
+            read_u64(&expected, 640)
+        );
+        let (mut svm, _events, _geyser) = SurfnetSvm::default();
+        svm.inner.set_account(address, cbb.market.clone()).unwrap();
+        svm.register_scenario(scenario, Some(slot)).unwrap();
+        assert_eq!(
+            svm.inner.get_account(&address).unwrap().unwrap(),
+            cbb.market
+        );
+        svm.materialize_overrides_for_slot(&None, slot)
+            .await
+            .unwrap();
+        let prepared = svm.inner.get_account(&address).unwrap().unwrap();
+        let mut expected_account = cbb.market.clone();
+        expected_account.data = expected;
+        assert_eq!(prepared, expected_account);
+        for (direction, offset, bps) in [(1, 160, sell_bps), (0, 640, buy_bps)] {
+            let first_capacity = read_u64(&cbb.market.data, offset);
+            let small_input = first_capacity / 20;
+            let large_input = first_capacity.checked_mul(2).unwrap();
+            assert!(small_input > 0);
+            let small_expected =
+                expected_first_level_output(&cbb.market.data, small_input, direction);
+            let small_before =
+                tessera_run_jupiter(&fork, cbb, small_input, direction, |_| {}).unwrap();
+            let small_after = tessera_run_jupiter(&fork, cbb, small_input, direction, |data| {
+                *data = prepared.data.clone()
+            })
+            .unwrap();
+            assert_eq!(small_before, small_expected);
+            assert_eq!(small_after, small_expected);
+            let large_before =
+                tessera_run_jupiter(&fork, cbb, large_input, direction, |_| {}).unwrap();
+            let large_after = tessera_run_jupiter(&fork, cbb, large_input, direction, |data| {
+                *data = prepared.data.clone()
+            })
+            .unwrap();
+            if bps == 10000 {
+                assert_eq!(large_after, large_before);
+            } else {
+                assert!(
+                    large_after > 0 && large_after < large_before,
+                    "reduced depth must worsen a large fill: {large_before} -> {large_after}"
+                );
+            }
+            eprintln!(
+                "cbBTC direction={direction} small_in={small_input} expected_out={small_expected} actual_out={small_after}; large_in={large_input} baseline_out={large_before} prepared_out={large_after}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -957,8 +1070,20 @@ async fn tessera_current_layout_controls_price_depth_and_freshness() {
     })
     .expect("doubled-price buy");
     let large_sell = 30_000_000_000;
-    let thin_sell_values = scale_ladder(&fork.market.data, "amount", 1_000, 10_000);
-    let thin_buy_values = scale_ladder(&fork.market.data, "amount", 10_000, 1_000);
+    let depth = |sell, buy| {
+        build_tessera_depth_scenario(
+            Pubkey::from_str_const(TESSERA_SOL_USDC_MARKET),
+            &fork.market,
+            sell,
+            buy,
+        )
+        .expect("build depth scenario")
+        .overrides
+        .remove(0)
+        .values
+    };
+    let thin_sell_values = depth(1_000, 10_000);
+    let thin_buy_values = depth(10_000, 1_000);
     let thin_sell_curve_values = scale_ladder(&fork.market.data, "factor", 5_000, 10_000);
     let thin_buy_curve_values = scale_ladder(&fork.market.data, "factor", 10_000, 5_000);
     let half_sell_curve = tessera_run(&fork, amount_in, 1, true, false, |market| {
@@ -1305,65 +1430,59 @@ async fn tessera_four_additional_markets_prove_price_and_curve_directions() {
 }
 
 #[tokio::test]
-async fn tessera_catalog_matches_live_markets() {
-    let registry = TemplateRegistry::new();
-    let template = registry
-        .get("tessera-fair-value")
-        .expect("Tessera fair-value template");
-    let catalog = template
-        .constants
-        .get("market")
-        .expect("Tessera market catalog");
-
-    let addresses: Vec<Pubkey> = catalog
-        .options
+async fn tessera_discovers_live_markets() {
+    let markets = discover_tessera_markets(&live::client())
+        .await
+        .expect("discover live markets");
+    assert!(!markets.is_empty(), "Tessera must expose market accounts");
+    let addresses = markets
         .iter()
-        .map(|option| {
-            option
-                .value
-                .parse()
-                .unwrap_or_else(|_| panic!("catalog entry {} is not a pubkey", option.id))
-        })
-        .collect();
-    let markets = live::fetch(&addresses).await;
-
-    let mut mints: Vec<Pubkey> = Vec::with_capacity(addresses.len() * 2);
-    for market in &markets {
-        let (base, quote) =
-            TesseraMarket::mint_addresses(market).expect("every catalog entry is a live market");
-        mints.extend([base, quote]);
+        .map(|market| market.address)
+        .collect::<Vec<_>>();
+    let unique = addresses.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), markets.len());
+    let mut accounts = Vec::new();
+    for batch in addresses.chunks(100) {
+        accounts.extend(live::fetch(batch).await);
     }
+    let mut mints = markets
+        .iter()
+        .flat_map(|market| [market.base_mint, market.quote_mint])
+        .collect::<Vec<_>>();
     mints.sort_unstable();
     mints.dedup();
-    let mint_accounts = live::fetch(&mints).await;
-
-    for (option, market_account) in catalog.options.iter().zip(&markets) {
-        let address: Pubkey = option.value.parse().expect("catalog pubkey");
-        let (base, quote) = TesseraMarket::mint_addresses(market_account).expect("live market");
-        let index = |mint: &Pubkey| mints.binary_search(mint).expect("fetched mint");
-        let market = TesseraMarket::validate(
-            address,
-            market_account,
+    let mut mint_accounts = Vec::new();
+    for batch in mints.chunks(100) {
+        mint_accounts.extend(live::fetch(batch).await);
+    }
+    for (market, account) in markets.iter().zip(&accounts) {
+        let (base, quote) =
+            TesseraMarket::mint_addresses(account).expect("valid discovered market");
+        let index = |mint| mints.binary_search(mint).expect("fetched mint");
+        let expected = TesseraMarket::validate(
+            market.address,
+            account,
             &mint_accounts[index(&base)],
             &mint_accounts[index(&quote)],
         )
-        .unwrap_or_else(|error| panic!("{} failed validation: {error}", option.id));
-
-        let metadata = |key: &str| {
-            option
-                .metadata
-                .get(key)
-                .unwrap_or_else(|| panic!("{} has no {key}", option.id))
-        };
-        assert_eq!(metadata("base_mint"), &market.base_mint.to_string());
-        assert_eq!(metadata("quote_mint"), &market.quote_mint.to_string());
-        assert_eq!(metadata("base_decimals"), &market.base_decimals);
-        assert_eq!(metadata("quote_decimals"), &market.quote_decimals);
-        // The catalog's freshness limit is what picks the stale template, so it has to be the
-        // number the deployed program actually reads at offset 88.
+        .unwrap();
+        assert_eq!(*market, expected);
         assert_eq!(
-            metadata("freshness_limit_slots"),
-            &read_u64(&market_account.data, FRESHNESS_LIMIT_OFFSET)
+            market.freshness_limit_slots,
+            read_u64(&account.data, FRESHNESS_LIMIT_OFFSET)
         );
+        assert!(!market.label().is_empty());
     }
+    let registry = TemplateRegistry::new();
+    assert!(
+        !registry
+            .get("tessera-fair-value")
+            .unwrap()
+            .constants
+            .contains_key("market")
+    );
+    eprintln!(
+        "Discovered {} Tessera markets from program accounts",
+        markets.len()
+    );
 }
