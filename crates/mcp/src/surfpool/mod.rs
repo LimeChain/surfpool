@@ -19,7 +19,11 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
-        protocols::phoenix_eternal::v1::state_builder::build_phoenix_collateral_scenario,
+        protocols::phoenix_eternal::v1::state_builder::{
+            PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
+            phoenix_global_trader_index_address, phoenix_market_symbols,
+            phoenix_perp_asset_map_address,
+        },
         protocols::pump::v1::graduation_builder::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
@@ -161,6 +165,15 @@ pub struct CreatePhoenixCollateralScenarioParams {
         description = "Exact signed collateral target in quote lots, encoded as a decimal string."
     )]
     pub target_quote_lots: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPhoenixMarketsParams {
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
@@ -1040,7 +1053,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The backend fetches and validates the live Trader account. This prepares risk state; it does not guarantee or execute liquidation."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. Validates effective collateral in the Trader or its GlobalTraderIndex entry. Hot traders require a supported single-arena index. This prepares risk state; it does not guarantee or execute liquidation."
     )]
     async fn create_phoenix_collateral_scenario(
         &self,
@@ -1055,7 +1068,7 @@ impl Surfpool {
             }
         };
         let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[trader])
+            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_CONFIG])
             .await
         {
             Ok(accounts) => accounts,
@@ -1066,16 +1079,88 @@ impl Surfpool {
                 "Phoenix Trader account {trader} was not found"
             )));
         };
-        let preparation = match build_phoenix_collateral_scenario(
+        let Some(global_account) = accounts[1].as_ref() else {
+            return Ok(scenario_tool_error(
+                "Phoenix GlobalConfig was not found".to_string(),
+            ));
+        };
+        let index_address = match phoenix_global_trader_index_address(global_account) {
+            Ok(address) => address,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        let index_accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[index_address])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let scenario = match build_phoenix_collateral_scenario(
             trader,
             trader_account,
             &params.target_quote_lots,
+            index_accounts[0].as_ref(),
         ) {
-            Ok(preparation) => preparation,
+            Ok(scenario) => scenario,
             Err(error) => return Ok(scenario_tool_error(error.to_string())),
         };
 
-        self.stage_scenario(preparation.scenario).await
+        self.stage_scenario(scenario).await
+    }
+
+    #[tool(
+        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's GlobalConfig and the map it points at, so the catalog reflects live state rather than a hardcoded snapshot. Use it to discover valid market symbols before preparing a Phoenix scenario."
+    )]
+    async fn list_phoenix_markets(
+        &self,
+        Parameters(params): Parameters<ListPhoenixMarketsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let Some(global_account) = accounts[0].as_ref() else {
+            return Ok(scenario_tool_error(
+                "Phoenix GlobalConfig account was not found on the surfnet".to_string(),
+            ));
+        };
+
+        let perp_asset_map = match phoenix_perp_asset_map_address(global_account) {
+            Ok(address) => address,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        let map_accounts = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[perp_asset_map])
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let Some(map_account) = map_accounts[0].as_ref() else {
+            return Ok(scenario_tool_error(format!(
+                "Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet"
+            )));
+        };
+
+        let symbols = match phoenix_market_symbols(perp_asset_map, map_account) {
+            Ok(symbols) => symbols,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        let payload = serde_json::json!({
+            "perpAssetMap": perp_asset_map.to_string(),
+            "count": symbols.len(),
+            "symbols": symbols,
+        });
+        let json = match serde_json::to_string(&payload) {
+            Ok(json) => json,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(

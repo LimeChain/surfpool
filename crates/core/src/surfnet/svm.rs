@@ -93,8 +93,11 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry,
-        protocols::phoenix_eternal::v1::state_builder::{
-            PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override,
+        protocols::phoenix_eternal::v1::{
+            collateral::collateral_override_value,
+            state_builder::{
+                PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override, is_phoenix_trader_account,
+            },
         },
     },
     storage::{OverlayStorage, Storage, StorageBackend},
@@ -217,7 +220,6 @@ pub fn apply_override_to_decoded_account(
     let final_key = parts[parts.len() - 1];
     match current {
         Value::Object(map) => {
-            // Convert serde_json::Value to txtx Value
             let txtx_value = json_to_txtx_value(value)?;
             map.insert(final_key.to_string(), txtx_value);
             Ok(())
@@ -2904,7 +2906,7 @@ impl SurfnetSvm {
             if !override_instance.values.is_empty() {
                 // Filter out values that are only used for PDA derivation (not account data)
                 let pda_refs = override_instance.account.get_pda_seed_references();
-                let account_values: HashMap<String, serde_json::Value> = override_instance
+                let mut account_values: HashMap<String, serde_json::Value> = override_instance
                     .values
                     .iter()
                     .filter(|(key, _)| !pda_refs.contains(key))
@@ -2936,6 +2938,22 @@ impl SurfnetSvm {
                     continue;
                 };
 
+                let is_phoenix_trader = account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID
+                    && is_phoenix_trader_account(account.data());
+                if is_phoenix_trader {
+                    if let Some(legacy) = account_values.remove("quote_lot_collateral") {
+                        if account_values.contains_key("traderState.quoteLotCollateral") {
+                            return Err(SurfpoolError::internal(
+                                "Phoenix collateral override must use only traderState.quoteLotCollateral",
+                            ));
+                        }
+                        account_values.insert("traderState.quoteLotCollateral".to_string(), legacy);
+                    }
+                    if let Some(value) = account_values.get_mut("traderState.quoteLotCollateral") {
+                        *value = collateral_override_value(value)?;
+                    }
+                }
+
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
@@ -2954,9 +2972,8 @@ impl SurfnetSvm {
                     }
                 }
 
-                // Phoenix Eternal accounts are zero-copy: route them by owner through
-                // the typed codec, the same seam the token path uses.
-                if account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID {
+                // Trader collateral uses the IDL; market maps need the typed price codec.
+                if account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID && !is_phoenix_trader {
                     let new_account_data = forge_phoenix_override(
                         &account_pubkey,
                         &account,
@@ -3041,6 +3058,21 @@ impl SurfnetSvm {
                     }
                 };
 
+                let index_update = if is_phoenix_trader
+                    && account_values.contains_key("traderState.quoteLotCollateral")
+                {
+                    self.prepare_phoenix_collateral_index_update(
+                        &account_pubkey,
+                        &account,
+                        idl,
+                        &account_values,
+                        remote_ctx,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+
                 // Create a new account with modified data
                 let modified_account = Account {
                     lamports: account.lamports(),
@@ -3049,6 +3081,16 @@ impl SurfnetSvm {
                     executable: account.executable(),
                     rent_epoch: account.rent_epoch(),
                 };
+
+                if let Some((index_key, before, after)) = index_update {
+                    self.inner.set_account(index_key, after)?;
+                    if let Err(error) = self.inner.set_account(account_pubkey, modified_account) {
+                        self.inner.set_account(index_key, before)?;
+                        return Err(error);
+                    }
+                    patched_this_slot.extend([index_key, account_pubkey]);
+                    continue;
+                }
 
                 // Update the account in the SVM
                 if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
@@ -3069,6 +3111,74 @@ impl SurfnetSvm {
         }
 
         Ok(())
+    }
+
+    async fn phoenix_dependency(
+        &self,
+        address: &Pubkey,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<Account> {
+        if let Some(account) = self.inner.get_account(address)? {
+            return Ok(account);
+        }
+        if self.offline_accounts.contains_key(&address.to_string())?
+            || self
+                .offline_accounts
+                .get(&PHOENIX_ETERNAL_PROGRAM_ID.to_string())?
+                .is_some_and(|config| config.include_owned_accounts)
+        {
+            return Err(SurfpoolError::internal(format!(
+                "Phoenix dependency {address} is offline and missing locally"
+            )));
+        }
+        let (client, commitment) = remote_ctx.as_ref().ok_or_else(|| {
+            SurfpoolError::internal(format!("Phoenix dependency {address} is missing locally"))
+        })?;
+        client
+            .get_account(address, *commitment)
+            .await?
+            .map_account()
+    }
+
+    async fn prepare_phoenix_collateral_index_update(
+        &self,
+        trader: &Pubkey,
+        account: &Account,
+        idl: &Idl,
+        values: &HashMap<String, serde_json::Value>,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<Option<(Pubkey, Account, Account)>> {
+        use crate::scenarios::protocols::phoenix_eternal::v1::{
+            collateral::{index_trader_state_range, trader_header},
+            state_builder::{PHOENIX_GLOBAL_CONFIG, phoenix_global_trader_index_address},
+        };
+        let header = trader_header(trader, account)?;
+        if !header.trader_state.is_hot() {
+            return Ok(None);
+        }
+        let global = self
+            .phoenix_dependency(&PHOENIX_GLOBAL_CONFIG, remote_ctx)
+            .await?;
+        let index_key = phoenix_global_trader_index_address(&global)?;
+        let before = self.phoenix_dependency(&index_key, remote_ctx).await?;
+        let range = index_trader_state_range(&before, &header.key)?;
+        let encoded = Self::get_forged_idl_type_data(
+            &before.data[range.clone()],
+            idl,
+            "TraderState",
+            &HashMap::from([(
+                "quoteLotCollateral".to_string(),
+                values["traderState.quoteLotCollateral"].clone(),
+            )]),
+        )?;
+        if encoded.len() != range.len() || encoded[8..] != before.data[range.start + 8..range.end] {
+            return Err(SurfpoolError::internal(
+                "Phoenix TraderState IDL must preserve the index record layout",
+            ));
+        }
+        let mut after = before.clone();
+        after.data[range].copy_from_slice(&encoded);
+        Ok(Some((index_key, before, after)))
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -3122,15 +3232,28 @@ impl SurfnetSvm {
                 ))
             })?;
 
-        // Find the corresponding type definition
+        let encoded =
+            Self::get_forged_idl_type_data(serialized_data, idl, &account_def.name, overrides)?;
+        let mut result = discriminator.to_vec();
+        result.extend_from_slice(&encoded);
+        Ok(result)
+    }
+
+    fn get_forged_idl_type_data(
+        serialized_data: &[u8],
+        idl: &Idl,
+        type_name: &str,
+        overrides: &HashMap<String, serde_json::Value>,
+    ) -> SurfpoolResult<Vec<u8>> {
+        // A type can also describe a record embedded in a dynamically addressed account.
         let account_type = idl
             .types
             .iter()
-            .find(|t| t.name == account_def.name)
+            .find(|t| t.name == type_name)
             .ok_or_else(|| {
                 SurfpoolError::internal(format!(
                     "Type definition for account '{}' not found in IDL",
-                    account_def.name
+                    type_name
                 ))
             })?;
 
@@ -3188,10 +3311,8 @@ impl SurfnetSvm {
                     ))
                 })?;
 
-        // Reconstruct the account data with discriminator and preserve any trailing bytes
-        let mut new_account_data =
-            Vec::with_capacity(8 + re_encoded_data.len() + leftover_bytes.len());
-        new_account_data.extend_from_slice(discriminator);
+        // Preserve trailing data outside the IDL type.
+        let mut new_account_data = Vec::with_capacity(re_encoded_data.len() + leftover_bytes.len());
         new_account_data.extend_from_slice(&re_encoded_data);
         new_account_data.extend_from_slice(leftover_bytes);
 
