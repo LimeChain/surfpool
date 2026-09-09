@@ -23,6 +23,7 @@ pub async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
     // the callers assert. Retry a few times with backoff so a transient refusal is not read as a
     // failure.
     let mut attempt = 0;
+    let mut errors = Vec::new();
     let results = loop {
         match client()
             .get_multiple_accounts(addresses, CommitmentConfig::confirmed())
@@ -31,10 +32,17 @@ pub async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
             Ok(results) => break results,
             Err(error) if attempt < 4 => {
                 attempt += 1;
+                errors.push(format!("attempt {attempt}: {error}"));
                 tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
-                let _ = error;
             }
-            Err(error) => panic!("failed to fetch {addresses:?} from mainnet: {error}"),
+            Err(error) => {
+                errors.push(format!("attempt {}: {error}", attempt + 1));
+                panic!(
+                    "failed to fetch {addresses:?} from mainnet after {} attempts: {}",
+                    errors.len(),
+                    errors.join("; ")
+                );
+            }
         }
     };
 
