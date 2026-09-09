@@ -66,7 +66,8 @@ does. The liquidation cascade combines those two templates in one scenario at sl
   only its Trader account. The builder's increase guard uses effective index collateral for
   hot traders, rather than the stale copy in their Trader account.
 - Hot collateral preparations currently support a single-arena `GlobalTraderIndex`. Missing,
-  corrupt, or multi-arena indexes fail before collateral writes. Node offsets are resolved
+  corrupt, or multi-arena indexes skip the override with a warning before any collateral write;
+  like every other override, a rejected value never stops block production. Node offsets are resolved
   again at Play; no trader address or node offset is pinned in the scenario.
 - Direct mark shock changes only the selected market's mark-price ticks and the mark-price slot,
   which is stamped with the slot the override materializes at so the program reads the new mark

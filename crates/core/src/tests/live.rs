@@ -22,19 +22,21 @@ pub async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
     // The public endpoint throttles and intermittently 503s, which has nothing to do with what
     // the callers assert. Retry a few times with backoff so a transient refusal is not read as a
     // failure.
-    let mut attempt = 0;
+    let mut errors = Vec::new();
     let results = loop {
         match client()
             .get_multiple_accounts(addresses, CommitmentConfig::confirmed())
             .await
         {
             Ok(results) => break results,
-            Err(error) if attempt < 4 => {
-                attempt += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
-                let _ = error;
+            Err(error) => {
+                errors.push(error.to_string());
+                if errors.len() > 4 {
+                    panic!("failed to fetch {addresses:?} from mainnet: {errors:#?}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500 * errors.len() as u64))
+                    .await;
             }
-            Err(error) => panic!("failed to fetch {addresses:?} from mainnet: {error}"),
         }
     };
 
