@@ -26,9 +26,15 @@ pub const PHOENIX_GLOBAL_CONFIG: Pubkey =
     Pubkey::from_str_const("2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ");
 
 pub fn is_phoenix_trader_account(data: &[u8]) -> bool {
-    data.len() >= 8
-        && PhoenixAccount::from_discriminant(data[..8].try_into().unwrap())
-            == Some(PhoenixAccount::Trader)
+    phoenix_account_kind(data) == Some(PhoenixAccount::Trader)
+}
+
+pub fn is_phoenix_perp_asset_map_account(data: &[u8]) -> bool {
+    phoenix_account_kind(data) == Some(PhoenixAccount::PerpAssetMap)
+}
+
+fn phoenix_account_kind(data: &[u8]) -> Option<PhoenixAccount> {
+    PhoenixAccount::from_discriminant(data.get(..8)?.try_into().unwrap())
 }
 
 const COLLATERAL_FIELD: &str = "traderState.quoteLotCollateral";
