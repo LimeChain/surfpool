@@ -1,0 +1,130 @@
+protocol: GoonFi
+version: deployed-438563879
+account_type: PriceOracle
+
+# The write target of every template here is the market's price-oracle account: 32 bytes owned by
+# the companion publisher program. It carries no discriminator, so the byte guard can only pin
+# the size; the owner predicate below is what keeps a raw write out of a foreign 32-byte account,
+# and the builder additionally resolves the oracle through the market account's own pointer.
+raw_layout:
+  account_size: 32
+  owner: dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: goonfi-price
+    name: Override GoonFi Price
+    description: Move a GoonFi market's oracle bid and ask atomically in both directions
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+      value: 7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3
+    properties:
+      - path: bid_price_x1e6
+        offset: 0
+        encoding: u64
+        label: Bid price
+        description: "The human pair price the venue buys base at, multiplied by 10^6. Independent of mint decimals."
+      - path: ask_price_x1e6
+        offset: 8
+        encoding: u64
+        label: Ask price
+        description: "The human pair price the venue sells base at, multiplied by 10^6. Live oracles publish it at or above the bid; keep that shape."
+    llm_context: |
+      SET BOTH FIELDS AS ONE INVARIANT, with ask >= bid. Values are the human pair price times
+      10^6 regardless of mint decimals: SOL at 99.74 USDC is bid_price_x1e6 "99740000". Use
+      decimal integer strings, not JSON numbers.
+
+      THE PRICE IS BAND-GUARDED ACROSS TWO ACCOUNTS. The deployed program rejects a swap with
+      custom error 0x24 when the oracle price sits outside the reference band stored in the
+      market account - a decoupled move of even 5% is proven to reject, and the live oracle
+      tracks its band within a fraction of a percent. Always apply goonfi-reference-band to the
+      market address returned by list_goonfi_markets, scaled by the same factor. The GoonFi price
+      builder composes both overrides plus freshness automatically; composing the raw templates
+      by hand and skipping one of them breaks the invariant.
+
+      Set fetchBeforeUse: true so the live oracle is forked before your bid and ask apply; on a
+      fresh fork the account is not local yet, and an override on a missing account is skipped.
+      Use false only for a later override that builds on state an earlier override prepared in the
+      same scenario.
+
+      GoonFi rejects a quote whose oracle is past its staleness window with custom error 0x15.
+      Pair long-running scenarios with goonfi-freshness.
+
+  - id: goonfi-stale-quote
+    name: Make GoonFi Quote Stale
+    description: Age a GoonFi oracle past its rejection window
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+      value: 7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3
+    properties:
+      - path: last_update_slot
+        offset: 16
+        encoding:
+          slot:
+            lead: -2000
+            width: 4
+        label: Slot lead
+        description: >-
+          How far behind the materialization slot to place the oracle's update slot, as a
+          negative integer. Pass null to use -2000, past every observed window including the
+          stablecoin tier's.
+    llm_context: |
+      The value you pass IS the lead: Surfpool writes the materialization slot plus it, clamped
+      at zero. Pass null to take the -2000 default. The slot field is 4 bytes; the dynamic
+      multiplier stored beside it stays untouched.
+
+      The rejection window is per-market and publisher-adjustable: ages 16 and 21 were observed
+      on volatile pairs and windows of a few hundred slots on stablecoin pairs, all on one day.
+      These observations are not fixed limits. Inside the window the deployed program decays
+      the quote with age -
+      faster the higher the oracle's multiplier at offset 20 - before rejecting outright with
+      custom error 0x15, so a small negative lead prepares a degraded-but-fillable quote and
+      the -2000 default prepares a rejected one on every observed market.
+
+      Do not persist this override: the quote should stay stale. For a standalone stale quote on a
+      fresh fork, set fetchBeforeUse: true so the live oracle is forked before the ageing applies;
+      an override on an account not yet local is skipped. In a lifecycle where an earlier
+      goonfi-freshness override already forked and edited the oracle locally, use false so this
+      override does not refetch remote bytes over that local edit: refresh once at slot zero, age
+      at the requested relative slot, then optionally refresh with persist at a later recovery
+      slot. The initial refresh must not persist or it will erase the stale event. Before a
+      delayed event, the initial quote naturally ages. Keep override labels short ("SOL/USDC stale
+      quote").
+
+  - id: goonfi-freshness
+    name: Refresh GoonFi Quote
+    description: Publish the materialization slot into the oracle's freshness field
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+      value: 7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3
+    properties:
+      - path: last_update_slot
+        offset: 16
+        encoding:
+          slot:
+            lead: 0
+            width: 4
+        label: Current materialization slot
+        description: Slot lead, as an integer. Pass null to take the lead of zero and write the materialization slot itself.
+    llm_context: |
+      GoonFi rejects a swap whose oracle has aged past its per-market window with custom error
+      0x15 - a loud failure, unlike BisonFi's silent zero - and decays the quote with age before
+      that, at a rate proportional to the oracle's multiplier at offset 20. Re-stamping this
+      field alone restores the full quote; the market account's own slot fields do not gate
+      freshness.
+
+      Pass null for last_update_slot to take this template's lead of zero, which writes the
+      exact materialization slot. A number would be read as the lead instead. Use persist: true
+      when the prepared state must remain executable beyond the window; each application then
+      writes its own slot.
+
+      Set fetchBeforeUse: true when this is the first override to touch the oracle on a fresh fork,
+      so the live account is forked before the stamp; an override on an account not yet local is
+      skipped. Use false when an earlier override in the same scenario already forked it.

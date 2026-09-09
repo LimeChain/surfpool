@@ -21,6 +21,8 @@ rmcp = { workspace = true, features = ["transport-io", "transport-sse-server", "
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+solana-account = { workspace = true }
+solana-commitment-config = { workspace = true }
 solana-keypair = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
