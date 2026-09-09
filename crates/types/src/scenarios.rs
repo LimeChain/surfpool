@@ -1032,9 +1032,18 @@ pub enum RawEncoding {
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus `lead` (may be negative).
+    ///
+    /// `width` is the byte width of the on-chain slot field: 8, or 4 for programs that store
+    /// slots as u32 next to unrelated bytes. Only those two widths are accepted.
     Slot {
         lead: i64,
+        #[serde(default = "default_slot_width")]
+        width: usize,
     },
+}
+
+fn default_slot_width() -> usize {
+    8
 }
 
 impl RawEncoding {
@@ -1044,7 +1053,8 @@ impl RawEncoding {
             RawEncoding::U8 => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
-            RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
+            RawEncoding::U64 | RawEncoding::I64 => 8,
+            RawEncoding::Slot { width, .. } => *width,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
         }
@@ -1107,7 +1117,7 @@ impl RawEncoding {
                     .to_bytes()
                     .to_vec()
             }
-            RawEncoding::Slot { lead } => {
+            RawEncoding::Slot { lead, width } => {
                 let lead = match value {
                     serde_json::Value::Null => *lead,
                     _ => {
@@ -1123,7 +1133,14 @@ impl RawEncoding {
                 } else {
                     target_slot.checked_sub(lead.unsigned_abs()).unwrap_or(0)
                 };
-                slot.to_le_bytes().to_vec()
+                match width {
+                    8 => slot.to_le_bytes().to_vec(),
+                    4 => u32::try_from(slot)
+                        .map_err(|_| format!("slot {slot} does not fit a 4-byte slot field"))?
+                        .to_le_bytes()
+                        .to_vec(),
+                    other => return Err(format!("slot width must be 4 or 8, not {other}")),
+                }
             }
         })
     }
@@ -1156,6 +1173,10 @@ pub struct RawLayout {
     /// Optional type tag. Omit for programs that have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub magic: Option<RawMagic>,
+    /// Base58 program id that must own the account. The byte guard cannot see the owner, so
+    /// without this a foreign account of the same size and magic passes a raw write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl RawLayout {
@@ -1184,6 +1205,22 @@ impl RawLayout {
     }
 
     /// Writes `values` into a copy of `data` using each property's offset and encoding.
+    /// Rejects an account owned by the wrong program, when the layout names one. Split from
+    /// [`RawLayout::guard`] because the byte guard has no access to the owner.
+    pub fn guard_owner(&self, owner: &Pubkey) -> Result<(), String> {
+        let Some(required) = &self.owner else {
+            return Ok(());
+        };
+        let required = Pubkey::from_str(required)
+            .map_err(|e| format!("raw layout owner '{required}' is not a valid pubkey: {e}"))?;
+        if owner != &required {
+            return Err(format!(
+                "account owner {owner} is not the layout's program {required}"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn materialize(
         &self,
         data: &[u8],
@@ -1562,49 +1599,121 @@ mod tests {
         assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()) >> 32, -25599);
 
         // The supplied value is the lead, so one property covers live and stale.
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(0), 500)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 500);
 
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(-5), 500)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 495);
 
         // The manifest lead is the default, used when no value is given.
-        let bytes = RawEncoding::Slot { lead: -1 }
+        let bytes = RawEncoding::Slot { lead: -1, width: 8 }
             .encode(&json!(null), 500)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 499);
 
         // A lead that would go below zero clamps rather than wrapping.
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(-10), 3)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
 
         // Slot is a u64. Values above i64::MAX must not wrap through a signed cast and become zero.
         let large_slot = i64::MAX as u64 + 1;
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(0), large_slot)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), large_slot);
 
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(-1), u64::MAX)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX - 1);
 
-        let bytes = RawEncoding::Slot { lead: 0 }
+        let bytes = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(0), u64::MAX)
             .unwrap();
         assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX);
 
-        let err = RawEncoding::Slot { lead: 0 }
+        let err = RawEncoding::Slot { lead: 0, width: 8 }
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn slot_width_defaults_to_eight_and_narrows_to_four() {
+        use super::RawEncoding;
+
+        // Manifests that spell no width keep the historical 8-byte slot bytes exactly.
+        let parsed: RawEncoding = serde_json::from_value(json!({"slot": {"lead": -20}})).unwrap();
+        assert_eq!(
+            parsed,
+            RawEncoding::Slot {
+                lead: -20,
+                width: 8
+            }
+        );
+        assert_eq!(
+            parsed.encode(&json!(null), 500).unwrap(),
+            480u64.to_le_bytes().to_vec()
+        );
+
+        let narrow: RawEncoding =
+            serde_json::from_value(json!({"slot": {"lead": 0, "width": 4}})).unwrap();
+        assert_eq!(narrow.width(), 4);
+        assert_eq!(
+            narrow.encode(&json!(null), 500).unwrap(),
+            500u32.to_le_bytes().to_vec()
+        );
+
+        let err = narrow
+            .encode(&json!(null), u64::from(u32::MAX) + 1)
+            .expect_err("a slot past u32::MAX must not be truncated");
+        assert!(err.contains("4-byte"), "unexpected error: {err}");
+
+        let err = RawEncoding::Slot { lead: 0, width: 2 }
+            .encode(&json!(null), 500)
+            .expect_err("only widths 4 and 8 exist");
+        assert!(err.contains("must be 4 or 8"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_layout_owner_predicate_rejects_the_wrong_program() {
+        use super::{Pubkey, RawLayout};
+
+        let program = Pubkey::new_unique();
+        let layout = RawLayout {
+            account_size: 32,
+            magic: None,
+            owner: Some(program.to_string()),
+        };
+        assert!(layout.guard_owner(&program).is_ok());
+        let err = layout
+            .guard_owner(&Pubkey::new_unique())
+            .expect_err("a foreign owner must be refused");
+        assert!(
+            err.contains("is not the layout's program"),
+            "unexpected error: {err}"
+        );
+
+        // No owner in the layout keeps the historical behavior: any owner passes.
+        let open = RawLayout {
+            account_size: 32,
+            magic: None,
+            owner: None,
+        };
+        assert!(open.guard_owner(&Pubkey::new_unique()).is_ok());
+
+        let broken = RawLayout {
+            account_size: 32,
+            magic: None,
+            owner: Some("not-a-pubkey".to_string()),
+        };
+        assert!(broken.guard_owner(&program).is_err());
     }
 
     #[test]
@@ -1614,6 +1723,7 @@ mod tests {
         let layout = RawLayout {
             account_size: 16,
             magic: None,
+            owner: None,
         };
         let mut property = Property::field("tail".to_string());
         property.offset = Some(12);
@@ -1636,6 +1746,7 @@ mod tests {
         let layout = RawLayout {
             account_size: 64,
             magic: None,
+            owner: None,
         };
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
@@ -1679,6 +1790,7 @@ mod tests {
         let layout = RawLayout {
             account_size: 32,
             magic: None,
+            owner: None,
         };
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
