@@ -22,7 +22,7 @@ tags:
 
 templates:
   - id: bisonfi-fair-value
-    name: Override BisonFi Fair Value
+    name: Override Fair Value
     description: Override the mid price BisonFi quotes around
     idl_account_name: PoolStat
     address:
@@ -68,7 +68,7 @@ templates:
       EXAMPLE - "SOL is worth $50":
       fair_value: "15474250491067253436239052800"
   - id: bisonfi-depth
-    name: Override BisonFi Depth
+    name: Override Depth
     description: Make BisonFi shallower so large trades move its price
     idl_account_name: PoolStat
     address:
@@ -119,7 +119,7 @@ templates:
       EXAMPLE - "BisonFi is thin, selling SOL into it slips badly":
       quote_reserve: 1100446538524
   - id: bisonfi-spread
-    name: Override BisonFi Spread
+    name: Override Spread
     description: Widen or tighten the spread BisonFi quotes around its mid
     idl_account_name: PoolStat
     address:
@@ -230,7 +230,7 @@ templates:
       continuation_levels.0.tick_offset: -25600
       continuation_source_levels.0.tick_offset: -25600
   - id: bisonfi-freshness
-    name: Override BisonFi Quote Freshness
+    name: Override Quote Freshness
     description: Keep BisonFi's published quote live
     idl_account_name: PoolStat
     address:
