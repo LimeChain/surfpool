@@ -2,9 +2,7 @@ mod liquidity;
 mod markets;
 mod price;
 
-pub use liquidity::{
-    GoonfiLiquidityPreparation, build_goonfi_liquidity_scenario, vault_addresses,
-};
+pub use liquidity::{GoonfiLiquidityPreparation, build_goonfi_liquidity_scenario, vault_addresses};
 
 pub use price::{
     GOONFI_DEFAULT_MARKET, GOONFI_ORACLE_PROGRAM_ID, GOONFI_PROGRAM_ID, GoonfiMarket,
