@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_rejects_invalid_or_missing_index_without_partial_trader_write() {
+    async fn materialization_skips_invalid_or_missing_index_without_partial_trader_write() {
         use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
         use crate::surfnet::svm::SurfnetSvm;
 
@@ -449,12 +449,11 @@ mod tests {
             }
             svm.register_scenario(scenario, Some(100)).unwrap();
 
-            assert!(
-                svm.materialize_overrides_for_slot(&None, 100)
-                    .await
-                    .is_err(),
-                "{failure}"
-            );
+            // A rejected override is skipped, never an error out of the batch: that error
+            // would abort block production.
+            svm.materialize_overrides_for_slot(&None, 100)
+                .await
+                .unwrap_or_else(|error| panic!("{failure}: {error}"));
             assert_eq!(
                 svm.get_account(&trader).unwrap().unwrap(),
                 before_trader,

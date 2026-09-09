@@ -192,6 +192,21 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
         Pubkey::new_from_array(global.perp_asset_map_key()),
         perp_asset_map
     );
+    for id in [
+        "phoenix-direct-mark-risk-shock",
+        "phoenix-reference-price-divergence",
+    ] {
+        let template_address = TemplateRegistry::new()
+            .get(id)
+            .unwrap_or_else(|| panic!("{id} template exists"))
+            .address
+            .resolve(None)
+            .unwrap_or_else(|| panic!("{id} carries a fixed address"));
+        assert_eq!(
+            template_address, perp_asset_map,
+            "{id} hardcodes the PerpAssetMap address; GlobalConfig says it moved"
+        );
+    }
     assert_ne!(
         Pubkey::new_from_array(global.global_trader_index_header_key()),
         Pubkey::default()

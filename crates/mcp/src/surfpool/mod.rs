@@ -788,6 +788,7 @@ impl Surfpool {
         2. `values` keys MUST be from the template's `properties` array
         3. For PDA addresses, DO NOT provide `account` - it will be generated from template + values
         4. For constant_ref properties (like feed_id), the value MUST come from search_constant_options results
+        5. For dynamic_ref properties, the value MUST come from the tool named in the property's `source` (e.g. list_phoenix_markets)
 
         CORRECT JSON STRUCTURE FOR PYTH PRICE FEED:
         {
@@ -893,6 +894,23 @@ impl Surfpool {
 
                     // Validate constant_ref values against template constants
                     for prop in &template.properties {
+                        if prop.is_dynamic_ref() {
+                            let present = override_instance
+                                .values
+                                .get(&prop.path)
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|value| !value.is_empty());
+                            if !present {
+                                validation_errors.push(format!(
+                                    "Override '{}' (template '{}'): Missing required value for '{}'. Resolve it with the `{}` tool and pass it as a non-empty string.",
+                                    override_instance.id,
+                                    override_instance.template_id,
+                                    prop.path,
+                                    prop.source_name().unwrap_or("source")
+                                ));
+                            }
+                            continue;
+                        }
                         if prop.is_constant_ref() {
                             if let Some(constant_name) = prop.constant_name() {
                                 if let Some(constant_def) = template.constants.get(constant_name) {
@@ -1164,7 +1182,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options."
+        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options; dynamic_ref properties with the tool named in their source."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -1187,7 +1205,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches one template's full detail (properties, address, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
+        description = "Fetches one template's full detail (properties, address, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options, and a dynamic_ref value with the tool named in its source."
     )]
     async fn get_override_template(
         &self,
@@ -1847,6 +1865,37 @@ mod tests {
                 "{mint} must not be offered for a bonding curve"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_a_missing_dynamic_ref_value() {
+        let surfpool = Surfpool::new();
+        let template = TemplateRegistry::new()
+            .get("phoenix-direct-mark-risk-shock")
+            .expect("template")
+            .clone();
+        let mut scenario = surfpool_types::Scenario::new(
+            "no symbol".to_string(),
+            "a dynamic_ref without a value must be rejected".to_string(),
+        );
+        scenario.add_override(
+            surfpool_types::OverrideInstance::new(template.id.clone(), 0, template.address)
+                .with_values(HashMap::from([(
+                    "target_ticks".to_string(),
+                    serde_json::json!("1"),
+                )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(scenario))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Missing required value")
+                && text.contains("symbol")
+                && text.contains("list_phoenix_markets"),
+            "the missing symbol and the tool that resolves it must be named, got: {text}"
+        );
     }
 
     #[tokio::test]
