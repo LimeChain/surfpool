@@ -1372,4 +1372,86 @@ mod tests {
         }
         assert_eq!(checked, 29, "every shipped SolFi property must be checked");
     }
+
+    #[test]
+    fn solfi_templates_expose_valid_direct_account_choices() {
+        let registry = TemplateRegistry::new();
+        let cases = [
+            (
+                "solfi-price",
+                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                [
+                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-freshness",
+                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                [
+                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-spread",
+                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                [
+                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-size-impact",
+                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                [
+                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-vault-balance",
+                "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
+                [
+                    "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
+                    "GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic",
+                    "5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc",
+                    "ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc",
+                ]
+                .as_slice(),
+            ),
+        ];
+
+        let mut checked = 0;
+        for (template_id, default_address, expected) in cases {
+            let template = registry.get(template_id).expect("SolFi template");
+            assert_eq!(
+                template.address,
+                surfpool_types::AccountAddress::Pubkey(default_address.to_string()),
+                "{template_id} should default to the first catalog entry"
+            );
+            let options = &template
+                .constants
+                .get("market")
+                .expect("Tessera-style market options")
+                .options;
+            assert_eq!(options.len(), expected.len(), "{template_id}");
+            assert_eq!(options[0].value, default_address, "{template_id}");
+
+            for (option, expected_address) in options.iter().zip(expected) {
+                assert_eq!(
+                    Pubkey::from_str(&option.value).expect("valid selectable pubkey"),
+                    Pubkey::from_str(expected_address).expect("valid expected pubkey"),
+                    "{template_id}:{}",
+                    option.id
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 12, "every selectable SolFi target must be checked");
+    }
 }

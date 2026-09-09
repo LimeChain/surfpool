@@ -1,12 +1,12 @@
 protocol: SolFi
-version: v2-market
+version: v2
 account_type: Market
 
 raw_layout:
   account_size: 1728
   magic:
     offset: 704
-    # The initialized/version word at the start of the serialized MarketConfig.
+    # The initialized marker at the start of the serialized MarketConfig.
     bytes: [1, 0, 0, 0, 0, 0, 0, 0]
 
 tags:
@@ -14,9 +14,29 @@ tags:
   - prop-amm
   - swap
 
+constants:
+  market:
+    label: SolFi market
+    description: Choose one of the two SolFi markets that currently has meaningful swap liquidity.
+    options:
+      - id: wsol-usdc
+        label: WSOL / USDC
+        description: The funded SolFi market for wrapped SOL and USDC.
+        value: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+        metadata:
+          oracle: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
+          pair: WSOL/USDC
+      - id: usdt-usdc
+        label: USDT / USDC
+        description: The funded SolFi stablecoin market for USDT and USDC.
+        value: FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32
+        metadata:
+          oracle: CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G
+          pair: USDT/USDC
+
 templates:
   - id: solfi-spread
-    name: Override SolFi Spread
+    name: Override Spread
     description: Replace SolFi's size and age dependent widening with a deterministic spread
     idl_account_name: Market
     address:
@@ -84,7 +104,7 @@ templates:
       curve_y 10000 plus max_widening 100000 produces exactly 1%. The verified USDT/USDC oracle has
       oracle_scale 1000, so curve_y 100000 produces exactly 1%.
 
-      EXAMPLE - deterministic 1% spread on the default WSOL/USDC market:
+      EXAMPLE - deterministic 1% spread on the selected WSOL/USDC market:
         quote_to_base_curve_y: 10000
         base_to_quote_curve_y: 10000
         age_multiplier_curve_y: 1000
@@ -99,7 +119,7 @@ templates:
       symmetric spread. These are configuration inputs and may be persisted.
 
   - id: solfi-size-impact
-    name: Override SolFi Size Impact
+    name: Override Size Impact
     description: Shape SolFi widening across the market's eight live trade-size breakpoints
     idl_account_name: Market
     address:

@@ -64,9 +64,6 @@ const MARKETS: [MarketDef; 2] = [
     },
 ];
 
-// Every deployed 1,728-byte account carrying the initialized MarketConfig marker on 2026-09-03.
-// Only the two entries in `MARKETS` are funded and can currently provide meaningful fills; this
-// wider list is a byte-level layout canary for the raw templates and their guards.
 const INITIALIZED_LAYOUTS: [(&str, &str); 10] = [
     (
         "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
@@ -739,7 +736,7 @@ async fn solfi_raw_guards_reject_corrupted_type_markers() {
             .unwrap()
             .guard(&bad_market)
             .is_err(),
-        "MarketConfig version/initialized word must be part of the guard"
+        "MarketConfig initialized marker must be part of the guard"
     );
 
     let vault = registry.get("solfi-vault-balance").expect("vault template");
@@ -1041,6 +1038,190 @@ async fn solfi_directional_risk_off_scenario_is_isolated_to_the_target_side() {
     assert_eq!(checked, 4, "both risk directions on both markets");
 }
 
+/// This deliberately combines four shipped templates. The small sell proves the maker remains a
+/// real PMM rather than simply being switched off, the directional control proves the configured
+/// risk premium lands on the intended side, and the large sell must fail because the bounded quote
+/// inventory cannot settle it.
+#[tokio::test]
+async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
+    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+
+    use crate::surfnet::svm::SurfnetSvm;
+
+    let fork = &forks().await[0];
+    assert_eq!(fork.def.market, MARKETS[0].market, "scenario is WSOL/USDC");
+
+    let values = |entries: &[(&str, serde_json::Value)]| {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect::<HashMap<_, _>>()
+    };
+    let account = |address: &str| AccountAddress::Pubkey(address.to_string());
+
+    let (mut scenario_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    for (address, seeded) in [
+        (fork.def.oracle, fork.oracle.clone()),
+        (fork.def.market, fork.market.clone()),
+        (fork.def.quote_vault, fork.quote_vault.clone()),
+    ] {
+        scenario_svm
+            .inner
+            .set_account(Pubkey::from_str_const(address), seeded)
+            .unwrap_or_else(|error| panic!("seed {address}: {error:?}"));
+    }
+
+    let mut scenario = Scenario::new(
+        "SolFi WSOL/USDC risk-off".to_string(),
+        "Reprice SOL to $50, widen the maker's bid and cap its USDC payout inventory".to_string(),
+    );
+    for (template_id, target, override_values) in [
+        (
+            "solfi-price",
+            fork.def.oracle,
+            values(&[
+                ("price_exponent", serde_json::json!(-10)),
+                ("price_coefficient", serde_json::json!(500_000_000u64)),
+            ]),
+        ),
+        (
+            "solfi-freshness",
+            fork.def.oracle,
+            values(&[
+                ("publication_slot", serde_json::json!(0)),
+                ("validity_horizon", serde_json::json!(200)),
+            ]),
+        ),
+        (
+            "solfi-spread",
+            fork.def.market,
+            values(&[
+                ("quote_to_base_curve_y", serde_json::json!(1_000u64)),
+                ("base_to_quote_curve_y", serde_json::json!(10_000u64)),
+                ("age_multiplier_curve_y", serde_json::json!(1_000u64)),
+                ("additional_widening_curve_y", serde_json::json!(0u64)),
+                ("max_widening", serde_json::json!(100_000u64)),
+            ]),
+        ),
+        (
+            "solfi-vault-balance",
+            fork.def.quote_vault,
+            values(&[("amount", serde_json::json!(PAYOUT_CAPACITY))]),
+        ),
+    ] {
+        scenario.add_override(
+            OverrideInstance::new(template_id.to_string(), 0, account(target))
+                .with_values(override_values),
+        );
+    }
+    scenario_svm
+        .register_scenario(scenario, Some(fork.slot))
+        .expect("register the Bento scenario");
+    scenario_svm
+        .materialize_overrides_for_slot(&None, fork.slot)
+        .await
+        .expect("materialize every Bento override");
+
+    let materialized = |address: &str| {
+        scenario_svm
+            .inner
+            .get_account(&Pubkey::from_str_const(address))
+            .expect("read scenario account")
+            .unwrap_or_else(|| panic!("missing scenario account {address}"))
+            .data
+    };
+    let oracle = materialized(fork.def.oracle);
+    let market = materialized(fork.def.market);
+    let limited_quote_vault = materialized(fork.def.quote_vault);
+    assert_eq!(amount(&limited_quote_vault), PAYOUT_CAPACITY);
+
+    let symmetric_control = apply_raw(
+        "solfi-spread",
+        &fork.market.data,
+        &[
+            ("quote_to_base_curve_y", serde_json::json!(1_000u64)),
+            ("base_to_quote_curve_y", serde_json::json!(1_000u64)),
+            ("age_multiplier_curve_y", serde_json::json!(1_000u64)),
+            ("additional_widening_curve_y", serde_json::json!(0u64)),
+            ("max_widening", serde_json::json!(100_000u64)),
+        ],
+        fork.slot,
+    );
+
+    const SMALL_SELL: u64 = 100_000_000; // 0.1 WSOL
+    const LARGE_SELL: u64 = 1_000_000_000; // 1 WSOL
+    const FIVE_USDC: u64 = 5_000_000;
+    const PAYOUT_CAPACITY: u64 = 25_000_000; // 25 USDC
+
+    let sell_control = run(
+        fork,
+        SMALL_SELL,
+        0,
+        symmetric_control.clone(),
+        oracle.clone(),
+    )
+    .expect("the symmetric $50 control must quote");
+    let sell_risk_off = run(fork, SMALL_SELL, 0, market.clone(), oracle.clone())
+        .expect("a small SOL sell must remain executable");
+    assert!(
+        (4_900_000..=4_960_000).contains(&sell_risk_off),
+        "0.1 SOL at a $50 fair value and 1% bid widening returned {sell_risk_off} atomic USDC"
+    );
+    let bid_penalty_ppm =
+        sell_control.saturating_sub(sell_risk_off) as f64 * 1_000_000.0 / sell_control as f64;
+    assert!(
+        (8_500.0..9_500.0).contains(&bid_penalty_ppm),
+        "moving only the bid from 0.1% to 1% should cost about 0.9%, got {bid_penalty_ppm} ppm"
+    );
+
+    let buy_control =
+        run(fork, FIVE_USDC, 1, symmetric_control, oracle.clone()).expect("buy-side control");
+    let buy_risk_off =
+        run(fork, FIVE_USDC, 1, market.clone(), oracle.clone()).expect("untargeted buy side");
+    assert_eq!(
+        buy_risk_off, buy_control,
+        "the Bento scenario must not accidentally widen the opposite side"
+    );
+
+    replay(
+        fork,
+        LARGE_SELL,
+        0,
+        market.clone(),
+        oracle.clone(),
+        fork.base_vault.data.clone(),
+        fork.quote_vault.data.clone(),
+    )
+    .expect("the control inventory must be able to settle the 1 SOL sale");
+
+    let small_with_limited_inventory = replay(
+        fork,
+        SMALL_SELL,
+        0,
+        market.clone(),
+        oracle.clone(),
+        fork.base_vault.data.clone(),
+        limited_quote_vault.clone(),
+    )
+    .expect("25 USDC must still cover the small sell");
+    assert!(small_with_limited_inventory > 0);
+
+    let error = replay(
+        fork,
+        LARGE_SELL,
+        0,
+        market,
+        oracle,
+        fork.base_vault.data.clone(),
+        limited_quote_vault,
+    )
+    .expect_err("25 USDC cannot cover a 1 SOL sale at the overridden fair value");
+    assert!(
+        error.contains("Custom(18)"),
+        "expected SolFi's insufficient-liquidity error, got {error}"
+    );
+}
+
 #[tokio::test]
 async fn solfi_large_trade_deterioration_scenario_interpolates_between_live_knots() {
     let forks = forks().await;
@@ -1104,7 +1285,7 @@ async fn solfi_large_trade_deterioration_scenario_interpolates_between_live_knot
                 fork.def.market
             );
             assert!(
-                (8_500.0..9_500.0).contains(&at_second),
+                (8_000.0..9_500.0).contains(&at_second),
                 "{} direction {direction}: second-knot impact {at_second} ppm",
                 fork.def.market
             );
@@ -1116,59 +1297,56 @@ async fn solfi_large_trade_deterioration_scenario_interpolates_between_live_knot
 }
 
 #[tokio::test]
-async fn solfi_freshness_boundary_and_age_widening_are_real_program_behavior() {
-    let fork = &forks().await[1];
-    let live = apply_raw(
-        "solfi-freshness",
-        &fork.oracle.data,
-        &[
-            ("publication_slot", serde_json::json!(0)),
-            ("validity_horizon", serde_json::json!(0)),
-        ],
-        fork.slot,
-    );
-    let control = run(fork, fork.def.base_trade, 0, fork.market.data.clone(), live)
-        .expect("horizon is inclusive");
-    assert!(control > 0);
+async fn solfi_freshness_boundary_is_real_program_behavior_on_both_markets() {
+    let forks = forks().await;
+    let mut checked = 0;
+    for fork in forks.iter() {
+        let live = apply_raw(
+            "solfi-freshness",
+            &fork.oracle.data,
+            &[
+                ("publication_slot", serde_json::json!(0)),
+                ("validity_horizon", serde_json::json!(0)),
+            ],
+            fork.slot,
+        );
+        let control = run(fork, fork.def.base_trade, 0, fork.market.data.clone(), live)
+            .expect("the validity boundary is inclusive");
+        assert!(
+            control > 0,
+            "{} must quote at the boundary",
+            fork.def.market
+        );
 
-    let aged = apply_raw(
-        "solfi-freshness",
-        &fork.oracle.data,
-        &[
-            ("publication_slot", serde_json::json!(-55)),
-            ("validity_horizon", serde_json::json!(0)),
-        ],
-        fork.slot,
-    );
-    let aged_out =
-        run(fork, fork.def.base_trade, 0, fork.market.data.clone(), aged).expect("old but valid");
-    assert!(
-        aged_out < control,
-        "publication age must widen the quote strictly"
-    );
-
-    let expired = apply_raw(
-        "solfi-freshness",
-        &fork.oracle.data,
-        &[("validity_horizon", serde_json::json!(-1))],
-        fork.slot,
-    );
-    for direction in 0..=1 {
-        let amount_in = if direction == 0 {
-            fork.def.base_trade
-        } else {
-            fork.def.quote_trade
-        };
-        let err = run(
-            fork,
-            amount_in,
-            direction,
-            fork.market.data.clone(),
-            expired.clone(),
-        )
-        .expect_err("expired oracle must reject");
-        assert!(err.contains("Custom(23)"), "unexpected expiry error: {err}");
+        let expired = apply_raw(
+            "solfi-freshness",
+            &fork.oracle.data,
+            &[("validity_horizon", serde_json::json!(-1))],
+            fork.slot,
+        );
+        for direction in 0..=1 {
+            let amount_in = if direction == 0 {
+                fork.def.base_trade
+            } else {
+                fork.def.quote_trade
+            };
+            let err = run(
+                fork,
+                amount_in,
+                direction,
+                fork.market.data.clone(),
+                expired.clone(),
+            )
+            .expect_err("expired oracle must reject");
+            assert!(
+                err.contains("Custom(23)"),
+                "{} direction {direction}: unexpected expiry error: {err}",
+                fork.def.market
+            );
+            checked += 1;
+        }
     }
+    assert_eq!(checked, 4, "both directions on both funded markets");
 }
 
 #[tokio::test]

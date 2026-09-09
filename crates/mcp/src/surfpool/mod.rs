@@ -884,7 +884,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options."
+        description = "Fetches ALL available override templates. MUST be called before create_scenario to get valid templateId values and property names. Constants are summarized as {label, description, optionsCount} - resolve an actual option value with search_constant_options. For a direct-pubkey template with constants.market, a selected market value replaces the template's default account pubkey; it does not belong in values."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -907,7 +907,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Searches the options of a template's constants (price feeds, markets, token mints). Use after get_override_templates to resolve a constant_ref value: pass the templateId, optionally the constant name, and a query like \"SOL/USD\". Returns matching options whose `value` field is what create_scenario expects."
+        description = "Searches the options of a template's constants (price feeds, markets, token mints). Use after get_override_templates: pass the templateId, optionally the constant name, and a query like \"SOL/USD\". Put a property constant in values. For a direct-pubkey template's constants.market catalog, put the selected value in account.pubkey."
     )]
     async fn search_constant_options(
         &self,
@@ -1193,6 +1193,18 @@ mod tests {
             price_feed.get("options").is_none(),
             "options must not be inlined; they blow past LLM token limits"
         );
+
+        let solfi = templates
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "solfi-price")
+            .expect("SolFi template present");
+        assert_eq!(
+            solfi["address"],
+            serde_json::json!({ "pubkey": "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou" })
+        );
+        assert_eq!(solfi["constants"]["market"]["optionsCount"], 2);
     }
 
     #[tokio::test]

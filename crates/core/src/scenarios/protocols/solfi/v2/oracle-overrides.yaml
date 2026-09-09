@@ -1,5 +1,5 @@
 protocol: SolFi
-version: v2-oracle
+version: v2
 account_type: XorPriceOracle
 
 raw_layout:
@@ -14,9 +14,29 @@ tags:
   - prop-amm
   - oracle
 
+constants:
+  market:
+    label: SolFi market
+    description: Choose one of the two SolFi markets that currently has meaningful swap liquidity.
+    options:
+      - id: wsol-usdc
+        label: WSOL / USDC
+        description: The funded SolFi market for wrapped SOL and USDC.
+        value: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
+        metadata:
+          market: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+          pair: WSOL/USDC
+      - id: usdt-usdc
+        label: USDT / USDC
+        description: The funded SolFi stablecoin market for USDT and USDC.
+        value: CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G
+        metadata:
+          market: FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32
+          pair: USDT/USDC
+
 templates:
   - id: solfi-price
-    name: Override SolFi Price
+    name: Override Price
     description: Override the external price coefficient consumed by a SolFi market
     idl_account_name: XorPriceOracle
     address:
@@ -64,12 +84,12 @@ templates:
       DIRECTION: raising the price increases base-to-quote output and reduces the amount of base paid
       by quote-to-base. The deployed-program test confirms the reciprocal response in both directions.
 
-      EXAMPLE - "SOL is worth $50" on the default 9/6 WSOL/USDC market at exponent -10:
+      EXAMPLE - "SOL is worth $50" on the selected 9/6 WSOL/USDC market at exponent -10:
         price_exponent: -10
         price_coefficient: 500000000
 
   - id: solfi-freshness
-    name: Override SolFi Oracle Freshness
+    name: Override Oracle Freshness
     description: Keep SolFi's oracle current or make the market stop quoting
     idl_account_name: XorPriceOracle
     address:
@@ -103,10 +123,6 @@ templates:
       The boundary is inclusive: validity_horizon 0 is valid in the materialization slot, while -1
       is expired and both swap directions revert with SolFi error 23. Unlike BisonFi's stale path,
       this is a transaction error, not a successful zero-output return.
-
-      Publication age is also a pricing input. SolFi's third market spline widens quotes as
-      current_slot - publication_slot grows, so extending validity_horizon alone keeps the market
-      executable but does not keep its spread unchanged. Re-stamp both fields for a truly fresh quote.
 
       HOW TO USE:
       1. Set publication_slot to 0

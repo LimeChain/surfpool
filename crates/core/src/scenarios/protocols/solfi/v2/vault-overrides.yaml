@@ -1,5 +1,5 @@
 protocol: SolFi
-version: v2-vault
+version: v2
 account_type: TokenAccount
 
 raw_layout:
@@ -14,9 +14,47 @@ tags:
   - vault
   - inventory
 
+constants:
+  market:
+    label: SolFi market vault
+    description: Choose the market and the token inventory that SolFi should have available.
+    options:
+      - id: wsol-usdc-base
+        label: WSOL / USDC — WSOL vault
+        description: Pays out WSOL when a user buys WSOL with USDC.
+        value: CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A
+        metadata:
+          market: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+          pair: WSOL/USDC
+          side: base
+      - id: wsol-usdc-quote
+        label: WSOL / USDC — USDC vault
+        description: Pays out USDC when a user sells WSOL.
+        value: GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic
+        metadata:
+          market: 65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc
+          pair: WSOL/USDC
+          side: quote
+      - id: usdt-usdc-base
+        label: USDT / USDC — USDT vault
+        description: Pays out USDT when a user buys USDT with USDC.
+        value: 5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc
+        metadata:
+          market: FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32
+          pair: USDT/USDC
+          side: base
+      - id: usdt-usdc-quote
+        label: USDT / USDC — USDC vault
+        description: Pays out USDC when a user sells USDT.
+        value: ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc
+        metadata:
+          market: FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32
+          pair: USDT/USDC
+          side: quote
+
 templates:
   - id: solfi-vault-balance
-    name: Override SolFi Vault Balance
+    name: Override Vault Balance
     description: Change one SolFi vault's inventory or make its payout direction unfillable
     idl_account_name: TokenAccount
     address:
