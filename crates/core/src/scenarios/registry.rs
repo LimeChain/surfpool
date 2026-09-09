@@ -189,7 +189,21 @@ impl TemplateRegistry {
             Ok(idl) => idl,
             Err(e) => panic!("unable to load {} idl: {}", protocol_name, e),
         };
+        self.load_collection(Some(idl), overrides_content, protocol_name);
+    }
 
+    /// For programs that publish no IDL. Their templates must carry a `raw_layout` and spell out
+    /// every property description, since there is no schema to fall back on.
+    pub fn load_raw_layout_overrides(&mut self, overrides_content: &str, protocol_name: &str) {
+        self.load_collection(None, overrides_content, protocol_name);
+    }
+
+    fn load_collection(
+        &mut self,
+        idl: Option<anchor_lang_idl::types::Idl>,
+        overrides_content: &str,
+        protocol_name: &str,
+    ) {
         let collection =
             match serde_yaml::from_str::<YamlOverrideTemplateCollection>(overrides_content) {
                 Ok(c) => c,
@@ -558,6 +572,49 @@ mod tests {
     }
 
     #[test]
+    fn raw_layout_collection_loads_without_an_idl() {
+        const OVERRIDES: &str = r#"
+protocol: Example
+version: v1
+account_type: State
+raw_layout:
+  account_size: 16
+  magic:
+    offset: 0
+    bytes: [69, 88]
+templates:
+  - id: example-raw-value
+    name: Override Value
+    description: Override one integer in an example binary account
+    address:
+      type: pubkey
+      value: "11111111111111111111111111111111"
+    properties:
+      - path: value
+        offset: 8
+        encoding: u64
+        label: Value
+        description: Example unsigned integer
+"#;
+
+        let mut registry = TemplateRegistry::default();
+        registry.load_raw_layout_overrides(OVERRIDES, "example");
+
+        let template = registry.get("example-raw-value").expect("raw template");
+        assert!(template.idl.is_none());
+        let layout = template.raw_layout.as_ref().expect("raw layout");
+        let output = layout
+            .materialize(
+                &[69, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &template.properties,
+                &HashMap::from([("value".to_string(), serde_json::json!(42))]),
+                0,
+            )
+            .expect("materialize raw template");
+        assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 42);
+    }
+
+    #[test]
     fn test_jupiter_template_loads_correctly() {
         let registry = TemplateRegistry::new();
 
@@ -717,7 +774,7 @@ mod tests {
         let registry = TemplateRegistry::new();
         let jupiter_template = registry.get("jupiter-token-ledger-override").unwrap();
         let has_token_ledger = jupiter_template
-            .idl
+            .idl()
             .accounts
             .iter()
             .any(|acc| acc.name == "TokenLedger");
@@ -1157,18 +1214,24 @@ mod tests {
         let registry = TemplateRegistry::new();
         let mut errors = Vec::new();
 
+        let mut checked = 0usize;
         for template in registry.all() {
+            // Templates for programs that publish no IDL declare their own byte offsets, so there
+            // is no schema for their paths to resolve against. Raw encoding and guarded writes are
+            // covered by the unit tests on `RawLayout`.
+            let Some(idl) = template.idl.as_ref() else {
+                continue;
+            };
             for property in &template.properties {
                 // constant_ref properties are UI dropdowns (e.g. token pickers), not
                 // account fields, so they are not expected to resolve against the IDL.
                 if property.is_constant_ref() {
                     continue;
                 }
-                if let Err(e) = surfpool_types::resolve_idl_type(
-                    &template.idl,
-                    &template.account_type,
-                    &property.path,
-                ) {
+                checked += 1;
+                if let Err(e) =
+                    surfpool_types::resolve_idl_type(idl, &template.account_type, &property.path)
+                {
                     errors.push(format!("[{}] {}: {}", template.id, property.path, e));
                 }
             }
@@ -1179,6 +1242,12 @@ mod tests {
             "{} template propert(ies) do not exist in their IDL:\n  {}",
             errors.len(),
             errors.join("\n  ")
+        );
+        // Without this the skip above could silently swallow every template and the test would pass
+        // having resolved nothing.
+        assert!(
+            checked > 0,
+            "no property was resolved against an IDL, so this proved nothing"
         );
     }
 
@@ -1339,7 +1408,7 @@ mod tests {
             ("ref_price.0", IdlType::U16),
         ] {
             let resolved =
-                surfpool_types::resolve_idl_type(&template.idl, &template.account_type, path)
+                surfpool_types::resolve_idl_type(template.idl(), &template.account_type, path)
                     .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
             assert_eq!(
                 *resolved, expected,
@@ -1352,7 +1421,7 @@ mod tests {
             .get("kamino-obligation-positions")
             .expect("kamino-obligation-positions should exist");
         let resolved = surfpool_types::resolve_idl_type(
-            &obligation.idl,
+            obligation.idl(),
             &obligation.account_type,
             "deposits.0.deposit_reserve",
         )
