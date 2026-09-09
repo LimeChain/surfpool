@@ -58,14 +58,15 @@ const PREPARATION_SLOT: u64 = 0;
 /// The parts of a GoonFi market a price move needs: the market account itself and the oracle it
 /// points at.
 ///
-/// `non_exhaustive` so the pair can only be built through `validate`, which reads the oracle from
-/// the market's own pointer. A caller assembling the two fields independently could otherwise
-/// point a price move at one market's band and an unrelated market's oracle.
+/// The two are private so the pair can only be built through `validate`, which reads the oracle
+/// from the market's own pointer. Public fields would let a caller assemble the pair from scratch
+/// or re-point a validated one, aiming a price move at one market's reference band and an
+/// unrelated market's oracle - a combination the deployed program rejects with 0x24 at best, and
+/// silently misprices at worst.
 #[derive(Clone, Debug, PartialEq)]
-#[non_exhaustive]
 pub struct GoonfiMarket {
-    pub address: Pubkey,
-    pub oracle: Pubkey,
+    address: Pubkey,
+    oracle: Pubkey,
 }
 
 impl GoonfiMarket {
