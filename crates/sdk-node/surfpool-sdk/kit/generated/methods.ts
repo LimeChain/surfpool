@@ -27,6 +27,7 @@ export const SURFNET_CHEATCODE_METHODS = [
   "surfnet_setTokenAccount",
   "surfnet_streamAccount",
   "surfnet_streamAccounts",
+  "surfnet_stopPersistingOverride",
   "surfnet_timeTravel",
   "surfnet_writeProgram",
 ] as const;

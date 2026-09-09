@@ -2804,6 +2804,19 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
     }
 
+    /// Stops persisted copies of an override without materializing another account write.
+    pub fn stop_persisting_override(
+        &self,
+        id: String,
+        account: surfpool_types::AccountAddress,
+        template_id: String,
+        values: Option<HashMap<String, serde_json::Value>>,
+    ) -> SurfpoolResult<usize> {
+        self.with_svm_writer(move |svm_writer| {
+            svm_writer.stop_persisting_override(&id, &account, &template_id, values.as_ref())
+        })
+    }
+
     /// Materializes overrides for a specific slot (not necessarily the current slot)
     pub async fn materialize_overrides_for_slot(
         &self,

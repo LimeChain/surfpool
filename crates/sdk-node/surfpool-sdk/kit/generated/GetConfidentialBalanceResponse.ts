@@ -6,16 +6,16 @@
  * The decrypted confidential-transfer balances of a Token-2022 token account,
  * returned by `surfnet_getConfidentialBalance`.
  */
-export type GetConfidentialBalanceResponse = { 
+export type GetConfidentialBalanceResponse = {
 /**
  * The available (spendable) balance, or `null` if no `aesKey` was supplied.
  */
-available: bigint | null, 
+available: bigint | null,
 /**
  * The pending (credited but not yet applied) balance, or `null` if no
  * `elgamalSecretKey` was supplied.
  */
-pending: bigint | null, 
+pending: bigint | null,
 /**
  * How many confidential credits are sitting in the pending balance. Non-zero
  * means an `ApplyPendingBalance` is required before they show up in

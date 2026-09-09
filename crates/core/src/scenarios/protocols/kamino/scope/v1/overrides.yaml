@@ -45,8 +45,12 @@ templates:
          [210, 3] means price = prices[210] * prices[3]
       4. Set price.value = usd_price * 10^exp, keeping exp as you found it
       5. Set last_updated_slot and unix_timestamp to now, or Kamino rejects the price as stale
-      6. Set persist: true if the scenario runs past one slot, so a transaction that writes
-         this account cannot restore the real price. Safe here: nothing in a fork cranks Scope
+      6. Set persist to a window covering your scenario if it runs past one slot, so a transaction
+         that writes this account cannot restore the real price - persist: { slots: N } where N is
+         how many slots the scenario spans. Prefer that to persist: true, which never expires: a
+         pinned price would then leak into every later scenario in the same surfnet run, and the
+         only symptom is numbers that are inexplicably wrong. Safe here: nothing in a fork cranks
+         Scope
 
       SCOPE INDICES (verified 2026-08-06, do not guess these):
       - 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH (Main Market):
