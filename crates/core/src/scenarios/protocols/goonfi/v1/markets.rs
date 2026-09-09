@@ -121,19 +121,24 @@ pub async fn discover_goonfi_markets(
         )
         .await?
         .into_result()?;
-    let accounts = accounts
-        .into_iter()
-        .map(|(address, encoded)| {
-            let account: Account = encoded.to_account().ok_or_else(|| {
-                SurfpoolError::internal(format!("Could not decode GoonFi market {address}"))
-            })?;
-            market_references(&account)?;
-            Ok((address, account))
-        })
-        .collect::<SurfpoolResult<Vec<_>>>()?;
+    // One obsolete or malformed market must not hide every valid one, so a market that fails
+    // validation is skipped with a warning and the rest of the catalog is still returned. This is
+    // the same warn-and-continue rule the materializer applies per override.
+    let candidates = accounts.len();
+    let mut retained = Vec::new();
     let mut addresses = Vec::new();
-    for (_, account) in &accounts {
-        addresses.extend(market_references(account)?);
+    for (address, encoded) in accounts {
+        let Some(account) = encoded.to_account() else {
+            warn!("Skipping GoonFi market {address}: its account data could not be decoded");
+            continue;
+        };
+        match market_references(&account) {
+            Ok(references) => {
+                addresses.extend(references);
+                retained.push((address, account));
+            }
+            Err(error) => warn!("Skipping GoonFi market {address}: {error}"),
+        }
     }
     addresses.sort_unstable();
     addresses.dedup();
@@ -143,13 +148,26 @@ pub async fn discover_goonfi_markets(
             .get_multiple_accounts(batch, CommitmentConfig::confirmed())
             .await?;
         for (address, account) in batch.iter().zip(fetched) {
-            references.insert(*address, account.map_account()?);
+            // A reference the fork cannot serve disqualifies only the markets pointing at it,
+            // which `resolve_market` reports below.
+            if let Ok(account) = account.map_account() {
+                references.insert(*address, account);
+            }
         }
     }
-    let mut markets = accounts
-        .iter()
-        .map(|(address, account)| resolve_market(*address, account, &references))
-        .collect::<SurfpoolResult<Vec<_>>>()?;
+    let mut markets = Vec::new();
+    for (address, account) in &retained {
+        match resolve_market(*address, account, &references) {
+            Ok(market) => markets.push(market),
+            Err(error) => warn!("Skipping GoonFi market {address}: {error}"),
+        }
+    }
+    // An empty catalog from a program that does own markets is a failure, not a partial result.
+    if markets.is_empty() && candidates > 0 {
+        return Err(SurfpoolError::internal(format!(
+            "none of the {candidates} discovered GoonFi markets validated; the integration needs a refresh"
+        )));
+    }
     markets.sort_by_cached_key(|market| {
         (
             market.address != GOONFI_DEFAULT_MARKET,

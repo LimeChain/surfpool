@@ -16,6 +16,7 @@ use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, Scenari
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
+    types::TokenAccount,
 };
 
 use super::{
@@ -27,8 +28,6 @@ const BASE_MINT_OFFSET: usize = 80;
 const QUOTE_MINT_OFFSET: usize = 112;
 const BASE_VAULT_OFFSET: usize = 144;
 const QUOTE_VAULT_OFFSET: usize = 176;
-/// The SPL token account amount field.
-const AMOUNT_OFFSET: usize = 64;
 
 const LIQUIDITY_TEMPLATE: &str = "spl-token-account-balance";
 const FRESHNESS_TEMPLATE: &str = "goonfi-freshness";
@@ -95,11 +94,10 @@ pub fn build_goonfi_liquidity_scenario(
     let oracle = GoonfiMarket::oracle_address(market_account)?;
     validate_goonfi_oracle_layout(oracle_account)?;
 
-    let base_amount = vault_amount(base_vault_account)?;
-    let quote_amount = vault_amount(quote_vault_account)?;
-
     let base_mint = read_pubkey(&market_account.data, BASE_MINT_OFFSET)?;
     let quote_mint = read_pubkey(&market_account.data, QUOTE_MINT_OFFSET)?;
+    let base_amount = vault_amount(base_vault_account, "base", &base_mint)?;
+    let quote_amount = vault_amount(quote_vault_account, "quote", &quote_mint)?;
     let label = market_label(&base_mint, &quote_mint);
 
     let registry = TemplateRegistry::new();
@@ -168,18 +166,27 @@ pub fn build_goonfi_liquidity_scenario(
     })
 }
 
-/// The SPL token vaults are 32 undiscriminated-looking bytes at the front; the owner check is the
-/// real discriminator that keeps a balance write out of a foreign account.
-fn vault_amount(account: &Account) -> SurfpoolResult<u64> {
+/// Reads a vault balance, proving first that the account really is that market's token vault.
+///
+/// An owner-and-length check is not enough: a mint is also owned by the token program and is long
+/// enough to read an amount out of, so it would pass and its bytes would be misread as a balance.
+/// Unpacking rejects anything that is not a token account, and the mint comparison ties the vault
+/// to the side of the market it is supposed to hold.
+fn vault_amount(account: &Account, side: &str, expected_mint: &Pubkey) -> SurfpoolResult<u64> {
     if account.owner != spl_token_interface::ID && account.owner != spl_token_2022_interface::ID {
-        return Err(invalid("vault is not owned by a supported token program"));
+        return Err(invalid(format!(
+            "{side} vault is not owned by a supported token program"
+        )));
     }
-    let bytes: [u8; 8] = account
-        .data
-        .get(AMOUNT_OFFSET..AMOUNT_OFFSET + 8)
-        .and_then(|slice| slice.try_into().ok())
-        .ok_or_else(|| invalid("vault is too small to be an SPL token account"))?;
-    Ok(u64::from_le_bytes(bytes))
+    let vault = TokenAccount::unpack(&account.data)
+        .map_err(|error| invalid(format!("{side} vault is not a token account: {error}")))?;
+    if vault.mint() != *expected_mint {
+        return Err(invalid(format!(
+            "{side} vault holds mint {} but the market's {side} mint is {expected_mint}",
+            vault.mint()
+        )));
+    }
+    Ok(vault.amount())
 }
 
 fn remaining_label(bps: u16) -> String {
@@ -230,9 +237,14 @@ mod tests {
         }
     }
 
-    fn vault(amount: u64) -> Account {
+    fn vault(mint: &Pubkey, amount: u64) -> Account {
+        const AMOUNT_OFFSET: usize = 64;
+        const STATE_OFFSET: usize = 108;
         let mut data = vec![0u8; 165];
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(Pubkey::new_unique().as_ref());
         data[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].copy_from_slice(&amount.to_le_bytes());
+        data[STATE_OFFSET] = 1;
         Account {
             data,
             owner: spl_token_interface::ID,
@@ -256,8 +268,8 @@ mod tests {
         let preparation = build_goonfi_liquidity_scenario(
             market,
             &market_account(&base_vault, &quote_vault),
-            &vault(2_441_078_070_812),
-            &vault(216_136_231_615),
+            &vault(&WSOL, 2_441_078_070_812),
+            &vault(&USDC, 216_136_231_615),
             &oracle(),
             0,
             0,
@@ -267,15 +279,15 @@ mod tests {
         assert_eq!(preparation.base_vault, base_vault);
         assert_eq!(preparation.quote_vault, quote_vault);
         // A friendly pair label, not the raw market pubkey.
-        assert_eq!(
-            preparation.scenario.name,
-            "GoonFi SOL/USDC liquidity drain"
-        );
+        assert_eq!(preparation.scenario.name, "GoonFi SOL/USDC liquidity drain");
         let [base, quote, freshness] = &preparation.scenario.overrides[..] else {
             panic!("expected base drain, quote drain and freshness overrides");
         };
         assert_eq!(base.account, AccountAddress::Pubkey(base_vault.to_string()));
-        assert_eq!(quote.account, AccountAddress::Pubkey(quote_vault.to_string()));
+        assert_eq!(
+            quote.account,
+            AccountAddress::Pubkey(quote_vault.to_string())
+        );
         assert_eq!(base.values.get("amount"), Some(&serde_json::json!("0")));
         assert_eq!(quote.values.get("amount"), Some(&serde_json::json!("0")));
         assert!(!base.fetch_before_use);
@@ -298,8 +310,8 @@ mod tests {
         let preparation = build_goonfi_liquidity_scenario(
             Pubkey::new_unique(),
             &market_account(&base_vault, &quote_vault),
-            &vault(1_000),
-            &vault(999),
+            &vault(&WSOL, 1_000),
+            &vault(&USDC, 999),
             &oracle(),
             2_500,
             FULL_BPS,
@@ -326,8 +338,8 @@ mod tests {
             build_goonfi_liquidity_scenario(
                 Pubkey::new_unique(),
                 &good_market,
-                &vault(1),
-                &vault(1),
+                &vault(&WSOL, 1),
+                &vault(&USDC, 1),
                 &oracle(),
                 10_001,
                 0
@@ -338,8 +350,8 @@ mod tests {
             build_goonfi_liquidity_scenario(
                 Pubkey::new_unique(),
                 &good_market,
-                &vault(1),
-                &vault(1),
+                &vault(&WSOL, 1),
+                &vault(&USDC, 1),
                 &oracle(),
                 FULL_BPS,
                 FULL_BPS
@@ -356,8 +368,8 @@ mod tests {
             build_goonfi_liquidity_scenario(
                 Pubkey::new_unique(),
                 &foreign_market,
-                &vault(1),
-                &vault(1),
+                &vault(&WSOL, 1),
+                &vault(&USDC, 1),
                 &oracle(),
                 0,
                 0
@@ -368,14 +380,14 @@ mod tests {
         // A vault not owned by a token program is not a real vault.
         let foreign_vault = Account {
             owner: Pubkey::new_unique(),
-            ..vault(1)
+            ..vault(&WSOL, 1)
         };
         assert!(
             build_goonfi_liquidity_scenario(
                 Pubkey::new_unique(),
                 &good_market,
                 &foreign_vault,
-                &vault(1),
+                &vault(&USDC, 1),
                 &oracle(),
                 0,
                 0
@@ -392,9 +404,47 @@ mod tests {
             build_goonfi_liquidity_scenario(
                 Pubkey::new_unique(),
                 &good_market,
-                &vault(1),
-                &vault(1),
+                &vault(&WSOL, 1),
+                &vault(&USDC, 1),
                 &foreign_oracle,
+                0,
+                0
+            )
+            .is_err()
+        );
+    }
+
+    /// An owner-and-length check would pass a mint: it is token-program-owned and long enough to
+    /// misread an amount out of. Unpacking plus the mint comparison is what rejects it.
+    #[test]
+    fn rejects_a_vault_that_is_not_this_markets_token_account() {
+        let market = market_account(&Pubkey::new_unique(), &Pubkey::new_unique());
+        let mint_account = Account {
+            data: vec![0u8; 82],
+            owner: spl_token_interface::ID,
+            ..Account::default()
+        };
+        assert!(
+            build_goonfi_liquidity_scenario(
+                Pubkey::new_unique(),
+                &market,
+                &mint_account,
+                &vault(&USDC, 1),
+                &oracle(),
+                0,
+                0
+            )
+            .is_err()
+        );
+
+        // A real token account holding the other side's mint is refused as well.
+        assert!(
+            build_goonfi_liquidity_scenario(
+                Pubkey::new_unique(),
+                &market,
+                &vault(&USDC, 1),
+                &vault(&USDC, 1),
+                &oracle(),
                 0,
                 0
             )
