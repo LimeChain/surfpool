@@ -91,6 +91,15 @@ impl GoonfiMarket {
         validate_goonfi_oracle_layout(oracle_account)?;
         Ok(Self { address, oracle })
     }
+
+    /// Read-only: the pair is fixed at validation so a caller can inspect it but not re-point it.
+    pub fn address(&self) -> Pubkey {
+        self.address
+    }
+
+    pub fn oracle(&self) -> Pubkey {
+        self.oracle
+    }
 }
 
 /// Rejects an account that is not a GoonFi market.
