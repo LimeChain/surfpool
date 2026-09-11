@@ -21,7 +21,6 @@ use crate::{
 
 use super::{
     GoonfiMarket, market_label, validate_goonfi_market_layout, validate_goonfi_oracle_layout,
-    verify_market_address,
 };
 
 /// Read, never written, so no template declares them.
@@ -92,14 +91,13 @@ pub fn build_goonfi_liquidity_scenario(
     }
 
     let [base_vault, quote_vault] = vault_addresses(market_account)?;
-    verify_market_address(market, base_vault_account)?;
     let oracle = GoonfiMarket::oracle_address(market_account)?;
     validate_goonfi_oracle_layout(oracle_account)?;
 
     let base_mint = read_pubkey(&market_account.data, BASE_MINT_OFFSET)?;
     let quote_mint = read_pubkey(&market_account.data, QUOTE_MINT_OFFSET)?;
-    let base_amount = vault_amount(base_vault_account, "base", &base_mint)?;
-    let quote_amount = vault_amount(quote_vault_account, "quote", &quote_mint)?;
+    let base_amount = vault_amount(base_vault_account, "base", &base_mint, market)?;
+    let quote_amount = vault_amount(quote_vault_account, "quote", &quote_mint, market)?;
     let label = market_label(&base_mint, &quote_mint);
 
     let registry = TemplateRegistry::new();
@@ -168,13 +166,20 @@ pub fn build_goonfi_liquidity_scenario(
     })
 }
 
-/// Reads a vault balance, proving first that the account really is that market's token vault.
+/// Reads a vault balance, proving first that the account really is this market's vault for `side`.
 ///
-/// An owner-and-length check is not enough: a mint is also owned by the token program and is long
-/// enough to read an amount out of, so it would pass and its bytes would be misread as a balance.
-/// Unpacking rejects anything that is not a token account, and the mint comparison ties the vault
-/// to the side of the market it is supposed to hold.
-fn vault_amount(account: &Account, side: &str, expected_mint: &Pubkey) -> SurfpoolResult<u64> {
+/// Three things have to line up, because the balance is read from the passed account but written to
+/// the vault address decoded from the market. An owner-and-length check is not enough: a mint is
+/// also token-program-owned and long enough to read an amount out of. Unpacking rejects anything
+/// that is not a token account, the authority ties the vault to this market, and the mint ties it to
+/// the right side of it - without all three, another market's vault of the same mint would pass and
+/// its balance would be scaled into this market's vault.
+fn vault_amount(
+    account: &Account,
+    side: &str,
+    expected_mint: &Pubkey,
+    market: Pubkey,
+) -> SurfpoolResult<u64> {
     if account.owner != spl_token_interface::ID && account.owner != spl_token_2022_interface::ID {
         return Err(invalid(format!(
             "{side} vault is not owned by a supported token program"
@@ -182,6 +187,12 @@ fn vault_amount(account: &Account, side: &str, expected_mint: &Pubkey) -> Surfpo
     }
     let vault = TokenAccount::unpack(&account.data)
         .map_err(|error| invalid(format!("{side} vault is not a token account: {error}")))?;
+    if vault.owner() != market {
+        return Err(invalid(format!(
+            "{side} vault is held by {}, not by the market {market} this scenario targets",
+            vault.owner()
+        )));
+    }
     if vault.mint() != *expected_mint {
         return Err(invalid(format!(
             "{side} vault holds mint {} but the market's {side} mint is {expected_mint}",
@@ -454,6 +465,33 @@ mod tests {
                 0
             )
             .is_err()
+        );
+    }
+
+    /// The balance is read from the passed account but written to the vault the market names, so a
+    /// vault of the right mint belonging to another market would scale the wrong balance into this
+    /// one - a drain that silently tops the vault up instead.
+    #[test]
+    fn rejects_a_vault_belonging_to_another_market() {
+        let other_market = Pubkey::new_unique();
+        let foreign_quote = {
+            let mut account = vault(&USDC, 999_999_999);
+            account.data[32..64].copy_from_slice(other_market.as_ref());
+            account
+        };
+        let error = build_goonfi_liquidity_scenario(
+            MARKET,
+            &market_account(&Pubkey::new_unique(), &Pubkey::new_unique()),
+            &vault(&WSOL, 1_000),
+            &foreign_quote,
+            &oracle(),
+            0,
+            0,
+        )
+        .expect_err("a vault held by another market must be refused");
+        assert!(
+            error.to_string().contains("quote vault is held by"),
+            "unexpected error: {error}"
         );
     }
 
