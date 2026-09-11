@@ -10,14 +10,13 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use surfpool_types::VERIFIED_TOKENS_BY_SYMBOL;
 
+use super::{GOONFI_DEFAULT_MARKET, GOONFI_PROGRAM_ID, GoonfiMarket, vault_addresses};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
     surfnet::remote::SurfnetRemoteClient,
     types::MintAccount,
 };
-
-use super::{GOONFI_DEFAULT_MARKET, GOONFI_PROGRAM_ID, GoonfiMarket, vault_addresses};
 
 #[derive(Debug, PartialEq)]
 pub struct GoonfiDiscoveredMarket {
@@ -52,7 +51,7 @@ pub fn market_label(base_mint: &Pubkey, quote_mint: &Pubkey) -> String {
 }
 
 /// The accounts a market points at: its two mints, its oracle, and its base vault. The vault comes
-/// along because it is what proves the market's address matches these bytes.
+/// along to check that its token authority is the market.
 fn market_references(account: &Account) -> SurfpoolResult<[Pubkey; 4]> {
     let oracle = GoonfiMarket::oracle_address(account)?;
     let base = Pubkey::new_from_array(account.data[80..112].try_into().unwrap());
@@ -86,7 +85,12 @@ fn resolve_market(
             SurfpoolError::internal(format!("GoonFi referenced account {address} was not found"))
         })
     };
-    GoonfiMarket::validate(address, account, required(&base_vault)?, required(&oracle)?)?;
+    GoonfiMarket::validate(
+        address,
+        account,
+        (base_vault, required(&base_vault)?),
+        (oracle, required(&oracle)?),
+    )?;
     Ok(GoonfiDiscoveredMarket {
         address,
         oracle,

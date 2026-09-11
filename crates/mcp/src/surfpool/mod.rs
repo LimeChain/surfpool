@@ -468,8 +468,6 @@ impl Surfpool {
             .ok_or_else(|| format!("GoonFi market account {market_address} was not found"))?;
         let oracle_address =
             GoonfiMarket::oracle_address(&market_account).map_err(|error| error.to_string())?;
-        // The base vault rides along in the same read: it is what proves `market_address` belongs
-        // to the bytes just fetched, since a market does not record its own address.
         let [base_vault_address, _] =
             vault_addresses(&market_account).map_err(|error| error.to_string())?;
         let referenced = self
@@ -484,8 +482,8 @@ impl Surfpool {
         GoonfiMarket::validate(
             market_address,
             &market_account,
-            base_vault_account,
-            oracle_account,
+            (base_vault_address, base_vault_account),
+            (oracle_address, oracle_account),
         )
         .map_err(|error| error.to_string())
     }
@@ -1214,9 +1212,9 @@ impl Surfpool {
         let preparation = match build_goonfi_liquidity_scenario(
             market_address,
             &market_account,
-            base_account,
-            quote_account,
-            oracle_account,
+            (base_vault, base_account),
+            (quote_vault, quote_account),
+            (oracle, oracle_account),
             params.base_remaining_bps.unwrap_or(0),
             params.quote_remaining_bps.unwrap_or(0),
         ) {

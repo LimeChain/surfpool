@@ -689,8 +689,16 @@ async fn goonfi_templates_guard_oracle_and_market_and_preserve_unwritten_bytes()
 async fn builder_prepares_and_the_program_fills(fork: &GoonfiFork) {
     let market_key = Pubkey::from_str_const(fork.spec.market);
     let oracle_key = Pubkey::from_str_const(fork.spec.oracle);
-    let market = GoonfiMarket::validate(market_key, &fork.market, &fork.base_vault, &fork.oracle)
-        .expect("validate market");
+    let market = GoonfiMarket::validate(
+        market_key,
+        &fork.market,
+        (
+            Pubkey::from_str_const(fork.spec.base_vault),
+            &fork.base_vault,
+        ),
+        (oracle_key, &fork.oracle),
+    )
+    .expect("validate market");
     let live_bid = read_u64(&fork.oracle.data, ORACLE_BID_OFFSET);
     let target = live_bid * 3 / 2;
     let price = format!("{}.{:06}", target / 1_000_000, target % 1_000_000);
@@ -1092,23 +1100,24 @@ async fn goonfi_discovery_fetches_live_market_and_oracle_relationships() {
             .flat_map(|market| [market.address, market.oracle])
             .collect();
         let accounts = live::fetch(&addresses).await;
-        // The base vault is what proves each discovered address against the bytes at it, so the
-        // live check has to read it too.
+        // Include each base vault to validate its token authority against the discovered market.
         let vaults: Vec<Pubkey> = accounts
             .chunks_exact(2)
             .map(|pair| vault_addresses(&pair[0]).expect("a live market names its vaults")[0])
             .collect();
         let vault_accounts = live::fetch(&vaults).await;
-        for ((discovered, accounts), vault) in chunk
+        for ((discovered, accounts), (vault_address, vault)) in chunk
             .iter()
             .zip(accounts.chunks_exact(2))
-            .zip(vault_accounts.iter())
+            .zip(vaults.iter().zip(vault_accounts.iter()))
         {
-            let validated =
-                GoonfiMarket::validate(discovered.address, &accounts[0], vault, &accounts[1])
-                    .expect(
-                        "discovered market and oracle must retain their live owners and layouts",
-                    );
+            let validated = GoonfiMarket::validate(
+                discovered.address,
+                &accounts[0],
+                (*vault_address, vault),
+                (discovered.oracle, &accounts[1]),
+            )
+            .expect("discovered market and oracle must retain their live owners and layouts");
             assert_eq!(
                 validated.oracle(),
                 discovered.oracle,
