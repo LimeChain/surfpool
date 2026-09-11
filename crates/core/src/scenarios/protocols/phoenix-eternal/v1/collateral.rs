@@ -1,4 +1,7 @@
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError, multi_arena::MultiArenaHeader, trader::TraderHeader,
@@ -16,13 +19,32 @@ pub fn trader_header(trader: &Pubkey, account: &Account) -> SurfpoolResult<Trade
             None::<PhoenixAccountDecodeError>,
         ));
     }
-    TraderHeader::try_read_from_account_bytes(&account.data).map_err(|error| {
+    let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|error| {
         SurfpoolError::invalid_account_data(
             trader,
             "Expected a valid Phoenix Eternal Trader account",
             Some(error),
         )
-    })
+    })?;
+    if Pubkey::new_from_array(header.key) != *trader {
+        return Err(SurfpoolError::invalid_account_data(
+            trader,
+            "Phoenix Trader header key does not match its account address",
+            None::<String>,
+        ));
+    }
+    Ok(header)
+}
+
+pub fn validate_collateral_fields(
+    values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<()> {
+    if values.contains_key("quote_lot_collateral") {
+        return Err(SurfpoolError::internal(
+            "Phoenix field quote_lot_collateral is no longer supported; use traderState.quoteLotCollateral as a decimal string",
+        ));
+    }
+    Ok(())
 }
 
 pub fn index_trader_state_range(
@@ -344,14 +366,6 @@ mod tests {
                 "traderState.quoteLotCollateral",
                 -9_007_199_254_740_993,
             ),
-            (FIRST_KEY, SECOND_KEY, 144, "quote_lot_collateral", 1),
-            (
-                SECOND_KEY,
-                FIRST_KEY,
-                208,
-                "quote_lot_collateral",
-                -9_007_199_254_740_993,
-            ),
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
@@ -420,6 +434,7 @@ mod tests {
             "missing key",
             "missing account",
             "conflicting fields",
+            "mismatched key",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = Pubkey::new_unique();
@@ -431,6 +446,7 @@ mod tests {
                 build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&before_index))
                     .unwrap();
             match failure {
+                "mismatched key" => before_trader.data[24..56].copy_from_slice(&SECOND_KEY),
                 "conflicting fields" => {
                     scenario.overrides[0]
                         .values
@@ -465,6 +481,60 @@ mod tests {
             } else {
                 assert_eq!(after_index.unwrap(), before_index, "{failure}");
             }
+        }
+    }
+
+    #[test]
+    fn trader_idl_keeps_max_positions_and_preference_bits_separate() {
+        use crate::{scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT, surfnet::svm::SurfnetSvm};
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut account = trader_account(FIRST_KEY, 9_999, false);
+        account.data[112..116].copy_from_slice(&7_u32.to_le_bytes());
+        account.data[116..120].copy_from_slice(&0xa5a5_5a5a_u32.to_le_bytes());
+        let idl = serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).unwrap();
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        for (field, offset, target) in [
+            ("maxPositions", 112, 11_u32),
+            ("traderPreferenceBits", 116, 0x1234_5678),
+        ] {
+            let forged = svm
+                .get_forged_account_data(
+                    &trader,
+                    &account.data,
+                    &idl,
+                    &HashMap::from([(field.to_string(), serde_json::json!(target))]),
+                )
+                .unwrap();
+            let mut expected = account.data.clone();
+            expected[offset..offset + 4].copy_from_slice(&target.to_le_bytes());
+            assert_eq!(
+                forged, expected,
+                "{field} must preserve all neighboring and trailing bytes"
+            );
+            let header = TraderHeader::try_read_from_account_bytes(&forged).unwrap();
+            assert_eq!(header.max_positions, if offset == 112 { target } else { 7 });
+            assert_eq!(
+                header.trader_preference_bits,
+                if offset == 116 { target } else { 0xa5a5_5a5a }
+            );
+        }
+    }
+
+    #[test]
+    fn trader_header_rejects_an_embedded_key_for_another_account() {
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        for hot in [false, true] {
+            let account = trader_account(SECOND_KEY, 9_999, hot);
+            let error = trader_header(&trader, &account).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("key does not match its account address")
+            );
+            assert!(
+                build_phoenix_collateral_scenario(trader, &account, "1", Some(&index_account()))
+                    .is_err()
+            );
         }
     }
 }

@@ -419,7 +419,7 @@ fn parse_unsigned_ticks(value: &serde_json::Value, field: &str) -> SurfpoolResul
 fn parse_quote_lot_collateral(value: &str) -> SurfpoolResult<i64> {
     value.parse::<i64>().map_err(|_| {
         SurfpoolError::internal(
-            "quote_lot_collateral must be a signed 64-bit integer encoded as a string",
+            "targetQuoteLots must be a signed 64-bit integer encoded as a string",
         )
     })
 }
@@ -467,6 +467,15 @@ pub(crate) mod tests {
         }
     }
 
+    fn trader_account_for(trader: Pubkey, collateral: i64) -> Account {
+        let mut account = Account {
+            data: trader_fixture(collateral, 1, 2),
+            ..trader_account()
+        };
+        account.data[24..56].copy_from_slice(trader.as_ref());
+        account
+    }
+
     pub(crate) fn perp_asset_map_fixture() -> Vec<u8> {
         let prefix = BASE64_STANDARD
             .decode(SOL_PERP_ASSET_MAP_PREFIX_B64)
@@ -506,9 +515,13 @@ pub(crate) mod tests {
     #[test]
     fn builds_one_editable_collateral_override_for_the_requested_trader() {
         let trader = Pubkey::new_unique();
-        let preparation =
-            build_phoenix_collateral_scenario(trader, &trader_account(), "-9007199254740993", None)
-                .unwrap();
+        let preparation = build_phoenix_collateral_scenario(
+            trader,
+            &trader_account_for(trader, 0),
+            "-9007199254740993",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(preparation.overrides.len(), 1);
 
@@ -532,10 +545,7 @@ pub(crate) mod tests {
     #[test]
     fn builder_refuses_to_raise_collateral_above_its_vault_backing() {
         let trader = Pubkey::new_unique();
-        let funded = Account {
-            data: trader_fixture(500, 1, 2),
-            ..trader_account()
-        };
+        let funded = trader_account_for(trader, 500);
 
         let raised = build_phoenix_collateral_scenario(trader, &funded, "501", None).unwrap_err();
         assert!(raised.to_string().contains("can only lower collateral"));
