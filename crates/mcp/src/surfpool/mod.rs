@@ -468,15 +468,26 @@ impl Surfpool {
             .ok_or_else(|| format!("GoonFi market account {market_address} was not found"))?;
         let oracle_address =
             GoonfiMarket::oracle_address(&market_account).map_err(|error| error.to_string())?;
-        let oracle_account = self
-            .fetch_surfnet_accounts(surfnet_port, &[oracle_address])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
+        // The base vault rides along in the same read: it is what proves `market_address` belongs
+        // to the bytes just fetched, since a market does not record its own address.
+        let [base_vault_address, _] =
+            vault_addresses(&market_account).map_err(|error| error.to_string())?;
+        let referenced = self
+            .fetch_surfnet_accounts(surfnet_port, &[oracle_address, base_vault_address])
+            .await?;
+        let oracle_account = referenced[0]
+            .as_ref()
             .ok_or_else(|| format!("GoonFi oracle {oracle_address} was not found"))?;
-        GoonfiMarket::validate(market_address, &market_account, &oracle_account)
-            .map_err(|error| error.to_string())
+        let base_vault_account = referenced[1]
+            .as_ref()
+            .ok_or_else(|| format!("GoonFi base vault {base_vault_address} was not found"))?;
+        GoonfiMarket::validate(
+            market_address,
+            &market_account,
+            base_vault_account,
+            oracle_account,
+        )
+        .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {

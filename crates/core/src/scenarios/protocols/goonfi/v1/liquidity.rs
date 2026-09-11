@@ -21,6 +21,7 @@ use crate::{
 
 use super::{
     GoonfiMarket, market_label, validate_goonfi_market_layout, validate_goonfi_oracle_layout,
+    verify_market_address,
 };
 
 /// Read, never written, so no template declares them.
@@ -91,6 +92,7 @@ pub fn build_goonfi_liquidity_scenario(
     }
 
     let [base_vault, quote_vault] = vault_addresses(market_account)?;
+    verify_market_address(market, base_vault_account)?;
     let oracle = GoonfiMarket::oracle_address(market_account)?;
     validate_goonfi_oracle_layout(oracle_account)?;
 
@@ -237,12 +239,15 @@ mod tests {
         }
     }
 
+    /// The market every fixture below belongs to; its vaults name it as their authority.
+    const MARKET: Pubkey = Pubkey::from_str_const("GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC");
+
     fn vault(mint: &Pubkey, amount: u64) -> Account {
         const AMOUNT_OFFSET: usize = 64;
         const STATE_OFFSET: usize = 108;
         let mut data = vec![0u8; 165];
         data[0..32].copy_from_slice(mint.as_ref());
-        data[32..64].copy_from_slice(Pubkey::new_unique().as_ref());
+        data[32..64].copy_from_slice(MARKET.as_ref());
         data[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].copy_from_slice(&amount.to_le_bytes());
         data[STATE_OFFSET] = 1;
         Account {
@@ -264,7 +269,7 @@ mod tests {
     fn drains_both_vaults_and_keeps_the_quote_fresh() {
         let base_vault = Pubkey::new_unique();
         let quote_vault = Pubkey::new_unique();
-        let market = Pubkey::new_unique();
+        let market = MARKET;
         let preparation = build_goonfi_liquidity_scenario(
             market,
             &market_account(&base_vault, &quote_vault),
@@ -308,7 +313,7 @@ mod tests {
         let base_vault = Pubkey::new_unique();
         let quote_vault = Pubkey::new_unique();
         let preparation = build_goonfi_liquidity_scenario(
-            Pubkey::new_unique(),
+            MARKET,
             &market_account(&base_vault, &quote_vault),
             &vault(&WSOL, 1_000),
             &vault(&USDC, 999),
@@ -336,7 +341,7 @@ mod tests {
         // Out of range and a no-op leave nothing to prepare.
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &good_market,
                 &vault(&WSOL, 1),
                 &vault(&USDC, 1),
@@ -348,7 +353,7 @@ mod tests {
         );
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &good_market,
                 &vault(&WSOL, 1),
                 &vault(&USDC, 1),
@@ -366,7 +371,7 @@ mod tests {
         };
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &foreign_market,
                 &vault(&WSOL, 1),
                 &vault(&USDC, 1),
@@ -384,7 +389,7 @@ mod tests {
         };
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &good_market,
                 &foreign_vault,
                 &vault(&USDC, 1),
@@ -402,7 +407,7 @@ mod tests {
         };
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &good_market,
                 &vault(&WSOL, 1),
                 &vault(&USDC, 1),
@@ -426,7 +431,7 @@ mod tests {
         };
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &market,
                 &mint_account,
                 &vault(&USDC, 1),
@@ -440,9 +445,29 @@ mod tests {
         // A real token account holding the other side's mint is refused as well.
         assert!(
             build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
+                MARKET,
                 &market,
                 &vault(&USDC, 1),
+                &vault(&USDC, 1),
+                &oracle(),
+                0,
+                0
+            )
+            .is_err()
+        );
+    }
+
+    /// The market account carries no self-address, so the vault's authority is what ties the
+    /// requested market to these bytes.
+    #[test]
+    fn rejects_a_market_address_that_does_not_hold_the_vault() {
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
+        assert!(
+            build_goonfi_liquidity_scenario(
+                Pubkey::new_unique(),
+                &market_account(&base_vault, &quote_vault),
+                &vault(&WSOL, 1),
                 &vault(&USDC, 1),
                 &oracle(),
                 0,

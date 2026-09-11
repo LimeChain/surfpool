@@ -17,7 +17,7 @@ use crate::{
     types::MintAccount,
 };
 
-use super::{GOONFI_DEFAULT_MARKET, GOONFI_PROGRAM_ID, GoonfiMarket};
+use super::{GOONFI_DEFAULT_MARKET, GOONFI_PROGRAM_ID, GoonfiMarket, vault_addresses};
 
 #[derive(Debug, PartialEq)]
 pub struct GoonfiDiscoveredMarket {
@@ -51,16 +51,19 @@ pub fn market_label(base_mint: &Pubkey, quote_mint: &Pubkey) -> String {
     format!("{}/{}", symbol(base_mint), symbol(quote_mint))
 }
 
-fn market_references(account: &Account) -> SurfpoolResult<[Pubkey; 3]> {
+/// The accounts a market points at: its two mints, its oracle, and its base vault. The vault comes
+/// along because it is what proves the market's address matches these bytes.
+fn market_references(account: &Account) -> SurfpoolResult<[Pubkey; 4]> {
     let oracle = GoonfiMarket::oracle_address(account)?;
     let base = Pubkey::new_from_array(account.data[80..112].try_into().unwrap());
     let quote = Pubkey::new_from_array(account.data[112..144].try_into().unwrap());
+    let [base_vault, _] = vault_addresses(account)?;
     if base == Pubkey::default() || quote == Pubkey::default() || base == quote {
         return Err(SurfpoolError::internal(
             "GoonFi market has invalid mint identities",
         ));
     }
-    Ok([base, quote, oracle])
+    Ok([base, quote, oracle, base_vault])
 }
 
 fn mint_decimals(account: &Account) -> SurfpoolResult<u8> {
@@ -77,13 +80,13 @@ fn resolve_market(
     account: &Account,
     references: &HashMap<Pubkey, Account>,
 ) -> SurfpoolResult<GoonfiDiscoveredMarket> {
-    let [base, quote, oracle] = market_references(account)?;
+    let [base, quote, oracle, base_vault] = market_references(account)?;
     let required = |address: &Pubkey| {
         references.get(address).ok_or_else(|| {
             SurfpoolError::internal(format!("GoonFi referenced account {address} was not found"))
         })
     };
-    GoonfiMarket::validate(address, account, required(&oracle)?)?;
+    GoonfiMarket::validate(address, account, required(&base_vault)?, required(&oracle)?)?;
     Ok(GoonfiDiscoveredMarket {
         address,
         oracle,
@@ -190,6 +193,8 @@ mod tests {
         let base = Pubkey::new_unique();
         let quote = Pubkey::new_unique();
         let oracle = Pubkey::new_unique();
+        let base_vault = Pubkey::new_unique();
+        let quote_vault = Pubkey::new_unique();
         let registry = TemplateRegistry::new();
         let layout = registry
             .get("goonfi-reference-band")
@@ -206,6 +211,8 @@ mod tests {
         market.data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
         market.data[80..112].copy_from_slice(base.as_ref());
         market.data[112..144].copy_from_slice(quote.as_ref());
+        market.data[144..176].copy_from_slice(base_vault.as_ref());
+        market.data[176..208].copy_from_slice(quote_vault.as_ref());
         market.data[208..240].copy_from_slice(oracle.as_ref());
         let mint = |decimals| {
             let mut account = Account {
@@ -221,12 +228,24 @@ mod tests {
             .pack_into_slice(&mut account.data);
             account
         };
+        let vault = {
+            let mut data = vec![0u8; 165];
+            data[0..32].copy_from_slice(base.as_ref());
+            data[32..64].copy_from_slice(address.as_ref());
+            data[108] = 1;
+            Account {
+                owner: spl_token_interface::ID,
+                data,
+                ..Account::default()
+            }
+        };
         (
             address,
             market,
             HashMap::from([
                 (base, mint(9)),
                 (quote, mint(6)),
+                (base_vault, vault),
                 (
                     oracle,
                     Account {
@@ -279,7 +298,7 @@ mod tests {
     #[test]
     fn goonfi_discovery_rejects_missing_or_invalid_referenced_accounts() {
         let (address, account, references) = fixture();
-        let [base, _, oracle] = market_references(&account).unwrap();
+        let [base, _, oracle, _] = market_references(&account).unwrap();
         for invalid in 0..5 {
             let mut references = references.clone();
             match invalid {
