@@ -1,0 +1,82 @@
+protocol: Phoenix Eternal
+version: v1
+account_type: Trader
+idl_file_path: idl.json
+
+tags:
+  - perpetuals
+  - collateral
+  - risk
+
+templates:
+  - id: phoenix-trader-collateral-stress
+    name: Phoenix Trader Collateral Stress
+    description: Set exact signed quote-lot collateral on a Phoenix Trader and its effective GlobalTraderIndex entry when hot.
+    idl_account_name: Trader
+    properties:
+      - path: traderState.quoteLotCollateral
+        label: Target Collateral in Quote Lots
+        description: Exact signed quote-lot collateral encoded as a decimal string
+    llm_context: |
+      This prepares collateral stress state. It does not guarantee liquidation and does not execute liquidation.
+      Hot traders read collateral from GlobalTraderIndex. Play resolves the reachable entry by trader key and updates both records through the IDL, preserving unrelated bytes. Cold traders use their own account.
+      Hot traders currently require a valid single-arena GlobalTraderIndex; unsupported layouts are rejected before collateral writes.
+      For a liquidation cascade, pair it with phoenix-direct-mark-risk-shock at the next slot. Keep override labels short.
+      Pass traderState.quoteLotCollateral as a decimal string. Builder-created scenarios leave fetchBeforeUse off; the value applies to the local fork state.
+    address:
+      type: pubkey
+
+  - id: phoenix-direct-mark-risk-shock
+    name: Phoenix Direct Mark Risk Shock
+    description: Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        value_type: string
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: target_ticks
+        value_type: string
+        label: Target Mark Ticks
+        description: Exact unsigned mark-price ticks encoded as a decimal string
+    llm_context: |
+      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
+      Pass target_ticks as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+    # The singleton named by GlobalConfig's perp_asset_map field, which only moves if the
+    # protocol migrates the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-reference-price-divergence
+    name: Phoenix Spot/Perp Reference Divergence
+    description: Set independent spot and external-perp reference ticks while preserving the current mark price.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        value_type: string
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: spot_ticks
+        value_type: string
+        label: Spot Reference Ticks
+        description: Exact spot reference ticks encoded as a decimal string
+      - path: perp_ticks
+        value_type: string
+        label: Perp Reference Ticks
+        description: Exact external-perp reference ticks encoded as a decimal string
+    llm_context: |
+      This prepares spot/perp reference and mark divergence state for bots to act on, setting the cached reference ticks and stamping their slots with the materialization slot.
+      It preserves the current mark, orderbook, and spline liquidity and does not execute a trade.
+      Pass both tick values as decimal strings. The account is the singleton PerpAssetMap, so this template carries its address.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
