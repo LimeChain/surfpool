@@ -15,6 +15,7 @@ use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, RawLayo
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
+    types::TokenAccount,
 };
 
 pub const GOONFI_PROGRAM_ID: Pubkey =
@@ -82,12 +83,16 @@ impl GoonfiMarket {
         Ok(oracle)
     }
 
+    /// `base_vault_account` must be the account at the base vault the market itself names; it is
+    /// what proves `address` belongs to `market_account` (see `verify_market_address`).
     pub fn validate(
         address: Pubkey,
         market_account: &Account,
+        base_vault_account: &Account,
         oracle_account: &Account,
     ) -> SurfpoolResult<Self> {
         let oracle = Self::oracle_address(market_account)?;
+        verify_market_address(address, base_vault_account)?;
         validate_goonfi_oracle_layout(oracle_account)?;
         Ok(Self { address, oracle })
     }
@@ -100,6 +105,26 @@ impl GoonfiMarket {
     pub fn oracle(&self) -> Pubkey {
         self.oracle
     }
+}
+
+/// Proves that `address` really is the market whose bytes sit in the account it was fetched with.
+///
+/// A market does not record its own address, but its vaults do: a GoonFi vault is a token account
+/// whose authority is the market. Reading the vault the market itself names and comparing that
+/// authority is what ties a caller-supplied address to the data - the same shape of cross-check the
+/// pump graduation builder makes through its curve vault's mint. It catches the realistic mistake,
+/// an address from one market paired with another market's bytes; it is not proof against a caller
+/// who deliberately assembles three mutually inconsistent accounts.
+pub fn verify_market_address(address: Pubkey, base_vault_account: &Account) -> SurfpoolResult<()> {
+    let vault = TokenAccount::unpack(&base_vault_account.data)
+        .map_err(|error| invalid(format!("market base vault is not a token account: {error}")))?;
+    if vault.owner() != address {
+        return Err(invalid(format!(
+            "market base vault is held by {}, not by the targeted market {address}",
+            vault.owner()
+        )));
+    }
+    Ok(())
 }
 
 /// Rejects an account that is not a GoonFi market.
@@ -303,16 +328,50 @@ mod tests {
         }
     }
 
+    /// A market's base vault: a token account whose authority is the market itself.
+    fn vault_account(authority: &Pubkey) -> Account {
+        let mut data = vec![0u8; 165];
+        data[0..32].copy_from_slice(Pubkey::new_unique().as_ref());
+        data[32..64].copy_from_slice(authority.as_ref());
+        data[108] = 1;
+        Account {
+            data,
+            owner: spl_token_interface::ID,
+            ..Account::default()
+        }
+    }
+
     const FIXTURE_ORACLE: Pubkey =
         Pubkey::from_str_const("7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3");
 
     fn market() -> GoonfiMarket {
+        let address = Pubkey::new_unique();
         GoonfiMarket::validate(
-            Pubkey::new_unique(),
+            address,
             &market_account(&FIXTURE_ORACLE),
+            &vault_account(&address),
             &oracle_account(),
         )
         .expect("valid GoonFi market")
+    }
+
+    /// The market account does not carry its own address, so a caller could hand `validate` one
+    /// market's address with another market's bytes. The base vault's authority is what catches it.
+    #[test]
+    fn rejects_an_address_that_does_not_own_the_market_vault() {
+        let other_market = Pubkey::new_unique();
+        assert!(
+            GoonfiMarket::validate(
+                Pubkey::new_unique(),
+                &market_account(&FIXTURE_ORACLE),
+                &vault_account(&other_market),
+                &oracle_account()
+            )
+            .is_err()
+        );
+
+        // A vault that is not a token account at all is refused before the comparison.
+        assert!(verify_market_address(Pubkey::new_unique(), &oracle_account()).is_err());
     }
 
     #[test]
@@ -421,8 +480,15 @@ mod tests {
             owner: Pubkey::new_unique(),
             ..market_account(&oracle)
         };
+        let address = Pubkey::new_unique();
         assert!(
-            GoonfiMarket::validate(Pubkey::new_unique(), &wrong_owner, &oracle_account()).is_err()
+            GoonfiMarket::validate(
+                address,
+                &wrong_owner,
+                &vault_account(&address),
+                &oracle_account()
+            )
+            .is_err()
         );
         // The raw guard cannot see the owner, which is the whole reason this check sits on top.
         assert!(MARKET_LAYOUT.guard(&wrong_owner.data).is_ok());
@@ -430,12 +496,24 @@ mod tests {
         let mut bad_magic = market_account(&oracle);
         bad_magic.data[0] ^= 0xff;
         assert!(
-            GoonfiMarket::validate(Pubkey::new_unique(), &bad_magic, &oracle_account()).is_err()
+            GoonfiMarket::validate(
+                address,
+                &bad_magic,
+                &vault_account(&address),
+                &oracle_account()
+            )
+            .is_err()
         );
 
         let no_pointer = market_account(&Pubkey::default());
         assert!(
-            GoonfiMarket::validate(Pubkey::new_unique(), &no_pointer, &oracle_account()).is_err()
+            GoonfiMarket::validate(
+                address,
+                &no_pointer,
+                &vault_account(&address),
+                &oracle_account()
+            )
+            .is_err()
         );
 
         // The oracle carries no magic at all, so the owner check is its only discriminator.
@@ -445,8 +523,9 @@ mod tests {
         };
         assert!(
             GoonfiMarket::validate(
-                Pubkey::new_unique(),
+                address,
                 &market_account(&oracle),
+                &vault_account(&address),
                 &foreign_oracle
             )
             .is_err()
