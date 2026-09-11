@@ -15,6 +15,12 @@ for submitting trades, arbitrage, and liquidation transactions.
 Tick inputs are Phoenix protocol ticks, not human-readable USD prices. Pass tick and collateral
 values as decimal strings so values outside JavaScript's safe integer range remain exact.
 
+Collateral overrides use `traderState.quoteLotCollateral`. The former `quote_lot_collateral`
+name is rejected by MCP scenario creation; an existing scenario using it is skipped at Play with
+an explicit warning naming the replacement. Update that scenario's values before playing it.
+Market templates identify the real `PerpAssetMap` account. Their `symbol` and tick properties
+carry `value_type: string` so Studio can render scenario inputs without synthetic IDL accounts.
+
 ## Use from Studio
 
 1. Start an online Surfpool fork and open Studio.

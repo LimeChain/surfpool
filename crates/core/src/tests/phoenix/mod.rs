@@ -17,6 +17,9 @@
 //! Nothing here hunts for a market that happens to sit in an interesting state: the live
 //! accounts are the raw material, and the production builders prepare the scene.
 
+use std::collections::HashMap;
+
+use bytemuck::{Pod, Zeroable};
 use phoenix_rise_accounts::{
     PhoenixAccount,
     global_config::GlobalConfig,
@@ -24,9 +27,6 @@ use phoenix_rise_accounts::{
     perp_asset_map::PerpAssetMap,
     trader::{Trader, TraderHeader},
 };
-use std::collections::HashMap;
-
-use bytemuck::{Pod, Zeroable};
 use solana_account::Account;
 use solana_account_decoder::UiAccountEncoding;
 use solana_clock::Clock;
@@ -41,7 +41,6 @@ use solana_rpc_client_api::{
 };
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-
 use surfpool_types::AccountAddress;
 
 use crate::{
@@ -918,7 +917,8 @@ fn phoenix_reference_price_scenario(
 #[tokio::test(flavor = "multi_thread")]
 async fn materialize_patches_only_phoenix_trader_collateral() {
     let trader = Pubkey::new_unique();
-    let base = phoenix_trader_fixture(6_996_825_500);
+    let mut base = phoenix_trader_fixture(6_996_825_500);
+    base[24..56].copy_from_slice(trader.as_ref());
     let scenario = phoenix_collateral_scenario(trader, serde_json::json!("371499999"), false);
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);

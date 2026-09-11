@@ -444,6 +444,14 @@ mod tests {
             "phoenix-reference-price-divergence",
         ] {
             let template = registry.get(id).expect("phoenix market template exists");
+            assert_eq!(template.account_type, "PerpAssetMap");
+            for property in &template.properties {
+                assert_eq!(
+                    serde_json::to_value(property).unwrap()["value_type"],
+                    "string"
+                );
+            }
+
             let symbol = template
                 .properties
                 .iter()
@@ -462,6 +470,23 @@ mod tests {
                 symbol.constant_name().is_none(),
                 "{id} symbol must not reference a static constant"
             );
+        }
+    }
+
+    #[test]
+    fn phoenix_idl_contains_only_real_accounts_with_unique_discriminators() {
+        let idl: surfpool_types::Idl = serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).unwrap();
+        let mut discriminators = std::collections::HashSet::new();
+        for account in &idl.accounts {
+            assert!(
+                discriminators.insert(&account.discriminator),
+                "duplicate {}",
+                account.name
+            );
+        }
+        for name in ["DirectMarkOverride", "ReferencePriceOverride"] {
+            assert!(!idl.accounts.iter().any(|account| account.name == name));
+            assert!(!idl.types.iter().any(|definition| definition.name == name));
         }
     }
 

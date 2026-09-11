@@ -94,7 +94,7 @@ use crate::{
     scenarios::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::{
-            collateral::collateral_override_value,
+            collateral::{collateral_override_value, validate_collateral_fields},
             state_builder::{
                 PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override,
                 is_phoenix_perp_asset_map_account, is_phoenix_trader_account,
@@ -2944,15 +2944,9 @@ impl SurfnetSvm {
                 let is_phoenix_trader = account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID
                     && is_phoenix_trader_account(account.data());
                 if is_phoenix_trader {
-                    if let Some(legacy) = account_values.remove("quote_lot_collateral") {
-                        if account_values.contains_key("traderState.quoteLotCollateral") {
-                            warn!(
-                                "Skipping override {}: Phoenix collateral must use only traderState.quoteLotCollateral",
-                                override_instance.id
-                            );
-                            continue;
-                        }
-                        account_values.insert("traderState.quoteLotCollateral".to_string(), legacy);
+                    if let Err(error) = validate_collateral_fields(&account_values) {
+                        warn!("Skipping override {}: {}", override_instance.id, error);
+                        continue;
                     }
                     if let Some(value) = account_values.get_mut("traderState.quoteLotCollateral") {
                         match collateral_override_value(value) {

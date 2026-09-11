@@ -283,6 +283,8 @@ pub struct Property {
     /// For dynamic_ref type: the MCP tool whose result supplies the dropdown options
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<anchor_lang_idl::types::IdlType>,
 }
 
 impl Property {
@@ -295,6 +297,7 @@ impl Property {
             description: None,
             constant: None,
             source: None,
+            value_type: None,
         }
     }
 
@@ -307,6 +310,7 @@ impl Property {
             description: None,
             constant: Some(constant.into()),
             source: None,
+            value_type: None,
         }
     }
 
@@ -858,6 +862,8 @@ pub enum YamlProperty {
         /// For dynamic_ref type: the MCP tool whose result supplies the options
         #[serde(default)]
         source: Option<String>,
+        #[serde(default)]
+        value_type: Option<anchor_lang_idl::types::IdlType>,
     },
 }
 
@@ -872,6 +878,7 @@ impl From<YamlProperty> for Property {
                 description,
                 constant,
                 source,
+                value_type,
             } => {
                 let kind = match kind.as_deref() {
                     Some("constant_ref") => PropertyKind::ConstantRef,
@@ -885,6 +892,7 @@ impl From<YamlProperty> for Property {
                     description,
                     constant,
                     source,
+                    value_type,
                 }
             }
         }
@@ -1180,5 +1188,36 @@ mod tests {
             let values = HashMap::from([("index".to_string(), value.clone())]);
             assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
         }
+    }
+}
+
+#[cfg(test)]
+mod property_value_type_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_value_types_roundtrip_without_changing_legacy_properties() {
+        for input in [
+            serde_json::json!("amount"),
+            serde_json::json!({"path": "amount"}),
+        ] {
+            let yaml: YamlProperty = serde_json::from_value(input).unwrap();
+            let property = Property::from(yaml);
+            assert!(property.value_type.is_none());
+            assert!(
+                serde_json::to_value(property)
+                    .unwrap()
+                    .get("value_type")
+                    .is_none()
+            );
+        }
+        let yaml: YamlProperty = serde_json::from_value(serde_json::json!({
+            "path": "target_ticks", "value_type": "string"
+        }))
+        .unwrap();
+        let property = Property::from(yaml);
+        let json = serde_json::to_value(&property).unwrap();
+        assert_eq!(json["value_type"], "string");
+        assert_eq!(serde_json::from_value::<Property>(json).unwrap(), property);
     }
 }
