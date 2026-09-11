@@ -12,6 +12,7 @@ use solana_account::Account;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, RawLayout, Scenario};
 
+use super::vault_addresses;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
@@ -83,17 +84,30 @@ impl GoonfiMarket {
         Ok(oracle)
     }
 
-    /// `base_vault_account` must be the account at the base vault the market itself names; it is
-    /// what proves `address` belongs to `market_account` (see `verify_market_address`).
+    /// Account addresses must remain paired with the data returned by the account reader.
+    /// These checks validate the account graph; they do not authenticate caller-supplied bytes.
     pub fn validate(
         address: Pubkey,
         market_account: &Account,
-        base_vault_account: &Account,
-        oracle_account: &Account,
+        base_vault_account: (Pubkey, &Account),
+        oracle_account: (Pubkey, &Account),
     ) -> SurfpoolResult<Self> {
         let oracle = Self::oracle_address(market_account)?;
-        verify_market_address(address, base_vault_account)?;
-        validate_goonfi_oracle_layout(oracle_account)?;
+        let [base_vault, _] = vault_addresses(market_account)?;
+        if base_vault_account.0 != base_vault {
+            return Err(invalid(format!(
+                "base vault address {} does not match the market's base vault {base_vault}",
+                base_vault_account.0
+            )));
+        }
+        if oracle_account.0 != oracle {
+            return Err(invalid(format!(
+                "oracle address {} does not match the market's oracle {oracle}",
+                oracle_account.0
+            )));
+        }
+        validate_market_authority(address, base_vault_account.1)?;
+        validate_goonfi_oracle_layout(oracle_account.1)?;
         Ok(Self { address, oracle })
     }
 
@@ -107,15 +121,14 @@ impl GoonfiMarket {
     }
 }
 
-/// Proves that `address` really is the market whose bytes sit in the account it was fetched with.
-///
-/// A market does not record its own address, but its vaults do: a GoonFi vault is a token account
-/// whose authority is the market. Reading the vault the market itself names and comparing that
-/// authority is what ties a caller-supplied address to the data - the same shape of cross-check the
-/// pump graduation builder makes through its curve vault's mint. It catches the realistic mistake,
-/// an address from one market paired with another market's bytes; it is not proof against a caller
-/// who deliberately assembles three mutually inconsistent accounts.
-pub fn verify_market_address(address: Pubkey, base_vault_account: &Account) -> SurfpoolResult<()> {
+fn validate_market_authority(address: Pubkey, base_vault_account: &Account) -> SurfpoolResult<()> {
+    if base_vault_account.owner != spl_token_interface::ID
+        && base_vault_account.owner != spl_token_2022_interface::ID
+    {
+        return Err(invalid(
+            "base vault is not owned by a supported token program",
+        ));
+    }
     let vault = TokenAccount::unpack(&base_vault_account.data)
         .map_err(|error| invalid(format!("market base vault is not a token account: {error}")))?;
     if vault.owner() != address {
@@ -308,10 +321,15 @@ fn invalid(message: impl Into<String>) -> SurfpoolError {
 mod tests {
     use super::*;
 
+    const FIXTURE_BASE_VAULT: Pubkey = Pubkey::new_from_array([2; 32]);
+    const FIXTURE_QUOTE_VAULT: Pubkey = Pubkey::new_from_array([3; 32]);
+
     fn market_account(oracle: &Pubkey) -> Account {
         let mut data = vec![0; MARKET_LAYOUT.account_size];
         let magic = MARKET_LAYOUT.magic.as_ref().expect("manifest layout tag");
         data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
+        data[144..176].copy_from_slice(FIXTURE_BASE_VAULT.as_ref());
+        data[176..208].copy_from_slice(FIXTURE_QUOTE_VAULT.as_ref());
         data[ORACLE_POINTER_OFFSET..ORACLE_POINTER_OFFSET + 32].copy_from_slice(oracle.as_ref());
         Account {
             data,
@@ -349,10 +367,59 @@ mod tests {
         GoonfiMarket::validate(
             address,
             &market_account(&FIXTURE_ORACLE),
-            &vault_account(&address),
-            &oracle_account(),
+            (FIXTURE_BASE_VAULT, &vault_account(&address)),
+            (FIXTURE_ORACLE, &oracle_account()),
         )
         .expect("valid GoonFi market")
+    }
+
+    #[test]
+    fn rejects_unrelated_base_vault_with_target_market_authority() {
+        let target_market = Pubkey::new_unique();
+        let mut other_market = market_account(&FIXTURE_ORACLE);
+        other_market.data[144..176].copy_from_slice(Pubkey::new_unique().as_ref());
+        other_market.data[176..208].copy_from_slice(Pubkey::new_unique().as_ref());
+        let error = GoonfiMarket::validate(
+            target_market,
+            &other_market,
+            (Pubkey::new_unique(), &vault_account(&target_market)),
+            (FIXTURE_ORACLE, &oracle_account()),
+        )
+        .expect_err("an unrelated vault must not validate another market's account graph");
+        assert!(error.to_string().contains("base vault address"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unrelated_publisher_owned_oracle() {
+        let address = Pubkey::new_unique();
+        let error = GoonfiMarket::validate(
+            address,
+            &market_account(&FIXTURE_ORACLE),
+            (FIXTURE_BASE_VAULT, &vault_account(&address)),
+            (Pubkey::new_unique(), &oracle_account()),
+        )
+        .expect_err("a correctly shaped oracle at another address must be refused");
+        assert!(error.to_string().contains("oracle address"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_base_vault_owned_by_an_unrelated_program() {
+        let address = Pubkey::new_unique();
+        let foreign_vault = Account {
+            owner: Pubkey::new_unique(),
+            ..vault_account(&address)
+        };
+        let error = GoonfiMarket::validate(
+            address,
+            &market_account(&FIXTURE_ORACLE),
+            (FIXTURE_BASE_VAULT, &foreign_vault),
+            (FIXTURE_ORACLE, &oracle_account()),
+        )
+        .expect_err("matching token bytes must not bypass the token program owner check");
+        assert!(
+            error.to_string().contains("supported token program"),
+            "{error}"
+        );
     }
 
     /// The market account does not carry its own address, so a caller could hand `validate` one
@@ -364,14 +431,14 @@ mod tests {
             GoonfiMarket::validate(
                 Pubkey::new_unique(),
                 &market_account(&FIXTURE_ORACLE),
-                &vault_account(&other_market),
-                &oracle_account()
+                (FIXTURE_BASE_VAULT, &vault_account(&other_market)),
+                (FIXTURE_ORACLE, &oracle_account()),
             )
             .is_err()
         );
 
         // A vault that is not a token account at all is refused before the comparison.
-        assert!(verify_market_address(Pubkey::new_unique(), &oracle_account()).is_err());
+        assert!(validate_market_authority(Pubkey::new_unique(), &oracle_account()).is_err());
     }
 
     #[test]
@@ -485,8 +552,8 @@ mod tests {
             GoonfiMarket::validate(
                 address,
                 &wrong_owner,
-                &vault_account(&address),
-                &oracle_account()
+                (FIXTURE_BASE_VAULT, &vault_account(&address)),
+                (oracle, &oracle_account()),
             )
             .is_err()
         );
@@ -499,8 +566,8 @@ mod tests {
             GoonfiMarket::validate(
                 address,
                 &bad_magic,
-                &vault_account(&address),
-                &oracle_account()
+                (FIXTURE_BASE_VAULT, &vault_account(&address)),
+                (oracle, &oracle_account()),
             )
             .is_err()
         );
@@ -510,8 +577,8 @@ mod tests {
             GoonfiMarket::validate(
                 address,
                 &no_pointer,
-                &vault_account(&address),
-                &oracle_account()
+                (FIXTURE_BASE_VAULT, &vault_account(&address)),
+                (oracle, &oracle_account()),
             )
             .is_err()
         );
@@ -525,8 +592,8 @@ mod tests {
             GoonfiMarket::validate(
                 address,
                 &market_account(&oracle),
-                &vault_account(&address),
-                &foreign_oracle
+                (FIXTURE_BASE_VAULT, &vault_account(&address)),
+                (oracle, &foreign_oracle),
             )
             .is_err()
         );

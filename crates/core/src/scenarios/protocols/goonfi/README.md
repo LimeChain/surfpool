@@ -68,6 +68,13 @@ These tools accept optional `surfnet_port`, defaulting to 8899, and read through
 Surfnet RPC. Missing accounts fall back to that Surfnet's datasource. The price tool
 stages through the shared Studio scenario API; Play registers the scenario.
 
+Direct library callers pass each vault and oracle as `(Pubkey, &Account)`, preserving
+the address used to read its data. Builders compare these addresses with the market's
+pointers before using any balance or preparing overrides. Owner, token mint and vault
+authority checks validate the account graph; they do not authenticate arbitrary bytes
+that a caller deliberately labels with an unrelated address. RPC reads remain outside
+the pure builders, as in Pump's graduation preparation.
+
 Studio's PMM fair-value dialog selects a protocol, a live market and a human price. It
 calls these tools through Studio MCP without forwarding `rpcUrl` or `surfnet_port`,
 matching the Tessera dialog convention. Consequently, these Studio GoonFi calls use the
