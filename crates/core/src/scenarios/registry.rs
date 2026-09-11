@@ -25,6 +25,12 @@ pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v
 
 pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
 
+pub const GOONFI_V1_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v1/oracle_overrides.yaml");
+
+pub const GOONFI_V1_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v1/market_overrides.yaml");
+
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -79,6 +85,7 @@ impl TemplateRegistry {
         default.load_meteora_overrides();
         default.load_kamino_overrides();
         default.load_bisonfi_overrides();
+        default.load_goonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -121,6 +128,12 @@ impl TemplateRegistry {
 
     pub fn load_bisonfi_overrides(&mut self) {
         self.load_raw_layout_overrides(BISONFI_OVERRIDES_CONTENT, "bisonfi");
+    }
+
+    /// GoonFi writes two account shapes - the price oracle and the market that band-guards it.
+    pub fn load_goonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(GOONFI_V1_ORACLE_OVERRIDES_CONTENT, "goonfi");
+        self.load_raw_layout_overrides(GOONFI_V1_MARKET_OVERRIDES_CONTENT, "goonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -271,9 +284,12 @@ impl TemplateRegistry {
 
 #[cfg(test)]
 mod tests {
-    use anchor_lang_idl::types::IdlType;
-    use std::{collections::BTreeSet, collections::HashMap, str::FromStr};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        str::FromStr,
+    };
 
+    use anchor_lang_idl::types::IdlType;
     use solana_pubkey::Pubkey;
     use surfpool_types::{AccountAddress, PdaSeed};
 
@@ -501,12 +517,18 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (4) = 66
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (4)
+        // + GoonFi (oracle 3 + market 1) = 70
         assert_eq!(
             registry.count(),
-            66,
-            "Registry should load 66 templates total"
+            70,
+            "Registry should load 70 templates total"
         );
+
+        assert!(registry.contains("goonfi-price"));
+        assert!(registry.contains("goonfi-stale-quote"));
+        assert!(registry.contains("goonfi-freshness"));
+        assert!(registry.contains("goonfi-reference-band"));
 
         assert!(registry.contains("pyth-price-feed-v2"));
 

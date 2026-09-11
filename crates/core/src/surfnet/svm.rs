@@ -3085,6 +3085,13 @@ impl SurfnetSvm {
                     .cloned();
                 if let Some(template) = raw_template {
                     let raw_layout = template.raw_layout.expect("filtered above");
+                    if let Err(e) = raw_layout.guard_owner(account.owner()) {
+                        warn!(
+                            "Raw-layout override {} refused on {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        continue;
+                    }
                     let properties = template.properties;
                     match raw_layout.materialize(
                         account.data(),
@@ -4529,10 +4536,6 @@ impl SurfnetSvm {
         Ok(fixtures)
     }
 
-    /// Registers a scenario for execution by scheduling its overrides
-    ///
-    /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
-    /// If not provided, uses the current slot.
     pub fn register_scenario(
         &mut self,
         scenario: surfpool_types::Scenario,

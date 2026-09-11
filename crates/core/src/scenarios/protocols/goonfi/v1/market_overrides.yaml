@@ -1,0 +1,55 @@
+protocol: GoonFi
+version: deployed-438563879
+account_type: MarketState
+
+# The write target here is the market account itself: 2048 bytes owned by the GoonFi program,
+# tagged by the 8 magic bytes every live market shares. Mints, vaults and the oracle pointer live
+# in cleartext at fixed offsets; the only fields a product flow writes are the two reference
+# prices the deployed program uses as an anti-manipulation band around the oracle.
+raw_layout:
+  account_size: 2048
+  owner: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
+  magic:
+    offset: 0
+    bytes: [48, 188, 47, 53, 52, 88, 50, 154]
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: goonfi-reference-band
+    name: Override GoonFi Reference Band
+    description: Move the market's reference prices that band-guard the oracle
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC
+    properties:
+      - path: reference_price_a_x1e6
+        offset: 1712
+        encoding: u64
+        label: Reference price A
+        description: "First reference anchor, human pair price times 10^6. Same scale as the oracle's bid and ask."
+      - path: reference_price_b_x1e6
+        offset: 1720
+        encoding: u64
+        label: Reference price B
+        description: "Second reference anchor, human pair price times 10^6. The pair's order is not fixed; scale both by the same factor."
+    llm_context: |
+      SET BOTH FIELDS AS ONE INVARIANT, scaled by the same factor as the oracle price move they
+      accompany. The deployed program rejects a swap with custom error 0x24 when the oracle
+      price it is about to use falls outside the band these two anchors define, in the
+      direction unfavorable to the venue: a raised bid blocks sells, a lowered ask blocks buys.
+
+      This template exists as the second half of goonfi-price: apply both to shift a market's
+      price beyond a fraction of a percent. Use the market address returned by
+      list_goonfi_markets; its oracle field identifies the paired price account. The
+      GoonFi price builder composes the pair (plus freshness) automatically; composing by hand
+      and skipping either account breaks the invariant with error 0x24.
+
+      Set fetchBeforeUse: true so the live market is forked before your reference prices apply; on
+      a fresh fork the account is not local yet, and an override on a missing account is skipped.
+      Use false only for a later override that builds on state an earlier override prepared in the
+      same scenario.
