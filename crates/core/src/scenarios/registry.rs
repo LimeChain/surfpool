@@ -132,8 +132,8 @@ impl TemplateRegistry {
 
     /// GoonFi writes two account shapes - the price oracle and the market that band-guards it.
     pub fn load_goonfi_overrides(&mut self) {
-        self.load_protocol_overrides_without_idl(GOONFI_V1_ORACLE_OVERRIDES_CONTENT, "goonfi");
-        self.load_protocol_overrides_without_idl(GOONFI_V1_MARKET_OVERRIDES_CONTENT, "goonfi");
+        self.load_raw_layout_overrides(GOONFI_V1_ORACLE_OVERRIDES_CONTENT, "goonfi");
+        self.load_raw_layout_overrides(GOONFI_V1_MARKET_OVERRIDES_CONTENT, "goonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
