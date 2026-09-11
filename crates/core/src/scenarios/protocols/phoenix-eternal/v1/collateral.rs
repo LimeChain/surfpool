@@ -1,28 +1,29 @@
 use std::{collections::HashSet, ops::Range};
 
-use phoenix_rise_accounts::{
-    PhoenixAccount, PhoenixAccountDecodeError, multi_arena::MultiArenaHeader, trader::TraderHeader,
-};
+use phoenix_rise_accounts::{PhoenixAccount, multi_arena::MultiArenaHeader, trader::TraderHeader};
 use solana_account::Account;
 use solana_pubkey::Pubkey;
 
-use super::state_builder::PHOENIX_ETERNAL_PROGRAM_ID;
+use super::state_builder::ensure_phoenix_account_owner;
 use crate::error::{SurfpoolError, SurfpoolResult};
 
 pub fn trader_header(trader: &Pubkey, account: &Account) -> SurfpoolResult<TraderHeader> {
-    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(SurfpoolError::invalid_account_owner(
-            *trader,
-            None::<PhoenixAccountDecodeError>,
-        ));
-    }
-    TraderHeader::try_read_from_account_bytes(&account.data).map_err(|error| {
+    ensure_phoenix_account_owner(trader, account)?;
+    let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|error| {
         SurfpoolError::invalid_account_data(
             trader,
             "Expected a valid Phoenix Eternal Trader account",
             Some(error),
         )
-    })
+    })?;
+    if Pubkey::new_from_array(header.key) != *trader {
+        return Err(SurfpoolError::invalid_account_data(
+            trader,
+            "Phoenix Trader header key does not match its account address",
+            None::<String>,
+        ));
+    }
+    Ok(header)
 }
 
 pub fn index_trader_state_range(
@@ -30,11 +31,7 @@ pub fn index_trader_state_range(
     trader_key: &[u8; 32],
 ) -> SurfpoolResult<Range<usize>> {
     let invalid = || SurfpoolError::internal("Invalid Phoenix GlobalTraderIndex tree");
-    if index.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(SurfpoolError::internal(
-            "Expected a Phoenix-owned GlobalTraderIndex account",
-        ));
-    }
+    ensure_phoenix_account_owner("Phoenix GlobalTraderIndex", index)?;
     let header = MultiArenaHeader::try_from_account_bytes(
         "GlobalTraderIndex",
         &index.data,
@@ -116,7 +113,9 @@ mod tests {
     use phoenix_rise_accounts::trader::TRADER_CAPABILITY_HOT;
 
     use super::*;
-    use crate::scenarios::protocols::phoenix_eternal::v1::state_builder::build_phoenix_collateral_scenario;
+    use crate::scenarios::protocols::phoenix_eternal::v1::state_builder::{
+        PHOENIX_ETERNAL_PROGRAM_ID, build_phoenix_collateral_scenario,
+    };
 
     const FIRST_KEY: [u8; 32] = [11; 32];
     const SECOND_KEY: [u8; 32] = [22; 32];
@@ -140,6 +139,34 @@ mod tests {
         ] {
             assert!(collateral_override_value(&value).is_err());
         }
+    }
+
+    #[test]
+    fn trader_idl_keeps_max_positions_and_preference_bits_separate() {
+        use crate::{scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT, surfnet::svm::SurfnetSvm};
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut account = trader_account(FIRST_KEY, 9_999, false);
+        account.data[112..116].copy_from_slice(&7_u32.to_le_bytes());
+        account.data[116..120].copy_from_slice(&0xa5a5_5a5a_u32.to_le_bytes());
+        let idl = serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).unwrap();
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+
+        let forged = svm
+            .get_forged_account_data(
+                &trader,
+                &account.data,
+                &idl,
+                &std::collections::HashMap::from([(
+                    "maxPositions".to_string(),
+                    serde_json::json!(11),
+                )]),
+            )
+            .unwrap();
+        let header = TraderHeader::try_read_from_account_bytes(&forged).unwrap();
+
+        assert_eq!(header.max_positions, 11);
+        assert_eq!(header.trader_preference_bits, 0xa5a5_5a5a);
     }
 
     fn write_u32(data: &mut [u8], offset: usize, value: u32) {
@@ -275,6 +302,14 @@ mod tests {
     }
 
     #[test]
+    fn trader_header_rejects_an_embedded_key_for_another_account() {
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let account = trader_account(SECOND_KEY, 9_999, true);
+
+        assert!(trader_header(&trader, &account).is_err());
+    }
+
+    #[test]
     fn collateral_builder_bounds_hot_targets_by_effective_state() {
         let trader = Pubkey::new_from_array(FIRST_KEY);
         let index = index_account();
@@ -344,14 +379,6 @@ mod tests {
                 "traderState.quoteLotCollateral",
                 -9_007_199_254_740_993,
             ),
-            (FIRST_KEY, SECOND_KEY, 144, "quote_lot_collateral", 1),
-            (
-                SECOND_KEY,
-                FIRST_KEY,
-                208,
-                "quote_lot_collateral",
-                -9_007_199_254_740_993,
-            ),
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
@@ -415,27 +442,17 @@ mod tests {
         use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
         use crate::surfnet::svm::SurfnetSvm;
 
-        for failure in [
-            "cycle",
-            "missing key",
-            "missing account",
-            "conflicting fields",
-        ] {
+        for failure in ["cycle", "missing key", "missing account"] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = Pubkey::new_unique();
             let mut before_trader = trader_account(FIRST_KEY, 9_999, true);
             before_trader.lamports = 1;
             let mut before_index = index_account();
             before_index.lamports = 1;
-            let mut scenario =
+            let scenario =
                 build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&before_index))
                     .unwrap();
             match failure {
-                "conflicting fields" => {
-                    scenario.overrides[0]
-                        .values
-                        .insert("quote_lot_collateral".to_string(), serde_json::json!("2"));
-                }
                 "cycle" => write_u32(&mut before_index.data, 96, 2),
                 "missing key" => before_index.data[112..144].copy_from_slice(&[33; 32]),
                 _ => {}
@@ -466,5 +483,38 @@ mod tests {
                 assert_eq!(after_index.unwrap(), before_index, "{failure}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn materialization_rejects_unsupported_hot_trader_state_fields() {
+        use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let index_key = Pubkey::new_unique();
+        let mut before_trader = trader_account(FIRST_KEY, 9_999, true);
+        before_trader.lamports = 1;
+        let mut before_index = index_account();
+        before_index.lamports = 1;
+        let mut scenario =
+            build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&before_index))
+                .unwrap();
+        scenario.overrides[0].values = std::collections::HashMap::from([(
+            "traderState.flags".to_string(),
+            serde_json::json!(0),
+        )]);
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&trader, before_trader.clone()).unwrap();
+        svm.set_account(&index_key, before_index.clone()).unwrap();
+        svm.set_account(&PHOENIX_GLOBAL_CONFIG, global_account(&index_key))
+            .unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(svm.get_account(&trader).unwrap().unwrap(), before_trader);
+        assert_eq!(svm.get_account(&index_key).unwrap().unwrap(), before_index);
     }
 }

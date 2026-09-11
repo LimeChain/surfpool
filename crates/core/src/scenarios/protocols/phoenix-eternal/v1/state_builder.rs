@@ -25,6 +25,23 @@ pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
 pub const PHOENIX_GLOBAL_CONFIG: Pubkey =
     Pubkey::from_str_const("2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ");
 
+pub fn ensure_phoenix_account_owner(
+    account_address: impl core::fmt::Display,
+    account: &Account,
+) -> SurfpoolResult<()> {
+    if account.owner == PHOENIX_ETERNAL_PROGRAM_ID {
+        return Ok(());
+    }
+
+    Err(SurfpoolError::invalid_account_owner(
+        account_address,
+        Some(format!(
+            "expected {PHOENIX_ETERNAL_PROGRAM_ID}, got {}",
+            account.owner
+        )),
+    ))
+}
+
 pub fn is_phoenix_trader_account(data: &[u8]) -> bool {
     phoenix_account_kind(data) == Some(PhoenixAccount::Trader)
 }
@@ -49,12 +66,7 @@ pub fn phoenix_market_symbols(
     perp_asset_map: Pubkey,
     account: &Account,
 ) -> SurfpoolResult<Vec<String>> {
-    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(SurfpoolError::invalid_account_owner(
-            perp_asset_map,
-            None::<PhoenixAccountDecodeError>,
-        ));
-    }
+    ensure_phoenix_account_owner(perp_asset_map, account)?;
 
     let map = PerpAssetMap::try_from_account_bytes(&account.data).map_err(|error| {
         SurfpoolError::invalid_account_data(
@@ -81,8 +93,6 @@ pub fn phoenix_market_symbols(
 
 #[derive(Debug, Error, PartialEq, Eq)]
 enum PhoenixPricePatchError {
-    #[error("expected Phoenix Eternal owner, got {actual}")]
-    InvalidOwner { actual: Pubkey },
     #[error("invalid Phoenix PerpAssetMap account: {0}")]
     InvalidPerpAssetMap(#[from] PhoenixAccountDecodeError),
     #[error("Phoenix market {symbol} was not found")]
@@ -111,15 +121,11 @@ fn changed_byte_outside(
 }
 
 fn patch_direct_mark(
-    owner: &Pubkey,
     data: &[u8],
     symbol: &str,
     target_ticks: u64,
     mark_slot: u64,
 ) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    if owner != &PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(PhoenixPricePatchError::InvalidOwner { actual: *owner });
-    }
     let target_ticks =
         Ticks::new_checked(target_ticks).map_err(|_| PhoenixPricePatchError::InvalidTicks {
             ticks: target_ticks,
@@ -131,16 +137,12 @@ fn patch_direct_mark(
 }
 
 fn patch_reference_prices(
-    owner: &Pubkey,
     data: &[u8],
     symbol: &str,
     spot_ticks: u64,
     perp_ticks: u64,
     reference_slot: u64,
 ) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    if owner != &PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(PhoenixPricePatchError::InvalidOwner { actual: *owner });
-    }
     let spot_ticks = Ticks::new_checked(spot_ticks)
         .map_err(|_| PhoenixPricePatchError::InvalidTicks { ticks: spot_ticks })?;
     let perp_ticks = Ticks::new_checked(perp_ticks)
@@ -249,6 +251,7 @@ pub fn forge_phoenix_override(
     account_values: &HashMap<String, serde_json::Value>,
     materialization_slot: u64,
 ) -> SurfpoolResult<Vec<u8>> {
+    ensure_phoenix_account_owner(account_pubkey, account)?;
     let wants_direct_mark = account_values.contains_key(DIRECT_MARK_TICKS_FIELD);
     let wants_reference = account_values.contains_key(REFERENCE_SPOT_TICKS_FIELD)
         || account_values.contains_key(REFERENCE_PERP_TICKS_FIELD);
@@ -282,7 +285,6 @@ pub fn forge_phoenix_override(
         .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))?;
     let patched = if wants_direct_mark {
         patch_direct_mark(
-            &account.owner,
             &account.data,
             symbol,
             parse_unsigned_ticks(
@@ -293,7 +295,6 @@ pub fn forge_phoenix_override(
         )
     } else {
         patch_reference_prices(
-            &account.owner,
             &account.data,
             symbol,
             parse_unsigned_ticks(
@@ -307,16 +308,59 @@ pub fn forge_phoenix_override(
             materialization_slot,
         )
     };
-    patched.map_err(|error| match error {
-        PhoenixPricePatchError::InvalidOwner { .. } => {
-            SurfpoolError::invalid_account_owner(account_pubkey, Some(error))
-        }
-        _ => SurfpoolError::invalid_account_data(
+    patched.map_err(|error| {
+        SurfpoolError::invalid_account_data(
             account_pubkey,
             "Expected a valid Phoenix Eternal PerpAssetMap account",
             Some(error),
-        ),
+        )
     })
+}
+
+pub enum PhoenixOverridePreparation {
+    GenericIdl { is_trader: bool },
+    Patched(Vec<u8>),
+}
+
+pub fn prepare_phoenix_override(
+    account_pubkey: &Pubkey,
+    account: &Account,
+    account_values: &mut HashMap<String, serde_json::Value>,
+    materialization_slot: u64,
+) -> SurfpoolResult<PhoenixOverridePreparation> {
+    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
+        return Ok(PhoenixOverridePreparation::GenericIdl { is_trader: false });
+    }
+
+    if is_phoenix_perp_asset_map_account(&account.data) {
+        return forge_phoenix_override(
+            account_pubkey,
+            account,
+            account_values,
+            materialization_slot,
+        )
+        .map(PhoenixOverridePreparation::Patched);
+    }
+
+    let is_trader = is_phoenix_trader_account(&account.data);
+    if is_trader {
+        super::collateral::trader_header(account_pubkey, account)?;
+        if let Some(field) = account_values.keys().find(|field| {
+            field.as_str() == "traderState"
+                || (field.starts_with("traderState.")
+                    && field.as_str() != "traderState.quoteLotCollateral")
+        }) {
+            return Err(SurfpoolError::internal(format!(
+                "Phoenix TraderState field '{field}' is unsupported; only \
+                 traderState.quoteLotCollateral has consistent hot-Trader mirroring"
+            )));
+        }
+        if let Some(value) = account_values.get_mut("traderState.quoteLotCollateral") {
+            *value = super::collateral::collateral_override_value(value)?;
+        }
+    }
+
+    Ok(PhoenixOverridePreparation::GenericIdl { is_trader })
 }
 
 pub fn build_phoenix_collateral_scenario(
@@ -382,12 +426,7 @@ pub fn phoenix_global_trader_index_address(global_account: &Account) -> Surfpool
 }
 
 fn phoenix_global_config(global_account: &Account) -> SurfpoolResult<GlobalConfig> {
-    if global_account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(SurfpoolError::invalid_account_owner(
-            PHOENIX_GLOBAL_CONFIG,
-            Some("expected Phoenix Eternal owner"),
-        ));
-    }
+    ensure_phoenix_account_owner(PHOENIX_GLOBAL_CONFIG, global_account)?;
     let global = GlobalConfig::try_from_account_bytes(&global_account.data).map_err(|error| {
         SurfpoolError::invalid_account_data(
             PHOENIX_GLOBAL_CONFIG,
@@ -467,6 +506,15 @@ pub(crate) mod tests {
         }
     }
 
+    fn trader_account_for(trader: Pubkey, collateral: i64) -> Account {
+        let mut account = Account {
+            data: trader_fixture(collateral, 1, 2),
+            ..trader_account()
+        };
+        account.data[24..56].copy_from_slice(trader.as_array());
+        account
+    }
+
     pub(crate) fn perp_asset_map_fixture() -> Vec<u8> {
         let prefix = BASE64_STANDARD
             .decode(SOL_PERP_ASSET_MAP_PREFIX_B64)
@@ -506,9 +554,13 @@ pub(crate) mod tests {
     #[test]
     fn builds_one_editable_collateral_override_for_the_requested_trader() {
         let trader = Pubkey::new_unique();
-        let preparation =
-            build_phoenix_collateral_scenario(trader, &trader_account(), "-9007199254740993", None)
-                .unwrap();
+        let preparation = build_phoenix_collateral_scenario(
+            trader,
+            &trader_account_for(trader, 0),
+            "-9007199254740993",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(preparation.overrides.len(), 1);
 
@@ -532,10 +584,7 @@ pub(crate) mod tests {
     #[test]
     fn builder_refuses_to_raise_collateral_above_its_vault_backing() {
         let trader = Pubkey::new_unique();
-        let funded = Account {
-            data: trader_fixture(500, 1, 2),
-            ..trader_account()
-        };
+        let funded = trader_account_for(trader, 500);
 
         let raised = build_phoenix_collateral_scenario(trader, &funded, "501", None).unwrap_err();
         assert!(raised.to_string().contains("can only lower collateral"));
@@ -581,7 +630,7 @@ pub(crate) mod tests {
         let before = map.find_by_symbol("SOL").unwrap().unwrap();
         let metadata_offset = unique_subslice_offset(&data, before.metadata.as_bytes()).unwrap();
 
-        let patched = patch_direct_mark(&PHOENIX_ETERNAL_PROGRAM_ID, &data, "SOL", 1, 123).unwrap();
+        let patched = patch_direct_mark(&data, "SOL", 1, 123).unwrap();
         let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
         let after = map.find_by_symbol("SOL").unwrap().unwrap();
         assert_eq!(after.metadata.oracle_price().mark_price.price.slot, 123);
@@ -624,15 +673,8 @@ pub(crate) mod tests {
             .as_inner();
 
         for (spot_ticks, perp_ticks) in [(8_000, 7_000), (7_000, 8_000)] {
-            let patched = patch_reference_prices(
-                &PHOENIX_ETERNAL_PROGRAM_ID,
-                &data,
-                "SOL",
-                spot_ticks,
-                perp_ticks,
-                123,
-            )
-            .unwrap();
+            let patched =
+                patch_reference_prices(&data, "SOL", spot_ticks, perp_ticks, 123).unwrap();
             let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
             let entry = map.find_by_symbol("SOL").unwrap().unwrap();
             let price = entry.metadata.oracle_price();
@@ -663,17 +705,11 @@ pub(crate) mod tests {
         let data = perp_asset_map_fixture();
 
         assert!(matches!(
-            patch_direct_mark(&PHOENIX_ETERNAL_PROGRAM_ID, &data, "BTC", 1, 123),
+            patch_direct_mark(&data, "BTC", 1, 123),
             Err(PhoenixPricePatchError::MarketNotFound { .. })
         ));
         assert!(matches!(
-            patch_direct_mark(
-                &PHOENIX_ETERNAL_PROGRAM_ID,
-                &data,
-                "SOL",
-                u64::from(u32::MAX) + 1,
-                123,
-            ),
+            patch_direct_mark(&data, "SOL", u64::from(u32::MAX) + 1, 123,),
             Err(PhoenixPricePatchError::InvalidTicks { .. })
         ));
     }

@@ -93,12 +93,8 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry,
-        protocols::phoenix_eternal::v1::{
-            collateral::collateral_override_value,
-            state_builder::{
-                PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override,
-                is_phoenix_perp_asset_map_account, is_phoenix_trader_account,
-            },
+        protocols::phoenix_eternal::v1::state_builder::{
+            PHOENIX_ETERNAL_PROGRAM_ID, PhoenixOverridePreparation, prepare_phoenix_override,
         },
     },
     storage::{OverlayStorage, Storage, StorageBackend},
@@ -2773,6 +2769,7 @@ impl SurfnetSvm {
         let mut patched_this_slot: HashSet<Pubkey> = HashSet::new();
 
         for override_instance in overrides {
+            let mut refreshed_target = false;
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
                 continue;
@@ -2893,6 +2890,8 @@ impl SurfnetSvm {
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
                             );
+                        } else {
+                            refreshed_target = true;
                         }
                     }
                 } else {
@@ -2941,29 +2940,39 @@ impl SurfnetSvm {
 
                 // A bad value in one override is that override's failure, never the batch's:
                 // an error returned from this loop aborts block production.
-                let is_phoenix_trader = account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID
-                    && is_phoenix_trader_account(account.data());
-                if is_phoenix_trader {
-                    if let Some(legacy) = account_values.remove("quote_lot_collateral") {
-                        if account_values.contains_key("traderState.quoteLotCollateral") {
+                let is_phoenix_trader = match prepare_phoenix_override(
+                    &account_pubkey,
+                    &account,
+                    &mut account_values,
+                    target_slot,
+                ) {
+                    Ok(PhoenixOverridePreparation::GenericIdl { is_trader }) => is_trader,
+                    Ok(PhoenixOverridePreparation::Patched(new_account_data)) => {
+                        let modified_account = Account {
+                            lamports: account.lamports(),
+                            data: new_account_data,
+                            owner: *account.owner(),
+                            executable: account.executable(),
+                            rent_epoch: account.rent_epoch(),
+                        };
+                        if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
                             warn!(
-                                "Skipping override {}: Phoenix collateral must use only traderState.quoteLotCollateral",
-                                override_instance.id
+                                "Failed to set modified Phoenix account {} for override {}: {}",
+                                account_pubkey, override_instance.id, e
                             );
-                            continue;
+                        } else {
+                            patched_this_slot.insert(account_pubkey);
                         }
-                        account_values.insert("traderState.quoteLotCollateral".to_string(), legacy);
+                        continue;
                     }
-                    if let Some(value) = account_values.get_mut("traderState.quoteLotCollateral") {
-                        match collateral_override_value(value) {
-                            Ok(parsed) => *value = parsed,
-                            Err(e) => {
-                                warn!("Skipping override {}: {}", override_instance.id, e);
-                                continue;
-                            }
-                        }
+                    Err(e) => {
+                        warn!(
+                            "Skipping override {} for {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        continue;
                     }
-                }
+                };
 
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
@@ -2981,38 +2990,6 @@ impl SurfnetSvm {
                         patched_this_slot.insert(account_pubkey);
                         continue;
                     }
-                }
-
-                // Trader collateral uses the IDL; the market map needs the typed price codec.
-                // Every other Phoenix account type stays on the generic IDL path.
-                if account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID
-                    && is_phoenix_perp_asset_map_account(account.data())
-                {
-                    let new_account_data = match forge_phoenix_override(
-                        &account_pubkey,
-                        &account,
-                        &account_values,
-                        target_slot,
-                    ) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!(
-                                "Skipping override {} for {}: {}",
-                                override_instance.id, account_pubkey, e
-                            );
-                            continue;
-                        }
-                    };
-                    let modified_account = Account {
-                        lamports: account.lamports(),
-                        data: new_account_data,
-                        owner: *account.owner(),
-                        executable: account.executable(),
-                        rent_epoch: account.rent_epoch(),
-                    };
-                    self.inner.set_account(account_pubkey, modified_account)?;
-                    patched_this_slot.insert(account_pubkey);
-                    continue;
                 }
 
                 // Get the account owner (program ID)
@@ -3091,6 +3068,7 @@ impl SurfnetSvm {
                             idl,
                             &account_values,
                             remote_ctx,
+                            refreshed_target,
                         )
                         .await
                     {
@@ -3116,13 +3094,24 @@ impl SurfnetSvm {
                     rent_epoch: account.rent_epoch(),
                 };
 
-                if let Some((index_key, before, after)) = index_update {
-                    self.inner.set_account(index_key, after)?;
-                    if let Err(error) = self.inner.set_account(account_pubkey, modified_account) {
-                        self.inner.set_account(index_key, before)?;
-                        return Err(error);
+                if let Some((index_key, after)) = index_update {
+                    if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                        warn!(
+                            "Failed to set Phoenix Trader {} for override {}: {}",
+                            account_pubkey, override_instance.id, e
+                        );
+                        continue;
                     }
-                    patched_this_slot.extend([index_key, account_pubkey]);
+                    patched_this_slot.insert(account_pubkey);
+
+                    if let Err(e) = self.inner.set_account(index_key, after) {
+                        warn!(
+                            "Failed to set Phoenix GlobalTraderIndex {} for override {}: {}; the effective hot-Trader collateral remains unchanged",
+                            index_key, override_instance.id, e
+                        );
+                    } else {
+                        patched_this_slot.insert(index_key);
+                    }
                     continue;
                 }
 
@@ -3151,9 +3140,13 @@ impl SurfnetSvm {
         &mut self,
         address: &Pubkey,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        refresh_from_remote: bool,
     ) -> SurfpoolResult<Account> {
-        if let Some(account) = self.inner.get_account(address)? {
-            return Ok(account);
+        let local_account = self.inner.get_account(address)?;
+        if !refresh_from_remote {
+            if let Some(account) = local_account {
+                return Ok(account);
+            }
         }
         if self.offline_accounts.contains_key(&address.to_string())?
             || self
@@ -3184,7 +3177,8 @@ impl SurfnetSvm {
         idl: &Idl,
         values: &HashMap<String, serde_json::Value>,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    ) -> SurfpoolResult<Option<(Pubkey, Account, Account)>> {
+        refresh_dependencies: bool,
+    ) -> SurfpoolResult<Option<(Pubkey, Account)>> {
         use crate::scenarios::protocols::phoenix_eternal::v1::{
             collateral::{index_trader_state_range, trader_header},
             state_builder::{PHOENIX_GLOBAL_CONFIG, phoenix_global_trader_index_address},
@@ -3194,10 +3188,12 @@ impl SurfnetSvm {
             return Ok(None);
         }
         let global = self
-            .phoenix_dependency(&PHOENIX_GLOBAL_CONFIG, remote_ctx)
+            .phoenix_dependency(&PHOENIX_GLOBAL_CONFIG, remote_ctx, refresh_dependencies)
             .await?;
         let index_key = phoenix_global_trader_index_address(&global)?;
-        let before = self.phoenix_dependency(&index_key, remote_ctx).await?;
+        let before = self
+            .phoenix_dependency(&index_key, remote_ctx, refresh_dependencies)
+            .await?;
         let range = index_trader_state_range(&before, &header.key)?;
         let encoded = Self::get_forged_idl_type_data(
             &before.data[range.clone()],
@@ -3215,7 +3211,7 @@ impl SurfnetSvm {
         }
         let mut after = before.clone();
         after.data[range].copy_from_slice(&encoded);
-        Ok(Some((index_key, before, after)))
+        Ok(Some((index_key, after)))
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -4666,6 +4662,32 @@ mod tests {
         r#"","base64"],"executable":false,"lamports":2039280,"#,
         r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
     );
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phoenix_dependency_refresh_replaces_a_cached_account() {
+        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let target = Pubkey::new_unique();
+        svm.inner
+            .set_account(
+                target,
+                Account {
+                    lamports: 1,
+                    data: vec![7],
+                    ..Account::default()
+                },
+            )
+            .unwrap();
+
+        let refreshed = svm
+            .phoenix_dependency(&target, &remote, true)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.lamports, 2_039_280);
+        assert_eq!(svm.inner.get_account(&target).unwrap(), Some(refreshed));
+    }
 
     fn fetch_before_use_scenario(target: Pubkey) -> surfpool_types::Scenario {
         let mut scenario = surfpool_types::Scenario::new(

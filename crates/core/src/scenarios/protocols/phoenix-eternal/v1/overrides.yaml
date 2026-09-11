@@ -29,7 +29,7 @@ templates:
   - id: phoenix-direct-mark-risk-shock
     name: Phoenix Direct Mark Risk Shock
     description: Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
-    idl_account_name: DirectMarkOverride
+    idl_account_name: PerpAssetMap
     properties:
       - path: symbol
         type: dynamic_ref
@@ -53,7 +53,7 @@ templates:
   - id: phoenix-reference-price-divergence
     name: Phoenix Spot/Perp Reference Divergence
     description: Set independent spot and external-perp reference ticks while preserving the current mark price.
-    idl_account_name: ReferencePriceOverride
+    idl_account_name: PerpAssetMap
     properties:
       - path: symbol
         type: dynamic_ref

@@ -19,6 +19,7 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
+        protocols::phoenix_eternal::v1::collateral::trader_header,
         protocols::phoenix_eternal::v1::state_builder::{
             PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
             phoenix_global_trader_index_address, phoenix_market_symbols,
@@ -447,6 +448,77 @@ impl Surfpool {
             .into_iter()
             .map(|result| result.map_account().ok())
             .collect())
+    }
+
+    async fn fetch_phoenix_global_pointee<F, E>(
+        &self,
+        surfnet_port: Option<u16>,
+        account_name: &str,
+        derive_address: F,
+    ) -> Result<(Pubkey, Account), String>
+    where
+        F: FnOnce(&Account) -> Result<Pubkey, E>,
+        E: core::fmt::Display,
+    {
+        let global_account = self
+            .fetch_surfnet_accounts(surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                format!(
+                    "Phoenix GlobalConfig account {PHOENIX_GLOBAL_CONFIG} was not found on the surfnet"
+                )
+            })?;
+        let address = derive_address(&global_account).map_err(|error| error.to_string())?;
+        let account = self
+            .fetch_surfnet_accounts(surfnet_port, &[address])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                format!("Phoenix {account_name} account {address} was not found on the surfnet")
+            })?;
+        Ok((address, account))
+    }
+
+    async fn build_phoenix_collateral_scenario_from_surfnet(
+        &self,
+        params: &CreatePhoenixCollateralScenarioParams,
+    ) -> Result<Scenario, String> {
+        let trader = Pubkey::from_str(params.trader.trim())
+            .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
+        let trader_account = self
+            .fetch_surfnet_accounts(params.surfnet_port, &[trader])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
+        let header = trader_header(&trader, &trader_account).map_err(|error| error.to_string())?;
+        let index = if header.trader_state.is_hot() {
+            Some(
+                self.fetch_phoenix_global_pointee(
+                    params.surfnet_port,
+                    "GlobalTraderIndex",
+                    phoenix_global_trader_index_address,
+                )
+                .await?
+                .1,
+            )
+        } else {
+            None
+        };
+
+        build_phoenix_collateral_scenario(
+            trader,
+            &trader_account,
+            &params.target_quote_lots,
+            index.as_ref(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -1077,50 +1149,12 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let trader = match Pubkey::from_str(params.trader.trim()) {
-            Ok(trader) => trader,
-            Err(error) => {
-                return Ok(scenario_tool_error(format!(
-                    "Invalid Trader pubkey: {error}"
-                )));
-            }
-        };
-        let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_CONFIG])
+        let scenario = match self
+            .build_phoenix_collateral_scenario_from_surfnet(&params)
             .await
         {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(trader_account) = accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(format!(
-                "Phoenix Trader account {trader} was not found"
-            )));
-        };
-        let Some(global_account) = accounts[1].as_ref() else {
-            return Ok(scenario_tool_error(
-                "Phoenix GlobalConfig was not found".to_string(),
-            ));
-        };
-        let index_address = match phoenix_global_trader_index_address(global_account) {
-            Ok(address) => address,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let index_accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[index_address])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let scenario = match build_phoenix_collateral_scenario(
-            trader,
-            trader_account,
-            &params.target_quote_lots,
-            index_accounts[0].as_ref(),
-        ) {
             Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+            Err(error) => return Ok(scenario_tool_error(error)),
         };
 
         self.stage_scenario(scenario).await
@@ -1133,38 +1167,19 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<ListPhoenixMarketsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
+        let (perp_asset_map, map_account) = match self
+            .fetch_phoenix_global_pointee(
+                params.surfnet_port,
+                "PerpAssetMap",
+                phoenix_perp_asset_map_address,
+            )
             .await
         {
-            Ok(accounts) => accounts,
+            Ok(result) => result,
             Err(error) => return Ok(scenario_tool_error(error)),
         };
-        let Some(global_account) = accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(
-                "Phoenix GlobalConfig account was not found on the surfnet".to_string(),
-            ));
-        };
 
-        let perp_asset_map = match phoenix_perp_asset_map_address(global_account) {
-            Ok(address) => address,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        let map_accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[perp_asset_map])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(map_account) = map_accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(format!(
-                "Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet"
-            )));
-        };
-
-        let symbols = match phoenix_market_symbols(perp_asset_map, map_account) {
+        let symbols = match phoenix_market_symbols(perp_asset_map, &map_account) {
             Ok(symbols) => symbols,
             Err(error) => return Ok(scenario_tool_error(error.to_string())),
         };
@@ -1547,6 +1562,80 @@ mod tests {
     fn json_of(result: &CallToolResult) -> serde_json::Value {
         let text = &result.content[0].as_text().expect("text content").text;
         serde_json::from_str(text).expect("valid JSON payload")
+    }
+
+    async fn serve_one_rpc_account(account: Account) -> (u16, tokio::task::JoinHandle<()>) {
+        use base64::{Engine as _, prelude::BASE64_STANDARD};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind canned RPC");
+        let port = listener.local_addr().expect("local address").port();
+        let data = BASE64_STANDARD.encode(&account.data);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context": { "apiVersion": "2.1.0", "slot": 1 },
+                "value": [{
+                    "data": [data, "base64"],
+                    "executable": account.executable,
+                    "lamports": account.lamports,
+                    "owner": account.owner.to_string(),
+                    "rentEpoch": account.rent_epoch,
+                    "space": account.data.len(),
+                }],
+            },
+            "id": 1,
+        })
+        .to_string();
+        let task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("accept RPC request");
+            let mut request = vec![0; 16 * 1024];
+            stream.read(&mut request).await.expect("read RPC request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write RPC response");
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn cold_phoenix_collateral_does_not_fetch_global_accounts() {
+        let trader = Pubkey::new_unique();
+        let mut data = vec![0; 224];
+        data[..8].copy_from_slice(&[41, 97, 73, 105, 110, 214, 112, 9]);
+        data[24..56].copy_from_slice(trader.as_ref());
+        data[88..96].copy_from_slice(&50_i64.to_le_bytes());
+        let account = Account {
+            lamports: 1,
+            data,
+            owner: surfpool_core::scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let (port, request) = serve_one_rpc_account(account).await;
+
+        let scenario = Surfpool::new()
+            .build_phoenix_collateral_scenario_from_surfnet(
+                &CreatePhoenixCollateralScenarioParams {
+                    surfnet_port: Some(port),
+                    trader: trader.to_string(),
+                    target_quote_lots: "49".to_string(),
+                },
+            )
+            .await
+            .expect("a cold Trader should need no GlobalConfig or GlobalTraderIndex fetch");
+
+        request.await.expect("single RPC request completes");
+        assert_eq!(scenario.overrides.len(), 1);
     }
 
     fn search(
