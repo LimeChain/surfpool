@@ -388,8 +388,10 @@ templates:
       EXAMPLE - "liquidate SOL collateral above 50% LTV":
       config.liquidation_threshold_pct: 50
 
-      persist: true is safe for the config.* fields only. liquidity.* and last_update.* are
-      rewritten by refresh_reserve, so pinning them fights every transaction that touches the reserve.
+      Persisting is safe for the config.* fields only. liquidity.* and last_update.* are rewritten by
+      refresh_reserve, so pinning them fights every transaction that touches the reserve. Bound the
+      window to the scenario - persist: { slots: N } - rather than persist: true, which never expires
+      and leaves the parameter pinned for every later scenario in the same surfnet run.
   - id: kamino-reserve-main-usdc
     name: Override USDC Reserve (Main Market)
     description: Override the USDC reserve of Kamino's Main Market
@@ -422,8 +424,10 @@ templates:
       EXAMPLE - "USDC depegs to $0.90":
       use kamino-scope-price with prices.13.price.value: 90000000 and prices.13.price.exp: 8
 
-      persist: true is safe for the config.* fields only. liquidity.* and last_update.* are
-      rewritten by refresh_reserve, so pinning them fights every transaction that touches the reserve.
+      Persisting is safe for the config.* fields only. liquidity.* and last_update.* are rewritten by
+      refresh_reserve, so pinning them fights every transaction that touches the reserve. Bound the
+      window to the scenario - persist: { slots: N } - rather than persist: true, which never expires
+      and leaves the parameter pinned for every later scenario in the same surfnet run.
   # ==========================================
   # Obligation
   # ==========================================
