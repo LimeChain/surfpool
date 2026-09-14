@@ -364,11 +364,11 @@ async fn humidifi_fair_value_scale_yields_a_sane_price() {
     );
 }
 
-/// The builder's full production path: read the live market and both mints, build the scenario, then
+/// The builder's materialization path: prepare the live market locally, build the scenario, then
 /// register and materialize it through the real materializer. The fair value lands from the human
-/// price and the persisted freshness re-stamps itself on the next slot.
+/// price and the persisted freshness re-stamps itself on the next slot without remote replacement.
 #[tokio::test]
-async fn humidifi_builder_scenario_fetches_market_and_keeps_quote_fresh() {
+async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh() {
     let market_account = fetch(&[SOL_USDC_MARKET]).await.remove(0);
     let base_slot = decode_u64(&market_account.data, LAST_UPDATE_SLOT_OFFSET, STATE_KEY) + 100;
     let (base_mint, quote_mint) = HumidiFiMarket::mint_addresses(&market_account).expect("mints");
@@ -380,9 +380,19 @@ async fn humidifi_builder_scenario_fetches_market_and_keeps_quote_fresh() {
     let preparation = build_humidifi_fair_value_scenario(&market, "175.5").expect("build scenario");
     let expected_fair_value = preparation.fair_value;
     assert!(preparation.scenario.name.contains(&market.label()));
+    let [price, freshness] = &preparation.scenario.overrides[..] else {
+        panic!("expected price and freshness overrides");
+    };
+    assert!(!price.fetch_before_use);
+    assert!(!freshness.fetch_before_use);
+    assert!(freshness.persist);
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
-    assert!(svm.inner.get_account(&market_key).unwrap().is_none());
+    let mut local_account = market_account.clone();
+    local_account.lamports = local_account.lamports.checked_add(1).unwrap();
+    svm.inner
+        .set_account(market_key, local_account.clone())
+        .expect("seed prepared market");
     let remote = Some((live::client(), CommitmentConfig::confirmed()));
     svm.register_scenario(preparation.scenario, Some(base_slot))
         .expect("register scenario");
@@ -392,8 +402,9 @@ async fn humidifi_builder_scenario_fetches_market_and_keeps_quote_fresh() {
         .await
         .expect("materialize");
     let applied_account = svm.inner.get_account(&market_key).unwrap().unwrap();
-    assert_eq!(applied_account.owner, market_account.owner);
-    assert_eq!(applied_account.data.len(), market_account.data.len());
+    assert_eq!(applied_account.owner, local_account.owner);
+    assert_eq!(applied_account.lamports, local_account.lamports);
+    assert_eq!(applied_account.data.len(), local_account.data.len());
     let applied = &applied_account.data;
     assert_eq!(
         decode_u64(applied, FAIR_VALUE_OFFSET, FAIR_VALUE_KEY),
@@ -405,7 +416,23 @@ async fn humidifi_builder_scenario_fetches_market_and_keeps_quote_fresh() {
         base_slot,
         "freshness must publish the base slot"
     );
+    assert_only_within(
+        &diff_indices(applied, &local_account.data),
+        &[
+            FAIR_VALUE_OFFSET..FAIR_VALUE_OFFSET + 8,
+            LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8,
+        ],
+        "prepared local market",
+    );
     // Next slot: the persisted freshness re-stamps offset 616 to the new slot, and nothing else.
+    let scheduled = svm
+        .scheduled_overrides
+        .get(&(base_slot + 1))
+        .expect("read scheduled freshness")
+        .expect("persisted freshness");
+    assert_eq!(scheduled.len(), 1);
+    assert!(scheduled[0].persist);
+    assert!(!scheduled[0].fetch_before_use);
     svm.materialize_overrides_for_slot(&remote, base_slot + 1)
         .await
         .expect("materialize next slot");
@@ -738,7 +765,9 @@ async fn humidifi_builder_price_matches_the_executed_exchange_rate() {
         let preparation = build_humidifi_fair_value_scenario(&market, &price.to_string())
             .expect("build human-price scenario");
         let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
-        assert!(svm.inner.get_account(&SOL_USDC_MARKET).unwrap().is_none());
+        svm.inner
+            .set_account(SOL_USDC_MARKET, account(SOL_USDC_MARKET).clone())
+            .expect("seed prepared market");
         svm.register_scenario(preparation.scenario, Some(slot))
             .expect("register price scenario");
         svm.materialize_overrides_for_slot(&remote, slot)

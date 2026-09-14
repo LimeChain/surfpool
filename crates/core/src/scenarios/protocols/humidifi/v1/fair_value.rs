@@ -181,7 +181,8 @@ pub fn build_humidifi_fair_value_scenario(
     let market_name = market.label();
     let target = AccountAddress::Pubkey(market.address.to_string());
 
-    let mut price_override = OverrideInstance::new(
+    // Refetching on Play would replace the local market used to prepare this scenario.
+    let price_override = OverrideInstance::new(
         fair_value_template.id.clone(),
         PREPARATION_SLOT,
         target.clone(),
@@ -191,7 +192,6 @@ pub fn build_humidifi_fair_value_scenario(
         serde_json::json!(fair_value.to_string()),
     )]))
     .with_label(format!("HumidiFi {market_name} fair value"));
-    price_override.fetch_before_use = true;
 
     // Null, not zero: the slot encoder reads a supplied number as the lead, so only null takes the
     // template's own lead of zero. Persisted, so the prepared price stays inside the market's
@@ -439,12 +439,12 @@ mod tests {
     }
 
     #[test]
-    fn price_fetches_the_market_before_use_and_freshness_preserves_the_price() {
+    fn price_and_freshness_preserve_the_prepared_market() {
         let preparation = build_humidifi_fair_value_scenario(&market(9, 6), "100.25").unwrap();
         let [price, freshness] = &preparation.scenario.overrides[..] else {
             panic!("expected exactly a price and a freshness override");
         };
-        assert!(price.fetch_before_use);
+        assert!(!price.fetch_before_use);
         assert!(!price.persist);
         assert!(!freshness.fetch_before_use);
         assert!(freshness.persist);

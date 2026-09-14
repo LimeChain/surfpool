@@ -100,13 +100,10 @@ filters the tag at offset 8 and version 8 at offset 1720.
 Surfnet RPC, where local accounts take precedence and missing accounts fall back to the
 datasource. It stages the result through the shared scenario path.
 
-The price override sets `fetchBeforeUse: true`: on Play the shared materializer fetches the
-market from the Surfnet datasource before applying the requested price. It does not require
-the market account read at creation to remain in local state. A successful fetch replaces earlier
-local edits to that market; it does not reset its vaults or the rest of the fork. The shared fetch
-path is best effort: on a remote failure, an existing local account may still be used.
-A second override sets `fetchBeforeUse: false` and persists freshness with a `null` value,
-so the encoder uses its zero lead at every materialization slot without fetching over the price.
+Both overrides leave `fetchBeforeUse: false`: the creation reads already cached the market in
+Surfnet, and Play applies the values to that local state. Refetching would replace earlier local
+edits. The second override persists freshness with a `null` value, so the encoder uses its zero
+lead at every materialization slot without fetching over the price.
 
 `build_humidifi_liquidity_scenario` scales the market's vault balances through the generic
 `spl-token-account-balance` template, one override per side that changes, from 0 to 10000 remaining
@@ -115,6 +112,9 @@ from the market's masked words at offsets 448 (quote) and 480 (base); each vault
 account for the market's mint on that side, owned by that mint's token program, initialized and
 controlled by the market. `create_humidifi_liquidity_scenario`
 reads the market, both mints and both vaults through the Surfnet RPC and stages the result.
+Its overrides also leave `fetchBeforeUse: false` to preserve the local state used to calculate
+the amounts. When composing templates directly, set `fetchBeforeUse: true` on the first override
+for each account that has not already been prepared.
 
 `list_humidifi_markets` returns addresses, labels, both mint identities and decimals, and
 `maxStalenessSlots`. Both creation tools require a non-empty `market` address from this list.

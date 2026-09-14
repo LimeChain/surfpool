@@ -465,7 +465,7 @@ mod tests {
         let overrides = stored[0]["overrides"].as_array().unwrap();
         assert_eq!(overrides[0]["templateId"], "humidifi-fair-value");
         assert_eq!(overrides[0]["values"]["fair_value"], "58546795155816");
-        assert_eq!(overrides[0]["fetchBeforeUse"], true);
+        assert_eq!(overrides[0]["fetchBeforeUse"], false);
         assert_eq!(overrides[1]["templateId"], "humidifi-freshness");
         assert!(overrides[1]["values"]["last_update_slot"].is_null());
         assert_eq!(overrides[1]["fetchBeforeUse"], false);

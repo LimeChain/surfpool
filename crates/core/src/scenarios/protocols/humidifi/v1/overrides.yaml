@@ -51,10 +51,11 @@ templates:
       as a decimal STRING, since it can exceed what a JSON number holds exactly.
 
       Discover markets with list_humidifi_markets and set the override account to the chosen address.
-      A market address is required; there is no default. Set fetchBeforeUse: true, as the builder does,
-      so the market is fetched from the Surfnet datasource before applying the requested price.
-      This replaces earlier local edits to the market. The following humidifi-freshness override
-      uses fetchBeforeUse: false to preserve that price, with persist: true to keep it fresh.
+      A market address is required; there is no default. When composing this template directly, set
+      fetchBeforeUse: true so the live market is forked before the write. The fair-value builder
+      leaves it false because creation already read and cached the market through Surfnet.
+      The following humidifi-freshness override uses fetchBeforeUse: false to preserve that price,
+      with persist: true to keep it fresh.
 
       EXAMPLE - SOL/USDC at 208 quote tokens per base token (9 base decimals, 6 quote):
       fair_value: "58546795155816"
@@ -95,9 +96,8 @@ templates:
       1. Set last_update_slot to null (or 0). The venue resumes quoting the price it already holds.
       2. Set persist: true, so every slot re-stamps itself and the quote stays live indefinitely. A
          fixed absolute slot would age by one slot per slot and go stale anyway.
-      3. Set fetchBeforeUse: true so the live market is forked first. Use false only for a later
-         override that builds on state an earlier one prepared in the same scenario, which is why the
-         fair-value builder pairs this override at false after the price write.
+      3. Set fetchBeforeUse: true so the live market is forked first. Use false when the market was
+         already prepared by a builder or an earlier override, so its local changes are preserved.
 
       EXAMPLE - keep the maker quoting for the whole run:
       last_update_slot: null, persist: true

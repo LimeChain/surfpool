@@ -1086,7 +1086,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates one editable HumidiFi fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet to derive the 2^48-scaled quote-per-base ratio from their decimals. On Play, fetchBeforeUse refreshes the market from the Surfnet datasource before applying the requested price; a second override keeps the quote fresh without fetching it again. Prepares state; sends no swap. Resolve `market` through list_humidifi_markets."
+        description = "Creates one editable HumidiFi fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet to derive the 2^48-scaled quote-per-base ratio from their decimals. These reads cache the accounts in Surfnet. On Play, the scenario applies the requested price and keeps the quote fresh with fetchBeforeUse disabled to preserve local state. Prepares state; sends no swap. Resolve `market` through list_humidifi_markets."
     )]
     async fn create_humidifi_fair_value_scenario(
         &self,
