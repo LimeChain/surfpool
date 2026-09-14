@@ -23,7 +23,7 @@ worth reaching for this protocol to test.
 | `fair_value` | price x 2^88, as a decimal **string** | $50 -> `"15474250491067253436239052800"` |
 | `tick_offset` | 1/2,560,000 of the mid | `25600` = 1%, `2560` = 10 bps, `256` = 100 ppm |
 | reserves | the mint's smallest unit | 1 USDC -> `1000000` |
-| `last_update_slot` | an absolute slot number | |
+| `last_update_slot` | a signed offset from the materialization slot | `0` = current slot, `-2` = two slots old |
 
 `fair_value` exceeds what a JSON number holds exactly, so it must be quoted. To convert a spread:
 `ticks = percent * 25600`.
@@ -80,12 +80,17 @@ as long as your scenario needs.
 
 ```
 template: bisonfi-freshness
-last_update_slot: <current slot>
-persist: true
+last_update_slot: 0              # relative to each materialization slot
+persist: { slots: N }            # when bounded persistence is available
 ```
 
-Refreshing resumes the price the venue already held - no new price is needed. Without `persist` the
-next slot's state overwrites yours.
+Refreshing resumes the price the venue already held - no new price is needed. The value is a signed
+offset, not an absolute slot: `0` means "published in this slot". Without persistence, the next
+slot's state overwrites yours.
+
+For a finite run, prefer `persist: { slots: N }` when bounded persistence is available, with `N`
+equal to the total number of application slots, counting the first. On a raw-layout-only installation,
+use `persist: true` and stop it when the scenario no longer needs the quote refreshed.
 
 An immediate scenario may not need this. A scenario that spans multiple slots should keep the quote
 fresh explicitly rather than depending on the venue's current tolerance.
@@ -138,7 +143,7 @@ executable margin - both legs fit in one transaction. Two things to get right:
 | The pool quotes nothing at any size | Probably one of the dormant markets. Check how far `last_update_slot` is behind the chain |
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
-| The override reverts after the next slot | Add `persist: true` |
+| The override reverts after the next slot | Reapply it for the required window; prefer `persist: { slots: N }` when available, otherwise use `persist: true` |
 | The guard rejects the account | Only version-3 pools are supported |
 | `Custom(60)` | A Token-2022 mint whose token accounts need matching extension data. Two live markets quote such an asset |
 | A swap in a simulated slot returns 0 for no reason | The `LastRestartSlot` sysvar must be at least `246464040`, and the default 200k compute budget cannot finish a large trade - ask for ~1.4M |

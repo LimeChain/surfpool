@@ -41,7 +41,9 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario.
+      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
+      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
+      applications including the first. Otherwise use persist: true and stop it after the scenario.
 
       This is the only price lever. The reserves control depth, not price: BisonFi quotes around a mid
       the operator publishes, so changing vault balances will not move the quote.
@@ -94,7 +96,9 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario.
+      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
+      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
+      applications including the first. Otherwise use persist: true and stop it after the scenario.
 
       The depth lever: how far a trade moves the price. For how wide the venue quotes around its mid,
       use bisonfi-spread instead.
@@ -203,7 +207,9 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario.
+      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
+      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
+      applications including the first. Otherwise use persist: true and stop it after the scenario.
 
       The spread lever: how wide the venue quotes around its mid, independently of how much inventory
       it holds. Use bisonfi-depth to make a venue THIN and this one to make it EXPENSIVE.
@@ -258,20 +264,22 @@ templates:
       that spans multiple slots.
 
       THE VALUE IS AN OFFSET, NOT A SLOT NUMBER. It is resolved against the slot the override
-      materializes at, so 0 means "published this slot". An absolute slot number would be wrong here:
-      persist replays the same value every slot, so a fixed number ages by one slot per slot and the
-      quote goes stale anyway.
+      materializes at, so 0 means "published this slot". Do not pass the chain's absolute slot: the
+      encoder would treat it as a positive offset and add it to the materialization slot.
 
       HOW TO USE THIS TEMPLATE:
       1. Set last_update_slot to 0. The venue resumes quoting the price it already held - a fresh
          timestamp is enough, no new price is needed
-      2. Set persist: true, so every slot re-stamps itself and the quote stays live indefinitely
+      2. For a finite scenario, prefer persist: { slots: N } when bounded persistence is available,
+         choosing N as the total number of application slots, counting the first. Otherwise use
+         persist: true and stop it when the scenario no longer needs the quote refreshed
 
       A scenario that executes immediately after forking may not need this. A multi-slot scenario
       should keep the publication fresh explicitly rather than depending on the current tolerance.
 
       EXAMPLE - "keep the maker quoting for the whole run":
-      last_update_slot: 0, persist: true
+      last_update_slot: 0, persist: { slots: N }
+      If bounded persistence is unavailable, use persist: true as the fallback.
 
       EXAMPLE - "the maker stopped publishing long ago":
       last_update_slot: -1000000
