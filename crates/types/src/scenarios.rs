@@ -1211,6 +1211,74 @@ pub struct RawLayout {
 }
 
 impl RawLayout {
+    /// Validates every byte range a template can write before the template enters the registry.
+    pub fn validate_properties(&self, properties: &[Property]) -> Result<(), String> {
+        if self.account_size == 0 {
+            return Err("raw_layout account_size must be greater than zero".to_string());
+        }
+
+        if let Some(magic) = &self.magic {
+            let end = magic
+                .offset
+                .checked_add(magic.bytes.len())
+                .ok_or_else(|| "raw_layout magic offset overflow".to_string())?;
+            if end > self.account_size {
+                return Err(format!(
+                    "raw_layout magic at offset {} + {} bytes exceeds the {} byte account",
+                    magic.offset,
+                    magic.bytes.len(),
+                    self.account_size
+                ));
+            }
+        }
+
+        for property in properties {
+            // Constant references select PDA seeds or catalog values; they are not account writes.
+            if property.is_constant_ref() {
+                continue;
+            }
+
+            let offset = property.offset.ok_or_else(|| {
+                format!(
+                    "writable raw-layout property '{}' is missing an offset",
+                    property.path
+                )
+            })?;
+            let encoding = property.encoding.as_ref().ok_or_else(|| {
+                format!(
+                    "writable raw-layout property '{}' is missing an encoding",
+                    property.path
+                )
+            })?;
+            let (count, stride) = encoding.placements();
+            if count == 0 {
+                return Err(format!(
+                    "writable raw-layout property '{}' has zero placements",
+                    property.path
+                ));
+            }
+
+            let final_offset = offset
+                .checked_add(
+                    (count - 1)
+                        .checked_mul(stride)
+                        .ok_or_else(|| format!("stride overflow for '{}'", property.path))?,
+                )
+                .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+            let end = final_offset
+                .checked_add(encoding.width())
+                .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+            if end > self.account_size {
+                return Err(format!(
+                    "writable raw-layout property '{}' ends at byte {}, beyond the {} byte account",
+                    property.path, end, self.account_size
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Rejects an account that is not the shape this layout describes.
     pub fn guard(&self, data: &[u8]) -> Result<(), String> {
         if data.len() != self.account_size {

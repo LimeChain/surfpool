@@ -204,6 +204,7 @@ impl TemplateRegistry {
         overrides_content: &str,
         protocol_name: &str,
     ) {
+        let requires_raw_layout = idl.is_none();
         let collection =
             match serde_yaml::from_str::<YamlOverrideTemplateCollection>(overrides_content) {
                 Ok(c) => c,
@@ -212,6 +213,27 @@ impl TemplateRegistry {
 
         // Convert all templates in the collection
         let templates = collection.to_override_templates(idl);
+
+        // Validate the entire collection before mutating the registry, so one malformed entry
+        // cannot leave its valid siblings partially registered.
+        if requires_raw_layout {
+            for template in &templates {
+                let layout = template.raw_layout.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "unable to load {protocol_name} overrides: raw-layout template '{}' has no raw_layout",
+                        template.id
+                    )
+                });
+                layout
+                    .validate_properties(&template.properties)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "unable to load {protocol_name} overrides: invalid raw-layout template '{}': {e}",
+                            template.id
+                        )
+                    });
+            }
+        }
 
         // Register each template
         for template in templates {
@@ -612,6 +634,122 @@ templates:
             )
             .expect("materialize raw template");
         assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn raw_layout_collection_rejects_invalid_write_definitions_at_load_time() {
+        fn rejected(yaml: &str, expected: &str) {
+            let result = std::panic::catch_unwind(|| {
+                let mut registry = TemplateRegistry::default();
+                registry.load_raw_layout_overrides(yaml, "broken");
+            });
+            let panic = result.expect_err("invalid raw-layout collection must be rejected");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .expect("panic message");
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in {message:?}"
+            );
+        }
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+templates:
+  - id: no-layout
+    name: No layout
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties: []
+"#,
+            "has no raw_layout",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: { account_size: 16 }
+templates:
+  - id: no-offset
+    name: No offset
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, encoding: u64 }
+"#,
+            "missing an offset",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: { account_size: 16 }
+templates:
+  - id: no-encoding
+    name: No encoding
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 8 }
+"#,
+            "missing an encoding",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: { account_size: 16 }
+templates:
+  - id: out-of-bounds
+    name: Out of bounds
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 12, encoding: u64 }
+"#,
+            "beyond the 16 byte account",
+        );
+
+        let mut registry = TemplateRegistry::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.load_raw_layout_overrides(
+                r#"
+protocol: Broken
+version: v1
+raw_layout: { account_size: 16 }
+templates:
+  - id: valid-sibling
+    name: Valid sibling
+    description: Valid alone
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 8, encoding: u64 }
+  - id: invalid-sibling
+    name: Invalid sibling
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, encoding: u64 }
+"#,
+                "broken",
+            );
+        }));
+        assert!(
+            result.is_err(),
+            "invalid sibling must reject the collection"
+        );
+        assert_eq!(
+            registry.count(),
+            0,
+            "validation must finish before any sibling is registered"
+        );
     }
 
     #[test]
