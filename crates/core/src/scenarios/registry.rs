@@ -23,6 +23,12 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const SOLFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/oracle-overrides.yaml");
+pub const SOLFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/market-overrides.yaml");
+pub const SOLFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/vault-overrides.yaml");
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -76,6 +82,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_solfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -116,6 +123,11 @@ impl TemplateRegistry {
         );
     }
 
+    pub fn load_solfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(SOLFI_ORACLE_OVERRIDES_CONTENT, "solfi-oracle");
+        self.load_raw_layout_overrides(SOLFI_MARKET_OVERRIDES_CONTENT, "solfi-market");
+        self.load_raw_layout_overrides(SOLFI_VAULT_OVERRIDES_CONTENT, "solfi-vault");
+    }
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
 
@@ -516,11 +528,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + SolFi (5) = 67
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            67,
+            "Registry should load 67 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -591,6 +603,11 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("solfi-price"));
+        assert!(registry.contains("solfi-freshness"));
+        assert!(registry.contains("solfi-spread"));
+        assert!(registry.contains("solfi-size-impact"));
+        assert!(registry.contains("solfi-vault-balance"));
     }
 
     #[test]
@@ -881,8 +898,8 @@ templates:
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            6,
+            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 2 SolFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1600,5 +1617,124 @@ templates:
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn test_every_solfi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "solfi-price",
+            "solfi-freshness",
+            "solfi-spread",
+            "solfi-size-impact",
+            "solfi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing SolFi template {id}"));
+            assert!(template.raw_layout.is_some(), "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6),
+                "{id} needs substantive LLM guidance"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 29, "every shipped SolFi property must be checked");
+    }
+
+    #[test]
+    fn solfi_templates_expose_valid_direct_account_choices() {
+        let registry = TemplateRegistry::new();
+        let cases = [
+            (
+                "solfi-price",
+                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                [
+                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-freshness",
+                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                [
+                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
+                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-spread",
+                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                [
+                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-size-impact",
+                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                [
+                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
+                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
+                ]
+                .as_slice(),
+            ),
+            (
+                "solfi-vault-balance",
+                "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
+                [
+                    "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
+                    "GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic",
+                    "5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc",
+                    "ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc",
+                ]
+                .as_slice(),
+            ),
+        ];
+
+        let mut checked = 0;
+        for (template_id, default_address, expected) in cases {
+            let template = registry.get(template_id).expect("SolFi template");
+            assert_eq!(
+                template.address,
+                surfpool_types::AccountAddress::Pubkey(default_address.to_string()),
+                "{template_id} should default to the first catalog entry"
+            );
+            let options = &template
+                .constants
+                .get("market")
+                .expect("Tessera-style market options")
+                .options;
+            assert_eq!(options.len(), expected.len(), "{template_id}");
+            assert_eq!(options[0].value, default_address, "{template_id}");
+
+            for (option, expected_address) in options.iter().zip(expected) {
+                assert_eq!(
+                    Pubkey::from_str(&option.value).expect("valid selectable pubkey"),
+                    Pubkey::from_str(expected_address).expect("valid expected pubkey"),
+                    "{template_id}:{}",
+                    option.id
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 12, "every selectable SolFi target must be checked");
     }
 }
