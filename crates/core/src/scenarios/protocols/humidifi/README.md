@@ -1,0 +1,170 @@
+# HumidiFi
+
+HumidiFi is a proprietary market maker without a published IDL. Surfpool prepares its market
+state through the raw layout in `v1/overrides.yaml`; it does not construct or submit a swap.
+
+## Deployment
+
+- Program: `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`
+- ProgramData: `G9S64i58RRWJA28vZiNhnP56Ux4Ef7hfMgHNREnZZSom`
+- Deploy slot: `446544344` (2026-09-12 22:35:04 UTC)
+- ProgramData length: 339485 bytes, including the 45-byte loader header
+- ELF length: 339440 bytes
+- ELF SHA-256: `4c2b4c29bce4ee4d2a0dfde28f6d511e60627e86ac3cd417e6734ff999ea4550`
+
+Mainnet RPC and PublicNode independently returned these values on 2026-09-13, and the running
+Surfnet fork matched them. The focused live suite then passed all ten tests against mainnet,
+including two-market layout and round-trip checks, materialization, fair-value and liquidity swap
+replays, and the inclusive staleness boundary. A signed original-wallet DFlow route simulation also
+succeeded against the same ELF; this is simulation evidence, not a committed transaction. These
+results validate compatibility with the existing `v1` raw layout. A later redeploy voids the layout
+evidence; the live suite pins ProgramData and fails when it moves.
+
+## The account is obfuscated
+
+A market is 1728 bytes. Its economic fields and public keys use per-offset XOR keys; the schema
+version at offset 1720 is plaintext. The templates keep values plaintext and declare `xor_mask`
+for each masked field. The shared raw-layout writer encodes a value, XORs the eight-byte word,
+then writes it. Other encodings cannot carry a mask.
+
+The fair-value key is `b957ed15dc877426`. Freshness and the staleness limit use
+`6e9de2b30b19f1ea`. The base mint at offset 416 and quote mint at 384 each occupy four words,
+decoded with `fb5ce87aae443c38`, `04a2178451bac3c7`, `04a1178751b9c3c6`, and
+`04a0178651b8c3c5`. These public-key keys are read-only in Rust.
+
+## The guard, and what it does not cover
+
+The raw-layout guard checks size 1728 and the masked tag `[44,90,19,124,56,111,47,150]` at
+offset 8. This tag is shared by several schema versions. `validate_humidifi_market_layout`
+also checks the program owner and requires plaintext schema version 8 at offset 1720.
+Discovery applies the same size, tag, and version filters, then validates the referenced mints.
+
+The YAML magic guard supports one contiguous range, so owner and schema checks belong in Rust.
+The fair-value tool uses them before reading mints or building a scenario. Direct raw-template
+composition does not perform these additional checks; the raw scenario API is unvalidated by
+contract. Schema versions other than 8 are unsupported.
+
+## Templates
+
+| Template | Prepared state |
+| --- | --- |
+| `humidifi-fair-value` | Quote-per-base atomic ratio at offset 576 |
+| `humidifi-freshness` | Materialization slot at offset 616, default lead 0 |
+| `humidifi-stale-quote` | Aged slot at offset 616, default lead -3 |
+
+The price conversion is `floor(price * 2^48 * 10^(quote_decimals - base_decimals))`.
+The builder reads both mint decimals and computes this with integer arithmetic. A raw template
+takes the resulting ratio as a decimal string. For SOL/USDC, price `208` gives
+`"58546795155816"`.
+
+Offset 608 holds the maximum accepted quote age in slots. A supplied `last_update_slot` value is a
+signed lead relative to materialization, not an absolute slot; `null` selects the template's
+default lead. Pass `-(maxStalenessSlots + 1)` to reach the first stale slot: age equal to the
+limit still fills, while the next slot fails with `Custom(1027565)` (`0xfaded`). Passing `0`
+makes a quote fresh, including on the stale template. Staleness is applied
+once; freshness can persist to keep the quote current over subsequent slots.
+
+## Live market discovery
+
+`list_humidifi_markets` uses the target Surfnet RPC's `getProgramAccounts`, then fetches the
+referenced mints in batches of at most 100. Addresses identify markets; labels use verified-token
+symbols with full mint addresses as a fallback. Discovery sorts by label and address. The templates
+contain no static market list or default address; every override must target an explicitly selected market.
+
+On 2026-09-11, a mainnet scan found 93 accounts of size 1728: 36 with schema 8, 50 with schema 5,
+two each with values 0, 2 and 4, and one with value 6. Schema membership is not proof of current
+trading or liquidity. Discovery validates compatible accounts and mint metadata; it does not
+promise that every market is quoting. The live test checks returned metadata without pinning a
+market count.
+
+On 2026-09-13, the focused mainnet run discovered and validated 36 compatible markets. PublicNode
+independently confirmed the ProgramData identity but returned HTTP 403 for `getProgramAccounts`, so
+that provider did not verify discovery.
+
+To inspect all market-sized accounts, including unsupported schemas:
+
+```bash
+curl -s -X POST "$RPC_URL" -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
+  "params":["9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
+    {"encoding":"base64","commitment":"confirmed","filters":[{"dataSize":1728}]}]}'
+```
+
+Decode the little-endian u64 at offset 1720 without an XOR mask. Normal discovery additionally
+filters the tag at offset 8 and version 8 at offset 1720.
+
+## Builders and tools
+
+`build_humidifi_fair_value_scenario` is a pure conversion over validated market metadata.
+`create_humidifi_fair_value_scenario` reads the market and both mints through the selected
+Surfnet RPC, where local accounts take precedence and missing accounts fall back to the
+datasource. It stages the result through the shared scenario path.
+
+The price override sets `fetchBeforeUse: true`: on Play the shared materializer fetches the
+market from the Surfnet datasource before applying the requested price. It does not require
+the market account read at creation to remain in local state. A successful fetch replaces earlier
+local edits to that market; it does not reset its vaults or the rest of the fork. The shared fetch
+path is best effort: on a remote failure, an existing local account may still be used.
+A second override sets `fetchBeforeUse: false` and persists freshness with a `null` value,
+so the encoder uses its zero lead at every materialization slot without fetching over the price.
+
+`build_humidifi_liquidity_scenario` scales the market's vault balances through the generic
+`spl-token-account-balance` template, one override per side that changes, from 0 to 10000 remaining
+basis points with integer floor, and pairs them with persisted freshness. The vault addresses come
+from the market's masked words at offsets 448 (quote) and 480 (base); each vault must be a token
+account for the market's mint on that side, owned by that mint's token program, initialized and
+controlled by the market. `create_humidifi_liquidity_scenario`
+reads the market, both mints and both vaults through the Surfnet RPC and stages the result.
+
+`list_humidifi_markets` returns addresses, labels, both mint identities and decimals, and
+`maxStalenessSlots`. Both creation tools require a non-empty `market` address from this list.
+All tools accept an optional `surfnet_port`, defaulting to 8899. Studio's PMM
+fair-value preset uses the market list and fair-value tools; the stale-quote and liquidity chips
+request editable state scenarios.
+
+## Behavioral evidence
+
+The live suite checks byte-limited template writes on two markets, guarded layout rejection,
+discovered metadata, and scenario materialization with persisted freshness. It loads the pinned
+deployed ELF into LiteSVM for swap replay. A native DFlow wrapper re-emits the captured HumidiFi
+CPI; its system-owned authority must remain a read-only signer, with signature verification off.
+The captured instruction comes from transaction
+[`3zevqw…g1Si`](https://explorer.solana.com/tx/3zevqwAa8u136UGE1bdBzP1o2dpFuc7X333dC1ut3T1uCgY6iidihfNJNoJ7tuyj3tHNin1i7HTFCUSFWqK7g1Si)
+at slot 444225745: DFlow outer instruction 2, HumidiFi CPI, 2427890 USDC atoms of input.
+The replay uses those instruction bytes and account identities, with live protocol-state contents
+and ELF. Test user token accounts and the signer are synthesized; it does not replay the entire
+DFlow transaction or load frozen protocol account snapshots.
+
+The fair-value replay checks unchanged output after re-encoding the current ratio, increased
+base output after halving the price, and decreased output or rejection after doubling it.
+An independent absolute-price test builds scenarios at 100 and 208 USDC per SOL, registers and
+materializes them, then compares actual swap output with the human price and mint decimals within
+1%. This expectation does not use the encoded fair-value word or the `2^48` conversion.
+The staleness replay uses an explicit clock: with the tested SOL/USDC market's limit of 2, age 3 fails with
+`Custom(1027565)` (`0xfaded`) and age 2 fills. Changing offset 608 to 10 moves those boundaries
+to ages 11 and 10; the stale template's default age 3 then fills. The limit is inclusive.
+
+The liquidity replay materializes the builder's scenarios through the production path and swaps
+against the prepared accounts. A drained base vault fails the transfer with the token program's
+insufficient-funds error. On the tested SOL/USDC market in the 2026-09-11 replay, a base vault cut
+to 0.5% of its live balance still filled at less than a hundredth of baseline output. Draining
+the quote vault left quote-to-base fills unchanged. These observations are tested against live
+state; the tool scales balances without assuming a fixed inventory threshold or output multiplier.
+
+```bash
+SURFPOOL_TEST_RPC_URL=<rpc-url> cargo test -p surfpool-core --features integration-tests \
+  tests::humidifi -- --test-threads=1 --nocapture
+```
+
+Run serially. Public endpoints can shed requests after discovery, sometimes reporting HTTP 413.
+`SURFPOOL_TEST_RPC_URL` defaults to the public mainnet endpoint; use a private endpoint when it
+rate-limits.
+
+## Known boundaries
+
+Depth and curve fields are not exposed; vault balances are, through the generic token template.
+Inventory response depends on current market state and trade direction; no universal price or
+depth formula is inferred from the vault-balance control. The behavioral replay covers USDC into
+WSOL on the replay's SOL/USDC market: the quote side's
+own depletion is proven only to leave that direction unchanged, and the opposite direction and other
+pairs are not replayed. Other market schema versions remain unsupported.

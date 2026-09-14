@@ -418,6 +418,61 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn humidifi_builder_scenario_keeps_value_types_through_the_api() {
+        use surfpool_core::scenarios::protocols::humidifi::v1::{
+            HumidiFiMarket, build_humidifi_fair_value_scenario,
+        };
+
+        let token_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse()
+            .unwrap();
+        let market = HumidiFiMarket {
+            address: solana_pubkey::Pubkey::new_unique(),
+            base_mint: "So11111111111111111111111111111111111111112"
+                .parse()
+                .unwrap(),
+            quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                .parse()
+                .unwrap(),
+            base_token_program: token_program,
+            quote_token_program: token_program,
+            base_decimals: 9,
+            quote_decimals: 6,
+            max_staleness_slots: 2,
+        };
+        let scenario = build_humidifi_fair_value_scenario(&market, "208")
+            .unwrap()
+            .scenario;
+        let expected = serde_json::to_value(&scenario).unwrap();
+        let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
+        let app = test::init_service(
+            App::new()
+                .app_data(loaded_scenarios)
+                .configure(configure_api),
+        )
+        .await;
+
+        let created = test::call_service(&app, post_scenario(expected.clone()).to_request()).await;
+        assert_eq!(created.status(), 200);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/v1/scenarios").to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let stored: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(stored, serde_json::json!([expected]));
+        let overrides = stored[0]["overrides"].as_array().unwrap();
+        assert_eq!(overrides[0]["templateId"], "humidifi-fair-value");
+        assert_eq!(overrides[0]["values"]["fair_value"], "58546795155816");
+        assert_eq!(overrides[0]["fetchBeforeUse"], true);
+        assert_eq!(overrides[1]["templateId"], "humidifi-freshness");
+        assert!(overrides[1]["values"]["last_update_slot"].is_null());
+        assert_eq!(overrides[1]["fetchBeforeUse"], false);
+        assert_eq!(overrides[1]["persist"], true);
+    }
+
+    #[actix_web::test]
     async fn creating_the_same_scenario_twice_is_a_no_op() {
         let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
         let app = test::init_service(
