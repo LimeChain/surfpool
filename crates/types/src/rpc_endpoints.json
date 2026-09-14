@@ -861,7 +861,7 @@
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
-                      "persist": "bool (Optional, defaults to false. If true, re-applies this override on every following slot instead of only one, which is needed when something else writes the account in between. Use it only for values no transaction writes - an oracle price, a disabled switch, a risk parameter - never for state the transactions under test mutate: re-applying reverts their writes at the start of the next slot, so a pool would refill itself after every swap)",
+                      "persist": "Optional, defaults to false. Controls how long the override keeps re-applying itself. Accepts a boolean or a bounded window: false applies once; true re-applies every following slot indefinitely; {\"slots\": 10} applies in 10 slots in total, counting the first, and {\"slots\": 0} is refused because an override always applies on the slot it is scheduled for. To stop a persisted override, register the same override again (same id, account and template) with persist false - that drops both the queued copy and any copy already armed for a later slot. Re-applying is needed when something else writes the account in between, but use it only for values no transaction writes - an oracle price, a disabled switch, a risk parameter - never for state the transactions under test mutate: re-applying reverts their writes at the start of the next slot, so a pool would refill itself after every swap. Prefer a bounded window over true, so a persisted override cannot outlive the scenario that created it.",
                       "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }
@@ -875,6 +875,33 @@
             }
           ],
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
+        },
+        {
+          "method": "surfnet_stopPersistingOverride",
+          "description": "Stops scheduler-generated continuations of one persisted scenario override without applying the override again. Independently authored future timeline entries are preserved.",
+          "params": [
+            {
+              "name": "id",
+              "type": "string",
+              "description": "The override instance identifier."
+            },
+            {
+              "name": "account",
+              "type": "AccountAddress",
+              "description": "The account identity as either a concrete pubkey or the original PDA recipe."
+            },
+            {
+              "name": "template_id",
+              "type": "string",
+              "description": "The override template identifier."
+            },
+            {
+              "name": "values",
+              "type": "Option<HashMap<String, serde_json::Value>>",
+              "description": "Values used to resolve property-backed PDA seeds. Optional when account is already a concrete pubkey or contains no property-reference seeds."
+            }
+          ],
+          "returns": "A `RpcResponse<usize>` containing the number of scheduler-generated continuations removed."
         }
       ]
     },
