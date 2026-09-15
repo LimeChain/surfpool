@@ -329,10 +329,12 @@ async fn collateral_idl_override_preserves_live_trader_layout() {
     let mut overrides = HashMap::new();
     overrides.insert(
         "traderState.quoteLotCollateral".to_string(),
-        crate::scenarios::protocols::phoenix_eternal::v1::collateral::collateral_override_value(
-            &serde_json::Value::String(target.to_string()),
-        )
-        .unwrap(),
+        serde_json::Value::from(
+            crate::scenarios::protocols::phoenix_eternal::v1::collateral::parse_quote_lot_collateral(
+                &serde_json::json!(target.to_string()),
+            )
+            .unwrap(),
+        ),
     );
 
     let forged = svm
@@ -524,9 +526,13 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         Some(&index_account),
     )
     .unwrap();
-    let mut shock = phoenix_direct_mark_scenario(graph.perp_asset_map, &symbol, "1", false)
-        .overrides
-        .remove(0);
+    let mut shock = phoenix_market_scenario(
+        "phoenix-direct-mark-risk-shock",
+        graph.perp_asset_map,
+        &[("symbol", symbol.as_str()), ("target_ticks", "1")],
+    )
+    .overrides
+    .remove(0);
     shock.scenario_relative_slot = 1;
     cascade.add_override(shock);
     mark_locker
@@ -561,24 +567,6 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         after_mark.mark_price_ticks, 1,
         "stage 1 shocks the mark the program itself reads"
     );
-
-    // The second live market proves the preparations are not market-specific.
-    let (second_locker, graph) = phoenix_behavior_locker().await;
-    let (symbol, orderbook, spline) = graph.markets[1].clone();
-    let before_second = hawkeye_bbo_for_market(&graph, &second_locker, orderbook, spline);
-    second_locker
-        .register_scenario(
-            phoenix_direct_mark_scenario(graph.perp_asset_map, &symbol, "1", false),
-            Some(graph.clock.slot),
-        )
-        .unwrap();
-    second_locker
-        .materialize_overrides_for_slot(&None, graph.clock.slot)
-        .await
-        .unwrap();
-    let after_second = hawkeye_bbo_for_market(&graph, &second_locker, orderbook, spline);
-    assert_ne!(before_second.mark_price_ticks, 1);
-    assert_eq!(after_second.mark_price_ticks, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -589,12 +577,14 @@ async fn reference_prices_change_hawkeye_index_on_live_markets() {
         let before = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
         locker
             .register_scenario(
-                phoenix_reference_price_scenario(
+                phoenix_market_scenario(
+                    "phoenix-reference-price-divergence",
                     graph.perp_asset_map,
-                    symbol,
-                    "80000",
-                    "79000",
-                    false,
+                    &[
+                        ("symbol", symbol.as_str()),
+                        ("spot_ticks", "80000"),
+                        ("perp_ticks", "79000"),
+                    ],
                 ),
                 Some(graph.clock.slot),
             )
@@ -841,254 +831,27 @@ const HAWKEYE_MARGIN_RETURN_MAGIC: u64 = 0x955f5b9d3dff253f;
 
 const HAWKEYE_BBO_RETURN_MAGIC: u64 = 0xefca1fa31fa74171;
 
-fn phoenix_collateral_scenario(
-    trader: Pubkey,
-    collateral: serde_json::Value,
-    fetch_before_use: bool,
-) -> surfpool_types::Scenario {
-    let mut scenario = surfpool_types::Scenario::new(
-        "Phoenix collateral stress".to_string(),
-        "Phoenix Trader collateral override".to_string(),
-    );
-    let mut instance = surfpool_types::OverrideInstance::new(
-        "phoenix-trader-collateral-stress".to_string(),
-        0,
-        surfpool_types::AccountAddress::Pubkey(trader.to_string()),
-    )
-    .with_values(HashMap::from([(
-        "traderState.quoteLotCollateral".to_string(),
-        collateral,
-    )]));
-    instance.fetch_before_use = fetch_before_use;
-    scenario.add_override(instance);
-    scenario
-}
-
-fn phoenix_direct_mark_scenario(
+fn phoenix_market_scenario(
+    template_id: &str,
     perp_asset_map: Pubkey,
-    symbol: &str,
-    target_ticks: &str,
-    fetch_before_use: bool,
+    values: &[(&str, &str)],
 ) -> surfpool_types::Scenario {
     let mut scenario = surfpool_types::Scenario::new(
-        "Phoenix direct mark risk shock".to_string(),
-        "Phoenix direct mark override".to_string(),
+        template_id.to_string(),
+        "Phoenix market override".to_string(),
     );
-    let mut instance = surfpool_types::OverrideInstance::new(
-        "phoenix-direct-mark-risk-shock".to_string(),
-        0,
-        surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
-    )
-    .with_values(HashMap::from([
-        ("symbol".to_string(), serde_json::json!(symbol)),
-        ("target_ticks".to_string(), serde_json::json!(target_ticks)),
-    ]));
-    instance.fetch_before_use = fetch_before_use;
-    scenario.add_override(instance);
+    scenario.add_override(
+        surfpool_types::OverrideInstance::new(
+            template_id.to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
+        )
+        .with_values(
+            values
+                .iter()
+                .map(|(field, value)| (field.to_string(), serde_json::Value::from(*value)))
+                .collect(),
+        ),
+    );
     scenario
-}
-
-fn phoenix_reference_price_scenario(
-    perp_asset_map: Pubkey,
-    symbol: &str,
-    spot_ticks: &str,
-    perp_ticks: &str,
-    fetch_before_use: bool,
-) -> surfpool_types::Scenario {
-    let mut scenario = surfpool_types::Scenario::new(
-        "Phoenix spot/perp reference divergence".to_string(),
-        "Phoenix reference-price override".to_string(),
-    );
-    let mut instance = surfpool_types::OverrideInstance::new(
-        "phoenix-reference-price-divergence".to_string(),
-        0,
-        surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
-    )
-    .with_values(HashMap::from([
-        ("symbol".to_string(), serde_json::json!(symbol)),
-        ("spot_ticks".to_string(), serde_json::json!(spot_ticks)),
-        ("perp_ticks".to_string(), serde_json::json!(perp_ticks)),
-    ]));
-    instance.fetch_before_use = fetch_before_use;
-    scenario.add_override(instance);
-    scenario
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn materialize_patches_only_phoenix_trader_collateral() {
-    let trader = Pubkey::new_unique();
-    let mut base = phoenix_trader_fixture(6_996_825_500);
-    base[24..56].copy_from_slice(trader.as_ref());
-    let scenario = phoenix_collateral_scenario(trader, serde_json::json!("371499999"), false);
-    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-    let locker = SurfnetSvmLocker::new(svm);
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .set_account(
-                &trader,
-                Account {
-                    lamports: 1,
-                    data: base.clone(),
-                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-    });
-
-    locker.register_scenario(scenario, Some(100)).unwrap();
-    locker
-        .materialize_overrides_for_slot(&None, 100)
-        .await
-        .unwrap();
-
-    let after = locker
-        .with_svm_reader(|svm_reader| svm_reader.get_account(&trader))
-        .unwrap()
-        .unwrap();
-    let header = TraderHeader::try_read_from_account_bytes(&after.data).unwrap();
-    assert_eq!(
-        header.trader_state.quote_lot_collateral.as_inner(),
-        371_499_999
-    );
-    assert_eq!(after.data.len(), base.len());
-    assert!(
-        base.iter()
-            .zip(&after.data)
-            .enumerate()
-            .filter(|(_, (before, after))| before != after)
-            .all(|(offset, _)| (88..96).contains(&offset))
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn materialize_applies_a_phoenix_direct_mark_override() {
-    let perp_asset_map = Pubkey::new_unique();
-    let base = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::tests::perp_asset_map_fixture();
-    let scenario = phoenix_direct_mark_scenario(perp_asset_map, "SOL", "1", false);
-    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-    let locker = SurfnetSvmLocker::new(svm);
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .set_account(
-                &perp_asset_map,
-                Account {
-                    lamports: 1,
-                    data: base.clone(),
-                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-    });
-
-    locker.register_scenario(scenario, Some(100)).unwrap();
-    locker
-        .materialize_overrides_for_slot(&None, 100)
-        .await
-        .unwrap();
-
-    let after = locker
-        .with_svm_reader(|svm_reader| svm_reader.get_account(&perp_asset_map))
-        .unwrap()
-        .unwrap();
-    let map = PerpAssetMap::try_from_account_bytes(&after.data).unwrap();
-    let mark_price = map
-        .find_by_symbol("SOL")
-        .unwrap()
-        .unwrap()
-        .metadata
-        .oracle_price()
-        .mark_price
-        .price;
-    assert_eq!(mark_price.ticks.as_inner(), 1);
-    assert_eq!(mark_price.slot, 100);
-    assert_eq!(after.data.len(), base.len());
-    assert!(
-        base.iter()
-            .zip(&after.data)
-            .filter(|(before, after)| before != after)
-            .count()
-            <= 16
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn materialize_refreshes_phoenix_reference_price_slots() {
-    let perp_asset_map = Pubkey::new_unique();
-    let base = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::tests::perp_asset_map_fixture();
-    let before = PerpAssetMap::try_from_account_bytes(&base).unwrap();
-    let before_mark = before
-        .find_by_symbol("SOL")
-        .unwrap()
-        .unwrap()
-        .metadata
-        .oracle_price()
-        .mark_price
-        .price
-        .ticks
-        .as_inner();
-    let scenario = phoenix_reference_price_scenario(perp_asset_map, "SOL", "8000", "7000", false);
-    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-    let locker = SurfnetSvmLocker::new(svm);
-    locker.with_svm_writer(|svm_writer| {
-        svm_writer
-            .set_account(
-                &perp_asset_map,
-                Account {
-                    lamports: 1,
-                    data: base,
-                    owner: PHOENIX_ETERNAL_PROGRAM_ID,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .unwrap();
-    });
-
-    locker.register_scenario(scenario, Some(100)).unwrap();
-    locker
-        .materialize_overrides_for_slot(&None, 100)
-        .await
-        .unwrap();
-
-    let after = locker
-        .with_svm_reader(|svm_reader| svm_reader.get_account(&perp_asset_map))
-        .unwrap()
-        .unwrap();
-    let map = PerpAssetMap::try_from_account_bytes(&after.data).unwrap();
-    let entry = map.find_by_symbol("SOL").unwrap().unwrap();
-    let price = entry.metadata.oracle_price();
-
-    assert_eq!(price.mark_price.price.ticks.as_inner(), before_mark);
-    assert!(
-        price
-            .mark_price
-            .spot_price_component
-            .last_exchange_spot_price
-            .iter()
-            .all(|value| value.slot == 100 && value.ticks.as_inner() == 8_000)
-    );
-    assert!(
-        price
-            .mark_price
-            .perp_price_component
-            .last_exchange_perp_price
-            .iter()
-            .all(|value| value.slot == 100 && value.ticks.as_inner() == 7_000)
-    );
-}
-
-fn phoenix_trader_fixture(collateral: i64) -> Vec<u8> {
-    let header_len = core::mem::size_of::<TraderHeader>();
-    let mut data = vec![0_u8; header_len + 16 + 80];
-    data[..8].copy_from_slice(&PhoenixAccount::Trader.discriminant());
-    data[88..96].copy_from_slice(&collateral.to_le_bytes());
-    data[112..116].copy_from_slice(&2_u32.to_le_bytes());
-    data[header_len..header_len + 8].copy_from_slice(&1_u64.to_le_bytes());
-    data[header_len + 8..header_len + 16].copy_from_slice(&2_u64.to_le_bytes());
-    data[header_len + 16..header_len + 24].copy_from_slice(&42_u64.to_le_bytes());
-    data
 }

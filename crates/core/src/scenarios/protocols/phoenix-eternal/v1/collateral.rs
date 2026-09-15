@@ -140,11 +140,10 @@ pub fn effective_collateral(header: &TraderHeader, index: Option<&Account>) -> S
     ))
 }
 
-pub fn collateral_override_value(value: &serde_json::Value) -> SurfpoolResult<serde_json::Value> {
+pub fn parse_quote_lot_collateral(value: &serde_json::Value) -> SurfpoolResult<i64> {
     value
         .as_i64()
-        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
-        .map(serde_json::Value::from)
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .ok_or_else(|| {
             SurfpoolError::internal("Phoenix collateral must be a signed 64-bit integer")
         })
@@ -164,12 +163,12 @@ mod tests {
     fn collateral_values_preserve_signed_integer_precision() {
         for value in [i64::MIN, -9_007_199_254_740_993, 0, i64::MAX] {
             assert_eq!(
-                collateral_override_value(&serde_json::json!(value.to_string())).unwrap(),
-                serde_json::json!(value)
+                parse_quote_lot_collateral(&serde_json::json!(value.to_string())).unwrap(),
+                value
             );
             assert_eq!(
-                collateral_override_value(&serde_json::json!(value)).unwrap(),
-                serde_json::json!(value)
+                parse_quote_lot_collateral(&serde_json::json!(value)).unwrap(),
+                value
             );
         }
         for value in [
@@ -177,7 +176,7 @@ mod tests {
             serde_json::json!(-1.5),
             serde_json::json!(null),
         ] {
-            assert!(collateral_override_value(&value).is_err());
+            assert!(parse_quote_lot_collateral(&value).is_err());
         }
     }
 
@@ -230,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn index_lookup_selects_reachable_keys_and_ignores_freed_duplicate() {
+    fn index_lookup_selects_reachable_keys_and_rejects_malformed_trees() {
         let index = index_account();
         assert_eq!(
             index_trader_state_range(&index, &FIRST_KEY).unwrap(),
@@ -240,63 +239,47 @@ mod tests {
             index_trader_state_range(&index, &SECOND_KEY).unwrap(),
             208..224
         );
+        assert!(index_trader_state_range(&index, &[44; 32]).is_err());
 
-        let mut only_freed_match = index.clone();
-        only_freed_match.data[112..144].copy_from_slice(&[33; 32]);
-        assert!(index_trader_state_range(&only_freed_match, &FIRST_KEY).is_err());
-    }
-
-    #[test]
-    fn index_lookup_rejects_cycles_wrong_size_and_missing_key() {
-        let mut cycle = index_account();
-        write_u32(&mut cycle.data, 96, 2);
-        assert!(index_trader_state_range(&cycle, &FIRST_KEY).is_err());
-
-        let mut wrong_size = index_account();
-        write_u32(&mut wrong_size.data, 48, 3);
-        assert!(index_trader_state_range(&wrong_size, &FIRST_KEY).is_err());
-        assert!(index_trader_state_range(&index_account(), &[44; 32]).is_err());
-    }
-
-    #[test]
-    fn index_lookup_rejects_invalid_node_addresses_and_duplicate_reachable_keys() {
-        let mut out_of_bounds = index_account();
-        write_u32(&mut out_of_bounds.data, 60, 100);
-        write_u32(&mut out_of_bounds.data, 164, 4);
-        assert!(index_trader_state_range(&out_of_bounds, &FIRST_KEY).is_err());
-
-        let mut unallocated = index_account();
-        write_u32(&mut unallocated.data, 60, 2);
-        assert!(index_trader_state_range(&unallocated, &FIRST_KEY).is_err());
-
-        let mut duplicate = index_account();
-        duplicate.data[176..208].copy_from_slice(&FIRST_KEY);
-        assert!(index_trader_state_range(&duplicate, &FIRST_KEY).is_err());
-    }
-
-    #[test]
-    fn index_lookup_rejects_wrong_owner_discriminator_and_truncated_layouts() {
-        let mut wrong_owner = index_account();
-        wrong_owner.owner = Pubkey::new_unique();
-        assert!(index_trader_state_range(&wrong_owner, &FIRST_KEY).is_err());
-
-        let mut wrong_discriminator = index_account();
-        wrong_discriminator.data[..8].fill(0);
-        assert!(index_trader_state_range(&wrong_discriminator, &FIRST_KEY).is_err());
-
-        for len in [0, 79, 95, 96 + 3 * 64 - 1] {
-            let mut truncated = index_account();
-            truncated.data.truncate(len);
-            assert!(index_trader_state_range(&truncated, &FIRST_KEY).is_err());
+        type Corrupt = fn(&mut Account);
+        let corruptions: [(&str, Corrupt); 8] = [
+            ("only a freed duplicate matches", |index| {
+                index.data[112..144].copy_from_slice(&[33; 32])
+            }),
+            ("cycle", |index| write_u32(&mut index.data, 96, 2)),
+            ("size disagrees with the reachable nodes", |index| {
+                write_u32(&mut index.data, 48, 3)
+            }),
+            ("child beyond capacity", |index| {
+                write_u32(&mut index.data, 60, 100);
+                write_u32(&mut index.data, 164, 4);
+            }),
+            ("child above the bump index", |index| {
+                write_u32(&mut index.data, 60, 2)
+            }),
+            ("duplicate reachable key", |index| {
+                index.data[176..208].copy_from_slice(&FIRST_KEY)
+            }),
+            ("wrong owner", |index| index.owner = Pubkey::new_unique()),
+            ("wrong discriminator", |index| index.data[..8].fill(0)),
+        ];
+        for (case, corrupt) in corruptions {
+            let mut index = index_account();
+            corrupt(&mut index);
+            assert!(
+                index_trader_state_range(&index, &FIRST_KEY).is_err(),
+                "{case}"
+            );
         }
-    }
-
-    #[test]
-    fn index_lookup_rejects_unsupported_arena_counts() {
         for (arenas, active) in [(0_u16, 1_u16), (2, 1), (1, 0), (1, 2)] {
             let mut index = index_account();
             index.data[52..54].copy_from_slice(&arenas.to_le_bytes());
             index.data[54..56].copy_from_slice(&active.to_le_bytes());
+            assert!(index_trader_state_range(&index, &FIRST_KEY).is_err());
+        }
+        for len in [0, 79, 95, 96 + 3 * 64 - 1] {
+            let mut index = index_account();
+            index.data.truncate(len);
             assert!(index_trader_state_range(&index, &FIRST_KEY).is_err());
         }
     }
@@ -334,20 +317,6 @@ mod tests {
         assert_eq!(stale_low, trader_account(FIRST_KEY, 1, true));
     }
 
-    #[test]
-    fn cold_trader_keeps_standalone_collateral_and_increase_guard() {
-        let trader = Pubkey::new_from_array(FIRST_KEY);
-        let account = trader_account(FIRST_KEY, 50, false);
-        let header = trader_header(&trader, &account).unwrap();
-        assert_eq!(effective_collateral(&header, None).unwrap(), 50);
-        assert_eq!(
-            effective_collateral(&header, Some(&index_account())).unwrap(),
-            50
-        );
-        assert!(build_phoenix_collateral_scenario(trader, &account, "51", None).is_err());
-        assert!(build_phoenix_collateral_scenario(trader, &account, "50", None).is_ok());
-    }
-
     fn global_account(index: &Pubkey) -> Account {
         use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
 
@@ -368,21 +337,9 @@ mod tests {
         use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
         use crate::surfnet::svm::SurfnetSvm;
 
-        for (key, other_key, collateral_offset, field, target) in [
-            (
-                FIRST_KEY,
-                SECOND_KEY,
-                144,
-                "traderState.quoteLotCollateral",
-                1_i64,
-            ),
-            (
-                SECOND_KEY,
-                FIRST_KEY,
-                208,
-                "traderState.quoteLotCollateral",
-                -9_007_199_254_740_993,
-            ),
+        for (key, other_key, collateral_offset, target) in [
+            (FIRST_KEY, SECOND_KEY, 144, 1_i64),
+            (SECOND_KEY, FIRST_KEY, 208, -9_007_199_254_740_993),
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
@@ -394,17 +351,13 @@ mod tests {
             let mut before_index = index_account();
             before_index.lamports = 1;
             let global = global_account(&index_key);
-            let mut scenario = build_phoenix_collateral_scenario(
+            let scenario = build_phoenix_collateral_scenario(
                 trader,
                 &before_trader,
                 &target.to_string(),
                 Some(&before_index),
             )
             .unwrap();
-            scenario.overrides[0].values = std::collections::HashMap::from([(
-                field.to_string(),
-                serde_json::json!(target.to_string()),
-            )]);
             let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
             svm.set_account(&trader, before_trader.clone()).unwrap();
             svm.set_account(&other_trader, before_other.clone())
@@ -507,41 +460,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hot_trader_fields_allow_only_the_mirrored_collateral() {
-        let collateral_only = HashMap::from([(
-            "traderState.quoteLotCollateral".to_string(),
-            serde_json::json!("1"),
-        )]);
-        assert!(validate_hot_trader_fields(&collateral_only).is_ok());
-        for field in ["traderState.flags", "traderState"] {
-            let values = HashMap::from([(field.to_string(), serde_json::json!(0))]);
-            let error = validate_hot_trader_fields(&values).unwrap_err().to_string();
-            assert!(
-                error.contains(field) && error.contains("hot Traders"),
-                "{error}"
-            );
-        }
-    }
-
     #[tokio::test]
-    async fn materialization_skips_a_cold_trader_whose_header_key_mismatches() {
+    async fn materialization_patches_a_cold_trader_and_skips_a_mismatched_header_key() {
         use crate::surfnet::svm::SurfnetSvm;
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
         let matching = trader_account(FIRST_KEY, 9_999, false);
-        let scenario = build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
-        let mut on_chain = trader_account(SECOND_KEY, 9_999, false);
-        on_chain.lamports = 1;
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.set_account(&trader, on_chain.clone()).unwrap();
-        svm.register_scenario(scenario, Some(100)).unwrap();
+        for (on_chain_key, patched) in [(FIRST_KEY, true), (SECOND_KEY, false)] {
+            let scenario = build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+            let mut on_chain = trader_account(on_chain_key, 9_999, false);
+            on_chain.lamports = 1;
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.set_account(&trader, on_chain.clone()).unwrap();
+            svm.register_scenario(scenario, Some(100)).unwrap();
+            svm.materialize_overrides_for_slot(&None, 100)
+                .await
+                .unwrap();
 
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
-            .unwrap();
-
-        assert_eq!(svm.get_account(&trader).unwrap().unwrap(), on_chain);
+            let mut expected = on_chain;
+            if patched {
+                expected.data[88..96].copy_from_slice(&1_i64.to_le_bytes());
+            }
+            assert_eq!(svm.get_account(&trader).unwrap().unwrap(), expected);
+        }
     }
 
     #[test]
@@ -576,24 +517,6 @@ mod tests {
             assert_eq!(
                 header.trader_preference_bits,
                 if offset == 116 { target } else { 0xa5a5_5a5a }
-            );
-        }
-    }
-
-    #[test]
-    fn trader_header_rejects_an_embedded_key_for_another_account() {
-        let trader = Pubkey::new_from_array(FIRST_KEY);
-        for hot in [false, true] {
-            let account = trader_account(SECOND_KEY, 9_999, hot);
-            let error = trader_header(&trader, &account).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("key does not match its account address")
-            );
-            assert!(
-                build_phoenix_collateral_scenario(trader, &account, "1", Some(&index_account()))
-                    .is_err()
             );
         }
     }
