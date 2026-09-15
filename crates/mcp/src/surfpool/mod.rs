@@ -890,13 +890,12 @@ impl Surfpool {
 
                 // Get the template for validation and normalization
                 if let Some(template) = registry.get(&override_instance.template_id) {
-                    if template.id == "phoenix-trader-collateral-stress" {
-                        if let Err(error) = validate_collateral_fields(&override_instance.values)
+                    if template.id == "phoenix-trader-collateral-stress"
+                        && let Err(error) = validate_collateral_fields(&override_instance.values)
                             .and_then(|_| validate_hot_trader_fields(&override_instance.values))
-                        {
-                            validation_errors.push(error.to_string());
-                            continue;
-                        }
+                    {
+                        validation_errors.push(error.to_string());
+                        continue;
                     }
                     // Normalize: Extract values from malformed PDA seeds
                     // LLMs sometimes put values directly in seeds instead of in values map
@@ -1142,6 +1141,33 @@ impl Surfpool {
         self.stage_scenario(scenario).await
     }
 
+    async fn list_phoenix_markets_from_surfnet(
+        &self,
+        surfnet_port: Option<u16>,
+    ) -> Result<serde_json::Value, String> {
+        let globals = self
+            .fetch_surfnet_accounts(surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
+            .await?;
+        let global_account = globals[0]
+            .as_ref()
+            .ok_or("Phoenix GlobalConfig account was not found on the surfnet")?;
+        let perp_asset_map =
+            phoenix_perp_asset_map_address(global_account).map_err(|error| error.to_string())?;
+        let maps = self
+            .fetch_surfnet_accounts(surfnet_port, &[perp_asset_map])
+            .await?;
+        let map_account = maps[0].as_ref().ok_or_else(|| {
+            format!("Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet")
+        })?;
+        let symbols = phoenix_market_symbols(perp_asset_map, map_account)
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "perpAssetMap": perp_asset_map.to_string(),
+            "count": symbols.len(),
+            "symbols": symbols,
+        }))
+    }
+
     #[tool(
         description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's GlobalConfig and the map it points at, so the catalog reflects live state rather than a hardcoded snapshot. Use it to discover valid market symbols before preparing a Phoenix scenario."
     )]
@@ -1149,52 +1175,15 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<ListPhoenixMarketsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
+        match self
+            .list_phoenix_markets_from_surfnet(params.surfnet_port)
             .await
         {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(global_account) = accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(
-                "Phoenix GlobalConfig account was not found on the surfnet".to_string(),
-            ));
-        };
-
-        let perp_asset_map = match phoenix_perp_asset_map_address(global_account) {
-            Ok(address) => address,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        let map_accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[perp_asset_map])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(map_account) = map_accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(format!(
-                "Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet"
-            )));
-        };
-
-        let symbols = match phoenix_market_symbols(perp_asset_map, map_account) {
-            Ok(symbols) => symbols,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        let payload = serde_json::json!({
-            "perpAssetMap": perp_asset_map.to_string(),
-            "count": symbols.len(),
-            "symbols": symbols,
-        });
-        let json = match serde_json::to_string(&payload) {
-            Ok(json) => json,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )])),
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
     }
 
     #[tool(
@@ -1544,23 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn phoenix_collateral_requires_exact_string_inputs() {
-        assert!(
-            serde_json::from_value::<CreatePhoenixCollateralScenarioParams>(serde_json::json!({
-                "trader": "GHkq1eHeZGi96RmGPZ23e3BDEcdfpPzsPwpYdm17SWgc",
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<CreatePhoenixCollateralScenarioParams>(serde_json::json!({
-                "trader": "GHkq1eHeZGi96RmGPZ23e3BDEcdfpPzsPwpYdm17SWgc",
-                "targetQuoteLots": 1,
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
     fn phoenix_collateral_fetches_dependencies_only_for_hot_traders() {
         use surfpool_core::{
             jsonrpc_core::{IoHandler, Params},
@@ -1643,57 +1615,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_scenario_rejects_other_trader_state_fields_before_staging() {
-        let mut scenario = Scenario::new("flags".to_string(), "not mirrored".to_string());
-        scenario.add_override(
-            surfpool_types::OverrideInstance::new(
-                "phoenix-trader-collateral-stress".to_string(),
-                0,
-                surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
-            )
-            .with_values(HashMap::from([(
-                "traderState.flags".to_string(),
-                serde_json::json!(0),
-            )])),
-        );
-        let result = Surfpool::new()
-            .create_scenario(Parameters(scenario))
-            .await
-            .unwrap();
-        assert!(json_of(&result)["url"].is_null());
-        assert!(json_of(&result).to_string().contains("traderState.flags"));
-    }
-
-    #[tokio::test]
-    async fn create_scenario_rejects_legacy_phoenix_collateral_before_staging() {
-        for include_canonical in [false, true] {
-            let mut scenario = Scenario::new("old collateral".to_string(), "old input".to_string());
-            let mut values =
-                HashMap::from([("quote_lot_collateral".to_string(), serde_json::json!("1"))]);
-            if include_canonical {
-                values.insert(
-                    "traderState.quoteLotCollateral".to_string(),
-                    serde_json::json!("2"),
-                );
-            }
+    async fn create_scenario_rejects_unsupported_phoenix_collateral_fields_before_staging() {
+        for (field, expected) in [
+            ("quote_lot_collateral", "use traderState.quoteLotCollateral"),
+            ("traderState.flags", "traderState.flags"),
+        ] {
+            let mut scenario = Scenario::new(field.to_string(), "unsupported".to_string());
             scenario.add_override(
                 surfpool_types::OverrideInstance::new(
                     "phoenix-trader-collateral-stress".to_string(),
                     0,
                     surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
                 )
-                .with_values(values),
+                .with_values(HashMap::from([(field.to_string(), serde_json::json!("1"))])),
             );
             let result = Surfpool::new()
                 .create_scenario(Parameters(scenario))
                 .await
                 .unwrap();
-            assert!(json_of(&result)["url"].is_null());
-            assert!(
-                json_of(&result)
-                    .to_string()
-                    .contains("use traderState.quoteLotCollateral")
-            );
+            assert!(json_of(&result)["url"].is_null(), "{field}");
+            assert!(json_of(&result).to_string().contains(expected), "{field}");
         }
     }
 

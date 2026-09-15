@@ -96,7 +96,7 @@ use crate::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::{
             collateral::{
-                collateral_override_value, trader_header, validate_collateral_fields,
+                parse_quote_lot_collateral, trader_header, validate_collateral_fields,
                 validate_hot_trader_fields,
             },
             state_builder::{
@@ -3096,31 +3096,21 @@ impl SurfnetSvm {
                 let is_phoenix_trader = account.owner() == &PHOENIX_ETERNAL_PROGRAM_ID
                     && is_phoenix_trader_account(account.data());
                 if is_phoenix_trader {
-                    let header = match trader_header(&account_pubkey, &account) {
-                        Ok(header) => header,
-                        Err(error) => {
-                            warn!("Skipping override {}: {}", override_instance.id, error);
-                            continue;
+                    let checked = trader_header(&account_pubkey, &account).and_then(|header| {
+                        validate_collateral_fields(&account_values)?;
+                        if header.trader_state.is_hot() {
+                            validate_hot_trader_fields(&account_values)?;
                         }
-                    };
-                    if let Err(error) = validate_collateral_fields(&account_values) {
+                        if let Some(value) =
+                            account_values.get_mut("traderState.quoteLotCollateral")
+                        {
+                            *value = serde_json::Value::from(parse_quote_lot_collateral(value)?);
+                        }
+                        Ok(())
+                    });
+                    if let Err(error) = checked {
                         warn!("Skipping override {}: {}", override_instance.id, error);
                         continue;
-                    }
-                    if header.trader_state.is_hot() {
-                        if let Err(error) = validate_hot_trader_fields(&account_values) {
-                            warn!("Skipping override {}: {}", override_instance.id, error);
-                            continue;
-                        }
-                    }
-                    if let Some(value) = account_values.get_mut("traderState.quoteLotCollateral") {
-                        match collateral_override_value(value) {
-                            Ok(parsed) => *value = parsed,
-                            Err(e) => {
-                                warn!("Skipping override {}: {}", override_instance.id, e);
-                                continue;
-                            }
-                        }
                     }
                 }
 
