@@ -135,12 +135,14 @@ pub struct CreatePumpGraduationScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ListHumidiFiMarketsParams {
     #[schemars(description = "The target local Surfnet RPC port. Omit to use 8899.")]
     pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateHumidiFiFairValueScenarioParams {
     #[schemars(
         description = "Required HumidiFi market account address. Select one returned by list_humidifi_markets; there is no default market."
@@ -155,6 +157,7 @@ pub struct CreateHumidiFiFairValueScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateHumidiFiLiquidityScenarioParams {
     #[schemars(
         description = "Required HumidiFi market account address. Select one returned by list_humidifi_markets; there is no default market."
@@ -1570,8 +1573,8 @@ mod tests {
             serde_json::from_value::<CreateHumidiFiFairValueScenarioParams>(fair_value).is_err()
         );
         let liquidity = serde_json::json!({
-            "base_remaining_bps": 500,
-            "quote_remaining_bps": 10000,
+            "baseRemainingBps": 500,
+            "quoteRemainingBps": 10000,
         });
         assert!(
             serde_json::from_value::<CreateHumidiFiLiquidityScenarioParams>(liquidity).is_err()

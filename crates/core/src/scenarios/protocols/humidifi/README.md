@@ -118,7 +118,7 @@ for each account that has not already been prepared.
 
 `list_humidifi_markets` returns addresses, labels, both mint identities and decimals, and
 `maxStalenessSlots`. Both creation tools require a non-empty `market` address from this list.
-All tools accept an optional `surfnet_port`, defaulting to 8899. Studio's PMM
+All tools accept an optional `surfnetPort`, defaulting to 8899, the same camelCase argument names as the pump tool. Studio's PMM
 fair-value preset uses the market list and fair-value tools; the stale-quote and liquidity chips
 request editable state scenarios.
 
