@@ -64,7 +64,7 @@ The backend exposes three GoonFi MCP tools:
   liquidity rather than a stale quote. Both default to 0; an omitted market selects the
   default SOL/USDC market.
 
-These tools accept optional `surfnet_port`, defaulting to 8899, and read through the local
+These tools accept optional `surfnetPort`, defaulting to 8899, with camelCase argument names like the pump tool, and read through the local
 Surfnet RPC. Missing accounts fall back to that Surfnet's datasource. The price tool
 stages through the shared Studio scenario API; Play registers the scenario.
 
@@ -76,7 +76,7 @@ that a caller deliberately labels with an unrelated address. RPC reads remain ou
 the pure builders, as in Pump's graduation preparation.
 
 Studio's PMM fair-value dialog selects a protocol, a live market and a human price. It
-calls these tools through Studio MCP without forwarding `rpcUrl` or `surfnet_port`,
+calls these tools through Studio MCP without forwarding `rpcUrl` or `surfnetPort`,
 matching the Tessera dialog convention. Consequently, these Studio GoonFi calls use the
 backend's default RPC port. Studio retains only each catalog entry's market address and
 label; the backend resolves the oracle when creating a price scenario.

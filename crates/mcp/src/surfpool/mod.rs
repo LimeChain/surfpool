@@ -44,12 +44,14 @@ mod set_token_account;
 mod start_surfnet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ListGoonfiMarketsParams {
     #[schemars(description = "Port of the selected local Surfnet RPC; default 8899.")]
     pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateGoonfiPriceScenarioParams {
     #[schemars(
         description = "The GoonFi market account. Resolve one through list_goonfi_markets; omit to use the default SOL/USDC market."
@@ -66,6 +68,7 @@ pub struct CreateGoonfiPriceScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateGoonfiLiquidityScenarioParams {
     #[schemars(
         description = "The GoonFi market account. Resolve one through list_goonfi_markets; omit to use the default SOL/USDC market."
