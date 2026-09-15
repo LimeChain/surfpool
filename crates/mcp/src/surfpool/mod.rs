@@ -49,6 +49,7 @@ fn scenario_tool_error(message: String) -> CallToolResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateTesseraFairValueScenarioParams {
     #[schemars(
         description = "The Tessera market account. Resolve an address through list_tessera_markets; omit to use the default SOL/USDC market."
@@ -65,12 +66,14 @@ pub struct CreateTesseraFairValueScenarioParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ListTesseraMarketsParams {
     #[schemars(description = "The target local Surfnet RPC port. Omit to use 8899.")]
     pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateTesseraDepthScenarioParams {
     #[schemars(description = "Market account address from list_tessera_markets.")]
     pub market: String,
