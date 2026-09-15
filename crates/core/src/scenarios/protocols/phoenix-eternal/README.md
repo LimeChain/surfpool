@@ -18,6 +18,12 @@ values as decimal strings so values outside JavaScript's safe integer range rema
 Collateral overrides use `traderState.quoteLotCollateral`. The former `quote_lot_collateral`
 name is rejected by MCP scenario creation; an existing scenario using it is skipped at Play with
 an explicit warning naming the replacement. Update that scenario's values before playing it.
+On a hot Trader only `traderState.quoteLotCollateral` can be overridden: the GlobalTraderIndex
+mirror carries just that field, so other `traderState` writes are rejected at creation and skipped
+at Play. A Trader whose header key differs from its address is skipped at Play as well. The
+GlobalConfig and GlobalTraderIndex a hot override needs are fetched once and then kept as local
+state: a later `fetchBeforeUse` on another Trader does not reinstall them, so mirrors prepared by
+earlier scenarios survive.
 Market templates identify the real `PerpAssetMap` account. Their `symbol` and tick properties
 carry `value_type: string` so Studio can render scenario inputs without synthetic IDL accounts.
 
