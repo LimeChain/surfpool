@@ -1,0 +1,582 @@
+protocol: Tessera
+version: deployed-438800691
+account_type: MarketState
+
+raw_layout:
+  account_size: 1264
+  magic:
+    offset: 96
+    bytes: [5, 0, 0, 0, 0, 0, 0, 0]
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: tessera-fair-value
+    name: Override Tessera Fair Value
+    description: Move a Tessera market's reference price atomically in both directions
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: quote_atoms_per_base_atom_x1e15
+        offset: 128
+        encoding: u64
+        label: Quote per base
+        description: "Quote atomic units per base atomic unit multiplied by 10^15. Use the builder to derive this from mint decimals."
+      - path: base_atoms_per_quote_atom_x1e15
+        offset: 144
+        encoding: u64
+        label: Base per quote
+        description: "Base atomic units per quote atomic unit multiplied by 10^15. Use the builder to derive the reciprocal atomically."
+    llm_context: |
+      Discover markets with list_tessera_markets and set the override account to the chosen address.
+      SET BOTH FIELDS AS ONE INVARIANT. Their product is approximately 10^30, with integer-floor
+      rounding in the reciprocal field. Changing only offset 128 moves base-to-quote sells but
+      leaves quote-to-base buys unchanged; changing only offset 144 does the opposite.
+
+      Use the Tessera fair-value builder when starting from a human price. It calculates both exact
+      integer fields from the selected market's mint decimals and rejects zero or overflow. If
+      composing the raw template directly, use decimal integer strings rather than JSON numbers.
+
+      Tessera rejects a quote once it reaches the market's freshness limit, with program error
+      0xffff. Pair long-running scenarios with tessera-freshness.
+
+      EXAMPLE - WSOL/USDC at 100 quote tokens per base token:
+      quote_atoms_per_base_atom_x1e15: "100000000000000"
+      base_atoms_per_quote_atom_x1e15: "10000000000000000"
+
+  - id: tessera-depth
+    name: Override Tessera Depth
+    description: Change the directional capacities of Tessera's sell and buy ladders
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_levels.0.amount
+        offset: 160
+        encoding: u64
+        label: Sell level 1 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.1.amount
+        offset: 184
+        encoding: u64
+        label: Sell level 2 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.2.amount
+        offset: 208
+        encoding: u64
+        label: Sell level 3 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.3.amount
+        offset: 232
+        encoding: u64
+        label: Sell level 4 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.4.amount
+        offset: 256
+        encoding: u64
+        label: Sell level 5 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.5.amount
+        offset: 280
+        encoding: u64
+        label: Sell level 6 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.6.amount
+        offset: 304
+        encoding: u64
+        label: Sell level 7 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.7.amount
+        offset: 328
+        encoding: u64
+        label: Sell level 8 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.8.amount
+        offset: 352
+        encoding: u64
+        label: Sell level 9 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.9.amount
+        offset: 376
+        encoding: u64
+        label: Sell level 10 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.10.amount
+        offset: 400
+        encoding: u64
+        label: Sell level 11 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.11.amount
+        offset: 424
+        encoding: u64
+        label: Sell level 12 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.12.amount
+        offset: 448
+        encoding: u64
+        label: Sell level 13 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.13.amount
+        offset: 472
+        encoding: u64
+        label: Sell level 14 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.14.amount
+        offset: 496
+        encoding: u64
+        label: Sell level 15 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.15.amount
+        offset: 520
+        encoding: u64
+        label: Sell level 16 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.16.amount
+        offset: 544
+        encoding: u64
+        label: Sell level 17 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.17.amount
+        offset: 568
+        encoding: u64
+        label: Sell level 18 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.18.amount
+        offset: 592
+        encoding: u64
+        label: Sell level 19 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: sell_levels.19.amount
+        offset: 616
+        encoding: u64
+        label: Sell level 20 capacity
+        description: Base-to-quote directional capacity in base atomic units.
+      - path: buy_levels.0.amount
+        offset: 640
+        encoding: u64
+        label: Buy level 1 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.1.amount
+        offset: 664
+        encoding: u64
+        label: Buy level 2 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.2.amount
+        offset: 688
+        encoding: u64
+        label: Buy level 3 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.3.amount
+        offset: 712
+        encoding: u64
+        label: Buy level 4 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.4.amount
+        offset: 736
+        encoding: u64
+        label: Buy level 5 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.5.amount
+        offset: 760
+        encoding: u64
+        label: Buy level 6 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.6.amount
+        offset: 784
+        encoding: u64
+        label: Buy level 7 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.7.amount
+        offset: 808
+        encoding: u64
+        label: Buy level 8 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.8.amount
+        offset: 832
+        encoding: u64
+        label: Buy level 9 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.9.amount
+        offset: 856
+        encoding: u64
+        label: Buy level 10 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.10.amount
+        offset: 880
+        encoding: u64
+        label: Buy level 11 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.11.amount
+        offset: 904
+        encoding: u64
+        label: Buy level 12 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.12.amount
+        offset: 928
+        encoding: u64
+        label: Buy level 13 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.13.amount
+        offset: 952
+        encoding: u64
+        label: Buy level 14 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.14.amount
+        offset: 976
+        encoding: u64
+        label: Buy level 15 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.15.amount
+        offset: 1000
+        encoding: u64
+        label: Buy level 16 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.16.amount
+        offset: 1024
+        encoding: u64
+        label: Buy level 17 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.17.amount
+        offset: 1048
+        encoding: u64
+        label: Buy level 18 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.18.amount
+        offset: 1072
+        encoding: u64
+        label: Buy level 19 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+      - path: buy_levels.19.amount
+        offset: 1096
+        encoding: u64
+        label: Buy level 20 capacity
+        description: Quote-to-base directional capacity in quote atomic units.
+    llm_context: |
+      Discover markets with list_tessera_markets and set the override account to the chosen address.
+      For percentage reductions, use create_tessera_depth_scenario, which reads the current Surfnet
+      account and scales enabled levels exactly. Pass remaining basis points: 1000 keeps 10%,
+      10000 leaves a direction unchanged. It also adds persistent freshness.
+      These are directional capacities, not token vault balances. Do not assume they
+      are monotonic cumulative breakpoints. To make one direction shallower, scale the currently
+      enabled amount fields for that direction by the same ratio. Lower sell_levels for a large
+      base-to-quote sell and buy_levels for a large quote-to-base buy. The opposite ladder is
+      behaviorally inactive for that direction.
+
+      Small trades may not reveal a depth change. The live-fork proof uses large trades and shows
+      that dividing all active-side capacities by ten worsens the fill, while changing the
+      inactive-side capacities leaves it unchanged.
+
+      Do not invent missing levels or enable disabled levels. Fetch the live account first and copy
+      all twenty current values before applying a uniform ratio only to enabled levels. A ratio that
+      rounds a live nonzero capacity down to zero leaves the level flagged enabled with nothing
+      behind it, which is not a state the market produces on its own; raise the ratio instead.
+
+  - id: tessera-curve
+    name: Override Tessera Curve
+    description: Scale the directional output factors while preserving the live ladder ordering
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_levels.0.factor
+        offset: 168
+        encoding: u64
+        label: Sell level 1 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.1.factor
+        offset: 192
+        encoding: u64
+        label: Sell level 2 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.2.factor
+        offset: 216
+        encoding: u64
+        label: Sell level 3 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.3.factor
+        offset: 240
+        encoding: u64
+        label: Sell level 4 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.4.factor
+        offset: 264
+        encoding: u64
+        label: Sell level 5 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.5.factor
+        offset: 288
+        encoding: u64
+        label: Sell level 6 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.6.factor
+        offset: 312
+        encoding: u64
+        label: Sell level 7 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.7.factor
+        offset: 336
+        encoding: u64
+        label: Sell level 8 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.8.factor
+        offset: 360
+        encoding: u64
+        label: Sell level 9 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.9.factor
+        offset: 384
+        encoding: u64
+        label: Sell level 10 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.10.factor
+        offset: 408
+        encoding: u64
+        label: Sell level 11 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.11.factor
+        offset: 432
+        encoding: u64
+        label: Sell level 12 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.12.factor
+        offset: 456
+        encoding: u64
+        label: Sell level 13 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.13.factor
+        offset: 480
+        encoding: u64
+        label: Sell level 14 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.14.factor
+        offset: 504
+        encoding: u64
+        label: Sell level 15 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.15.factor
+        offset: 528
+        encoding: u64
+        label: Sell level 16 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.16.factor
+        offset: 552
+        encoding: u64
+        label: Sell level 17 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.17.factor
+        offset: 576
+        encoding: u64
+        label: Sell level 18 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.18.factor
+        offset: 600
+        encoding: u64
+        label: Sell level 19 output factor
+        description: Base-to-quote directional output factor.
+      - path: sell_levels.19.factor
+        offset: 624
+        encoding: u64
+        label: Sell level 20 output factor
+        description: Base-to-quote directional output factor.
+      - path: buy_levels.0.factor
+        offset: 648
+        encoding: u64
+        label: Buy level 1 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.1.factor
+        offset: 672
+        encoding: u64
+        label: Buy level 2 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.2.factor
+        offset: 696
+        encoding: u64
+        label: Buy level 3 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.3.factor
+        offset: 720
+        encoding: u64
+        label: Buy level 4 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.4.factor
+        offset: 744
+        encoding: u64
+        label: Buy level 5 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.5.factor
+        offset: 768
+        encoding: u64
+        label: Buy level 6 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.6.factor
+        offset: 792
+        encoding: u64
+        label: Buy level 7 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.7.factor
+        offset: 816
+        encoding: u64
+        label: Buy level 8 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.8.factor
+        offset: 840
+        encoding: u64
+        label: Buy level 9 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.9.factor
+        offset: 864
+        encoding: u64
+        label: Buy level 10 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.10.factor
+        offset: 888
+        encoding: u64
+        label: Buy level 11 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.11.factor
+        offset: 912
+        encoding: u64
+        label: Buy level 12 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.12.factor
+        offset: 936
+        encoding: u64
+        label: Buy level 13 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.13.factor
+        offset: 960
+        encoding: u64
+        label: Buy level 14 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.14.factor
+        offset: 984
+        encoding: u64
+        label: Buy level 15 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.15.factor
+        offset: 1008
+        encoding: u64
+        label: Buy level 16 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.16.factor
+        offset: 1032
+        encoding: u64
+        label: Buy level 17 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.17.factor
+        offset: 1056
+        encoding: u64
+        label: Buy level 18 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.18.factor
+        offset: 1080
+        encoding: u64
+        label: Buy level 19 output factor
+        description: Quote-to-base directional output factor.
+      - path: buy_levels.19.factor
+        offset: 1104
+        encoding: u64
+        label: Buy level 20 output factor
+        description: Quote-to-base directional output factor.
+    llm_context: |
+      Discover markets with list_tessera_markets and set the override account to the chosen address.
+      These forty fields control the directional output curve. Scaling every nonzero factor on the
+      active side by one half produces approximately one half of the baseline output on six live
+      markets, while scaling the inactive side leaves output unchanged.
+
+      Read the live account first and copy all twenty current factors per direction, then apply one
+      ratio to every nonzero factor on the side you are stressing. Two rules are not optional. The
+      factors descend across the ladder, and a single factor that breaks that order is rejected by
+      the deployed program with custom error 8. A ratio that rounds a live nonzero factor down to
+      zero disables a level that the market has enabled. Check both before you write, and do not
+      edit one factor independently.
+
+  - id: tessera-halt
+    name: Halt Tessera Liquidity
+    description: Disable the first required level on both directional ladders
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_level_0_enabled
+        offset: 176
+        encoding: u8
+        label: Sell liquidity enabled
+        description: Set to zero to make base-to-quote quotes fail deterministically.
+      - path: buy_level_0_enabled
+        offset: 656
+        encoding: u8
+        label: Buy liquidity enabled
+        description: Set to zero to make quote-to-base quotes fail deterministically.
+    llm_context: |
+      Discover markets with list_tessera_markets and set the override account to the chosen address.
+      SET BOTH FIELDS TO ZERO AS ONE INVARIANT. The current deployed program rejects either quote
+      direction with custom error 0xffff when its required first level is disabled. Use this as a
+      deterministic liquidity-outage scenario, not as a depth or price scenario. Do not persist it.
+
+  - id: tessera-stale-quote
+    name: Make Tessera Quote Stale
+    description: Age a Tessera quote to its market's rejection boundary
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding:
+          slot:
+            lead: -20
+        label: Slot lead
+        description: >-
+          How far behind the materialization slot to place the quote, as a negative integer.
+          Pass null to use -20, the limit of most markets and of the default one.
+    llm_context: |
+      The value you pass IS the lead: Surfpool writes the materialization slot plus it, clamped at
+      zero. Pass null to take the -20 default. This is one template for every market, not one per
+      limit.
+
+      Rejection is at age greater than or equal to the market's own limit, so the lead must be at
+      most minus that limit. Call list_tessera_markets, select the market address, and negate its
+      freshnessLimitSlots. Set the override account to that address. Offset 88 on the market
+      account stores the same limit; do not assume all markets share a limit.
+
+      At the boundary the current deployed program rejects the swap with custom error 65535, while
+      one slot younger succeeds. Do not persist this override: the quote should stay stale.
+
+      Set fetchBeforeUse: true so the live market is forked first. Keep override labels short
+      ("SOL/USDC stale quote").
+
+  - id: tessera-freshness
+    name: Refresh Tessera Quote
+    description: Publish the materialization slot into Tessera's freshness field
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding:
+          slot:
+            lead: 0
+        label: Current materialization slot
+        description: Slot lead, as an integer. Pass null to take the lead of zero and write the materialization slot itself.
+    llm_context: |
+      Call list_tessera_markets and set the override account to the chosen address. The returned
+      freshnessLimitSlots is the age at which that market rejects quotes with custom error 0xffff.
+
+      Pass null for last_update_slot to take this template's lead of zero, which writes the exact
+      materialization slot. A number would be read as the lead instead, so passing 0 happens to mean
+      the same thing here and -5 would quietly age the quote by five slots.
+
+      Use persist: true when the prepared state must remain executable beyond the market's freshness
+      window; each application then writes its own slot rather than repeating the first one.
