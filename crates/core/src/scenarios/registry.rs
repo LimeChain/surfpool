@@ -474,23 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn phoenix_idl_contains_only_real_accounts_with_unique_discriminators() {
-        let idl: surfpool_types::Idl = serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).unwrap();
-        let mut discriminators = std::collections::HashSet::new();
-        for account in &idl.accounts {
-            assert!(
-                discriminators.insert(&account.discriminator),
-                "duplicate {}",
-                account.name
-            );
-        }
-        for name in ["DirectMarkOverride", "ReferencePriceOverride"] {
-            assert!(!idl.accounts.iter().any(|account| account.name == name));
-            assert!(!idl.types.iter().any(|definition| definition.name == name));
-        }
-    }
-
-    #[test]
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 

@@ -65,10 +65,6 @@ The collateral builder and live market catalog are available through MCP:
 The collateral tool returns a Studio editor URL. The backend reads the live Trader account and refuses a target
 above the trader’s effective collateral.
 
-The market scenarios need no tool: their templates carry the perp asset map address, so a client
-fills in the values and posts the scenario to `/v1/scenarios`, which is what the Studio preset
-does. The liquidation cascade combines those two templates in one scenario at slots 0 and 1.
-
 ## What each preparation guarantees
 
 - Collateral stress uses the IDL for `Trader.traderState.quoteLotCollateral`. For a hot trader,
@@ -120,73 +116,35 @@ and Clock together with `getMultipleAccounts` after discovering the addresses; t
 oracle timestamps or fabricate trader positions. An old fork can also fail price-staleness guards
 independently of whether the override wrote the correct values.
 
-## Layout drift
+## Verification against mainnet
 
 Phoenix is zero-copy, so decoding an account built by these tests can never disagree with the
-decoder that built it. Drift is caught against live mainnet accounts instead:
+decoder that built it. Layout drift and behavior are both checked against live mainnet accounts:
 
 ```sh
 cargo test -p surfpool-core --features integration-tests tests::phoenix
 ```
 
-Those tests resolve the live account graph, assert the typed invariants the program relies on,
-and prove an override on a live account changes only its target bytes. Set
-`SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
+Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. The suite
+resolves the live account graph, asserts the typed invariants the program relies on, proves an
+override on a live account changes only its target bytes, and runs the deployed Phoenix Eternal
+and Hawkeye bytecode in the test VM. The bytecode is read from the ProgramData accounts
+(`B5ayDaz9HegiNZqYeBtcFqfZBVSGwjB2CJgHshoSfMQg` and `Gv1WgG864CQqF5vedJVbpnhpRpRbTW1A7SyARzSw9B4Y`)
+and cached under the system temp directory as `surfpool-phoenix-eternal.so` and
+`surfpool-phoenix-hawkeye.so`; delete those files to pick up a program upgrade.
 
-## Behavioral verification
+The behavioral run discovers a live hot Trader that carries collateral and a long position, and
+fails loudly with `no eligible live candidate` rather than skipping if none exists. The risk
+condition is produced by the preparations, not found pre-existing. Through real Phoenix and
+Hawkeye execution it proves that:
 
-To check reference prices independently on the live SOL and BTC markets:
-
-```sh
-cargo test -p surfpool-core --features integration-tests reference_prices_change_hawkeye_index_on_live_markets
-```
-
-The behavioral test runs with the rest of the integration suite; there is nothing to install by
-hand and no snapshots to keep current, since the deployed bytecode is fetched straight from the
-chain:
-
-```sh
-cargo test -p surfpool-core --features integration-tests tests::phoenix
-```
-
-It forks the live account graph, discovers a live hot Trader that carries collateral and a long
-position, and loads the deployed Phoenix Eternal and Hawkeye bytecode straight from their
-ProgramData accounts (`B5ayDaz9HegiNZqYeBtcFqfZBVSGwjB2CJgHshoSfMQg` and
-`Gv1WgG864CQqF5vedJVbpnhpRpRbTW1A7SyARzSw9B4Y`), cached under the system temp directory as
-`surfpool-phoenix-eternal.so` and `surfpool-phoenix-hawkeye.so`. Delete those files to pick up a
-program upgrade; the cached bytecode is otherwise reused as-is.
-
-The collateral check uses the production builder, verifies creation leaves the Trader and
-GlobalTraderIndex unchanged, and compares both complete accounts after Play: only their
-collateral fields may change. A real Hawkeye transaction must read collateral `1` and report
-the trader liquidatable. This runs in the isolated test VM, outside Studio's Transaction Inspector.
-
-The raw material is selected, not arbitrary: it walks the program's Trader accounts for one that
-carries collateral, and for the mark-shock and cascade tests, one that also holds a long position,
-since a downward shock only threatens a long. The risk condition itself — a trader actually
-falling below its maintenance requirement — is produced by the preparations, not found
-pre-existing. The run fails loudly with `no eligible live candidate` rather than skipping if the
-raw material is missing. It proves, through real Phoenix and Hawkeye execution:
-
-- collateral stress lands in the account the program reads, and lowers the collateral its risk
-  engine can count on;
+- collateral stress lands in the account the program reads, lowers the collateral its risk
+  engine can count on, and a Hawkeye margin view reports the trader liquidatable;
 - the two cascade stages arrive in order: the prepared collateral at the first slot, and the
   mark the program reads shocked at the next;
-- spot/perp divergence moves the cached reference away from the mark while the mark itself
-  stands;
-- a second live market takes the same direct-mark preparation, so the templates are not
-  market-specific.
+- spot/perp divergence moves the cached index away from the mark on both live markets while
+  the mark itself stands.
 
-Expected test summary:
-
-```text
-test result: ok. 9 passed; 0 failed; 0 ignored
-```
-
-## Why there is no orderbook-consumption test
-
-An earlier version proved a bot could consume the prepared orderbook by signing a market sell as
-the localnet fixture's taker. A live Trader's key is not ours to sign with, so that test went
-with the fixture. What it covered is still covered: the market and spline accounts are never
-written by any Phoenix preparation, which the byte-level assertions on live accounts enforce
-directly, and Hawkeye reads the resulting book state in the behavioral test.
+The market and spline accounts are never written by any Phoenix preparation; the byte-level
+assertions on live accounts enforce that directly, and Hawkeye reads the resulting book state
+in the behavioral run.

@@ -55,25 +55,19 @@ pub fn phoenix_market_symbols(
             None::<PhoenixAccountDecodeError>,
         ));
     }
-
-    let map = PerpAssetMap::try_from_account_bytes(&account.data).map_err(|error| {
+    let invalid = |error: PhoenixAccountDecodeError| {
         SurfpoolError::invalid_account_data(
             perp_asset_map,
             "Expected a valid Phoenix Eternal PerpAssetMap account",
             Some(error),
         )
-    })?;
+    };
+    let map = PerpAssetMap::try_from_account_bytes(&account.data).map_err(invalid)?;
     let mut symbols = map
         .iter()
         .map(|entry| entry.map(|entry| entry.symbol.as_str().to_string()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            SurfpoolError::invalid_account_data(
-                perp_asset_map,
-                "Expected a valid Phoenix Eternal PerpAssetMap account",
-                Some(error),
-            )
-        })?;
+        .map_err(invalid)?;
     symbols.sort_unstable();
 
     Ok(symbols)
@@ -81,8 +75,6 @@ pub fn phoenix_market_symbols(
 
 #[derive(Debug, Error, PartialEq, Eq)]
 enum PhoenixPricePatchError {
-    #[error("expected Phoenix Eternal owner, got {actual}")]
-    InvalidOwner { actual: Pubkey },
     #[error("invalid Phoenix PerpAssetMap account: {0}")]
     InvalidPerpAssetMap(#[from] PhoenixAccountDecodeError),
     #[error("Phoenix market {symbol} was not found")]
@@ -111,15 +103,11 @@ fn changed_byte_outside(
 }
 
 fn patch_direct_mark(
-    owner: &Pubkey,
     data: &[u8],
     symbol: &str,
     target_ticks: u64,
     mark_slot: u64,
 ) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    if owner != &PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(PhoenixPricePatchError::InvalidOwner { actual: *owner });
-    }
     let target_ticks =
         Ticks::new_checked(target_ticks).map_err(|_| PhoenixPricePatchError::InvalidTicks {
             ticks: target_ticks,
@@ -131,16 +119,12 @@ fn patch_direct_mark(
 }
 
 fn patch_reference_prices(
-    owner: &Pubkey,
     data: &[u8],
     symbol: &str,
     spot_ticks: u64,
     perp_ticks: u64,
     reference_slot: u64,
 ) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    if owner != &PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(PhoenixPricePatchError::InvalidOwner { actual: *owner });
-    }
     let spot_ticks = Ticks::new_checked(spot_ticks)
         .map_err(|_| PhoenixPricePatchError::InvalidTicks { ticks: spot_ticks })?;
     let perp_ticks = Ticks::new_checked(perp_ticks)
@@ -218,29 +202,13 @@ fn reference_value_ranges() -> Vec<core::ops::Range<usize>> {
 }
 
 fn unique_subslice_offset(data: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > data.len() {
-        return None;
-    }
-
-    let mut match_offset = None;
-    let mut search_start = 0;
-    while search_start + needle.len() <= data.len() {
-        let Some(relative_offset) = data[search_start..=data.len() - needle.len()]
-            .iter()
-            .position(|byte| *byte == needle[0])
-        else {
-            break;
-        };
-        let offset = search_start + relative_offset;
-        if data[offset..].starts_with(needle) {
-            if match_offset.is_some() {
-                return None;
-            }
-            match_offset = Some(offset);
-        }
-        search_start = offset + 1;
-    }
-    match_offset
+    let mut matches = data
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(offset, _)| offset);
+    let offset = matches.next()?;
+    matches.next().is_none().then_some(offset)
 }
 
 pub fn forge_phoenix_override(
@@ -249,73 +217,52 @@ pub fn forge_phoenix_override(
     account_values: &HashMap<String, serde_json::Value>,
     materialization_slot: u64,
 ) -> SurfpoolResult<Vec<u8>> {
-    let wants_direct_mark = account_values.contains_key(DIRECT_MARK_TICKS_FIELD);
-    let wants_reference = account_values.contains_key(REFERENCE_SPOT_TICKS_FIELD)
-        || account_values.contains_key(REFERENCE_PERP_TICKS_FIELD);
-    let fields: &[&str] = match (wants_direct_mark, wants_reference) {
-        (true, false) => &[DIRECT_MARK_SYMBOL_FIELD, DIRECT_MARK_TICKS_FIELD],
-        (false, true) => &[
-            DIRECT_MARK_SYMBOL_FIELD,
-            REFERENCE_SPOT_TICKS_FIELD,
+    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
+        return Err(SurfpoolError::invalid_account_owner(
+            account_pubkey,
+            None::<PhoenixAccountDecodeError>,
+        ));
+    }
+    let mut fields: Vec<&str> = account_values.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    let symbol = || {
+        account_values[DIRECT_MARK_SYMBOL_FIELD]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))
+    };
+    let ticks = |field: &str| parse_unsigned_ticks(&account_values[field], field);
+    let patched = match fields.as_slice() {
+        [DIRECT_MARK_SYMBOL_FIELD, DIRECT_MARK_TICKS_FIELD] => patch_direct_mark(
+            &account.data,
+            symbol()?,
+            ticks(DIRECT_MARK_TICKS_FIELD)?,
+            materialization_slot,
+        ),
+        [
             REFERENCE_PERP_TICKS_FIELD,
-        ],
+            REFERENCE_SPOT_TICKS_FIELD,
+            DIRECT_MARK_SYMBOL_FIELD,
+        ] => patch_reference_prices(
+            &account.data,
+            symbol()?,
+            ticks(REFERENCE_SPOT_TICKS_FIELD)?,
+            ticks(REFERENCE_PERP_TICKS_FIELD)?,
+            materialization_slot,
+        ),
         _ => {
             return Err(SurfpoolError::internal(
                 "Phoenix map overrides accept exactly one value group: \
-             symbol + target_ticks, or symbol + spot_ticks + perp_ticks",
+                 symbol + target_ticks, or symbol + spot_ticks + perp_ticks",
             ));
         }
     };
-    if account_values.len() != fields.len()
-        || fields
-            .iter()
-            .any(|field| !account_values.contains_key(*field))
-    {
-        return Err(SurfpoolError::internal(format!(
-            "Phoenix map overrides accept only {}",
-            fields.join(", ")
-        )));
-    }
-    let symbol = account_values[DIRECT_MARK_SYMBOL_FIELD]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))?;
-    let patched = if wants_direct_mark {
-        patch_direct_mark(
-            &account.owner,
-            &account.data,
-            symbol,
-            parse_unsigned_ticks(
-                &account_values[DIRECT_MARK_TICKS_FIELD],
-                DIRECT_MARK_TICKS_FIELD,
-            )?,
-            materialization_slot,
-        )
-    } else {
-        patch_reference_prices(
-            &account.owner,
-            &account.data,
-            symbol,
-            parse_unsigned_ticks(
-                &account_values[REFERENCE_SPOT_TICKS_FIELD],
-                REFERENCE_SPOT_TICKS_FIELD,
-            )?,
-            parse_unsigned_ticks(
-                &account_values[REFERENCE_PERP_TICKS_FIELD],
-                REFERENCE_PERP_TICKS_FIELD,
-            )?,
-            materialization_slot,
-        )
-    };
-    patched.map_err(|error| match error {
-        PhoenixPricePatchError::InvalidOwner { .. } => {
-            SurfpoolError::invalid_account_owner(account_pubkey, Some(error))
-        }
-        _ => SurfpoolError::invalid_account_data(
+    patched.map_err(|error| {
+        SurfpoolError::invalid_account_data(
             account_pubkey,
             "Expected a valid Phoenix Eternal PerpAssetMap account",
             Some(error),
-        ),
+        )
     })
 }
 
@@ -325,7 +272,8 @@ pub fn build_phoenix_collateral_scenario(
     target_quote_lots: &str,
     global_trader_index: Option<&Account>,
 ) -> SurfpoolResult<Scenario> {
-    let target_quote_lots = parse_quote_lot_collateral(target_quote_lots)?;
+    let target_quote_lots =
+        super::collateral::parse_quote_lot_collateral(&serde_json::json!(target_quote_lots))?;
     let header = super::collateral::trader_header(&trader, trader_account)?;
 
     // Raising collateral needs a real deposit into the global vault.
@@ -416,16 +364,8 @@ fn parse_unsigned_ticks(value: &serde_json::Value, field: &str) -> SurfpoolResul
         })
 }
 
-fn parse_quote_lot_collateral(value: &str) -> SurfpoolResult<i64> {
-    value.parse::<i64>().map_err(|_| {
-        SurfpoolError::internal(
-            "targetQuoteLots must be a signed 64-bit integer encoded as a string",
-        )
-    })
-}
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use base64::{Engine, prelude::BASE64_STANDARD};
     use phoenix_rise_accounts::{PhoenixAccount, trader::TraderHeader};
     use solana_account::Account;
@@ -476,7 +416,7 @@ pub(crate) mod tests {
         account
     }
 
-    pub(crate) fn perp_asset_map_fixture() -> Vec<u8> {
+    fn perp_asset_map_fixture() -> Vec<u8> {
         let prefix = BASE64_STANDARD
             .decode(SOL_PERP_ASSET_MAP_PREFIX_B64)
             .unwrap();
@@ -488,165 +428,167 @@ pub(crate) mod tests {
         data
     }
 
-    #[test]
-    fn builder_rejects_an_account_that_is_not_a_trader() {
-        let mut account = trader_account();
-        account.data[..8].fill(0);
-
-        let error = build_phoenix_collateral_scenario(Pubkey::new_unique(), &account, "1", None)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("Trader"));
-    }
-
-    #[test]
-    fn builder_rejects_collateral_outside_the_signed_64_bit_range() {
-        let error = build_phoenix_collateral_scenario(
-            Pubkey::new_unique(),
-            &trader_account(),
-            "9223372036854775808",
-            None,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("signed 64-bit integer"));
-    }
-
-    #[test]
-    fn builds_one_editable_collateral_override_for_the_requested_trader() {
-        let trader = Pubkey::new_unique();
-        let preparation = build_phoenix_collateral_scenario(
-            trader,
-            &trader_account_for(trader, 0),
-            "-9007199254740993",
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(preparation.overrides.len(), 1);
-
-        let collateral_override = &preparation.overrides[0];
-        assert_eq!(
-            collateral_override.template_id,
-            "phoenix-trader-collateral-stress"
-        );
-        assert_eq!(
-            collateral_override.account,
-            AccountAddress::Pubkey(trader.to_string())
-        );
-        assert_eq!(
-            collateral_override.values[COLLATERAL_FIELD],
-            serde_json::json!("-9007199254740993")
-        );
-        assert_eq!(collateral_override.scenario_relative_slot, PREPARATION_SLOT);
-        assert!(!collateral_override.fetch_before_use);
-    }
-
-    #[test]
-    fn builder_refuses_to_raise_collateral_above_its_vault_backing() {
-        let trader = Pubkey::new_unique();
-        let funded = trader_account_for(trader, 500);
-
-        let raised = build_phoenix_collateral_scenario(trader, &funded, "501", None).unwrap_err();
-        assert!(raised.to_string().contains("can only lower collateral"));
-
-        let lowered = build_phoenix_collateral_scenario(trader, &funded, "499", None).unwrap();
-        assert_eq!(lowered.overrides[0].values[COLLATERAL_FIELD], "499");
-        let held = build_phoenix_collateral_scenario(trader, &funded, "500", None).unwrap();
-        assert_eq!(held.overrides[0].values[COLLATERAL_FIELD], "500");
-    }
-
-    #[test]
-    fn builder_rejects_a_non_phoenix_account() {
-        let trader = Pubkey::new_unique();
-        let mut account = trader_account();
-        account.owner = Pubkey::new_unique();
-
-        let error = build_phoenix_collateral_scenario(trader, &account, "1", None).unwrap_err();
-
-        assert!(error.to_string().contains("invalid account owner"));
-    }
-
-    #[test]
-    fn lists_active_market_symbols_from_the_perp_asset_map() {
-        let perp_asset_map = Pubkey::new_unique();
-        let account = Account {
+    fn perp_asset_map_account() -> Account {
+        Account {
             lamports: 1,
             data: perp_asset_map_fixture(),
             owner: PHOENIX_ETERNAL_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
-        };
+        }
+    }
 
+    #[test]
+    fn builder_rejects_non_traders_and_out_of_range_collateral() {
+        let mut not_a_trader = trader_account();
+        not_a_trader.data[..8].fill(0);
+        let mut foreign = trader_account();
+        foreign.owner = Pubkey::new_unique();
+        for (account, target, expected) in [
+            (not_a_trader, "1", "Trader"),
+            (foreign, "1", "invalid account owner"),
+            (
+                trader_account(),
+                "9223372036854775808",
+                "signed 64-bit integer",
+            ),
+        ] {
+            let error =
+                build_phoenix_collateral_scenario(Pubkey::new_unique(), &account, target, None)
+                    .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn builds_one_collateral_override_bounded_by_its_vault_backing() {
+        let trader = Pubkey::new_unique();
+        let funded = trader_account_for(trader, 500);
+        let raised = build_phoenix_collateral_scenario(trader, &funded, "501", None).unwrap_err();
+        assert!(raised.to_string().contains("can only lower collateral"));
+
+        for target in ["500", "-9007199254740993"] {
+            let preparation =
+                build_phoenix_collateral_scenario(trader, &funded, target, None).unwrap();
+            assert_eq!(preparation.overrides.len(), 1);
+            let collateral_override = &preparation.overrides[0];
+            assert_eq!(
+                collateral_override.template_id,
+                "phoenix-trader-collateral-stress"
+            );
+            assert_eq!(
+                collateral_override.account,
+                AccountAddress::Pubkey(trader.to_string())
+            );
+            assert_eq!(
+                collateral_override.values[COLLATERAL_FIELD],
+                serde_json::json!(target)
+            );
+            assert_eq!(collateral_override.scenario_relative_slot, PREPARATION_SLOT);
+            assert!(!collateral_override.fetch_before_use);
+        }
+    }
+
+    #[test]
+    fn lists_active_market_symbols_from_the_perp_asset_map() {
         assert_eq!(
-            phoenix_market_symbols(perp_asset_map, &account).unwrap(),
+            phoenix_market_symbols(Pubkey::new_unique(), &perp_asset_map_account()).unwrap(),
             vec!["SOL"]
         );
     }
 
     #[test]
-    fn patches_only_the_selected_mark_ticks_and_slot_in_an_official_market_entry() {
-        let data = perp_asset_map_fixture();
-        let map = PerpAssetMap::try_from_account_bytes(&data).unwrap();
-        let before = map.find_by_symbol("SOL").unwrap().unwrap();
-        let metadata_offset = unique_subslice_offset(&data, before.metadata.as_bytes()).unwrap();
+    fn direct_mark_patches_only_the_selected_mark_ticks_and_slot() {
+        let account = perp_asset_map_account();
+        let before = PerpAssetMap::try_from_account_bytes(&account.data)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap();
+        let metadata_offset =
+            unique_subslice_offset(&account.data, before.metadata.as_bytes()).unwrap();
+        let values = HashMap::from([
+            (
+                DIRECT_MARK_SYMBOL_FIELD.to_string(),
+                serde_json::json!("SOL"),
+            ),
+            (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
+        ]);
 
-        let patched = patch_direct_mark(&PHOENIX_ETERNAL_PROGRAM_ID, &data, "SOL", 1, 123).unwrap();
-        let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
-        let after = map.find_by_symbol("SOL").unwrap().unwrap();
-        assert_eq!(after.metadata.oracle_price().mark_price.price.slot, 123);
-
-        assert_eq!(
-            after
-                .metadata
-                .oracle_price()
-                .mark_price
-                .price
-                .ticks
-                .as_inner(),
-            1
-        );
-        assert_eq!(patched.len(), data.len());
+        let patched =
+            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
+        let after = PerpAssetMap::try_from_account_bytes(&patched)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap();
+        let price = after.metadata.oracle_price().mark_price.price;
+        assert_eq!((price.ticks.as_inner(), price.slot), (1, 123));
+        assert_eq!(patched.len(), account.data.len());
+        let allowed =
+            metadata_offset + MARK_PRICE_RANGE.start..metadata_offset + MARK_PRICE_RANGE.end;
         assert!(
-            data.iter()
+            account
+                .data
+                .iter()
                 .zip(&patched)
                 .enumerate()
                 .filter(|(_, (before, after))| before != after)
-                .all(|(offset, _)| {
-                    (metadata_offset + MARK_PRICE_RANGE.start
-                        ..metadata_offset + MARK_PRICE_RANGE.end)
-                        .contains(&offset)
-                })
+                .all(|(offset, _)| allowed.contains(&offset))
+        );
+
+        let mut numeric_ticks = values;
+        numeric_ticks.insert(DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!(1));
+        assert!(
+            forge_phoenix_override(&Pubkey::new_unique(), &account, &numeric_ticks, 123)
+                .unwrap_err()
+                .to_string()
+                .contains("encoded as a string")
         );
     }
 
     #[test]
-    fn reference_price_patch_supports_both_divergence_directions_and_preserves_mark() {
-        let data = perp_asset_map_fixture();
-        let before_map = PerpAssetMap::try_from_account_bytes(&data).unwrap();
-        let before = before_map.find_by_symbol("SOL").unwrap().unwrap();
-        let before_mark = before
+    fn reference_prices_patch_both_directions_and_preserve_the_mark() {
+        let account = perp_asset_map_account();
+        let before_mark = PerpAssetMap::try_from_account_bytes(&account.data)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap()
             .metadata
             .oracle_price()
             .mark_price
             .price
             .ticks
             .as_inner();
+        let values = |spot_ticks: u64, perp_ticks: u64| {
+            HashMap::from([
+                (
+                    DIRECT_MARK_SYMBOL_FIELD.to_string(),
+                    serde_json::json!("SOL"),
+                ),
+                (
+                    REFERENCE_SPOT_TICKS_FIELD.to_string(),
+                    serde_json::json!(spot_ticks.to_string()),
+                ),
+                (
+                    REFERENCE_PERP_TICKS_FIELD.to_string(),
+                    serde_json::json!(perp_ticks.to_string()),
+                ),
+            ])
+        };
 
         for (spot_ticks, perp_ticks) in [(8_000, 7_000), (7_000, 8_000)] {
-            let patched = patch_reference_prices(
-                &PHOENIX_ETERNAL_PROGRAM_ID,
-                &data,
-                "SOL",
-                spot_ticks,
-                perp_ticks,
+            let patched = forge_phoenix_override(
+                &Pubkey::new_unique(),
+                &account,
+                &values(spot_ticks, perp_ticks),
                 123,
             )
             .unwrap();
             let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
             let entry = map.find_by_symbol("SOL").unwrap().unwrap();
             let price = entry.metadata.oracle_price();
-
             assert_eq!(price.mark_price.price.ticks.as_inner(), before_mark);
             assert!(
                 price
@@ -664,118 +606,10 @@ pub(crate) mod tests {
                     .iter()
                     .all(|value| value.ticks.as_inner() == perp_ticks && value.slot == 123)
             );
-            assert_eq!(patched.len(), data.len());
+            assert_eq!(patched.len(), account.data.len());
         }
-    }
 
-    #[test]
-    fn direct_mark_rejects_unknown_markets_and_out_of_range_ticks() {
-        let data = perp_asset_map_fixture();
-
-        assert!(matches!(
-            patch_direct_mark(&PHOENIX_ETERNAL_PROGRAM_ID, &data, "BTC", 1, 123),
-            Err(PhoenixPricePatchError::MarketNotFound { .. })
-        ));
-        assert!(matches!(
-            patch_direct_mark(
-                &PHOENIX_ETERNAL_PROGRAM_ID,
-                &data,
-                "SOL",
-                u64::from(u32::MAX) + 1,
-                123,
-            ),
-            Err(PhoenixPricePatchError::InvalidTicks { .. })
-        ));
-    }
-
-    #[test]
-    fn direct_mark_override_requires_exact_string_fields() {
-        let account = Account {
-            lamports: 1,
-            data: perp_asset_map_fixture(),
-            owner: PHOENIX_ETERNAL_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let values = HashMap::from([
-            (
-                DIRECT_MARK_SYMBOL_FIELD.to_string(),
-                serde_json::json!("SOL"),
-            ),
-            (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
-        ]);
-
-        let patched =
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
-        let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
-        let price = map
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap()
-            .metadata
-            .oracle_price()
-            .mark_price
-            .price;
-        assert_eq!(price.ticks.as_inner(), 1);
-        assert_eq!(price.slot, 123);
-
-        let mut numeric_ticks = values;
-        numeric_ticks.insert(DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!(1));
-        assert!(
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &numeric_ticks, 123)
-                .unwrap_err()
-                .to_string()
-                .contains("encoded as a string")
-        );
-    }
-
-    #[test]
-    fn reference_override_patches_prices_and_requires_string_fields() {
-        let account = Account {
-            lamports: 1,
-            data: perp_asset_map_fixture(),
-            owner: PHOENIX_ETERNAL_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let values = HashMap::from([
-            (
-                DIRECT_MARK_SYMBOL_FIELD.to_string(),
-                serde_json::json!("SOL"),
-            ),
-            (
-                REFERENCE_SPOT_TICKS_FIELD.to_string(),
-                serde_json::json!("8000"),
-            ),
-            (
-                REFERENCE_PERP_TICKS_FIELD.to_string(),
-                serde_json::json!("7000"),
-            ),
-        ]);
-
-        let patched =
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
-        let map = PerpAssetMap::try_from_account_bytes(&patched).unwrap();
-        let entry = map.find_by_symbol("SOL").unwrap().unwrap();
-        let price = entry.metadata.oracle_price();
-
-        assert!(
-            price
-                .mark_price
-                .spot_price_component
-                .last_exchange_spot_price
-                .iter()
-                .all(|value| value.slot == 123 && value.ticks.as_inner() == 8_000)
-        );
-        assert!(
-            price
-                .mark_price
-                .perp_price_component
-                .last_exchange_perp_price
-                .iter()
-                .all(|value| value.slot == 123 && value.ticks.as_inner() == 7_000)
-        );
-        let mut numeric = values;
+        let mut numeric = values(8_000, 7_000);
         numeric.insert(
             REFERENCE_SPOT_TICKS_FIELD.to_string(),
             serde_json::json!(8000),
@@ -789,31 +623,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn forge_rejects_no_value_group() {
-        let error = forge_phoenix_override(
-            &Pubkey::new_unique(),
-            &trader_account(),
-            &HashMap::new(),
-            100,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("exactly one value group"));
+    fn direct_mark_rejects_unknown_markets_and_out_of_range_ticks() {
+        let data = perp_asset_map_fixture();
+        assert!(matches!(
+            patch_direct_mark(&data, "BTC", 1, 123),
+            Err(PhoenixPricePatchError::MarketNotFound { .. })
+        ));
+        assert!(matches!(
+            patch_direct_mark(&data, "SOL", u64::from(u32::MAX) + 1, 123),
+            Err(PhoenixPricePatchError::InvalidTicks { .. })
+        ));
     }
 
     #[test]
-    fn forge_rejects_mixed_value_groups() {
-        let values = HashMap::from([
-            (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
-            (
-                REFERENCE_SPOT_TICKS_FIELD.to_string(),
-                serde_json::json!("2"),
-            ),
-        ]);
-
-        let error = forge_phoenix_override(&Pubkey::new_unique(), &trader_account(), &values, 100)
+    fn forge_rejects_missing_or_mixed_value_groups() {
+        for values in [
+            HashMap::new(),
+            HashMap::from([
+                (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
+                (
+                    REFERENCE_SPOT_TICKS_FIELD.to_string(),
+                    serde_json::json!("2"),
+                ),
+            ]),
+        ] {
+            let error = forge_phoenix_override(
+                &Pubkey::new_unique(),
+                &perp_asset_map_account(),
+                &values,
+                100,
+            )
             .unwrap_err();
-
-        assert!(error.to_string().contains("exactly one value group"));
+            assert!(
+                error.to_string().contains("exactly one value group"),
+                "{error}"
+            );
+        }
     }
 }
