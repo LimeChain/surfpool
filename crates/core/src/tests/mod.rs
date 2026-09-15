@@ -1,7 +1,11 @@
 pub mod helpers;
+#[cfg(feature = "integration-tests")]
+pub mod humidifi;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
+#[cfg(feature = "integration-tests")]
+pub mod live;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
