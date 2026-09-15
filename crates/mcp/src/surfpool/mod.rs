@@ -21,7 +21,9 @@ use surfpool_core::{
         TemplateRegistry,
         protocols::{
             phoenix_eternal::v1::{
-                collateral::{trader_header, validate_collateral_fields},
+                collateral::{
+                    trader_header, validate_collateral_fields, validate_hot_trader_fields,
+                },
                 state_builder::{
                     PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
                     phoenix_global_trader_index_address, phoenix_market_symbols,
@@ -889,7 +891,9 @@ impl Surfpool {
                 // Get the template for validation and normalization
                 if let Some(template) = registry.get(&override_instance.template_id) {
                     if template.id == "phoenix-trader-collateral-stress" {
-                        if let Err(error) = validate_collateral_fields(&override_instance.values) {
+                        if let Err(error) = validate_collateral_fields(&override_instance.values)
+                            .and_then(|_| validate_hot_trader_fields(&override_instance.values))
+                        {
                             validation_errors.push(error.to_string());
                             continue;
                         }
@@ -1636,6 +1640,28 @@ mod tests {
             }
             assert_eq!(*requests.lock().unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_other_trader_state_fields_before_staging() {
+        let mut scenario = Scenario::new("flags".to_string(), "not mirrored".to_string());
+        scenario.add_override(
+            surfpool_types::OverrideInstance::new(
+                "phoenix-trader-collateral-stress".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+            )
+            .with_values(HashMap::from([(
+                "traderState.flags".to_string(),
+                serde_json::json!(0),
+            )])),
+        );
+        let result = Surfpool::new()
+            .create_scenario(Parameters(scenario))
+            .await
+            .unwrap();
+        assert!(json_of(&result)["url"].is_null());
+        assert!(json_of(&result).to_string().contains("traderState.flags"));
     }
 
     #[tokio::test]

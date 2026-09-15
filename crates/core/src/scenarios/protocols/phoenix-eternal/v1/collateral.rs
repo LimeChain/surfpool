@@ -47,6 +47,23 @@ pub fn validate_collateral_fields(
     Ok(())
 }
 
+/// A hot Trader's TraderState is mirrored in the GlobalTraderIndex and the mirror update carries
+/// only the collateral, so any other TraderState write would leave the two copies disagreeing.
+pub fn validate_hot_trader_fields(
+    values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<()> {
+    if let Some(field) = values.keys().find(|field| {
+        field.as_str() == "traderState"
+            || (field.starts_with("traderState.")
+                && field.as_str() != "traderState.quoteLotCollateral")
+    }) {
+        return Err(SurfpoolError::internal(format!(
+            "Phoenix TraderState field '{field}' is unsupported; only traderState.quoteLotCollateral is mirrored into the GlobalTraderIndex for hot Traders"
+        )));
+    }
+    Ok(())
+}
+
 pub fn index_trader_state_range(
     index: &Account,
     trader_key: &[u8; 32],
@@ -435,6 +452,7 @@ mod tests {
             "missing account",
             "conflicting fields",
             "mismatched key",
+            "unsupported field",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = Pubkey::new_unique();
@@ -447,6 +465,11 @@ mod tests {
                     .unwrap();
             match failure {
                 "mismatched key" => before_trader.data[24..56].copy_from_slice(&SECOND_KEY),
+                "unsupported field" => {
+                    scenario.overrides[0]
+                        .values
+                        .insert("traderState.flags".to_string(), serde_json::json!(0));
+                }
                 "conflicting fields" => {
                     scenario.overrides[0]
                         .values
@@ -482,6 +505,43 @@ mod tests {
                 assert_eq!(after_index.unwrap(), before_index, "{failure}");
             }
         }
+    }
+
+    #[test]
+    fn hot_trader_fields_allow_only_the_mirrored_collateral() {
+        let collateral_only = HashMap::from([(
+            "traderState.quoteLotCollateral".to_string(),
+            serde_json::json!("1"),
+        )]);
+        assert!(validate_hot_trader_fields(&collateral_only).is_ok());
+        for field in ["traderState.flags", "traderState"] {
+            let values = HashMap::from([(field.to_string(), serde_json::json!(0))]);
+            let error = validate_hot_trader_fields(&values).unwrap_err().to_string();
+            assert!(
+                error.contains(field) && error.contains("hot Traders"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_skips_a_cold_trader_whose_header_key_mismatches() {
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let matching = trader_account(FIRST_KEY, 9_999, false);
+        let scenario = build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+        let mut on_chain = trader_account(SECOND_KEY, 9_999, false);
+        on_chain.lamports = 1;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&trader, on_chain.clone()).unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(svm.get_account(&trader).unwrap().unwrap(), on_chain);
     }
 
     #[test]
