@@ -3,8 +3,8 @@
 Surfpool bundles IDLs and override templates for **six Kamino programs**, so a scenario can put a
 Kamino market into whatever state you need before your code runs against it.
 
-This is a how-to. For how scenarios work in general see the [scenarios README](../../README.md)
-every field's own purpose and units are on the template itself, visible in Studio and via
+This is a how-to. For how scenarios work in general see the [scenarios README](../../README.md).
+Every field's own purpose and units are on the template itself, visible in Studio and via
 `get_override_templates`.
 
 ## Two rules that decide whether an override sticks
@@ -19,10 +19,11 @@ So overriding a computed value is discarded moments later.
 | A price | `kamino-scope-price` | `liquidity.market_price_sf` |
 | Position health | `kamino-reserve-config` → `liquidation_threshold_pct` | `kamino-obligation-health` |
 
-**2. Add `"persist": true`** only to inputs your scenario never writes - prices, risk config,
-caps. Never to state your transactions mutate (reserve liquidity, obligation or vault balances):
-re-applying reverts their writes each slot, so a swap leaves no trace and the arbitrage it measures
-is not real.
+**2. Do not persist by default.** An override applied once already remains in later slots. Add
+`"persist": true` only when a known later update or fetch would overwrite a scenario-controlled
+input that must stay pinned, such as an oracle price while its updater continues running. Never pin
+state whose changes you are testing (reserve liquidity, obligations, farm rewards, or vault
+balances): re-applying it undoes those changes at the beginning of the next slot.
 
 ## Number formats
 
@@ -63,7 +64,7 @@ Two independent levers where either works, both together is safest.
 {
   "templateId": "kamino-scope-price",
   "scenarioRelativeSlot": 0, "enabled": true,
-  "fetchBeforeUse": true, "persist": true,
+  "fetchBeforeUse": true,
   "account": { "pubkey": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C" },
   "values": { "prices.492.price.value": 2124828, "prices.492.price.exp": 8 }
 }
@@ -201,7 +202,7 @@ kamino-swap-order
 | `exceeds what a JSON number can hold exactly` | Pass large `u128`/`i128` values as decimal strings, e.g. `"1152921504606846976000"`. Plain JSON numbers are fine below 2^53 |
 | `Account with discriminator ... not found in IDL` | The account is not Anchor-based (e.g. Raydium AMM v4). It cannot be overridden through the IDL path |
 | `Failed to resolve account address` | The `pubkey` is not valid base58 |
-| Override reverted after a transaction touched the account | Add `"persist": true` - but only if that field is an input, not state the transaction is meant to change |
+| A later update replaced a scenario-controlled input | Add `"persist": true` only when that input must stay pinned; do not use it merely because the scenario spans multiple slots |
 | A value the program recomputes will not stay put | Pin the input it reads instead: Scope price over a Reserve's cached price, `liquidation_threshold_pct` over the Obligation's health fields |
 
 ---

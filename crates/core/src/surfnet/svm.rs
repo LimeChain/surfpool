@@ -660,6 +660,8 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
 /// What one `fetch_before_use` attempt settled. Decides whether a persisted override keeps
 /// asking on later slots, which it must while another attempt could still change the answer.
 enum FetchOutcome {
+    /// No further remote fetch is needed: none was requested, the account was already settled
+    /// earlier in this slot, or the requested fetch succeeded.
     Retired,
     /// There is no remote to ask. Only a local account can satisfy the request.
     NoRemote,
@@ -667,6 +669,16 @@ enum FetchOutcome {
     NotOnRemote,
     /// No answer was obtained. Another attempt may get one.
     Unanswered,
+}
+
+impl FetchOutcome {
+    fn is_fetch_retired(&self, has_local_account: bool) -> bool {
+        match self {
+            Self::Retired => true,
+            Self::Unanswered => false,
+            Self::NoRemote | Self::NotOnRemote => has_local_account,
+        }
+    }
 }
 
 impl SurfnetSvm {
@@ -3012,18 +3024,14 @@ impl SurfnetSvm {
             };
 
             // The request is only retired when another attempt could no longer change anything.
-            let fetch_retired = match fetch_outcome {
-                FetchOutcome::Retired => true,
-                FetchOutcome::Unanswered => false,
-                FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
-            };
+            let is_fetch_retired = fetch_outcome.is_fetch_retired(existing_account.is_some());
 
             if override_instance.persist {
                 let mut requeued = override_instance.clone();
-                if requeued.fetch_before_use && fetch_retired {
+                if requeued.fetch_before_use && is_fetch_retired {
                     requeued.fetch_before_use = false;
                 }
-                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                if let Err(e) = self.reschedule_override_for_next_slot(requeued, target_slot) {
                     restore_unprocessed(self, index);
                     return Err(e);
                 }
@@ -3182,7 +3190,7 @@ impl SurfnetSvm {
     /// already queued there. One entry per id, so an override cannot be applied twice to one slot.
     fn reschedule_override_for_next_slot(
         &mut self,
-        instance: &OverrideInstance,
+        instance: OverrideInstance,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
         let next_slot = target_slot.checked_add(1).ok_or_else(|| {
@@ -3201,9 +3209,9 @@ impl SurfnetSvm {
                 && queued.account == instance.account
                 && queued.template_id == instance.template_id
         }) {
-            *existing = instance.clone();
+            *existing = instance;
         } else {
-            next.push(instance.clone());
+            next.push(instance);
         }
         self.scheduled_overrides.store(next_slot, next)?;
         Ok(())
@@ -7583,6 +7591,19 @@ mod tests {
         assert_eq!(restored_account.lamports, 1_000_000);
     }
 
+    #[test]
+    fn fetch_outcome_retires_only_when_no_later_fetch_can_help() {
+        for has_local_account in [false, true] {
+            assert!(FetchOutcome::Retired.is_fetch_retired(has_local_account));
+            assert!(!FetchOutcome::Unanswered.is_fetch_retired(has_local_account));
+        }
+
+        for outcome in [FetchOutcome::NoRemote, FetchOutcome::NotOnRemote] {
+            assert!(!outcome.is_fetch_retired(false));
+            assert!(outcome.is_fetch_retired(true));
+        }
+    }
+
     /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
     const UNHEALTHY_OFFSET: usize = 2256;
 
@@ -7906,7 +7927,7 @@ mod tests {
         let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
 
         assert!(
-            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+            svm.reschedule_override_for_next_slot(instance, u64::MAX)
                 .is_err(),
             "there is no slot after u64::MAX"
         );
@@ -8041,10 +8062,10 @@ mod tests {
         second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(first.clone(), SLOT)
             .expect("reschedule");
         surfnet_svm
-            .reschedule_override_for_next_slot(&second, SLOT)
+            .reschedule_override_for_next_slot(second, SLOT)
             .expect("reschedule");
 
         let queued = surfnet_svm
@@ -8060,7 +8081,7 @@ mod tests {
         );
 
         surfnet_svm
-            .reschedule_override_for_next_slot(&first, SLOT)
+            .reschedule_override_for_next_slot(first, SLOT)
             .expect("reschedule");
         let queued = surfnet_svm
             .scheduled_overrides
