@@ -12,13 +12,7 @@ state through the raw layout in `v1/overrides.yaml`; it does not construct or su
 - ELF length: 339440 bytes
 - ELF SHA-256: `4c2b4c29bce4ee4d2a0dfde28f6d511e60627e86ac3cd417e6734ff999ea4550`
 
-Mainnet RPC and PublicNode independently returned these values on 2026-09-13, and the running
-Surfnet fork matched them. The focused live suite then passed all ten tests against mainnet,
-including two-market layout and round-trip checks, materialization, fair-value and liquidity swap
-replays, and the inclusive staleness boundary. A signed original-wallet DFlow route simulation also
-succeeded against the same ELF; this is simulation evidence, not a committed transaction. These
-results validate compatibility with the existing `v1` raw layout. A later redeploy voids the layout
-evidence; the live suite pins ProgramData and fails when it moves.
+A later redeploy voids the layout evidence; the live suite pins ProgramData and fails when it moves.
 
 ## The account is obfuscated
 
@@ -52,17 +46,8 @@ contract. Schema versions other than 8 are unsupported.
 | `humidifi-freshness` | Materialization slot at offset 616, default lead 0 |
 | `humidifi-stale-quote` | Aged slot at offset 616, default lead -3 |
 
-The price conversion is `floor(price * 2^48 * 10^(quote_decimals - base_decimals))`.
-The builder reads both mint decimals and computes this with integer arithmetic. A raw template
-takes the resulting ratio as a decimal string. For SOL/USDC, price `208` gives
-`"58546795155816"`.
-
-Offset 608 holds the maximum accepted quote age in slots. A supplied `last_update_slot` value is a
-signed lead relative to materialization, not an absolute slot; `null` selects the template's
-default lead. Pass `-(maxStalenessSlots + 1)` to reach the first stale slot: age equal to the
-limit still fills, while the next slot fails with `Custom(1027565)` (`0xfaded`). Passing `0`
-makes a quote fresh, including on the stale template. Staleness is applied
-once; freshness can persist to keep the quote current over subsequent slots.
+Each template's `llm_context` in `v1/overrides.yaml` documents its value: the fair-value
+conversion, the slot lead, and the staleness boundary.
 
 ## Live market discovery
 
@@ -71,15 +56,10 @@ referenced mints in batches of at most 100. Addresses identify markets; labels u
 symbols with full mint addresses as a fallback. Discovery sorts by label and address. The templates
 contain no static market list or default address; every override must target an explicitly selected market.
 
-On 2026-09-11, a mainnet scan found 93 accounts of size 1728: 36 with schema 8, 50 with schema 5,
-two each with values 0, 2 and 4, and one with value 6. Schema membership is not proof of current
-trading or liquidity. Discovery validates compatible accounts and mint metadata; it does not
-promise that every market is quoting. The live test checks returned metadata without pinning a
+Market-sized accounts on mainnet span several schema versions, and schema membership is not proof
+of current trading or liquidity. Discovery validates compatible accounts and mint metadata; it does
+not promise that every market is quoting. The live test checks returned metadata without pinning a
 market count.
-
-On 2026-09-13, the focused mainnet run discovered and validated 36 compatible markets. PublicNode
-independently confirmed the ProgramData identity but returned HTTP 403 for `getProgramAccounts`, so
-that provider did not verify discovery.
 
 To inspect all market-sized accounts, including unsupported schemas:
 
@@ -100,10 +80,12 @@ filters the tag at offset 8 and version 8 at offset 1720.
 Surfnet RPC, where local accounts take precedence and missing accounts fall back to the
 datasource. It stages the result through the shared scenario path.
 
-Both overrides leave `fetchBeforeUse: false`: the creation reads already cached the market in
-Surfnet, and Play applies the values to that local state. Refetching would replace earlier local
-edits. The second override persists freshness with a `null` value, so the encoder uses its zero
-lead at every materialization slot without fetching over the price.
+Both builders leave every override at `fetchBeforeUse: false`: the creation reads already cached
+the accounts in Surfnet, and Play applies the values to that local state. Refetching would replace
+earlier local edits and the state the amounts were calculated from. Freshness is persisted with a
+`null` value, so the encoder uses its zero lead at every materialization slot without fetching over
+the price. When composing templates directly, set `fetchBeforeUse: true` on the first override for
+each account that has not already been prepared.
 
 `build_humidifi_liquidity_scenario` scales the market's vault balances through the generic
 `spl-token-account-balance` template, one override per side that changes, from 0 to 10000 remaining
@@ -112,28 +94,18 @@ from the market's masked words at offsets 448 (quote) and 480 (base); each vault
 account for the market's mint on that side, owned by that mint's token program, initialized and
 controlled by the market. `create_humidifi_liquidity_scenario`
 reads the market, both mints and both vaults through the Surfnet RPC and stages the result.
-Its overrides also leave `fetchBeforeUse: false` to preserve the local state used to calculate
-the amounts. When composing templates directly, set `fetchBeforeUse: true` on the first override
-for each account that has not already been prepared.
 
 `list_humidifi_markets` returns addresses, labels, both mint identities and decimals, and
 `maxStalenessSlots`. Both creation tools require a non-empty `market` address from this list.
-All tools accept an optional `surfnetPort`, defaulting to 8899, the same camelCase argument names as the pump tool. Studio's PMM
+All tools accept an optional `surfnetPort`, defaulting to 8899. Studio's PMM
 fair-value preset uses the market list and fair-value tools; the stale-quote and liquidity chips
 request editable state scenarios.
 
 ## Behavioral evidence
 
 The live suite checks byte-limited template writes on two markets, guarded layout rejection,
-discovered metadata, and scenario materialization with persisted freshness. It loads the pinned
-deployed ELF into LiteSVM for swap replay. A native DFlow wrapper re-emits the captured HumidiFi
-CPI; its system-owned authority must remain a read-only signer, with signature verification off.
-The captured instruction comes from transaction
-[`3zevqw…g1Si`](https://explorer.solana.com/tx/3zevqwAa8u136UGE1bdBzP1o2dpFuc7X333dC1ut3T1uCgY6iidihfNJNoJ7tuyj3tHNin1i7HTFCUSFWqK7g1Si)
-at slot 444225745: DFlow outer instruction 2, HumidiFi CPI, 2427890 USDC atoms of input.
-The replay uses those instruction bytes and account identities, with live protocol-state contents
-and ELF. Test user token accounts and the signer are synthesized; it does not replay the entire
-DFlow transaction or load frozen protocol account snapshots.
+discovered metadata, and scenario materialization with persisted freshness. The swap replay's
+setup is described in `crates/core/src/tests/humidifi/mod.rs`.
 
 The fair-value replay checks unchanged output after re-encoding the current ratio, increased
 base output after halving the price, and decreased output or rejection after doubling it.
@@ -142,23 +114,16 @@ materializes them, then compares actual swap output with the human price and min
 1%. This expectation does not use the encoded fair-value word or the `2^48` conversion.
 The staleness replay uses an explicit clock: with the tested SOL/USDC market's limit of 2, age 3 fails with
 `Custom(1027565)` (`0xfaded`) and age 2 fills. Changing offset 608 to 10 moves those boundaries
-to ages 11 and 10; the stale template's default age 3 then fills. The limit is inclusive.
+to ages 11 and 10. The limit is inclusive.
 
 The liquidity replay materializes the builder's scenarios through the production path and swaps
 against the prepared accounts. A drained base vault fails the transfer with the token program's
-insufficient-funds error. On the tested SOL/USDC market in the 2026-09-11 replay, a base vault cut
+insufficient-funds error. On the tested SOL/USDC market, a base vault cut
 to 0.5% of its live balance still filled at less than a hundredth of baseline output. Draining
 the quote vault left quote-to-base fills unchanged. These observations are tested against live
 state; the tool scales balances without assuming a fixed inventory threshold or output multiplier.
 
-```bash
-SURFPOOL_TEST_RPC_URL=<rpc-url> cargo test -p surfpool-core --features integration-tests \
-  tests::humidifi -- --test-threads=1 --nocapture
-```
-
-Run serially. Public endpoints can shed requests after discovery, sometimes reporting HTTP 413.
-`SURFPOOL_TEST_RPC_URL` defaults to the public mainnet endpoint; use a private endpoint when it
-rate-limits.
+The run command for the live suite is in [`../../README.md`](../../README.md#humidifi-integration-tests).
 
 ## Known boundaries
 

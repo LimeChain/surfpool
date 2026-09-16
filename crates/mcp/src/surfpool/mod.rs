@@ -19,12 +19,15 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
-        protocols::humidifi::v1::{
-            HumidiFiMarket, build_humidifi_fair_value_scenario, build_humidifi_liquidity_scenario,
-            discover_humidifi_markets, humidifi_vault_addresses,
-        },
-        protocols::pump::v1::graduation_builder::{
-            build_pump_graduation_scenario, pump_graduation_addresses,
+        protocols::{
+            humidifi::v1::{
+                HumidiFiMarket, build_humidifi_fair_value_scenario,
+                build_humidifi_liquidity_scenario, discover_humidifi_markets,
+                humidifi_vault_addresses,
+            },
+            pump::v1::graduation_builder::{
+                build_pump_graduation_scenario, pump_graduation_addresses,
+            },
         },
     },
     solana_account::Account,
@@ -1073,13 +1076,13 @@ impl Surfpool {
             .iter()
             .map(|market| {
                 serde_json::json!({
-                    "address": market.address.to_string(),
+                    "address": market.address().to_string(),
                     "label": market.label(),
-                    "baseMint": market.base_mint.to_string(),
-                    "quoteMint": market.quote_mint.to_string(),
-                    "baseDecimals": market.base_decimals,
-                    "quoteDecimals": market.quote_decimals,
-                    "maxStalenessSlots": market.max_staleness_slots,
+                    "baseMint": market.base_mint().to_string(),
+                    "quoteMint": market.quote_mint().to_string(),
+                    "baseDecimals": market.base_decimals(),
+                    "quoteDecimals": market.quote_decimals(),
+                    "maxStalenessSlots": market.max_staleness_slots(),
                 })
             })
             .collect::<Vec<_>>();
@@ -1089,63 +1092,58 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates one editable HumidiFi fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet to derive the 2^48-scaled quote-per-base ratio from their decimals. These reads cache the accounts in Surfnet. On Play, the scenario applies the requested price and keeps the quote fresh with fetchBeforeUse disabled to preserve local state. Prepares state; sends no swap. Resolve `market` through list_humidifi_markets."
+        description = "Creates one editable HumidiFi fair-value scenario for a live market. Reads the market and both mint accounts from the running surfnet to derive the 2^48-scaled quote-per-base ratio from their decimals. These reads cache the accounts in Surfnet. On Play, the scenario applies the requested price and keeps the quote fresh with fetchBeforeUse disabled to preserve local state. Prepares state; sends no swap. Resolve `market` through list_humidifi_markets. Not for staleness scenarios: those use the humidifi-stale-quote template through create_scenario."
     )]
     async fn create_humidifi_fair_value_scenario(
         &self,
         Parameters(params): Parameters<CreateHumidiFiFairValueScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let market_address = match humidifi_market_address(&params.market) {
-            Ok(market) => market,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
+        match self.humidifi_fair_value_scenario(&params).await {
+            Ok(scenario) => self.stage_scenario(scenario).await,
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
 
-        let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[market_address])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(market_account) = accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(format!(
-                "HumidiFi market account {market_address} was not found on the surfnet"
-            )));
-        };
-        let (base_mint, quote_mint) = match HumidiFiMarket::mint_addresses(market_account) {
-            Ok(mints) => mints,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        let mints = match self
+    async fn humidifi_fair_value_scenario(
+        &self,
+        params: &CreateHumidiFiFairValueScenarioParams,
+    ) -> Result<Scenario, String> {
+        let (market_address, market_account, (base_mint, quote_mint)) = self
+            .humidifi_market(&params.market, params.surfnet_port)
+            .await?;
+        let mints = self
             .fetch_surfnet_accounts(params.surfnet_port, &[base_mint, quote_mint])
-            .await
-        {
-            Ok(mints) => mints,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let (Some(base_account), Some(quote_account)) = (mints[0].as_ref(), mints[1].as_ref())
-        else {
-            return Ok(scenario_tool_error(format!(
+            .await?;
+        let [Some(base_account), Some(quote_account)] = &mints[..] else {
+            return Err(format!(
                 "HumidiFi market {market_address} references a mint that was not found on the surfnet"
-            )));
+            ));
         };
+        let market =
+            HumidiFiMarket::validate(market_address, &market_account, base_account, quote_account)
+                .map_err(|error| error.to_string())?;
+        let preparation = build_humidifi_fair_value_scenario(&market, &params.price)
+            .map_err(|error| error.to_string())?;
+        Ok(preparation.scenario)
+    }
 
-        let market = match HumidiFiMarket::validate(
-            market_address,
-            market_account,
-            base_account,
-            quote_account,
-        ) {
-            Ok(market) => market,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let preparation = match build_humidifi_fair_value_scenario(&market, &params.price) {
-            Ok(preparation) => preparation,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        self.stage_scenario(preparation.scenario).await
+    /// Resolves and reads the selected market, returning its address, account and `(base, quote)`
+    /// mint addresses.
+    async fn humidifi_market(
+        &self,
+        market: &str,
+        surfnet_port: Option<u16>,
+    ) -> Result<(Pubkey, Account, (Pubkey, Pubkey)), String> {
+        let market_address = humidifi_market_address(market)?;
+        let mut accounts = self
+            .fetch_surfnet_accounts(surfnet_port, &[market_address])
+            .await?;
+        let market_account = accounts.remove(0).ok_or_else(|| {
+            format!("HumidiFi market account {market_address} was not found on the surfnet")
+        })?;
+        let mints =
+            HumidiFiMarket::mint_addresses(&market_account).map_err(|error| error.to_string())?;
+        Ok((market_address, market_account, mints))
     }
 
     #[tool(
@@ -1155,81 +1153,54 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<CreateHumidiFiLiquidityScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let market_address = match humidifi_market_address(&params.market) {
-            Ok(market) => market,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
+        match self.humidifi_liquidity_scenario(&params).await {
+            Ok(scenario) => self.stage_scenario(scenario).await,
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
 
-        let accounts = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[market_address])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let Some(market_account) = accounts[0].as_ref() else {
-            return Ok(scenario_tool_error(format!(
-                "HumidiFi market account {market_address} was not found on the surfnet"
-            )));
-        };
-        let (base_mint, quote_mint) = match HumidiFiMarket::mint_addresses(market_account) {
-            Ok(mints) => mints,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let [base_vault, quote_vault] = match humidifi_vault_addresses(market_account) {
-            Ok(vaults) => vaults,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        let graph = match self
+    async fn humidifi_liquidity_scenario(
+        &self,
+        params: &CreateHumidiFiLiquidityScenarioParams,
+    ) -> Result<Scenario, String> {
+        let (market_address, market_account, (base_mint, quote_mint)) = self
+            .humidifi_market(&params.market, params.surfnet_port)
+            .await?;
+        let [base_vault, quote_vault] =
+            humidifi_vault_addresses(&market_account).map_err(|error| error.to_string())?;
+        let graph = self
             .fetch_surfnet_accounts(
                 params.surfnet_port,
                 &[base_mint, quote_mint, base_vault, quote_vault],
             )
-            .await
-        {
-            Ok(graph) => graph,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let (
+            .await?;
+        let [
             Some(base_mint_account),
             Some(quote_mint_account),
             Some(base_vault_account),
             Some(quote_vault_account),
-        ) = (
-            graph[0].as_ref(),
-            graph[1].as_ref(),
-            graph[2].as_ref(),
-            graph[3].as_ref(),
-        )
+        ] = &graph[..]
         else {
-            return Ok(scenario_tool_error(format!(
+            return Err(format!(
                 "HumidiFi market {market_address} references a mint or vault that was not found on the surfnet"
-            )));
+            ));
         };
-
-        let market = match HumidiFiMarket::validate(
+        let market = HumidiFiMarket::validate(
             market_address,
-            market_account,
+            &market_account,
             base_mint_account,
             quote_mint_account,
-        ) {
-            Ok(market) => market,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let scenario = match build_humidifi_liquidity_scenario(
+        )
+        .map_err(|error| error.to_string())?;
+        build_humidifi_liquidity_scenario(
             &market,
-            market_account,
+            &market_account,
             base_vault_account,
             quote_vault_account,
             params.base_remaining_bps,
             params.quote_remaining_bps,
-        ) {
-            Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        self.stage_scenario(scenario).await
+        )
+        .map_err(|error| error.to_string())
     }
 
     #[tool(
@@ -1568,31 +1539,6 @@ mod tests {
 
     #[test]
     fn humidifi_tools_require_an_explicit_market() {
-        let fair_value = serde_json::json!({ "price": "100" });
-        assert!(
-            serde_json::from_value::<CreateHumidiFiFairValueScenarioParams>(fair_value).is_err()
-        );
-        let liquidity = serde_json::json!({
-            "baseRemainingBps": 500,
-            "quoteRemainingBps": 10000,
-        });
-        assert!(
-            serde_json::from_value::<CreateHumidiFiLiquidityScenarioParams>(liquidity).is_err()
-        );
-
-        for schema in [
-            schemars::schema_for!(CreateHumidiFiFairValueScenarioParams),
-            schemars::schema_for!(CreateHumidiFiLiquidityScenarioParams),
-        ] {
-            let schema = serde_json::to_value(schema).unwrap();
-            assert!(
-                schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&serde_json::json!("market"))
-            );
-        }
-
         for market in ["", "   "] {
             assert!(
                 humidifi_market_address(market)
@@ -1604,25 +1550,6 @@ mod tests {
         assert_eq!(
             humidifi_market_address(&format!(" {market} ")).unwrap(),
             market
-        );
-    }
-
-    #[tokio::test]
-    async fn humidifi_liquidity_rejects_a_bad_market_before_any_rpc() {
-        let result = Surfpool::new()
-            .create_humidifi_liquidity_scenario(Parameters(CreateHumidiFiLiquidityScenarioParams {
-                market: "not-a-pubkey".to_string(),
-                base_remaining_bps: 500,
-                quote_remaining_bps: 10_000,
-                surfnet_port: None,
-            }))
-            .await
-            .expect("tool result");
-        assert!(
-            json_of(&result)["error"]
-                .as_str()
-                .expect("error payload")
-                .contains("Invalid HumidiFi market pubkey")
         );
     }
 

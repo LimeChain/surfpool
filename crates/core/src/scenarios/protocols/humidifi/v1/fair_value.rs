@@ -36,7 +36,7 @@ const ACTIVE_SCHEMA_VERSION: u64 = 8;
 /// The four per-word XOR keys the program uses to obfuscate a 32-byte pubkey field. Global across
 /// the supported markets. Used only to READ the mints for their decimals, never to
 /// write, which is why they live here rather than as template masks.
-pub(super) const PUBKEY_XOR_KEYS: [u64; 4] = [
+const PUBKEY_XOR_KEYS: [u64; 4] = [
     0xfb5c_e87a_ae44_3c38,
     0x04a2_1784_51ba_c3c7,
     0x04a1_1787_51b9_c3c6,
@@ -67,27 +67,47 @@ pub(super) static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| {
 /// The parts of a HumidiFi market a price needs: which mints it quotes, and at what scale.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HumidiFiMarket {
-    pub address: Pubkey,
-    pub base_mint: Pubkey,
-    pub quote_mint: Pubkey,
-    pub base_token_program: Pubkey,
-    pub quote_token_program: Pubkey,
-    pub base_decimals: u8,
-    pub quote_decimals: u8,
-    pub max_staleness_slots: u64,
+    pub(crate) address: Pubkey,
+    pub(crate) base_mint: Pubkey,
+    pub(crate) quote_mint: Pubkey,
+    pub(crate) base_token_program: Pubkey,
+    pub(crate) quote_token_program: Pubkey,
+    pub(crate) base_decimals: u8,
+    pub(crate) quote_decimals: u8,
+    pub(crate) max_staleness_slots: u64,
 }
 
 impl HumidiFiMarket {
+    pub fn address(&self) -> Pubkey {
+        self.address
+    }
+
+    pub fn base_mint(&self) -> Pubkey {
+        self.base_mint
+    }
+
+    pub fn quote_mint(&self) -> Pubkey {
+        self.quote_mint
+    }
+
+    pub fn base_decimals(&self) -> u8 {
+        self.base_decimals
+    }
+
+    pub fn quote_decimals(&self) -> u8 {
+        self.quote_decimals
+    }
+
+    pub fn max_staleness_slots(&self) -> u64 {
+        self.max_staleness_slots
+    }
+
     pub fn mint_addresses(market_account: &Account) -> SurfpoolResult<(Pubkey, Pubkey)> {
-        validate_humidifi_market_layout(market_account)?;
-        let base_mint = read_masked_pubkey(&market_account.data, BASE_MINT_OFFSET)?;
-        let quote_mint = read_masked_pubkey(&market_account.data, QUOTE_MINT_OFFSET)?;
-        if base_mint == Pubkey::default()
-            || quote_mint == Pubkey::default()
-            || base_mint == quote_mint
-        {
-            return Err(invalid("market has invalid mint identities"));
-        }
+        let [base_mint, quote_mint] = read_masked_pubkey_pair(
+            market_account,
+            [BASE_MINT_OFFSET, QUOTE_MINT_OFFSET],
+            "mint",
+        )?;
         Ok((base_mint, quote_mint))
     }
 
@@ -177,32 +197,20 @@ pub fn build_humidifi_fair_value_scenario(
 
     let registry = TemplateRegistry::new();
     let fair_value_template = template(&registry, FAIR_VALUE_TEMPLATE)?;
-    let freshness = template(&registry, FRESHNESS_TEMPLATE)?;
     let market_name = market.label();
-    let target = AccountAddress::Pubkey(market.address.to_string());
 
     // Refetching on Play would replace the local market used to prepare this scenario.
     let price_override = OverrideInstance::new(
         fair_value_template.id.clone(),
         PREPARATION_SLOT,
-        target.clone(),
+        AccountAddress::Pubkey(market.address.to_string()),
     )
     .with_values(HashMap::from([(
         "fair_value".to_string(),
         serde_json::json!(fair_value.to_string()),
     )]))
     .with_label(format!("HumidiFi {market_name} fair value"));
-
-    // Null, not zero: the slot encoder reads a supplied number as the lead, so only null takes the
-    // template's own lead of zero. Persisted, so the prepared price stays inside the market's
-    // freshness window however long the scenario is left running.
-    let freshness_override = OverrideInstance::new(freshness.id.clone(), PREPARATION_SLOT, target)
-        .with_values(HashMap::from([(
-            "last_update_slot".to_string(),
-            serde_json::Value::Null,
-        )]))
-        .with_label("Keep HumidiFi quote fresh".to_string())
-        .with_persist(true);
+    let freshness = freshness_override(&registry, &market.address)?;
 
     let normalized_price = price.trim();
     let mut scenario = Scenario::new(
@@ -218,7 +226,7 @@ pub fn build_humidifi_fair_value_scenario(
         "price-dislocation".to_string(),
     ];
     scenario.add_override(price_override);
-    scenario.add_override(freshness_override);
+    scenario.add_override(freshness);
 
     Ok(HumidiFiFairValuePreparation {
         scenario,
@@ -227,8 +235,44 @@ pub fn build_humidifi_fair_value_scenario(
     })
 }
 
+/// Null, not zero: the slot encoder reads a supplied number as the lead, so only null takes the
+/// template's own lead of zero. Persisted, so the prepared price stays inside the market's
+/// freshness window however long the scenario is left running.
+pub(super) fn freshness_override(
+    registry: &TemplateRegistry,
+    market: &Pubkey,
+) -> SurfpoolResult<OverrideInstance> {
+    let freshness = template(registry, FRESHNESS_TEMPLATE)?;
+    Ok(OverrideInstance::new(
+        freshness.id.clone(),
+        PREPARATION_SLOT,
+        AccountAddress::Pubkey(market.to_string()),
+    )
+    .with_values(HashMap::from([(
+        "last_update_slot".to_string(),
+        serde_json::Value::Null,
+    )]))
+    .with_label("Keep HumidiFi quote fresh".to_string())
+    .with_persist(true))
+}
+
+/// Validates the market, then unmasks a `[base, quote]` pubkey pair that must be set and distinct.
+pub(super) fn read_masked_pubkey_pair(
+    market_account: &Account,
+    [base_offset, quote_offset]: [usize; 2],
+    field: &str,
+) -> SurfpoolResult<[Pubkey; 2]> {
+    validate_humidifi_market_layout(market_account)?;
+    let base = read_masked_pubkey(&market_account.data, base_offset)?;
+    let quote = read_masked_pubkey(&market_account.data, quote_offset)?;
+    if base == Pubkey::default() || quote == Pubkey::default() || base == quote {
+        return Err(invalid(format!("market has invalid {field} identities")));
+    }
+    Ok([base, quote])
+}
+
 /// Unmasks a 32-byte pubkey stored as four XOR-obfuscated words.
-pub(super) fn read_masked_pubkey(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
+fn read_masked_pubkey(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
     let end = offset
         .checked_add(32)
         .ok_or_else(|| invalid("market mint offset overflow"))?;
@@ -326,49 +370,65 @@ pub(super) fn invalid(message: impl Into<String>) -> SurfpoolError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) fn mint_account(decimals: u8, token_program: Pubkey) -> Account {
     use solana_program_pack::Pack;
 
-    use super::*;
-
-    fn mint_account(decimals: u8) -> Account {
-        let mut data = vec![0; spl_token_interface::state::Mint::LEN];
+    let mut data = vec![0; spl_token_interface::state::Mint::LEN];
+    if token_program == spl_token_2022_interface::id() {
+        spl_token_2022_interface::state::Mint {
+            decimals,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+    } else {
         spl_token_interface::state::Mint {
             decimals,
             is_initialized: true,
             ..Default::default()
         }
         .pack_into_slice(&mut data);
-        Account {
-            data,
-            owner: spl_token_interface::id(),
-            ..Account::default()
-        }
     }
-
-    fn write_masked_pubkey(data: &mut [u8], offset: usize, pubkey: &Pubkey) {
-        let bytes = pubkey.to_bytes();
-        for (i, key) in PUBKEY_XOR_KEYS.iter().enumerate() {
-            let word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-            data[offset + i * 8..offset + i * 8 + 8].copy_from_slice(&(word ^ key).to_le_bytes());
-        }
+    Account {
+        data,
+        owner: token_program,
+        ..Account::default()
     }
+}
 
-    fn market_account(base_mint: &Pubkey, quote_mint: &Pubkey) -> Account {
-        let mut data = vec![0; MARKET_LAYOUT.account_size];
-        let magic = MARKET_LAYOUT.magic.as_ref().unwrap();
-        data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
-        data[SCHEMA_VERSION_OFFSET..SCHEMA_VERSION_OFFSET + 8]
-            .copy_from_slice(&schema_version_bytes());
-        data[MAX_STALENESS_OFFSET..MAX_STALENESS_OFFSET + 8]
-            .copy_from_slice(&(6u64 ^ STATE_XOR_KEY).to_le_bytes());
-        write_masked_pubkey(&mut data, BASE_MINT_OFFSET, base_mint);
-        write_masked_pubkey(&mut data, QUOTE_MINT_OFFSET, quote_mint);
-        Account {
-            data,
-            owner: HUMIDIFI_PROGRAM_ID,
-            ..Account::default()
-        }
+#[cfg(test)]
+pub(super) fn write_masked_pubkey(data: &mut [u8], offset: usize, pubkey: &Pubkey) {
+    let bytes = pubkey.to_bytes();
+    for (i, key) in PUBKEY_XOR_KEYS.iter().enumerate() {
+        let word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        data[offset + i * 8..offset + i * 8 + 8].copy_from_slice(&(word ^ key).to_le_bytes());
+    }
+}
+
+/// A version-8 market with a staleness limit of 6 slots and the given mints.
+#[cfg(test)]
+pub(super) fn market_account(base_mint: &Pubkey, quote_mint: &Pubkey) -> Account {
+    let mut data = vec![0; MARKET_LAYOUT.account_size];
+    let magic = MARKET_LAYOUT.magic.as_ref().unwrap();
+    data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
+    data[SCHEMA_VERSION_OFFSET..SCHEMA_VERSION_OFFSET + 8].copy_from_slice(&schema_version_bytes());
+    data[MAX_STALENESS_OFFSET..MAX_STALENESS_OFFSET + 8]
+        .copy_from_slice(&(6u64 ^ STATE_XOR_KEY).to_le_bytes());
+    write_masked_pubkey(&mut data, BASE_MINT_OFFSET, base_mint);
+    write_masked_pubkey(&mut data, QUOTE_MINT_OFFSET, quote_mint);
+    Account {
+        data,
+        owner: HUMIDIFI_PROGRAM_ID,
+        ..Account::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spl_mint(decimals: u8) -> Account {
+        mint_account(decimals, spl_token_interface::id())
     }
 
     fn market(base_decimals: u8, quote_decimals: u8) -> HumidiFiMarket {
@@ -377,8 +437,8 @@ mod tests {
         HumidiFiMarket::validate(
             Pubkey::new_unique(),
             &market_account(&base_mint, &quote_mint),
-            &mint_account(base_decimals),
-            &mint_account(quote_decimals),
+            &spl_mint(base_decimals),
+            &spl_mint(quote_decimals),
         )
         .expect("valid HumidiFi market")
     }
@@ -394,8 +454,7 @@ mod tests {
         );
         let address = Pubkey::new_unique();
         let market =
-            HumidiFiMarket::validate(address, &account, &mint_account(9), &mint_account(6))
-                .unwrap();
+            HumidiFiMarket::validate(address, &account, &spl_mint(9), &spl_mint(6)).unwrap();
         assert_eq!(market.address, address);
         assert_eq!(market.base_mint, base_mint);
         assert_eq!(market.quote_mint, quote_mint);
@@ -419,51 +478,45 @@ mod tests {
     }
 
     #[test]
-    fn builds_fair_value_for_sol_usdc_decimals() {
-        let market = market(9, 6);
-        let preparation = build_humidifi_fair_value_scenario(&market, "208").unwrap();
-        // 208 * 2^48 * 10^(6-9), floored.
-        assert_eq!(preparation.fair_value, 58_546_795_155_816);
-        assert_eq!(preparation.scenario.overrides.len(), 2);
+    fn builds_fair_value_from_the_market_decimals_and_keeps_the_quote_fresh() {
+        for (base_decimals, quote_decimals, price, expected) in [
+            // 208 * 2^48 * 10^(6-9), floored.
+            (9, 6, "208", 58_546_795_155_816),
+            (
+                9,
+                6,
+                "100.25",
+                (10_025u128 * FAIR_VALUE_SCALE / 100_000) as u64,
+            ),
+            // A d6/d6 pair: the decimals cancel, so raw is price * 2^48 directly.
+            (
+                6,
+                6,
+                "0.4433",
+                (4433u128 * FAIR_VALUE_SCALE / 10_000) as u64,
+            ),
+        ] {
+            let market = market(base_decimals, quote_decimals);
+            let preparation = build_humidifi_fair_value_scenario(&market, price).unwrap();
+            assert_eq!(preparation.fair_value, expected, "{price}");
+            assert!(preparation.scenario.name.contains(&market.label()));
 
-        let [price, _] = &preparation.scenario.overrides[..] else {
-            panic!("expected exactly a price and a freshness override");
-        };
-        let stored: u64 = price
-            .values
-            .get("fair_value")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap();
-        assert_eq!(stored, 58_546_795_155_816);
-    }
-
-    #[test]
-    fn price_and_freshness_preserve_the_prepared_market() {
-        let preparation = build_humidifi_fair_value_scenario(&market(9, 6), "100.25").unwrap();
-        let [price, freshness] = &preparation.scenario.overrides[..] else {
-            panic!("expected exactly a price and a freshness override");
-        };
-        assert!(!price.fetch_before_use);
-        assert!(!price.persist);
-        assert!(!freshness.fetch_before_use);
-        assert!(freshness.persist);
-        assert_eq!(
-            freshness.values.get("last_update_slot"),
-            Some(&serde_json::Value::Null)
-        );
-    }
-
-    #[test]
-    fn derives_fair_value_from_market_mint_decimals() {
-        // A d6/d6 pair: the decimals cancel, so raw is price * 2^48 directly.
-        let market = market(6, 6);
-        let preparation =
-            build_humidifi_fair_value_scenario(&market, "0.4433").expect("build JUP/USDC price");
-        assert_eq!(
-            preparation.fair_value,
-            (4433u128 * FAIR_VALUE_SCALE / 10_000) as u64
-        );
+            let [price_override, freshness] = &preparation.scenario.overrides[..] else {
+                panic!("expected exactly a price and a freshness override");
+            };
+            assert_eq!(
+                price_override.values.get("fair_value"),
+                Some(&serde_json::json!(expected.to_string()))
+            );
+            assert!(!price_override.fetch_before_use);
+            assert!(!price_override.persist);
+            assert!(!freshness.fetch_before_use);
+            assert!(freshness.persist);
+            assert_eq!(
+                freshness.values.get("last_update_slot"),
+                Some(&serde_json::Value::Null)
+            );
+        }
     }
 
     #[test]
@@ -473,8 +526,8 @@ mod tests {
             assert!(build_humidifi_fair_value_scenario(&market, price).is_err());
         }
 
-        let base_mint = mint_account(9);
-        let quote_mint = mint_account(6);
+        let base_mint = spl_mint(9);
+        let quote_mint = spl_mint(6);
         let wrong_owner = Account {
             owner: Pubkey::new_unique(),
             ..market_account(&Pubkey::new_unique(), &Pubkey::new_unique())

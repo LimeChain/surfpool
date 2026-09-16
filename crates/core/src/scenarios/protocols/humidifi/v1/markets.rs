@@ -8,14 +8,13 @@ use solana_client::{
 };
 use solana_commitment_config::CommitmentConfig;
 
-use crate::{
-    error::{SurfpoolError, SurfpoolResult},
-    surfnet::remote::SurfnetRemoteClient,
-};
-
 use super::{
     HUMIDIFI_PROGRAM_ID, HumidiFiMarket,
     fair_value::{MARKET_LAYOUT, SCHEMA_VERSION_OFFSET, schema_version_bytes},
+};
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    surfnet::remote::SurfnetRemoteClient,
 };
 
 pub async fn discover_humidifi_markets(

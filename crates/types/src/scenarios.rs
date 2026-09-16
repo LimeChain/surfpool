@@ -1703,105 +1703,68 @@ mod tests {
 
         // A program that keeps every word as `plaintext XOR key`. The template value stays
         // plaintext; the engine masks it on write, so the account holds value ^ key.
-        let key: u64 = 0xb957_ed15_dc87_7426;
-        let layout = RawLayout {
-            account_size: 16,
-            magic: None,
-        };
-        let mut property = Property::field("fair_value".to_string());
-        property.offset = Some(8);
-        property.encoding = Some(RawEncoding::U64);
-        property.xor_mask = Some(key);
+        fn masked_property(encoding: RawEncoding, key: u64) -> Property {
+            let mut property = Property::field("word".to_string());
+            property.offset = Some(0);
+            property.encoding = Some(encoding);
+            property.xor_mask = Some(key);
+            property
+        }
 
-        let plaintext: u64 = 29_278_243_997_902;
-        let out = layout
-            .materialize(
-                &[0u8; 16],
-                &[property],
-                &HashMap::from([("fair_value".to_string(), json!(plaintext.to_string()))]),
-                0,
-            )
-            .expect("masked write");
-
-        let stored = u64::from_le_bytes(out[8..16].try_into().unwrap());
-        assert_eq!(
-            stored,
-            plaintext ^ key,
-            "the account must hold the masked word"
-        );
-        assert_eq!(
-            stored ^ key,
-            plaintext,
-            "unmasking reproduces the plaintext"
-        );
-    }
-
-    #[test]
-    fn xor_mask_masks_a_materialization_slot() {
-        use super::{Property, RawEncoding, RawLayout};
-
-        let key: u64 = 0x6e9d_e2b3_0b19_f1ea;
         let layout = RawLayout {
             account_size: 8,
             magic: None,
         };
-        let mut property = Property::field("last_update_slot".to_string());
-        property.offset = Some(0);
-        property.encoding = Some(RawEncoding::Slot { lead: 0 });
-        property.xor_mask = Some(key);
-
-        let out = layout
-            .materialize(
-                &[0u8; 8],
-                &[property.clone()],
-                &HashMap::from([("last_update_slot".to_string(), serde_json::Value::Null)]),
+        let fair_value_key: u64 = 0xb957_ed15_dc87_7426;
+        let state_key: u64 = 0x6e9d_e2b3_0b19_f1ea;
+        for (encoding, key, value, slot, plaintext) in [
+            (
+                RawEncoding::U64,
+                fair_value_key,
+                json!("29278243997902"),
+                0,
+                29_278_243_997_902u64,
+            ),
+            (
+                RawEncoding::Slot { lead: 0 },
+                state_key,
+                serde_json::Value::Null,
                 444_223_940,
-            )
-            .expect("masked slot write");
-        assert_eq!(
-            u64::from_le_bytes(out[0..8].try_into().unwrap()) ^ key,
-            444_223_940,
-            "the slot must round-trip through the mask"
-        );
-
-        // A negative lead ages the quote, still masked.
-        property.encoding = Some(RawEncoding::Slot { lead: -3 });
-        let out = layout
-            .materialize(
-                &[0u8; 8],
-                &[property],
-                &HashMap::from([("last_update_slot".to_string(), serde_json::Value::Null)]),
                 444_223_940,
-            )
-            .expect("masked stale slot");
-        assert_eq!(
-            u64::from_le_bytes(out[0..8].try_into().unwrap()) ^ key,
-            444_223_937
-        );
+            ),
+            // A negative lead ages the quote, still masked.
+            (
+                RawEncoding::Slot { lead: -3 },
+                state_key,
+                serde_json::Value::Null,
+                444_223_940,
+                444_223_937,
+            ),
+        ] {
+            let out = layout
+                .materialize(
+                    &[0u8; 8],
+                    &[masked_property(encoding, key)],
+                    &HashMap::from([("word".to_string(), value)]),
+                    slot,
+                )
+                .expect("masked write");
+            assert_eq!(
+                u64::from_le_bytes(out[0..8].try_into().unwrap()),
+                plaintext ^ key,
+                "the account must hold the masked word for {plaintext}"
+            );
+        }
     }
 
     #[test]
-    fn xor_mask_leaves_unmasked_properties_untouched_and_rejects_narrow_encodings() {
+    fn xor_mask_rejects_narrow_encodings() {
         use super::{Property, RawEncoding, RawLayout};
 
         let layout = RawLayout {
             account_size: 16,
             magic: None,
         };
-
-        // No mask: bytes are written verbatim, exactly as before this feature existed.
-        let mut plain = Property::field("value".to_string());
-        plain.offset = Some(0);
-        plain.encoding = Some(RawEncoding::U64);
-        let out = layout
-            .materialize(
-                &[0u8; 16],
-                &[plain],
-                &HashMap::from([("value".to_string(), json!(7u64.to_string()))]),
-                0,
-            )
-            .expect("plain write");
-        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 7);
 
         // A mask on a non-8-byte encoding is a template error, not a silent half-write.
         let mut narrow = Property::field("small".to_string());

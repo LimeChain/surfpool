@@ -79,15 +79,12 @@ templates:
           slot itself, which keeps the quote live.
     llm_context: |
       This field is the venue's liveness signal, compared against the chain slot. HumidiFi accepts a
-      quote through the market's staleness limit. Discover markets and their maxStalenessSlots with
-      list_humidifi_markets and set the override account to the chosen address; there is no default.
-      At age maxStalenessSlots + 1 the swap fails with Custom(1027565), or 0xfaded;
-      at age maxStalenessSlots it still fills.
+      quote through the market's staleness limit (maxStalenessSlots in list_humidifi_markets) and
+      rejects it after. Set the override account to a market address from that list; there is no default.
 
-      A FORKED MARKET GOES STALE BY ITSELF. Surfpool caches fetched accounts and does not
-      continuously republish the quote. Once past the
-      limit the market stops quoting and the fair-value override is silently ineffective - the swap
-      fails on staleness. That makes this template the precondition for humidifi-fair-value.
+      A FORKED MARKET GOES STALE BY ITSELF. Surfpool caches fetched accounts and does not republish
+      the quote, so once past the limit the swap fails on staleness and any humidifi-fair-value
+      override is silently ineffective. This template is that override's precondition.
 
       THE VALUE IS A LEAD, NOT A SLOT NUMBER. It is resolved against the slot the override
       materializes at, so 0 means "published this slot". Pass null to take the lead of zero.
@@ -122,11 +119,11 @@ templates:
       The value you pass IS the lead: Surfpool writes the materialization slot plus it, clamped at
       zero. Pass null to take the -3 default. This is one template for every market, not one per limit.
 
-      Rejection is at age strictly greater than the market's own limit. Discover markets with
-      list_humidifi_markets and set the override account to the chosen address; there is no default.
-      Read maxStalenessSlots for that market (the market's masked
-      word at offset 608), and pass -(maxStalenessSlots + 1) to reach the first rejection slot.
-      At that age the swap fails with Custom(1027565), or 0xfaded; one slot younger it fills.
+      Rejection is at age strictly greater than the market's own limit. Set the override account to
+      a market address from list_humidifi_markets; there is no default. Read its maxStalenessSlots
+      (the market's masked word at offset 608) and pass -(maxStalenessSlots + 1) to reach the first
+      rejection slot. At that age the swap fails with Custom(1027565), or 0xfaded; one slot younger
+      it fills.
 
       Do not persist this override: the quote should stay stale. Set fetchBeforeUse: true so the live
       market is forked first. Keep override labels short ("SOL/USDC stale quote").

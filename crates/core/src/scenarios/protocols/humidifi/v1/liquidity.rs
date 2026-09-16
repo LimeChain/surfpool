@@ -9,12 +9,11 @@ use solana_account::Account;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-use crate::{error::SurfpoolResult, scenarios::TemplateRegistry, types::TokenAccount};
-
 use super::fair_value::{
-    FRESHNESS_TEMPLATE, HumidiFiMarket, PREPARATION_SLOT, invalid, read_masked_pubkey, template,
-    validate_humidifi_market_layout,
+    HumidiFiMarket, PREPARATION_SLOT, freshness_override, invalid, read_masked_pubkey_pair,
+    template,
 };
+use crate::{error::SurfpoolResult, scenarios::TemplateRegistry, types::TokenAccount};
 
 /// The vault addresses are read, never written: their balances ride the generic token template.
 const QUOTE_VAULT_OFFSET: usize = 448;
@@ -25,13 +24,11 @@ const BPS: u128 = 10_000;
 
 /// The market's `[base, quote]` vault addresses, unmasked.
 pub fn humidifi_vault_addresses(market_account: &Account) -> SurfpoolResult<[Pubkey; 2]> {
-    validate_humidifi_market_layout(market_account)?;
-    let base = read_masked_pubkey(&market_account.data, BASE_VAULT_OFFSET)?;
-    let quote = read_masked_pubkey(&market_account.data, QUOTE_VAULT_OFFSET)?;
-    if base == Pubkey::default() || quote == Pubkey::default() || base == quote {
-        return Err(invalid("market has invalid vault identities"));
-    }
-    Ok([base, quote])
+    read_masked_pubkey_pair(
+        market_account,
+        [BASE_VAULT_OFFSET, QUOTE_VAULT_OFFSET],
+        "vault",
+    )
 }
 
 pub fn build_humidifi_liquidity_scenario(
@@ -77,7 +74,6 @@ pub fn build_humidifi_liquidity_scenario(
 
     let registry = TemplateRegistry::new();
     let balance_template = template(&registry, TOKEN_BALANCE_TEMPLATE)?;
-    let freshness = template(&registry, FRESHNESS_TEMPLATE)?;
     let label = market.label();
 
     let mut scenario = Scenario::new(
@@ -123,19 +119,7 @@ pub fn build_humidifi_liquidity_scenario(
         );
     }
 
-    scenario.add_override(
-        OverrideInstance::new(
-            freshness.id.clone(),
-            PREPARATION_SLOT,
-            AccountAddress::Pubkey(market.address.to_string()),
-        )
-        .with_values(HashMap::from([(
-            "last_update_slot".to_string(),
-            serde_json::Value::Null,
-        )]))
-        .with_label("Keep HumidiFi quote fresh".to_string())
-        .with_persist(true),
-    );
+    scenario.add_override(freshness_override(&registry, &market.address)?);
     Ok(scenario)
 }
 
@@ -149,11 +133,6 @@ fn vault_balance(
     if vault.owner != token_program {
         return Err(invalid(format!(
             "{side} vault token program does not match the market's {side} mint"
-        )));
-    }
-    if vault.owner != spl_token_interface::id() && vault.owner != spl_token_2022_interface::id() {
-        return Err(invalid(format!(
-            "{side} vault is not owned by a supported token program"
         )));
     }
     let token = TokenAccount::unpack(&vault.data)
@@ -191,14 +170,13 @@ fn percent(bps: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use solana_program_pack::Pack;
-
     use super::{
-        super::fair_value::{HUMIDIFI_PROGRAM_ID, PUBKEY_XOR_KEYS, schema_version_bytes},
+        super::fair_value::{
+            FRESHNESS_TEMPLATE, SCHEMA_VERSION_OFFSET, market_account, mint_account,
+            write_masked_pubkey,
+        },
         *,
     };
-
-    const STATE_KEY: u64 = 0x6e9d_e2b3_0b19_f1ea;
 
     struct Fixture {
         market: HumidiFiMarket,
@@ -209,35 +187,22 @@ mod tests {
         quote_vault: Account,
     }
 
-    fn write_masked_pubkey(data: &mut [u8], offset: usize, pubkey: &Pubkey) {
-        let bytes = pubkey.to_bytes();
-        for (i, key) in PUBKEY_XOR_KEYS.iter().enumerate() {
-            let word = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-            data[offset + i * 8..offset + i * 8 + 8].copy_from_slice(&(word ^ key).to_le_bytes());
-        }
-    }
-
-    fn mint_account(decimals: u8, token_program: Pubkey) -> Account {
-        let mut data = vec![0; spl_token_interface::state::Mint::LEN];
-        if token_program == spl_token_2022_interface::id() {
-            spl_token_2022_interface::state::Mint {
-                decimals,
-                is_initialized: true,
-                ..Default::default()
-            }
-            .pack_into_slice(&mut data);
-        } else {
-            spl_token_interface::state::Mint {
-                decimals,
-                is_initialized: true,
-                ..Default::default()
-            }
-            .pack_into_slice(&mut data);
-        }
-        Account {
-            data,
-            owner: token_program,
-            ..Account::default()
+    impl Fixture {
+        fn build(
+            &self,
+            base_vault: &Account,
+            quote_vault: &Account,
+            base_remaining_bps: u16,
+            quote_remaining_bps: u16,
+        ) -> SurfpoolResult<Scenario> {
+            build_humidifi_liquidity_scenario(
+                &self.market,
+                &self.market_account,
+                base_vault,
+                quote_vault,
+                base_remaining_bps,
+                quote_remaining_bps,
+            )
         }
     }
 
@@ -280,25 +245,17 @@ mod tests {
         let base_vault_address = Pubkey::new_unique();
         let quote_vault_address = Pubkey::new_unique();
 
-        let registry = TemplateRegistry::new();
-        let layout = registry
-            .get("humidifi-fair-value")
-            .and_then(|template| template.raw_layout.clone())
-            .unwrap();
-        let magic = layout.magic.unwrap();
-        let mut data = vec![0; layout.account_size];
-        data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
-        data[1720..1728].copy_from_slice(&schema_version_bytes());
-        data[608..616].copy_from_slice(&(2u64 ^ STATE_KEY).to_le_bytes());
-        write_masked_pubkey(&mut data, 416, &base_mint);
-        write_masked_pubkey(&mut data, 384, &quote_mint);
-        write_masked_pubkey(&mut data, BASE_VAULT_OFFSET, &base_vault_address);
-        write_masked_pubkey(&mut data, QUOTE_VAULT_OFFSET, &quote_vault_address);
-        let market_account = Account {
-            data,
-            owner: HUMIDIFI_PROGRAM_ID,
-            ..Account::default()
-        };
+        let mut market_account = market_account(&base_mint, &quote_mint);
+        write_masked_pubkey(
+            &mut market_account.data,
+            BASE_VAULT_OFFSET,
+            &base_vault_address,
+        );
+        write_masked_pubkey(
+            &mut market_account.data,
+            QUOTE_VAULT_OFFSET,
+            &quote_vault_address,
+        );
         let market = HumidiFiMarket::validate(
             address,
             &market_account,
@@ -349,15 +306,9 @@ mod tests {
     #[test]
     fn scales_only_the_selected_side_and_keeps_the_quote_fresh() {
         let fixture = fixture(1_000_000, 2_000_000);
-        let scenario = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &fixture.base_vault,
-            &fixture.quote_vault,
-            50,
-            10_000,
-        )
-        .unwrap();
+        let scenario = fixture
+            .build(&fixture.base_vault, &fixture.quote_vault, 50, 10_000)
+            .unwrap();
 
         let [base, freshness] = &scenario.overrides[..] else {
             panic!("expected one vault override and the freshness override");
@@ -388,21 +339,15 @@ mod tests {
     #[test]
     fn drains_a_side_floors_the_remainder_and_rejects_noops() {
         let fixture = fixture(1_000_001, 2_000_000);
-        let build = |base: u16, quote: u16| {
-            build_humidifi_liquidity_scenario(
-                &fixture.market,
-                &fixture.market_account,
-                &fixture.base_vault,
-                &fixture.quote_vault,
-                base,
-                quote,
-            )
-        };
 
-        let drained = build(0, 10_000).unwrap();
+        let drained = fixture
+            .build(&fixture.base_vault, &fixture.quote_vault, 0, 10_000)
+            .unwrap();
         assert_eq!(amount_of(&drained.overrides[0]), 0);
 
-        let both = build(3_333, 2_500).unwrap();
+        let both = fixture
+            .build(&fixture.base_vault, &fixture.quote_vault, 3_333, 2_500)
+            .unwrap();
         assert_eq!(both.overrides.len(), 3);
         assert_eq!(amount_of(&both.overrides[0]), 333_300);
         assert_eq!(
@@ -411,139 +356,111 @@ mod tests {
         );
         assert_eq!(amount_of(&both.overrides[1]), 500_000);
 
-        assert!(build(10_000, 10_000).is_err());
-        assert!(build(10_001, 10_000).is_err());
+        assert!(
+            fixture
+                .build(&fixture.base_vault, &fixture.quote_vault, 10_000, 10_000)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .build(&fixture.base_vault, &fixture.quote_vault, 10_001, 10_000)
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_vaults_that_do_not_belong_to_the_market() {
         let fixture = fixture(1_000_000, 2_000_000);
-        let build = |base_vault: &Account, quote_vault: &Account| {
-            build_humidifi_liquidity_scenario(
-                &fixture.market,
-                &fixture.market_account,
-                base_vault,
-                quote_vault,
-                500,
-                10_000,
-            )
-        };
-
-        let wrong_mint = token_account(
-            Pubkey::new_unique(),
-            fixture.market.address,
-            1,
-            spl_token_interface::id(),
-            "initialized",
-        );
-        assert!(build(&wrong_mint, &fixture.quote_vault).is_err());
-
-        let wrong_authority = token_account(
-            fixture.market.base_mint,
-            Pubkey::new_unique(),
-            1,
-            spl_token_interface::id(),
-            "initialized",
-        );
-        assert!(build(&wrong_authority, &fixture.quote_vault).is_err());
-
-        let foreign_program = Account {
-            owner: Pubkey::new_unique(),
-            ..fixture.base_vault.clone()
-        };
-        assert!(build(&foreign_program, &fixture.quote_vault).is_err());
-
-        let not_a_token_account = Account {
-            data: vec![0; 10],
-            ..fixture.base_vault.clone()
-        };
-        assert!(build(&not_a_token_account, &fixture.quote_vault).is_err());
+        let market = &fixture.market;
+        let token = spl_token_interface::id();
+        let token_2022 = spl_token_2022_interface::id();
+        for (side, vault, expected) in [
+            (
+                "base",
+                token_account(
+                    Pubkey::new_unique(),
+                    market.address,
+                    1,
+                    token,
+                    "initialized",
+                ),
+                "base vault does not hold the market's base mint",
+            ),
+            (
+                "base",
+                token_account(
+                    market.base_mint,
+                    Pubkey::new_unique(),
+                    1,
+                    token,
+                    "initialized",
+                ),
+                "base vault is not controlled by the market",
+            ),
+            (
+                "base",
+                Account {
+                    owner: Pubkey::new_unique(),
+                    ..fixture.base_vault.clone()
+                },
+                "base vault token program",
+            ),
+            (
+                "base",
+                Account {
+                    data: vec![0; 10],
+                    ..fixture.base_vault.clone()
+                },
+                "base vault is not an initialized token account",
+            ),
+            (
+                "base",
+                Account {
+                    owner: token_2022,
+                    ..fixture.base_vault.clone()
+                },
+                "base vault token program",
+            ),
+            (
+                "quote",
+                Account {
+                    owner: token_2022,
+                    ..fixture.quote_vault.clone()
+                },
+                "quote vault token program",
+            ),
+            (
+                "base",
+                token_account(market.base_mint, market.address, 1_000_000, token, "frozen"),
+                "base vault is not initialized",
+            ),
+            (
+                "quote",
+                token_account(
+                    market.quote_mint,
+                    market.address,
+                    2_000_000,
+                    token,
+                    "uninitialized",
+                ),
+                "quote vault is not an initialized token account",
+            ),
+        ] {
+            let (base_vault, quote_vault) = if side == "base" {
+                (&vault, &fixture.quote_vault)
+            } else {
+                (&fixture.base_vault, &vault)
+            };
+            let error = fixture
+                .build(base_vault, quote_vault, 500, 10_000)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{side}: {error}");
+        }
 
         let mut version_5 = fixture.market_account.clone();
-        version_5.data[1720..1728].copy_from_slice(&5u64.to_le_bytes());
+        version_5.data[SCHEMA_VERSION_OFFSET..SCHEMA_VERSION_OFFSET + 8]
+            .copy_from_slice(&5u64.to_le_bytes());
         assert!(humidifi_vault_addresses(&version_5).is_err());
-    }
-
-    #[test]
-    fn rejects_vault_token_program_mismatches_on_both_sides() {
-        let fixture = fixture(1_000_000, 2_000_000);
-        let mut base_mismatch = fixture.base_vault.clone();
-        base_mismatch.owner = spl_token_2022_interface::id();
-        let base_error = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &base_mismatch,
-            &fixture.quote_vault,
-            500,
-            10_000,
-        )
-        .unwrap_err();
-        assert!(base_error.to_string().contains("base vault token program"));
-
-        let mut quote_mismatch = fixture.quote_vault.clone();
-        quote_mismatch.owner = spl_token_2022_interface::id();
-        let quote_error = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &fixture.base_vault,
-            &quote_mismatch,
-            500,
-            10_000,
-        )
-        .unwrap_err();
-        assert!(
-            quote_error
-                .to_string()
-                .contains("quote vault token program")
-        );
-    }
-
-    #[test]
-    fn rejects_frozen_and_uninitialized_vaults() {
-        let fixture = fixture(1_000_000, 2_000_000);
-        let frozen = token_account(
-            fixture.market.base_mint,
-            fixture.market.address,
-            1_000_000,
-            spl_token_interface::id(),
-            "frozen",
-        );
-        let frozen_error = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &frozen,
-            &fixture.quote_vault,
-            500,
-            10_000,
-        )
-        .unwrap_err();
-        assert!(
-            frozen_error
-                .to_string()
-                .contains("base vault is not initialized")
-        );
-
-        let uninitialized = token_account(
-            fixture.market.quote_mint,
-            fixture.market.address,
-            2_000_000,
-            spl_token_interface::id(),
-            "uninitialized",
-        );
-        let uninitialized_error = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &fixture.base_vault,
-            &uninitialized,
-            500,
-            10_000,
-        )
-        .unwrap_err();
-        assert!(
-            uninitialized_error
-                .to_string()
-                .contains("quote vault is not an initialized token account")
-        );
     }
 
     #[test]
@@ -554,32 +471,19 @@ mod tests {
             spl_token_2022_interface::id(),
             spl_token_2022_interface::id(),
         );
-        let scenario = build_humidifi_liquidity_scenario(
-            &fixture.market,
-            &fixture.market_account,
-            &fixture.base_vault,
-            &fixture.quote_vault,
-            500,
-            10_000,
-        )
-        .unwrap();
+        let scenario = fixture
+            .build(&fixture.base_vault, &fixture.quote_vault, 500, 10_000)
+            .unwrap();
         assert_eq!(amount_of(&scenario.overrides[0]), 50_000);
     }
 
     #[test]
     fn rejects_market_metadata_from_a_different_account_graph() {
-        let fixture = fixture(1_000_000, 2_000_000);
-        let mut mismatched_market = fixture.market.clone();
-        mismatched_market.base_mint = Pubkey::new_unique();
-        let error = build_humidifi_liquidity_scenario(
-            &mismatched_market,
-            &fixture.market_account,
-            &fixture.base_vault,
-            &fixture.quote_vault,
-            500,
-            10_000,
-        )
-        .unwrap_err();
+        let mut fixture = fixture(1_000_000, 2_000_000);
+        fixture.market.base_mint = Pubkey::new_unique();
+        let error = fixture
+            .build(&fixture.base_vault, &fixture.quote_vault, 500, 10_000)
+            .unwrap_err();
         assert!(error.to_string().contains("mint identities do not match"));
     }
 }

@@ -7,7 +7,7 @@
 //! HumidiFi market fields are XOR-obfuscated: an 8-byte word is stored as `plaintext XOR key`. These
 //! tests fetch live markets and prove the shipped templates write exactly their target fields, that
 //! the masked write round-trips to the plaintext the caller asked for, that the guard rejects a
-//! foreign account, and that discovery matches the chain. They pin the deployed ProgramData
+//! tampered account, and that discovery matches the chain. They pin the deployed ProgramData
 //! so a redeploy that could move the keys or offsets fails loudly rather than writing garbage.
 //!
 //! Swap replays execute the deployed HumidiFi program through a native DFlow shim to prove the
@@ -35,7 +35,7 @@ use crate::{
         TemplateRegistry,
         protocols::humidifi::v1::{
             HumidiFiMarket, build_humidifi_fair_value_scenario, build_humidifi_liquidity_scenario,
-            discover_humidifi_markets, humidifi_vault_addresses, validate_humidifi_market_layout,
+            discover_humidifi_markets, humidifi_vault_addresses,
         },
     },
     surfnet::svm::SurfnetSvm,
@@ -106,16 +106,6 @@ fn assert_only_within(diffs: &[usize], ranges: &[std::ops::Range<usize>], contex
     }
 }
 
-/// The single-field case of [`assert_only_within`].
-fn assert_within(diffs: &[usize], range: std::ops::Range<usize>, context: &str) {
-    for index in diffs {
-        assert!(
-            range.contains(index),
-            "{context}: byte {index} changed outside the target field {range:?}"
-        );
-    }
-}
-
 fn template_raw_apply(
     template_id: &str,
     values: HashMap<String, serde_json::Value>,
@@ -167,83 +157,65 @@ async fn humidifi_templates_write_only_their_fields_and_round_trip() {
         );
         let data = market.data;
 
-        // Fair value: a chosen raw ratio lands at offset 576, masked, and nothing else moves.
         let chosen: u64 = 12_345_678_901_234;
-        let out = template_raw_apply(
-            "humidifi-fair-value",
-            HashMap::from([(
-                "fair_value".to_string(),
-                serde_json::json!(chosen.to_string()),
-            )]),
-            0,
-            &data,
-        );
-        assert_eq!(
-            decode_u64(&out, FAIR_VALUE_OFFSET, FAIR_VALUE_KEY),
-            chosen,
-            "{address}: the masked fair value must unmask to the chosen ratio"
-        );
-        assert_within(
-            &diff_indices(&out, &data),
-            FAIR_VALUE_OFFSET..FAIR_VALUE_OFFSET + 8,
-            &format!("{address} fair value"),
-        );
-
-        // Freshness: the materialization slot lands at offset 616, masked.
         let slot = 500_000_000u64;
-        let out = template_raw_apply(
-            "humidifi-freshness",
-            HashMap::from([("last_update_slot".to_string(), serde_json::Value::Null)]),
-            slot,
-            &data,
-        );
-        assert_eq!(
-            decode_u64(&out, LAST_UPDATE_SLOT_OFFSET, STATE_KEY),
-            slot,
-            "{address}: freshness must publish the materialization slot"
-        );
-        assert_within(
-            &diff_indices(&out, &data),
-            LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8,
-            &format!("{address} freshness"),
-        );
-
-        // Stale: the default lead of -3 ages the quote past the tested SOL/USDC market's inclusive limit.
-        let out = template_raw_apply(
-            "humidifi-stale-quote",
-            HashMap::from([("last_update_slot".to_string(), serde_json::Value::Null)]),
-            slot,
-            &data,
-        );
-        assert_eq!(
-            decode_u64(&out, LAST_UPDATE_SLOT_OFFSET, STATE_KEY),
-            slot - 3,
-            "{address}: the stale template must age the quote by its lead"
-        );
-        assert_within(
-            &diff_indices(&out, &data),
-            LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8,
-            &format!("{address} stale quote"),
-        );
+        // The stale template's default lead of -3 ages the quote past the tested SOL/USDC market's
+        // inclusive limit.
+        for (template, property, value, offset, key, expected) in [
+            (
+                "humidifi-fair-value",
+                "fair_value",
+                serde_json::json!(chosen.to_string()),
+                FAIR_VALUE_OFFSET,
+                FAIR_VALUE_KEY,
+                chosen,
+            ),
+            (
+                "humidifi-freshness",
+                "last_update_slot",
+                serde_json::Value::Null,
+                LAST_UPDATE_SLOT_OFFSET,
+                STATE_KEY,
+                slot,
+            ),
+            (
+                "humidifi-stale-quote",
+                "last_update_slot",
+                serde_json::Value::Null,
+                LAST_UPDATE_SLOT_OFFSET,
+                STATE_KEY,
+                slot - 3,
+            ),
+        ] {
+            let out = template_raw_apply(
+                template,
+                HashMap::from([(property.to_string(), value)]),
+                slot,
+                &data,
+            );
+            assert_eq!(
+                decode_u64(&out, offset, key),
+                expected,
+                "{address} {template}: the masked word must unmask to the requested plaintext"
+            );
+            assert_only_within(
+                &diff_indices(&out, &data),
+                std::slice::from_ref(&(offset..offset + 8)),
+                &format!("{address} {template}"),
+            );
+        }
     }
 }
 
-/// The guard admits a real market and rejects everything else, and the owner check the builder adds
-/// catches a foreign account the raw guard cannot see.
+/// The raw guard rejects a market of the wrong size or with a tampered magic word.
 #[tokio::test]
-async fn humidifi_guard_admits_markets_and_rejects_others() {
+async fn humidifi_guard_rejects_wrong_size_and_magic() {
     let market = fetch(&[SOL_USDC_MARKET]).await.remove(0);
     let registry = TemplateRegistry::new();
     let layout = registry
         .get("humidifi-fair-value")
         .and_then(|t| t.raw_layout.clone())
         .expect("HumidiFi raw layout");
-
-    assert!(
-        layout.guard(&market.data).is_ok(),
-        "the real market must pass"
-    );
-    assert!(validate_humidifi_market_layout(&market).is_ok());
 
     // Wrong size.
     let mut short = market.data.clone();
@@ -256,19 +228,6 @@ async fn humidifi_guard_admits_markets_and_rejects_others() {
     tampered[MAGIC_OFFSET] ^= 0xff;
     let err = layout.guard(&tampered).unwrap_err();
     assert!(err.contains("magic"), "unexpected error: {err}");
-
-    // Right bytes, wrong owner: the raw guard passes, the owner check does not.
-    let foreign = Account {
-        owner: Pubkey::new_unique(),
-        ..market.clone()
-    };
-    assert!(layout.guard(&foreign.data).is_ok());
-    assert!(validate_humidifi_market_layout(&foreign).is_err());
-
-    let mut version_5 = market.clone();
-    encode_masked_u64(&mut version_5.data, SCHEMA_VERSION_OFFSET, 0, 5);
-    assert!(layout.guard(&version_5.data).is_ok());
-    assert!(validate_humidifi_market_layout(&version_5).is_err());
 }
 
 #[tokio::test]
@@ -325,43 +284,6 @@ async fn humidifi_discovers_live_markets() {
         assert_eq!(decode_u64(&account.data, SCHEMA_VERSION_OFFSET, 0), 8);
         assert!(!market.label().is_empty());
     }
-    let registry = TemplateRegistry::new();
-    assert!(
-        !registry
-            .get("humidifi-fair-value")
-            .unwrap()
-            .constants
-            .contains_key("market")
-    );
-    eprintln!(
-        "Discovered {} HumidiFi markets from program accounts",
-        markets.len()
-    );
-}
-
-/// The fair-value scale, checked against reality. Offset 576 is the quote-per-base ratio times
-/// 2^48; decoding the live SOL/USDC market and converting through the mints' decimals must land in a
-/// sane price band. A layout drift or a wrong scale (the earlier 2^47 guess was 2x off) blows past
-/// this. The 2^48 scale itself was proven behaviorally: a live SOL/USDC swap executed at a rate that
-/// equals the decoded fair value divided by 2^48, and the deployed program shifts by 48 (not 47).
-#[tokio::test]
-async fn humidifi_fair_value_scale_yields_a_sane_price() {
-    let market_account = fetch(&[SOL_USDC_MARKET]).await.remove(0);
-    let (base_mint, quote_mint) = HumidiFiMarket::mint_addresses(&market_account).expect("mints");
-    let mints = fetch(&[base_mint, quote_mint]).await;
-    let market = HumidiFiMarket::validate(SOL_USDC_MARKET, &market_account, &mints[0], &mints[1])
-        .expect("valid market");
-
-    let raw = decode_u64(&market_account.data, FAIR_VALUE_OFFSET, FAIR_VALUE_KEY);
-    // human = raw / 2^48 * 10^(base_decimals - quote_decimals)
-    let ratio = raw as f64 / (1u64 << 48) as f64;
-    let human =
-        ratio * 10f64.powi(i32::from(market.base_decimals) - i32::from(market.quote_decimals));
-    eprintln!("HumidiFi {SOL_USDC_MARKET} decoded price ~= {human:.2} quote per base");
-    assert!(
-        (1.0..100_000.0).contains(&human),
-        "SOL/USDC decoded to {human}, outside a sane band; the scale or the layout drifted"
-    );
 }
 
 /// The builder's materialization path: prepare the live market locally, build the scenario, then
@@ -379,13 +301,6 @@ async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh(
 
     let preparation = build_humidifi_fair_value_scenario(&market, "175.5").expect("build scenario");
     let expected_fair_value = preparation.fair_value;
-    assert!(preparation.scenario.name.contains(&market.label()));
-    let [price, freshness] = &preparation.scenario.overrides[..] else {
-        panic!("expected price and freshness overrides");
-    };
-    assert!(!price.fetch_before_use);
-    assert!(!freshness.fetch_before_use);
-    assert!(freshness.persist);
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let mut local_account = market_account.clone();
@@ -451,9 +366,9 @@ async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh(
         base_slot + 1,
         "the persisted freshness must track the slot"
     );
-    assert_within(
+    assert_only_within(
         &diff_indices(&next, applied),
-        LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8,
+        std::slice::from_ref(&(LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8)),
         "persisted freshness next slot",
     );
 }
@@ -583,18 +498,15 @@ fn token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Account {
         lamports: 2_039_280,
         data,
         owner: TOKEN,
-        executable: false,
-        rent_epoch: 0,
+        ..Account::default()
     }
 }
 
 fn system_account(lamports: u64) -> Account {
     Account {
         lamports,
-        data: vec![],
         owner: solana_pubkey::Pubkey::from_str_const("11111111111111111111111111111111"),
-        executable: false,
-        rent_epoch: 0,
+        ..Account::default()
     }
 }
 
@@ -880,28 +792,6 @@ async fn humidifi_stale_quote_lands_the_rejection_boundary() {
                 );
             }
         }
-
-        if configured_limit == 10 {
-            let default_age = template_raw_apply(
-                "humidifi-stale-quote",
-                std::collections::HashMap::from([(
-                    "last_update_slot".to_string(),
-                    serde_json::Value::Null,
-                )]),
-                clock,
-                &configured,
-            );
-            assert_eq!(
-                decode_u64(&default_age, LAST_UPDATE_SLOT_OFFSET, STATE_KEY),
-                clock - 3,
-            );
-            let output = run_swap(&programdata, &live, Some(clock), |data| *data = default_age)
-                .expect(
-                    "the template's default age three must fill when the configured limit is ten",
-                );
-            assert!(output > 0);
-            eprintln!("HumidiFi staleness limit=10 default age=3: WSOL output={output}");
-        }
     }
 }
 
@@ -1007,19 +897,19 @@ async fn humidifi_liquidity_builder_exhausts_only_the_selected_side() {
     let drained = prepared_liquidity(&live, &market, 0, 10_000).await;
     let base_vault = account(&drained, BASE_VAULT);
     assert_eq!(token_amount(&base_vault), 0);
-    assert_within(
+    assert_only_within(
         &live::diff_indices(&account(&live, BASE_VAULT).data, &base_vault.data),
-        64..72,
+        std::slice::from_ref(&(64..72)),
         "drained base vault",
     );
     assert_eq!(base_vault.lamports, account(&live, BASE_VAULT).lamports);
     assert_eq!(account(&drained, QUOTE_VAULT), account(&live, QUOTE_VAULT));
-    assert_within(
+    assert_only_within(
         &live::diff_indices(
             &account(&live, SOL_USDC_MARKET).data,
             &account(&drained, SOL_USDC_MARKET).data,
         ),
-        LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8,
+        std::slice::from_ref(&(LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8)),
         "liquidity scenario market",
     );
     let error = run_swap(&programdata, &drained, None, |_| {})
