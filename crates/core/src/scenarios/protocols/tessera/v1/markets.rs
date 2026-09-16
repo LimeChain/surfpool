@@ -8,12 +8,11 @@ use solana_client::{
 };
 use solana_commitment_config::CommitmentConfig;
 
+use super::{TESSERA_DEFAULT_MARKET, TESSERA_PROGRAM_ID, TesseraMarket, fair_value::MARKET_LAYOUT};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     surfnet::remote::SurfnetRemoteClient,
 };
-
-use super::{TESSERA_DEFAULT_MARKET, TESSERA_PROGRAM_ID, TesseraMarket, fair_value::MARKET_LAYOUT};
 
 pub async fn discover_tessera_markets(
     client: &SurfnetRemoteClient,

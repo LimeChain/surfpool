@@ -9,23 +9,25 @@ submit a swap.
 - Program: `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`
 - ProgramData: `BzSXM6KLDpHQQChzr7Fdgbzwp8r8zRYWFFrHK2uZmDYV`
 - Upgrade authority: `7bJ9xu9UGVZPtYzH1fMwdaKdvfhqeSJtoFc2eGrXBPhK`
-- Deploy slot: `438800691`
-- ELF SHA-256: `433f2a857ffe2045310a478b4aca0fd824308d01f283719275baec60e2aecb3b`
+- Deploy slot: `446053401`
+- ELF SHA-256: `82fd37995fcece47a253b1a00c1dd7e4c3fff706b2e42384110e2cbabf4201b3`
 
-Every offset and behavior below was proven against exactly this deployment; the live suite pins
-it and fails when any of these values move. A redeploy voids the layout evidence — re-verify
+The live suite checks the layout and behavior against this pinned deployment and fails when
+its identity changes. A redeploy voids the layout evidence — re-verify
 before trusting the templates again.
 
 ## The guard, and what it does not cover
 
-A market is 1264 bytes with the eight-byte layout tag `05 00 00 00 00 00 00 00` at offset 96.
-Discovery selects accounts with this size and tag, then validates the mint identities. The tag is
-the version half of the guard: it is what rejects a future market layout that reuses the size.
+The manifest requires 1264 bytes and `05 00 00 00 00 00 00 00` at offset 96, then discovery
+validates ownership and mint identities. These bytes are a conservative observed-state filter,
+not a version discriminator: the deployed program also reads this field during age adjustment.
+A different value may exclude a valid market, and a matching value does not authenticate a future
+layout. Deployment revalidation remains necessary.
 
 The shared raw-layout schema has no owner predicate, so a foreign account of the same size carrying
-the same eight bytes would pass a raw template. `validate_tessera_market_layout` adds the ownership
-check, and every scenario made through the fair-value builder goes through it. Composing the raw
-template against an arbitrary address does not. That is a property of the shared schema, not of
+the same eight bytes would pass a raw template. `TesseraMarket` validation adds the ownership
+check used by discovery and both scenario tools; the depth builder also validates its input
+account. Composing the raw template against an arbitrary address does not. That is a property of the shared schema, not of
 this integration, and the raw scenario API is unvalidated by contract.
 
 ## Templates
@@ -35,7 +37,7 @@ this integration, and the raw scenario API is unvalidated by contract.
 | `tessera-fair-value` | both directional atomic-ratio fields |
 | `tessera-depth` | all twenty directional capacities on both ladders |
 | `tessera-curve` | all twenty directional output factors on both ladders |
-| `tessera-halt` | both required first-level enabled flags |
+| `tessera-halt` | all twenty enabled flags on both ladders |
 | `tessera-stale-quote` | offset 120, aged by the lead you pass (default -20) |
 | `tessera-freshness` | offset 120, the current materialization slot |
 
@@ -47,8 +49,18 @@ where it was, which is why they are one invariant.
 The sell ladder occupies bytes 160 through 639 and the buy ladder 640 through 1119. Each holds
 twenty 24-byte records: directional capacity at `+0`, marginal-price factor at `+8`, enabled flag
 at `+16`. Capacity and factor changes affect only their active quote direction. For a fill
-contained in the first level, both directions match
-`floor(input_atoms * directional_price * first_level_factor / 10^21)` exactly.
+starting and ending in level zero, the modeled output is
+`floor(input_atoms * directional_price * first_level_factor / 10^21)`. The live tests check exact
+atomic output after clearing the captured flow counters at 0/8 and neutralizing the five
+selectable configurations at 1136 + 12*i (ppm adjustment 0, factor scale 1,000,000, no skipped
+levels) in their local fixtures. A small input alone cannot
+establish this condition: prior flow or the selected configuration can start at a later level.
+These fixture controls are not exposed as scenario properties.
+
+`tessera-halt` writes zero to every enabled flag using two strided byte properties. Its existing
+property names are retained, but each now covers twenty levels. Clearing only level zero can
+leave later levels tradable. The live regression checks both captured state and an explicit
+one-level skip, including a control where clearing only level zero still allows a swap.
 
 Offset 88 stores the age at which the program rejects a quote. Age 19 succeeds and age 20 fails
 with custom error 65535 on a market configured at 20.
@@ -62,24 +74,18 @@ template writes a perfectly fresh quote.
 ## Live market discovery
 
 `list_tessera_markets` queries Tessera program accounts through the selected Surfnet RPC.
-It filters by the manifest's account size and layout tag, validates ownership and mint identities,
+It filters by the manifest's account size and pinned bytes, validates ownership and mint identities,
 and reads decimals from the referenced mint accounts. The freshness limit comes from offset 88.
 The existing Surfnet account resolver merges remote discovery with local accounts, preferring local
 state. Discovery needs a datasource that supports `getProgramAccounts`; offline instances can list
 only their local accounts.
 
-Studio loads this list when opening the fair-value dialog. The model uses the same tool to select
-an override account and its freshness limit. There is no market list in `overrides.yaml`; the six
-shared templates retain the SOL/USDC default address for callers that omit an account.
+The six shared templates retain the SOL/USDC default address for callers that omit an account.
 
 Labels use mint symbols from Surfpool's existing token metadata. An unknown mint is displayed by
 its full address, so missing symbol metadata never hides a discovered market. Addresses are the
 identities; symbols are not unique. Market membership, decimals and freshness limits are not taken
 from the token metadata catalog.
-
-`tessera_discovers_live_markets` exercises the production discovery function and checks the returned
-mint identities, decimals and freshness limits against fetched accounts. It does not pin a market
-count, so newly listed markets are included without changing the test or templates.
 
 ## Builders and tools
 
@@ -88,15 +94,13 @@ decimals. It is a pure function over account data. `create_tessera_fair_value_sc
 surfnet's own RPC, so local state wins and only missing accounts fall back to the datasource, then
 stages the scenario through the shared path.
 
-The price override deliberately does not set `fetchBeforeUse`. Reading the accounts at creation
-hydrates them into local state, so the values apply to the same bytes they were derived from; a
-Play-time refetch would reinstall remote bytes over any local edit and patch a different read.
+Builder-created overrides keep `fetchBeforeUse: false`: creation has already read and hydrated
+the target account, and the scenario must use that prepared local snapshot. When composing a
+direct template scenario, set `fetchBeforeUse: true` on the first override for each account not
+yet in local state. Freshness overrides use `persist: true` and `last_update_slot: null` to write
+the current materialization slot on every application.
 
-The paired freshness override is persisted. Its slot encoder writes the slot it materializes at,
-so the prepared price stays inside the market's freshness window however long the scenario runs.
-
-The `Tessera Depth Stress` AI chip requests a 90% reduction in both directions. The
-`create_tessera_depth_scenario` tool reads current Surfnet state and takes remaining basis points
+The `create_tessera_depth_scenario` tool reads current Surfnet state and takes remaining basis points
 per direction: 1000 retains 10%, 10000 leaves that direction unchanged. It scales only enabled
 capacities, with integer-floor rounding, and rejects zero capacities or increases. Prices, factors
 and disabled levels are preserved. The scenario combines `tessera-depth` with persisted freshness;
@@ -105,13 +109,10 @@ Curve changes remain available through the raw template.
 
 ## Behavioral evidence
 
-The live suite loads the pinned deployed ELF from ProgramData into LiteSVM and fails if the
-ProgramData address, deploy slot, or ELF hash changes. It proves each price field controls only its
-matching direction, that active-side capacities and factors alter large fills while the opposite
-side stays byte-for-byte identical, that first-level output in both directions equals the
-price-times-factor formula to the atom, that age 19 succeeds and age 20 fails with error 65535,
-that disabling both required first levels fails both directions, that an unordered single curve
-factor fails with error 8, and that live market discovery returns valid mint metadata.
+The live suite loads the pinned ELF into LiteSVM and exercises price direction isolation,
+depth reductions, curve factors, freshness boundaries, halted ladders, vault bindings,
+invalid sentinel/global account metas, and live market discovery. Raw writes are checked against
+complete expected buffers or permitted byte ranges.
 
 Run it serially. The public endpoint sheds queued requests right after a `getProgramAccounts` scan,
 sometimes as a 413 that looks like a request-size error:
@@ -126,9 +127,9 @@ private endpoint when the public one rate-limits.
 
 ## Known boundaries
 
-The remaining header and trailing fields carry no assigned semantics. No separate fee field is
-exposed: the proven first-level output has no deduction beyond its directional price and factor,
-but that does not establish how Tessera decomposes the factor into spread, fee, or another price
-adjustment. The structured region from 1120 onward stays unexposed because its economic meaning has
-not been behaviorally proven. Vault depletion is not exposed either; the generic SPL Token balance
-template follows the Anchor discriminator path and does not materialize a non-Anchor token account.
+No separate fee field is exposed. Exact controlled first-level output does not establish how
+Tessera decomposes its price factor into spread, fee, or another adjustment. The region from 1120
+onward includes configuration-dependent quote adjustments and leading-level selection; its full
+economic meaning remains unmodeled and it is not exposed by the templates. Vault depletion is
+not exposed by the Tessera templates. The generic SPL Token balance template uses the shared
+typed token-account writer, but Tessera vault depletion behavior is outside this suite's coverage.

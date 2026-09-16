@@ -4,12 +4,14 @@ use solana_account::Account;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
+use super::{
+    TesseraMarket,
+    fair_value::{FRESHNESS_TEMPLATE, freshness_override, template},
+};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
 };
-
-use super::TesseraMarket;
 
 pub fn build_tessera_depth_scenario(
     market: Pubkey,
@@ -27,11 +29,10 @@ pub fn build_tessera_depth_scenario(
     }
     TesseraMarket::mint_addresses(account)?;
     let registry = TemplateRegistry::new();
-    let template = registry
-        .get("tessera-depth")
-        .expect("compiled Tessera template");
+    let depth_template = template(&registry, "tessera-depth")?;
+    template(&registry, FRESHNESS_TEMPLATE)?;
     let mut values = HashMap::new();
-    for property in &template.properties {
+    for property in &depth_template.properties {
         let bps = if property.path.starts_with("sell_levels.") {
             sell_remaining_bps
         } else {
@@ -68,19 +69,11 @@ pub fn build_tessera_depth_scenario(
     );
     let target = AccountAddress::Pubkey(market.to_string());
     scenario.add_override(
-        OverrideInstance::new(template.id.clone(), 0, target.clone())
+        OverrideInstance::new(depth_template.id.clone(), 0, target.clone())
             .with_values(values)
             .with_label("Reduce Tessera depth".to_string()),
     );
-    scenario.add_override(
-        OverrideInstance::new("tessera-freshness".to_string(), 0, target)
-            .with_values(HashMap::from([(
-                "last_update_slot".to_string(),
-                serde_json::Value::Null,
-            )]))
-            .with_label("Keep Tessera quote fresh".to_string())
-            .with_persist(true),
-    );
+    scenario.add_override(freshness_override(target));
     scenario.tags = vec![
         "tessera".to_string(),
         "pmm".to_string(),

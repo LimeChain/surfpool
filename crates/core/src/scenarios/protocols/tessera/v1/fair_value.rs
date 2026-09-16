@@ -28,7 +28,7 @@ pub const TESSERA_DEFAULT_MARKET: Pubkey =
 const BASE_MINT_OFFSET: usize = 24;
 const QUOTE_MINT_OFFSET: usize = 56;
 
-/// The size and layout tag a Tessera market must have, taken from the manifest the raw templates
+/// The size and pinned bytes a Tessera market must have, taken from the manifest the raw templates
 /// are written against so there is one definition of them. Built once; the manifest is compiled in.
 pub(super) static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| {
     template(&TemplateRegistry::new(), FAIR_VALUE_TEMPLATE)
@@ -41,7 +41,7 @@ pub(super) static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| {
 });
 
 const FAIR_VALUE_TEMPLATE: &str = "tessera-fair-value";
-const FRESHNESS_TEMPLATE: &str = "tessera-freshness";
+pub(super) const FRESHNESS_TEMPLATE: &str = "tessera-freshness";
 
 /// Both ratio fields are integers scaled by 10^15, so their product is 10^30.
 const ATOMIC_RATIO_SCALE: u128 = 1_000_000_000_000_000;
@@ -122,7 +122,7 @@ impl TesseraMarket {
 /// Rejects an account that is not a Tessera market.
 ///
 /// The shared raw-layout guard has no owner predicate, so a foreign account of the same size
-/// carrying the same layout tag would pass it. Every builder-made scenario comes through here,
+/// carrying the same pinned bytes would pass it. Every builder-made scenario comes through here,
 /// which adds the ownership check the schema cannot express.
 pub fn validate_tessera_market_layout(account: &Account) -> SurfpoolResult<()> {
     if account.owner != TESSERA_PROGRAM_ID {
@@ -151,13 +151,12 @@ pub fn build_tessera_fair_value_scenario(
 
     let registry = TemplateRegistry::new();
     let fair_value = template(&registry, FAIR_VALUE_TEMPLATE)?;
-    let freshness = template(&registry, FRESHNESS_TEMPLATE)?;
+    template(&registry, FRESHNESS_TEMPLATE)?;
     let market_name = market.label();
     let target = AccountAddress::Pubkey(market.address.to_string());
 
-    // No fetch_before_use: these values were derived from the market account this scenario was
-    // built against, which creation already hydrated into local state. A Play-time refetch would
-    // reinstall remote bytes over any local edit and apply numbers derived from a different read.
+    // Creation hydrates the market into local state. Both overrides must use that prepared
+    // snapshot, so they leave fetch_before_use false.
     let price_override =
         OverrideInstance::new(fair_value.id.clone(), PREPARATION_SLOT, target.clone())
             .with_values(HashMap::from([
@@ -171,17 +170,6 @@ pub fn build_tessera_fair_value_scenario(
                 ),
             ]))
             .with_label(format!("Tessera {market_name} fair value"));
-
-    // Null, not zero: the slot encoder reads a supplied number AS the lead, so only null takes the
-    // template's own lead of zero. Persisted, so the prepared price stays inside the market's
-    // freshness window however long the scenario is left running.
-    let freshness_override = OverrideInstance::new(freshness.id.clone(), PREPARATION_SLOT, target)
-        .with_values(HashMap::from([(
-            "last_update_slot".to_string(),
-            serde_json::Value::Null,
-        )]))
-        .with_label("Keep Tessera quote fresh".to_string())
-        .with_persist(true);
 
     let normalized_price = price.trim();
     let mut scenario = Scenario::new(
@@ -197,7 +185,7 @@ pub fn build_tessera_fair_value_scenario(
         "price-dislocation".to_string(),
     ];
     scenario.add_override(price_override);
-    scenario.add_override(freshness_override);
+    scenario.add_override(freshness_override(target));
 
     Ok(TesseraFairValuePreparation {
         scenario,
@@ -205,6 +193,17 @@ pub fn build_tessera_fair_value_scenario(
         quote_atoms_per_base_atom_x1e15,
         base_atoms_per_quote_atom_x1e15,
     })
+}
+
+pub(super) fn freshness_override(target: AccountAddress) -> OverrideInstance {
+    // Persisted, so the quote stays fresh however long the scenario runs.
+    OverrideInstance::new(FRESHNESS_TEMPLATE.to_string(), PREPARATION_SLOT, target)
+        .with_values(HashMap::from([(
+            "last_update_slot".to_string(),
+            serde_json::Value::Null,
+        )]))
+        .with_label("Keep Tessera quote fresh".to_string())
+        .with_persist(true)
 }
 
 fn read_pubkey(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
@@ -275,7 +274,10 @@ fn checked_power_of_ten(exponent: u32) -> SurfpoolResult<u128> {
         .ok_or_else(|| invalid("price scale exceeds supported precision"))
 }
 
-fn template<'a>(registry: &'a TemplateRegistry, id: &str) -> SurfpoolResult<&'a OverrideTemplate> {
+pub(super) fn template<'a>(
+    registry: &'a TemplateRegistry,
+    id: &str,
+) -> SurfpoolResult<&'a OverrideTemplate> {
     registry
         .get(id)
         .ok_or_else(|| SurfpoolError::internal(format!("Tessera template {id} is unavailable")))
@@ -310,7 +312,7 @@ mod tests {
         let mut data = vec![0; MARKET_LAYOUT.account_size];
         data[BASE_MINT_OFFSET..BASE_MINT_OFFSET + 32].copy_from_slice(base_mint.as_ref());
         data[QUOTE_MINT_OFFSET..QUOTE_MINT_OFFSET + 32].copy_from_slice(quote_mint.as_ref());
-        let magic = MARKET_LAYOUT.magic.as_ref().expect("manifest layout tag");
+        let magic = MARKET_LAYOUT.magic.as_ref().expect("manifest byte guard");
         data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
         Account {
             data,
@@ -347,56 +349,35 @@ mod tests {
     }
 
     #[test]
-    fn builds_atomic_fair_value_for_wsol_usdc_decimals() {
-        let market = market(9, 6);
-        let preparation = build_tessera_fair_value_scenario(&market, "100.25").unwrap();
-        assert_eq!(
-            preparation.quote_atoms_per_base_atom_x1e15,
-            100_250_000_000_000
-        );
-        assert_eq!(
-            preparation.base_atoms_per_quote_atom_x1e15,
-            (RECIPROCAL_PRODUCT / 100_250_000_000_000u128) as u64
-        );
-        assert_eq!(preparation.scenario.overrides.len(), 2);
-        assert_eq!(
-            preparation.scenario.overrides[0].account,
-            AccountAddress::Pubkey(market.address.to_string())
-        );
-    }
-
-    #[test]
     fn derives_price_scale_from_market_mint_decimals() {
-        let market = market(8, 6);
-        let preparation = build_tessera_fair_value_scenario(&market, "78.8477010015472512")
-            .expect("build CBB/USDC price");
-        assert_eq!(
-            preparation.quote_atoms_per_base_atom_x1e15,
-            788_477_010_015_472
-        );
-        assert_eq!(
-            preparation.base_atoms_per_quote_atom_x1e15,
-            (RECIPROCAL_PRODUCT / 788_477_010_015_472u128) as u64
-        );
-    }
-
-    /// The price is computed from one read of the market; a Play-time refetch would apply it to a
-    /// different one and overwrite local edits. The freshness value must stay null, because the
-    /// slot encoder reads a supplied number as the lead rather than ignoring it.
-    #[test]
-    fn price_applies_to_the_read_it_came_from_and_freshness_keeps_the_template_lead() {
-        let preparation = build_tessera_fair_value_scenario(&market(9, 6), "100.25").unwrap();
-        let [price, freshness] = &preparation.scenario.overrides[..] else {
-            panic!("expected exactly a price and a freshness override");
-        };
-        assert!(!price.fetch_before_use);
-        assert!(!price.persist);
-        assert!(!freshness.fetch_before_use);
-        assert!(freshness.persist);
-        assert_eq!(
-            freshness.values.get("last_update_slot"),
-            Some(&serde_json::Value::Null)
-        );
+        for (base_decimals, quote_decimals, price, expected) in [
+            (9, 6, "100.25", 100_250_000_000_000u64),
+            (8, 6, "78.8477010015472512", 788_477_010_015_472),
+        ] {
+            let market = market(base_decimals, quote_decimals);
+            let preparation = build_tessera_fair_value_scenario(&market, price).unwrap();
+            assert_eq!(preparation.market, market.address);
+            assert_eq!(preparation.quote_atoms_per_base_atom_x1e15, expected);
+            assert_eq!(
+                preparation.base_atoms_per_quote_atom_x1e15,
+                (RECIPROCAL_PRODUCT / u128::from(expected)) as u64
+            );
+            let [price, freshness] = &preparation.scenario.overrides[..] else {
+                panic!("expected exactly a price and a freshness override");
+            };
+            assert_eq!(
+                price.account,
+                AccountAddress::Pubkey(market.address.to_string())
+            );
+            assert!(!price.fetch_before_use);
+            assert!(!price.persist);
+            assert!(!freshness.fetch_before_use);
+            assert!(freshness.persist);
+            assert_eq!(
+                freshness.values.get("last_update_slot"),
+                Some(&serde_json::Value::Null)
+            );
+        }
     }
 
     #[test]
@@ -418,6 +399,10 @@ mod tests {
         );
         // The raw guard cannot see the owner, which is the whole reason this check sits on top.
         assert!(MARKET_LAYOUT.guard(&wrong_owner.data).is_ok());
+
+        let mut wrong_magic = market_account(&Pubkey::new_unique(), &Pubkey::new_unique());
+        wrong_magic.data[MARKET_LAYOUT.magic.as_ref().unwrap().offset] ^= 1;
+        assert!(TesseraMarket::mint_addresses(&wrong_magic).is_err());
 
         let same_mint = Pubkey::new_unique();
         assert!(

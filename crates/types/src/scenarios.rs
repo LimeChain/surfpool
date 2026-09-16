@@ -1029,6 +1029,10 @@ pub enum RawEncoding {
         count: usize,
         stride: usize,
     },
+    U8Strided {
+        count: usize,
+        stride: usize,
+    },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus `lead` (may be negative).
@@ -1041,7 +1045,7 @@ impl RawEncoding {
     /// Byte width of this encoding.
     pub fn width(&self) -> usize {
         match self {
-            RawEncoding::U8 => 1,
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
             RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
@@ -1056,7 +1060,8 @@ impl RawEncoding {
     /// encodings with the same loop instead of special-casing one of them.
     pub fn placements(&self) -> (usize, usize) {
         match self {
-            RawEncoding::I32Strided { count, stride } => (*count, *stride),
+            RawEncoding::I32Strided { count, stride }
+            | RawEncoding::U8Strided { count, stride } => (*count, *stride),
             other => (1, other.width()),
         }
     }
@@ -1090,7 +1095,7 @@ impl RawEncoding {
             }};
         }
         Ok(match self {
-            RawEncoding::U8 => int!(u8, "u8"),
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => int!(u8, "u8"),
             RawEncoding::U16 => int!(u16, "u16"),
             RawEncoding::U32 => int!(u32, "u32"),
             RawEncoding::U64 => int!(u64, "u64"),
@@ -1763,6 +1768,83 @@ mod tests {
             )
             .expect_err("a run crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn u8_strided_round_trips_and_rejects_out_of_range_values() {
+        use super::RawEncoding;
+
+        let encoding = RawEncoding::U8Strided {
+            count: 3,
+            stride: 8,
+        };
+        let serialized = json!({"u8_strided": {"count": 3, "stride": 8}});
+        assert_eq!(serde_json::to_value(&encoding).unwrap(), serialized);
+        assert_eq!(
+            serde_json::from_value::<RawEncoding>(serialized).unwrap(),
+            encoding
+        );
+        for value in [json!(-1), json!(256), json!("256")] {
+            let err = encoding.encode(&value, 0).expect_err("outside u8 range");
+            assert!(err.contains("invalid u8"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn u8_strided_writes_single_bytes_and_preserves_padding() {
+        use super::{Property, RawEncoding, RawLayout};
+
+        let layout = RawLayout {
+            account_size: 19,
+            magic: None,
+        };
+        let mut property = Property::field("flags".to_string());
+        property.offset = Some(2);
+        property.encoding = Some(RawEncoding::U8Strided {
+            count: 3,
+            stride: 8,
+        });
+        let properties = [property];
+        layout.validate_properties(&properties).unwrap();
+        for value in [0, 255] {
+            let out = layout
+                .materialize(
+                    &[0xa5; 19],
+                    &properties,
+                    &HashMap::from([("flags".to_string(), json!(value))]),
+                    0,
+                )
+                .unwrap();
+            let mut expected = [0xa5; 19];
+            for offset in [2, 10, 18] {
+                expected[offset] = value;
+            }
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn u8_strided_rejects_invalid_run_bounds_count_and_stride() {
+        use super::{Property, RawEncoding, RawLayout};
+
+        let layout = RawLayout {
+            account_size: 19,
+            magic: None,
+        };
+        for (offset, count, stride, message) in [
+            (3, 3, 8, "beyond"),
+            (2, 0, 8, "zero placements"),
+            (2, 3, usize::MAX, "stride overflow"),
+            (usize::MAX, 1, 1, "offset overflow"),
+        ] {
+            let mut property = Property::field("flags".to_string());
+            property.offset = Some(offset);
+            property.encoding = Some(RawEncoding::U8Strided { count, stride });
+            let err = layout
+                .validate_properties(&[property])
+                .expect_err("invalid strided run");
+            assert!(err.contains(message), "unexpected error: {err}");
+        }
     }
 
     #[test]
