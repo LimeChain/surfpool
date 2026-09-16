@@ -7,66 +7,32 @@ before a user runs a strategy. Product scenarios do not construct or submit swap
 
 ## Pinned deployment
 
-The live tests in `crates/core/src/tests/goonfi/mod.rs` check these ProgramData sizes,
-deployment slots and ELF hashes before replaying the program:
-
-| | Trading program | Oracle publisher |
-|---|---|---|
-| Program | `goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE` | `dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu` |
-| ProgramData | `124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s` | `7btzN5NEjnZqdQECwT88XhixeGnZjz5YKqjYGYKxKE5z` |
-| ProgramData bytes | 252,429 | 557 |
-| Deployment slot | 438563879 | 404369628 |
-| ELF SHA-256 | `73e580830356c7a086d8bec422790b2600108a8129faebdfc055bd46d8936c2e` | `0fc545beb6abd12682ae68a27fa1e2a22d86d5d1dbbbe6d1e8f49e53ef762695` |
-
-A deployment change requires revalidation. These are test pins, not an upgrade-monitoring
-service or a claim that every future deployment has the same layout.
+The live tests in `crates/core/src/tests/goonfi/mod.rs` pin both programs by ProgramData
+size, deployment slot and ELF SHA-256 (the constants at the top of that file) before
+replaying the program. A deployment change requires revalidation. These are test pins, not
+an upgrade-monitoring service or a claim that every future deployment has the same layout.
 
 ## Layouts and templates
 
-A market is 2048 bytes with magic `30 bc 2f 35 34 58 32 9a` at offset 0. Its base/quote
-mints are at offsets 80/112, vaults at 144/176, and oracle pointer at 208. The oracle is
-32 bytes with no discriminator. Both YAML layouts declare their expected program owner;
-the shared materializer checks ownership before writing, then validates size, optional
-magic bytes and write bounds. A failed owner check skips the override with a warning.
-
-| Template | Account | Fields |
-|---|---|---|
-| `goonfi-price` | Oracle | Bid and ask, u64 at offsets 0 and 8 |
-| `goonfi-stale-quote` | Oracle | Freshness slot, u32 at offset 16; default lead -2000 |
-| `goonfi-freshness` | Oracle | Freshness slot, u32 at offset 16; default lead 0 |
-| `goonfi-reference-band` | Market | Reference prices, u64 at offsets 1712 and 1720 |
-
-Prices use the human pair price multiplied by `10^6`, independent of mint decimals.
-For example, 99.74 quote tokens per base token becomes the integer string `"99740000"`.
-Use strings for u64 price values to preserve precision in JSON and Studio.
-
-Slot templates write exactly four bytes. The u32 multiplier at offset 20 and the
-millisecond timestamp at offset 24 remain untouched. A slot value of `null` selects the
-template's default lead; an integer specifies a lead relative to the materialization
-slot. The resulting slot must fit u32.
+`market_overrides.yaml` and `oracle_overrides.yaml` carry the two layouts, every field
+offset and the usage notes (`llm_context`) for the four templates: `goonfi-price` and
+`goonfi-reference-band` move the oracle bid/ask and the market's reference band as one
+invariant; `goonfi-stale-quote` and `goonfi-freshness` write the oracle's 4-byte slot with
+a default lead of -2000 or 0. Both layouts declare their program owner; the shared
+materializer and builders use the same owner predicate. The materializer then validates size,
+optional magic bytes and write bounds. A failed owner check skips the override with a warning.
 
 ## Catalog and price scenario
 
-The backend exposes three GoonFi MCP tools:
+The backend exposes three MCP tools, `list_goonfi_markets`, `create_goonfi_price_scenario`
+and `create_goonfi_liquidity_scenario`; their `#[tool(description)]` and parameter
+descriptions in `crates/mcp/src/surfpool/mod.rs` document the arguments and defaults. The
+YAML files contain no market catalog, and discovery does not require a fixed count.
 
-- `list_goonfi_markets` discovers program accounts and validates market, oracle and mint
-  relationships. It returns market/oracle addresses, labels, mint addresses and decimals.
-  The YAML files contain no market catalog, and discovery does not require a fixed count.
-- `create_goonfi_price_scenario` accepts a market address and a positive human price with
-  up to six decimal places. It resolves the oracle from the market account, validates
-  both accounts, and composes three overrides: equal oracle bid/ask, equal market reference
-  prices, and persistent freshness. An omitted market selects the default SOL/USDC market.
-- `create_goonfi_liquidity_scenario` accepts a market address and per-vault remaining basis
-  points. It resolves both token vaults from the market's own pointers (offsets 144 and
-  176), reads each current balance, validates the vault and oracle owners, and scales each
-  vault through `spl-token-account-balance`: 0 drains a vault so a swap rejects with `0x1`,
-  10000 leaves it unchanged. A persistent freshness override keeps the rejection about
-  liquidity rather than a stale quote. Both default to 0; an omitted market selects the
-  default SOL/USDC market.
-
-These tools accept optional `surfnetPort`, defaulting to 8899, with camelCase argument names like the pump tool, and read through the local
-Surfnet RPC. Missing accounts fall back to that Surfnet's datasource. The price tool
-stages through the shared Studio scenario API; Play registers the scenario.
+These tools accept optional `surfnetPort`, defaulting to 8899, with camelCase argument
+names like the pump tool, and read through the local Surfnet RPC. Missing accounts fall
+back to that Surfnet's datasource. The scenario tools stage through the shared Studio
+scenario API; Play registers the scenario.
 
 Direct library callers pass each vault and oracle as `(Pubkey, &Account)`, preserving
 the address used to read its data. Builders compare these addresses with the market's
@@ -74,12 +40,6 @@ pointers before using any balance or preparing overrides. Owner, token mint and 
 authority checks validate the account graph; they do not authenticate arbitrary bytes
 that a caller deliberately labels with an unrelated address. RPC reads remain outside
 the pure builders, as in Pump's graduation preparation.
-
-Studio's PMM fair-value dialog selects a protocol, a live market and a human price. It
-calls these tools through Studio MCP without forwarding `rpcUrl` or `surfnetPort`,
-matching the Tessera dialog convention. Consequently, these Studio GoonFi calls use the
-backend's default RPC port. Studio retains only each catalog entry's market address and
-label; the backend resolves the oracle when creating a price scenario.
 
 The price builder does not set `fetchBeforeUse`: the accounts read at creation retain
 local edits, and only the specified fields are changed. Freshness uses `persist: true`
@@ -107,7 +67,7 @@ override does not recalculate percentages at execution time.
 The live suite fetches deployed account data and runs the pinned trading ELF in LiteSVM,
 using a builtin wrapper for the Jupiter-shaped CPI. It checks:
 
-- Unchanged encoding produces the same fill; coupled price/reference changes alter output.
+- Coupled price/reference changes move the fill linearly in both directions.
 - Raising only the bid or lowering only the ask rejects with `0x24` (reference-band guard).
 - Quotes decay with slot age and eventually reject with `0x15`. Changing the multiplier
   changes decay in the tested fixture; stamping the slot restores freshness. Changing
@@ -121,20 +81,12 @@ using a builtin wrapper for the Jupiter-shaped CPI. It checks:
 
 Behavior fixtures fund local vaults to at least 10,000 whole tokens and retain wrapped SOL
 backing. This isolates price, ageing and inventory changes from fluctuating live liquidity;
-it does not prove that the same trade currently has sufficient mainnet liquidity. Layout
-and discovery checks use unfunded fetched accounts. Owner-predicate unit tests live in
-`crates/types/src/scenarios.rs`. This suite does not provide a `pmm-sim` differential run
-or a Studio browser test.
+it does not prove that the same trade currently has sufficient mainnet liquidity.
 
-Run all GoonFi unit and live checks serially:
-
-```bash
-SURFPOOL_TEST_RPC_URL=<rpc-url> cargo test -p surfpool-core --features integration-tests \
-  goonfi -- --test-threads=1 --nocapture
-```
-
-The RPC variable is optional and defaults to the public mainnet endpoint. A private endpoint
-can avoid public RPC rate limits. Re-run after a program upgrade or account-layout change.
+Run the suite serially with the command at the top of `crates/core/src/tests/goonfi/mod.rs`.
+`SURFPOOL_TEST_RPC_URL` is optional and defaults to the public mainnet endpoint; a private
+endpoint can avoid public RPC rate limits. Re-run after a program upgrade or account-layout
+change.
 
 ## Known boundaries
 

@@ -21,8 +21,8 @@ use surfpool_core::{
         TemplateRegistry,
         protocols::{
             goonfi::v1::{
-                GoonfiMarket, build_goonfi_liquidity_scenario, build_goonfi_price_scenario,
-                discover_goonfi_markets, vault_addresses,
+                GOONFI_DEFAULT_MARKET, GoonfiMarket, build_goonfi_liquidity_scenario,
+                build_goonfi_price_scenario, discover_goonfi_markets, vault_addresses,
             },
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
@@ -390,6 +390,14 @@ fn scenario_tool_error(message: String) -> CallToolResult {
     )])
 }
 
+fn resolve_goonfi_market_address(address: Option<&str>) -> Result<Pubkey, String> {
+    match address.map(str::trim) {
+        None | Some("") => Ok(GOONFI_DEFAULT_MARKET),
+        Some(value) => Pubkey::from_str(value)
+            .map_err(|error| format!("Invalid GoonFi market pubkey: {error}")),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GetTokenAddressParams {
     #[schemars(description = "The token symbol to look up (e.g., 'USDC', 'SOL', 'JUP')")]
@@ -455,13 +463,7 @@ impl Surfpool {
         address: Option<&str>,
         surfnet_port: Option<u16>,
     ) -> Result<GoonfiMarket, String> {
-        let market_address = match address.map(str::trim) {
-            None | Some("") => {
-                surfpool_core::scenarios::protocols::goonfi::v1::GOONFI_DEFAULT_MARKET
-            }
-            Some(value) => Pubkey::from_str(value)
-                .map_err(|error| format!("Invalid GoonFi market pubkey: {error}"))?,
-        };
+        let market_address = resolve_goonfi_market_address(address)?;
         let market_account = self
             .fetch_surfnet_accounts(surfnet_port, &[market_address])
             .await?
@@ -489,6 +491,44 @@ impl Surfpool {
             (oracle_address, oracle_account),
         )
         .map_err(|error| error.to_string())
+    }
+
+    async fn build_goonfi_liquidity(
+        &self,
+        params: &CreateGoonfiLiquidityScenarioParams,
+    ) -> Result<Scenario, String> {
+        let market_address = resolve_goonfi_market_address(params.market.as_deref())?;
+        let market_account = self
+            .fetch_surfnet_accounts(params.surfnet_port, &[market_address])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("GoonFi market account {market_address} was not found"))?;
+        // Vaults and oracle are read from the market's own pointers, never taken from the caller.
+        let [base_vault, quote_vault] =
+            vault_addresses(&market_account).map_err(|error| error.to_string())?;
+        let oracle =
+            GoonfiMarket::oracle_address(&market_account).map_err(|error| error.to_string())?;
+        let referenced = self
+            .fetch_surfnet_accounts(params.surfnet_port, &[base_vault, quote_vault, oracle])
+            .await?;
+        let account = |index: usize, name: &str| {
+            referenced[index]
+                .as_ref()
+                .ok_or_else(|| format!("GoonFi {name} account was not found"))
+        };
+        let preparation = build_goonfi_liquidity_scenario(
+            market_address,
+            &market_account,
+            (base_vault, account(0, "base vault")?),
+            (quote_vault, account(1, "quote vault")?),
+            (oracle, account(2, "oracle")?),
+            params.base_remaining_bps.unwrap_or(0),
+            params.quote_remaining_bps.unwrap_or(0),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(preparation.scenario)
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -1154,78 +1194,10 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<CreateGoonfiLiquidityScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let market_address = match params.market.as_deref().map(str::trim) {
-            None | Some("") => {
-                surfpool_core::scenarios::protocols::goonfi::v1::GOONFI_DEFAULT_MARKET
-            }
-            Some(value) => match Pubkey::from_str(value) {
-                Ok(market) => market,
-                Err(error) => {
-                    return Ok(scenario_tool_error(format!(
-                        "Invalid GoonFi market pubkey: {error}"
-                    )));
-                }
-            },
-        };
-        let market_account = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[market_address])
-            .await
-        {
-            Ok(mut accounts) => match accounts.remove(0) {
-                Some(account) => account,
-                None => {
-                    return Ok(scenario_tool_error(format!(
-                        "GoonFi market account {market_address} was not found"
-                    )));
-                }
-            },
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        // Vaults and oracle are read from the market's own pointers, never taken from the caller.
-        let [base_vault, quote_vault] = match vault_addresses(&market_account) {
-            Ok(addresses) => addresses,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let oracle = match GoonfiMarket::oracle_address(&market_account) {
-            Ok(oracle) => oracle,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        let referenced = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[base_vault, quote_vault, oracle])
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let account = |index: usize, name: &str| {
-            referenced[index]
-                .as_ref()
-                .ok_or_else(|| format!("GoonFi {name} account was not found"))
-        };
-        let (base_account, quote_account, oracle_account) = match (
-            account(0, "base vault"),
-            account(1, "quote vault"),
-            account(2, "oracle"),
-        ) {
-            (Ok(base), Ok(quote), Ok(oracle)) => (base, quote, oracle),
-            (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => {
-                return Ok(scenario_tool_error(error));
-            }
-        };
-        let preparation = match build_goonfi_liquidity_scenario(
-            market_address,
-            &market_account,
-            (base_vault, base_account),
-            (quote_vault, quote_account),
-            (oracle, oracle_account),
-            params.base_remaining_bps.unwrap_or(0),
-            params.quote_remaining_bps.unwrap_or(0),
-        ) {
-            Ok(preparation) => preparation,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        self.stage_scenario(preparation.scenario).await
+        match self.build_goonfi_liquidity(&params).await {
+            Ok(scenario) => self.stage_scenario(scenario).await,
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
     }
 
     #[tool(
@@ -1543,9 +1515,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goonfi_price_rejects_a_bad_market_before_any_rpc() {
+    async fn goonfi_tools_reject_a_bad_market_before_any_rpc() {
         let surfpool = Surfpool::new();
-        let result = surfpool
+        let price = surfpool
             .create_goonfi_price_scenario(Parameters(CreateGoonfiPriceScenarioParams {
                 surfnet_port: None,
                 market: Some("not-a-pubkey".to_string()),
@@ -1553,17 +1525,7 @@ mod tests {
             }))
             .await
             .expect("the tool reports input errors in its payload, not as a protocol error");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Invalid GoonFi market pubkey"),
-            "unexpected payload: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn goonfi_liquidity_rejects_a_bad_market_before_any_rpc() {
-        let surfpool = Surfpool::new();
-        let result = surfpool
+        let liquidity = surfpool
             .create_goonfi_liquidity_scenario(Parameters(CreateGoonfiLiquidityScenarioParams {
                 surfnet_port: None,
                 market: Some("not-a-pubkey".to_string()),
@@ -1572,11 +1534,15 @@ mod tests {
             }))
             .await
             .expect("the tool reports input errors in its payload, not as a protocol error");
-        let text = format!("{:?}", result.content);
-        assert!(
-            text.contains("Invalid GoonFi market pubkey"),
-            "unexpected payload: {text}"
-        );
+        for result in [price, liquidity] {
+            let payload = json_of(&result);
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Invalid GoonFi market pubkey")),
+                "unexpected payload: {payload}"
+            );
+        }
     }
 
     #[tokio::test]

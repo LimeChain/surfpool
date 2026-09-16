@@ -10,9 +10,12 @@ use std::{collections::HashMap, sync::LazyLock};
 
 use solana_account::Account;
 use solana_pubkey::Pubkey;
-use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, RawLayout, Scenario};
+use surfpool_types::{AccountAddress, OverrideInstance, RawLayout, Scenario};
 
-use super::vault_addresses;
+use super::{
+    FRESHNESS_TEMPLATE, PREPARATION_SLOT, freshness_override, invalid, market_label,
+    markets::market_references, read_pubkey, template, vault_addresses,
+};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
@@ -28,13 +31,14 @@ pub const GOONFI_DEFAULT_MARKET: Pubkey =
     Pubkey::from_str_const("GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC");
 
 /// Read, never written, so no template declares it.
-const ORACLE_POINTER_OFFSET: usize = 208;
+pub(super) const ORACLE_POINTER_OFFSET: usize = 208;
 
 /// The layouts a GoonFi market and its oracle must have, taken from the manifests the raw
 /// templates are written against so there is one definition of them. Built once; both manifests
 /// are compiled in.
-static ORACLE_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| layout_of(PRICE_TEMPLATE));
-static MARKET_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| layout_of(REFERENCE_TEMPLATE));
+pub(super) static ORACLE_LAYOUT: LazyLock<RawLayout> = LazyLock::new(|| layout_of(PRICE_TEMPLATE));
+pub(super) static MARKET_LAYOUT: LazyLock<RawLayout> =
+    LazyLock::new(|| layout_of(REFERENCE_TEMPLATE));
 
 fn layout_of(template_id: &str) -> RawLayout {
     template(&TemplateRegistry::new(), template_id)
@@ -49,13 +53,9 @@ fn layout_of(template_id: &str) -> RawLayout {
 
 const PRICE_TEMPLATE: &str = "goonfi-price";
 const REFERENCE_TEMPLATE: &str = "goonfi-reference-band";
-const FRESHNESS_TEMPLATE: &str = "goonfi-freshness";
 
 /// Prices are the human pair price times 10^6, independent of mint decimals.
 const PRICE_SCALE_DECIMALS: u32 = 6;
-
-/// All three overrides apply on Play, before any slot advance.
-const PREPARATION_SLOT: u64 = 0;
 
 /// The parts of a GoonFi market a price move needs: the market account itself and the oracle it
 /// points at.
@@ -69,6 +69,8 @@ const PREPARATION_SLOT: u64 = 0;
 pub struct GoonfiMarket {
     address: Pubkey,
     oracle: Pubkey,
+    base_mint: Pubkey,
+    quote_mint: Pubkey,
 }
 
 impl GoonfiMarket {
@@ -77,7 +79,8 @@ impl GoonfiMarket {
     /// plus the owner check below are what keep a write out of a foreign account.
     pub fn oracle_address(market_account: &Account) -> SurfpoolResult<Pubkey> {
         validate_goonfi_market_layout(market_account)?;
-        let oracle = read_pubkey(&market_account.data, ORACLE_POINTER_OFFSET)?;
+        let oracle = read_pubkey(&market_account.data, ORACLE_POINTER_OFFSET)
+            .ok_or_else(|| invalid("market oracle bytes are truncated"))?;
         if oracle == Pubkey::default() {
             return Err(invalid("market carries no oracle pointer"));
         }
@@ -108,7 +111,13 @@ impl GoonfiMarket {
         }
         validate_market_authority(address, base_vault_account.1)?;
         validate_goonfi_oracle_layout(oracle_account.1)?;
-        Ok(Self { address, oracle })
+        let [base_mint, quote_mint, _, _] = market_references(market_account)?;
+        Ok(Self {
+            address,
+            oracle,
+            base_mint,
+            quote_mint,
+        })
     }
 
     /// Read-only: the pair is fixed at validation so a caller can inspect it but not re-point it.
@@ -118,6 +127,10 @@ impl GoonfiMarket {
 
     pub fn oracle(&self) -> Pubkey {
         self.oracle
+    }
+
+    pub fn label(&self) -> String {
+        market_label(&self.base_mint, &self.quote_mint)
     }
 }
 
@@ -142,13 +155,12 @@ fn validate_market_authority(address: Pubkey, base_vault_account: &Account) -> S
 
 /// Rejects an account that is not a GoonFi market.
 ///
-/// The shared raw-layout guard has no owner predicate, so a foreign account of the same size
-/// carrying the same magic would pass it. Every builder-made scenario comes through here, which
-/// adds the ownership check the schema cannot express.
+/// The owner and byte guards use the same manifest as the materializer, so a builder cannot
+/// accept an account that the template's owner predicate would later reject.
 pub fn validate_goonfi_market_layout(account: &Account) -> SurfpoolResult<()> {
-    if account.owner != GOONFI_PROGRAM_ID {
-        return Err(invalid("market is not owned by GoonFi"));
-    }
+    MARKET_LAYOUT
+        .guard_owner(&account.owner)
+        .map_err(|_| invalid("market is not owned by GoonFi"))?;
     MARKET_LAYOUT.guard(&account.data).map_err(invalid)
 }
 
@@ -157,9 +169,9 @@ pub fn validate_goonfi_market_layout(account: &Account) -> SurfpoolResult<()> {
 /// The oracle is 32 bytes with no magic at all, so its guard pins only the size; the owner check
 /// here is the real discriminator.
 pub fn validate_goonfi_oracle_layout(account: &Account) -> SurfpoolResult<()> {
-    if account.owner != GOONFI_ORACLE_PROGRAM_ID {
-        return Err(invalid("oracle is not owned by the GoonFi publisher"));
-    }
+    ORACLE_LAYOUT
+        .guard_owner(&account.owner)
+        .map_err(|_| invalid("oracle is not owned by the GoonFi publisher"))?;
     ORACLE_LAYOUT.guard(&account.data).map_err(invalid)
 }
 
@@ -182,28 +194,25 @@ pub fn build_goonfi_price_scenario(
     let price_template = template(&registry, PRICE_TEMPLATE)?;
     let reference = template(&registry, REFERENCE_TEMPLATE)?;
     let freshness = template(&registry, FRESHNESS_TEMPLATE)?;
-    let market_name = market.address.to_string();
+    let market_name = market.label();
     let oracle_target = AccountAddress::Pubkey(market.oracle.to_string());
 
     // No fetch_before_use anywhere: the oracle and reference values are absolute targets for the
     // account graph creation read, and a Play-time refetch would reinstall remote bytes over any
     // local edit.
-    let price_override = OverrideInstance::new(
-        price_template.id.clone(),
-        PREPARATION_SLOT,
-        oracle_target.clone(),
-    )
-    .with_values(HashMap::from([
-        (
-            "bid_price_x1e6".to_string(),
-            serde_json::json!(scaled.clone()),
-        ),
-        (
-            "ask_price_x1e6".to_string(),
-            serde_json::json!(scaled.clone()),
-        ),
-    ]))
-    .with_label(format!("GoonFi {market_name} price"));
+    let price_override =
+        OverrideInstance::new(price_template.id.clone(), PREPARATION_SLOT, oracle_target)
+            .with_values(HashMap::from([
+                (
+                    "bid_price_x1e6".to_string(),
+                    serde_json::json!(scaled.clone()),
+                ),
+                (
+                    "ask_price_x1e6".to_string(),
+                    serde_json::json!(scaled.clone()),
+                ),
+            ]))
+            .with_label(format!("GoonFi {market_name} price"));
 
     // The deployed program rejects an oracle price outside the market's reference band with
     // custom error 0x24, so the band moves to the same target as one invariant.
@@ -224,18 +233,6 @@ pub fn build_goonfi_price_scenario(
     ]))
     .with_label(format!("GoonFi {market_name} reference band"));
 
-    // Null, not zero: the slot encoder reads a supplied number AS the lead, so only null takes
-    // the template's own lead of zero. Persisted, so the prepared price stays inside the oracle's
-    // staleness window however long the scenario is left running.
-    let freshness_override =
-        OverrideInstance::new(freshness.id.clone(), PREPARATION_SLOT, oracle_target)
-            .with_values(HashMap::from([(
-                "last_update_slot".to_string(),
-                serde_json::Value::Null,
-            )]))
-            .with_label("Keep GoonFi quote fresh".to_string())
-            .with_persist(true);
-
     let normalized_price = price.trim();
     let mut scenario = Scenario::new(
         format!("GoonFi {market_name} at {normalized_price}"),
@@ -251,7 +248,7 @@ pub fn build_goonfi_price_scenario(
     ];
     scenario.add_override(price_override);
     scenario.add_override(reference_override);
-    scenario.add_override(freshness_override);
+    scenario.add_override(freshness_override(freshness.id.clone(), &market.oracle));
 
     Ok(GoonfiPricePreparation {
         scenario,
@@ -261,14 +258,7 @@ pub fn build_goonfi_price_scenario(
     })
 }
 
-fn read_pubkey(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
-    let bytes: [u8; 32] = data[offset..offset + 32]
-        .try_into()
-        .map_err(|_| invalid("market oracle bytes are truncated"))?;
-    Ok(Pubkey::new_from_array(bytes))
-}
-
-pub(super) fn human_price_to_x1e6(price: &str) -> SurfpoolResult<u64> {
+fn human_price_to_x1e6(price: &str) -> SurfpoolResult<u64> {
     let value = price.trim();
     let mut parts = value.split('.');
     let whole = parts.next().unwrap_or_default();
@@ -307,60 +297,39 @@ pub(super) fn human_price_to_x1e6(price: &str) -> SurfpoolResult<u64> {
     })
 }
 
-fn template<'a>(registry: &'a TemplateRegistry, id: &str) -> SurfpoolResult<&'a OverrideTemplate> {
-    registry
-        .get(id)
-        .ok_or_else(|| SurfpoolError::internal(format!("GoonFi template {id} is unavailable")))
-}
-
-fn invalid(message: impl Into<String>) -> SurfpoolError {
-    SurfpoolError::internal(message.into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenarios::protocols::goonfi::v1::fixtures::{
+        self, FIXTURE_BASE_VAULT, FIXTURE_ORACLE, FIXTURE_QUOTE_VAULT, oracle_account,
+    };
 
-    const FIXTURE_BASE_VAULT: Pubkey = Pubkey::new_from_array([2; 32]);
-    const FIXTURE_QUOTE_VAULT: Pubkey = Pubkey::new_from_array([3; 32]);
-
-    fn market_account(oracle: &Pubkey) -> Account {
-        let mut data = vec![0; MARKET_LAYOUT.account_size];
-        let magic = MARKET_LAYOUT.magic.as_ref().expect("manifest layout tag");
-        data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
-        data[144..176].copy_from_slice(FIXTURE_BASE_VAULT.as_ref());
-        data[176..208].copy_from_slice(FIXTURE_QUOTE_VAULT.as_ref());
-        data[ORACLE_POINTER_OFFSET..ORACLE_POINTER_OFFSET + 32].copy_from_slice(oracle.as_ref());
-        Account {
-            data,
-            owner: GOONFI_PROGRAM_ID,
-            ..Account::default()
+    #[test]
+    fn template_owners_match_the_discovered_programs() {
+        let registry = TemplateRegistry::new();
+        for (id, owner) in [
+            (REFERENCE_TEMPLATE, GOONFI_PROGRAM_ID),
+            (PRICE_TEMPLATE, GOONFI_ORACLE_PROGRAM_ID),
+            (FRESHNESS_TEMPLATE, GOONFI_ORACLE_PROGRAM_ID),
+            ("goonfi-stale-quote", GOONFI_ORACLE_PROGRAM_ID),
+        ] {
+            let layout = registry.get(id).unwrap().raw_layout.as_ref().unwrap();
+            assert_eq!(layout.owner, Some(owner.to_string()), "{id}");
         }
     }
 
-    fn oracle_account() -> Account {
-        Account {
-            data: vec![0; ORACLE_LAYOUT.account_size],
-            owner: GOONFI_ORACLE_PROGRAM_ID,
-            ..Account::default()
-        }
+    fn market_account(oracle: &Pubkey) -> Account {
+        fixtures::market_account(
+            [&Pubkey::new_unique(), &Pubkey::new_unique()],
+            [&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT],
+            oracle,
+        )
     }
 
     /// A market's base vault: a token account whose authority is the market itself.
     fn vault_account(authority: &Pubkey) -> Account {
-        let mut data = vec![0u8; 165];
-        data[0..32].copy_from_slice(Pubkey::new_unique().as_ref());
-        data[32..64].copy_from_slice(authority.as_ref());
-        data[108] = 1;
-        Account {
-            data,
-            owner: spl_token_interface::ID,
-            ..Account::default()
-        }
+        fixtures::token_account(&Pubkey::new_unique(), authority, 0)
     }
-
-    const FIXTURE_ORACLE: Pubkey =
-        Pubkey::from_str_const("7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3");
 
     fn market() -> GoonfiMarket {
         let address = Pubkey::new_unique();
@@ -371,6 +340,44 @@ mod tests {
             (FIXTURE_ORACLE, &oracle_account()),
         )
         .expect("valid GoonFi market")
+    }
+
+    #[test]
+    fn names_the_scenario_and_overrides_by_the_pair_label() {
+        const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
+        const USDC: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        let address = Pubkey::new_unique();
+        let market = GoonfiMarket::validate(
+            address,
+            &fixtures::market_account(
+                [&WSOL, &USDC],
+                [&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT],
+                &FIXTURE_ORACLE,
+            ),
+            (FIXTURE_BASE_VAULT, &vault_account(&address)),
+            (FIXTURE_ORACLE, &oracle_account()),
+        )
+        .unwrap();
+
+        let scenario = build_goonfi_price_scenario(&market, "150")
+            .unwrap()
+            .scenario;
+        let labels: Vec<&str> = scenario
+            .overrides
+            .iter()
+            .map(|instance| instance.label.as_deref().unwrap_or(""))
+            .collect();
+
+        assert_eq!(scenario.name, "GoonFi SOL/USDC at 150");
+        assert_eq!(
+            labels,
+            [
+                "GoonFi SOL/USDC price",
+                "GoonFi SOL/USDC reference band",
+                "Keep GoonFi quote fresh"
+            ]
+        );
+        assert!(scenario.description.contains(&address.to_string()));
     }
 
     #[test]
@@ -441,6 +448,9 @@ mod tests {
         assert!(validate_market_authority(Pubkey::new_unique(), &oracle_account()).is_err());
     }
 
+    /// The values are absolute targets for the creation read, so nothing refetches at Play; the
+    /// freshness value must stay null because the slot encoder reads a supplied number as the
+    /// lead rather than ignoring it.
     #[test]
     fn builds_price_scenario_across_both_accounts() {
         let market = market();
@@ -470,17 +480,6 @@ mod tests {
             reference.values.get("reference_price_b_x1e6"),
             Some(&serde_json::json!("99740000"))
         );
-    }
-
-    /// The values are absolute targets for the creation read, so nothing refetches at Play; the
-    /// freshness value must stay null because the slot encoder reads a supplied number as the
-    /// lead rather than ignoring it.
-    #[test]
-    fn price_stays_on_the_creation_read_and_freshness_keeps_the_template_lead() {
-        let preparation = build_goonfi_price_scenario(&market(), "1").unwrap();
-        let [price, reference, freshness] = &preparation.scenario.overrides[..] else {
-            panic!("expected exactly three overrides");
-        };
         assert!(!price.fetch_before_use);
         assert!(!price.persist);
         assert!(!reference.fetch_before_use);
@@ -532,72 +531,68 @@ mod tests {
         let uncataloged = GoonfiMarket {
             address: Pubkey::new_unique(),
             oracle: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
         };
         let preparation = build_goonfi_price_scenario(&uncataloged, "1").unwrap();
+        assert!(preparation.scenario.name.contains(&uncataloged.label()));
         assert!(
             preparation
                 .scenario
-                .name
+                .description
                 .contains(&uncataloged.address.to_string())
         );
         assert_eq!(preparation.oracle, uncataloged.oracle);
 
         let oracle = Pubkey::new_unique();
+        let address = Pubkey::new_unique();
         let wrong_owner = Account {
             owner: Pubkey::new_unique(),
             ..market_account(&oracle)
         };
-        let address = Pubkey::new_unique();
-        assert!(
-            GoonfiMarket::validate(
-                address,
-                &wrong_owner,
-                (FIXTURE_BASE_VAULT, &vault_account(&address)),
-                (oracle, &oracle_account()),
-            )
-            .is_err()
-        );
         // The raw guard cannot see the owner, which is the whole reason this check sits on top.
         assert!(MARKET_LAYOUT.guard(&wrong_owner.data).is_ok());
-
         let mut bad_magic = market_account(&oracle);
         bad_magic.data[0] ^= 0xff;
-        assert!(
-            GoonfiMarket::validate(
-                address,
-                &bad_magic,
-                (FIXTURE_BASE_VAULT, &vault_account(&address)),
-                (oracle, &oracle_account()),
-            )
-            .is_err()
-        );
-
-        let no_pointer = market_account(&Pubkey::default());
-        assert!(
-            GoonfiMarket::validate(
-                address,
-                &no_pointer,
-                (FIXTURE_BASE_VAULT, &vault_account(&address)),
-                (oracle, &oracle_account()),
-            )
-            .is_err()
-        );
-
         // The oracle carries no magic at all, so the owner check is its only discriminator.
         let foreign_oracle = Account {
             owner: Pubkey::new_unique(),
             ..oracle_account()
         };
-        assert!(
-            GoonfiMarket::validate(
-                address,
-                &market_account(&oracle),
-                (FIXTURE_BASE_VAULT, &vault_account(&address)),
-                (oracle, &foreign_oracle),
-            )
-            .is_err()
-        );
         assert!(ORACLE_LAYOUT.guard(&foreign_oracle.data).is_ok());
+        for (label, market, oracle_fixture) in [
+            (
+                "market owned by another program",
+                wrong_owner,
+                oracle_account(),
+            ),
+            (
+                "market with a flipped magic byte",
+                bad_magic,
+                oracle_account(),
+            ),
+            (
+                "market without an oracle pointer",
+                market_account(&Pubkey::default()),
+                oracle_account(),
+            ),
+            (
+                "oracle owned by another program",
+                market_account(&oracle),
+                foreign_oracle,
+            ),
+        ] {
+            assert!(
+                GoonfiMarket::validate(
+                    address,
+                    &market,
+                    (FIXTURE_BASE_VAULT, &vault_account(&address)),
+                    (oracle, &oracle_fixture),
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
 
         let truncated_oracle = Account {
             data: vec![0; 16],

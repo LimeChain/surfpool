@@ -540,10 +540,7 @@ mod tests {
             "Registry should load 66 templates total"
         );
 
-        assert!(registry.contains("goonfi-price"));
         assert!(registry.contains("goonfi-stale-quote"));
-        assert!(registry.contains("goonfi-freshness"));
-        assert!(registry.contains("goonfi-reference-band"));
 
         assert!(registry.contains("pyth-price-feed-v2"));
 

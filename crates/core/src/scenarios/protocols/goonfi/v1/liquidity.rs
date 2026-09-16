@@ -11,28 +11,21 @@ use std::collections::HashMap;
 
 use solana_account::Account;
 use solana_pubkey::Pubkey;
-use surfpool_types::{AccountAddress, OverrideInstance, OverrideTemplate, Scenario};
+use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::{
-    GoonfiMarket, market_label, validate_goonfi_market_layout, validate_goonfi_oracle_layout,
+    FRESHNESS_TEMPLATE, GoonfiMarket, PREPARATION_SLOT, freshness_override, invalid, market_label,
+    read_pubkey, template, validate_goonfi_market_layout, validate_goonfi_oracle_layout,
 };
-use crate::{
-    error::{SurfpoolError, SurfpoolResult},
-    scenarios::TemplateRegistry,
-    types::TokenAccount,
-};
+use crate::{error::SurfpoolResult, scenarios::TemplateRegistry, types::TokenAccount};
 
 /// Read, never written, so no template declares them.
-const BASE_MINT_OFFSET: usize = 80;
-const QUOTE_MINT_OFFSET: usize = 112;
-const BASE_VAULT_OFFSET: usize = 144;
-const QUOTE_VAULT_OFFSET: usize = 176;
+pub(super) const BASE_MINT_OFFSET: usize = 80;
+pub(super) const QUOTE_MINT_OFFSET: usize = 112;
+pub(super) const BASE_VAULT_OFFSET: usize = 144;
+pub(super) const QUOTE_VAULT_OFFSET: usize = 176;
 
 const LIQUIDITY_TEMPLATE: &str = "spl-token-account-balance";
-const FRESHNESS_TEMPLATE: &str = "goonfi-freshness";
-
-/// Both overrides apply on Play, before any slot advance.
-const PREPARATION_SLOT: u64 = 0;
 
 /// 10000 basis points leaves a vault untouched; 0 drains it.
 const FULL_BPS: u16 = 10_000;
@@ -49,12 +42,11 @@ pub struct GoonfiLiquidityPreparation {
 
 /// The two SPL token vaults a market draws liquidity from, read from the market's own pointers.
 ///
-/// Validates the market first: the shared raw-layout guard has no owner predicate, so the owner
-/// check in `validate_goonfi_market_layout` is what keeps these offsets pointed at a real market.
+/// Validates the market's owner and byte layout before reading its pointers.
 pub fn vault_addresses(market_account: &Account) -> SurfpoolResult<[Pubkey; 2]> {
     validate_goonfi_market_layout(market_account)?;
-    let base = read_pubkey(&market_account.data, BASE_VAULT_OFFSET)?;
-    let quote = read_pubkey(&market_account.data, QUOTE_VAULT_OFFSET)?;
+    let base = market_pointer(&market_account.data, BASE_VAULT_OFFSET)?;
+    let quote = market_pointer(&market_account.data, QUOTE_VAULT_OFFSET)?;
     if base == Pubkey::default() || quote == Pubkey::default() || base == quote {
         return Err(invalid("market carries invalid vault pointers"));
     }
@@ -98,8 +90,8 @@ pub fn build_goonfi_liquidity_scenario(
     }
     validate_goonfi_oracle_layout(oracle_account.1)?;
 
-    let base_mint = read_pubkey(&market_account.data, BASE_MINT_OFFSET)?;
-    let quote_mint = read_pubkey(&market_account.data, QUOTE_MINT_OFFSET)?;
+    let base_mint = market_pointer(&market_account.data, BASE_MINT_OFFSET)?;
+    let quote_mint = market_pointer(&market_account.data, QUOTE_MINT_OFFSET)?;
     let base_amount = vault_amount(base_vault_account, base_vault, "base", &base_mint, market)?;
     let quote_amount = vault_amount(
         quote_vault_account,
@@ -149,22 +141,9 @@ pub fn build_goonfi_liquidity_scenario(
         );
     }
 
-    // Null, not zero: the slot encoder reads a supplied number AS the lead, so only null keeps the
-    // template's own lead of zero. Persisted so the quote stays inside the staleness window and the
-    // swap the drained state is proven against is rejected for liquidity (0x1), not a stale quote.
-    scenario.add_override(
-        OverrideInstance::new(
-            FRESHNESS_TEMPLATE.to_string(),
-            PREPARATION_SLOT,
-            AccountAddress::Pubkey(oracle.to_string()),
-        )
-        .with_values(HashMap::from([(
-            "last_update_slot".to_string(),
-            serde_json::Value::Null,
-        )]))
-        .with_label("Keep GoonFi quote fresh".to_string())
-        .with_persist(true),
-    );
+    // Persisted so the swap the drained state is proven against is rejected for liquidity (0x1),
+    // not a stale quote.
+    scenario.add_override(freshness_override(FRESHNESS_TEMPLATE.to_string(), &oracle));
 
     Ok(GoonfiLiquidityPreparation {
         scenario,
@@ -214,82 +193,38 @@ fn remaining_label(bps: u16) -> String {
     format!("{}.{:02}%", bps / 100, bps % 100)
 }
 
-fn read_pubkey(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
-    let bytes: [u8; 32] = data
-        .get(offset..offset + 32)
-        .and_then(|slice| slice.try_into().ok())
-        .ok_or_else(|| invalid("market vault bytes are truncated"))?;
-    Ok(Pubkey::new_from_array(bytes))
-}
-
-fn template<'a>(registry: &'a TemplateRegistry, id: &str) -> SurfpoolResult<&'a OverrideTemplate> {
-    registry
-        .get(id)
-        .ok_or_else(|| SurfpoolError::internal(format!("GoonFi template {id} is unavailable")))
-}
-
-fn invalid(message: impl Into<String>) -> SurfpoolError {
-    SurfpoolError::internal(message.into())
+fn market_pointer(data: &[u8], offset: usize) -> SurfpoolResult<Pubkey> {
+    read_pubkey(data, offset).ok_or_else(|| invalid("market vault bytes are truncated"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenarios::protocols::goonfi::v1::{GOONFI_ORACLE_PROGRAM_ID, GOONFI_PROGRAM_ID};
+    use crate::scenarios::protocols::goonfi::v1::fixtures::{
+        self, FIXTURE_BASE_VAULT, FIXTURE_ORACLE, FIXTURE_QUOTE_VAULT, oracle_account,
+    };
 
-    const FIXTURE_BASE_VAULT: Pubkey = Pubkey::new_from_array([2; 32]);
-    const FIXTURE_QUOTE_VAULT: Pubkey = Pubkey::new_from_array([3; 32]);
-
-    const FIXTURE_ORACLE: Pubkey =
-        Pubkey::from_str_const("7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3");
     const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
     const USDC: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-
-    fn market_account(base_vault: &Pubkey, quote_vault: &Pubkey) -> Account {
-        let mut data = vec![0u8; 2048];
-        // Magic tag every live market shares.
-        data[0..8].copy_from_slice(&[48, 188, 47, 53, 52, 88, 50, 154]);
-        data[BASE_MINT_OFFSET..BASE_MINT_OFFSET + 32].copy_from_slice(WSOL.as_ref());
-        data[QUOTE_MINT_OFFSET..QUOTE_MINT_OFFSET + 32].copy_from_slice(USDC.as_ref());
-        data[BASE_VAULT_OFFSET..BASE_VAULT_OFFSET + 32].copy_from_slice(base_vault.as_ref());
-        data[QUOTE_VAULT_OFFSET..QUOTE_VAULT_OFFSET + 32].copy_from_slice(quote_vault.as_ref());
-        data[208..240].copy_from_slice(FIXTURE_ORACLE.as_ref());
-        Account {
-            data,
-            owner: GOONFI_PROGRAM_ID,
-            ..Account::default()
-        }
-    }
 
     /// The market every fixture below belongs to; its vaults name it as their authority.
     const MARKET: Pubkey = Pubkey::from_str_const("GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC");
 
-    fn vault(mint: &Pubkey, amount: u64) -> Account {
-        const AMOUNT_OFFSET: usize = 64;
-        const STATE_OFFSET: usize = 108;
-        let mut data = vec![0u8; 165];
-        data[0..32].copy_from_slice(mint.as_ref());
-        data[32..64].copy_from_slice(MARKET.as_ref());
-        data[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].copy_from_slice(&amount.to_le_bytes());
-        data[STATE_OFFSET] = 1;
-        Account {
-            data,
-            owner: spl_token_interface::ID,
-            ..Account::default()
-        }
+    fn market_account() -> Account {
+        fixtures::market_account(
+            [&WSOL, &USDC],
+            [&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT],
+            &FIXTURE_ORACLE,
+        )
     }
 
-    fn oracle() -> Account {
-        Account {
-            data: vec![0u8; 32],
-            owner: GOONFI_ORACLE_PROGRAM_ID,
-            ..Account::default()
-        }
+    fn vault(mint: &Pubkey, amount: u64) -> Account {
+        fixtures::token_account(mint, &MARKET, amount)
     }
 
     #[test]
     fn rejects_unrelated_vault_with_matching_mint_and_authority() {
-        let market = market_account(&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT);
+        let market = market_account();
         for (base_address, quote_address, side) in [
             (Pubkey::new_unique(), FIXTURE_QUOTE_VAULT, "base"),
             (FIXTURE_BASE_VAULT, Pubkey::new_unique(), "quote"),
@@ -299,7 +234,7 @@ mod tests {
                 &market,
                 (base_address, &vault(&WSOL, 999_999_999)),
                 (quote_address, &vault(&USDC, 999_999_999)),
-                (FIXTURE_ORACLE, &oracle()),
+                (FIXTURE_ORACLE, &oracle_account()),
                 5_000,
                 5_000,
             )
@@ -313,13 +248,12 @@ mod tests {
 
     #[test]
     fn rejects_an_unrelated_publisher_owned_oracle() {
-        let market = market_account(&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT);
         let error = build_goonfi_liquidity_scenario(
             MARKET,
-            &market,
+            &market_account(),
             (FIXTURE_BASE_VAULT, &vault(&WSOL, 1_000)),
             (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1_000)),
-            (Pubkey::new_unique(), &oracle()),
+            (Pubkey::new_unique(), &oracle_account()),
             5_000,
             FULL_BPS,
         )
@@ -329,31 +263,31 @@ mod tests {
 
     #[test]
     fn drains_both_vaults_and_keeps_the_quote_fresh() {
-        let base_vault = FIXTURE_BASE_VAULT;
-        let quote_vault = FIXTURE_QUOTE_VAULT;
-        let market = MARKET;
         let preparation = build_goonfi_liquidity_scenario(
-            market,
-            &market_account(&base_vault, &quote_vault),
+            MARKET,
+            &market_account(),
             (FIXTURE_BASE_VAULT, &vault(&WSOL, 2_441_078_070_812)),
             (FIXTURE_QUOTE_VAULT, &vault(&USDC, 216_136_231_615)),
-            (FIXTURE_ORACLE, &oracle()),
+            (FIXTURE_ORACLE, &oracle_account()),
             0,
             0,
         )
         .unwrap();
 
-        assert_eq!(preparation.base_vault, base_vault);
-        assert_eq!(preparation.quote_vault, quote_vault);
+        assert_eq!(preparation.base_vault, FIXTURE_BASE_VAULT);
+        assert_eq!(preparation.quote_vault, FIXTURE_QUOTE_VAULT);
         // A friendly pair label, not the raw market pubkey.
         assert_eq!(preparation.scenario.name, "GoonFi SOL/USDC liquidity drain");
         let [base, quote, freshness] = &preparation.scenario.overrides[..] else {
             panic!("expected base drain, quote drain and freshness overrides");
         };
-        assert_eq!(base.account, AccountAddress::Pubkey(base_vault.to_string()));
+        assert_eq!(
+            base.account,
+            AccountAddress::Pubkey(FIXTURE_BASE_VAULT.to_string())
+        );
         assert_eq!(
             quote.account,
-            AccountAddress::Pubkey(quote_vault.to_string())
+            AccountAddress::Pubkey(FIXTURE_QUOTE_VAULT.to_string())
         );
         assert_eq!(base.values.get("amount"), Some(&serde_json::json!("0")));
         assert_eq!(quote.values.get("amount"), Some(&serde_json::json!("0")));
@@ -372,14 +306,12 @@ mod tests {
 
     #[test]
     fn scales_partially_and_skips_an_unchanged_side() {
-        let base_vault = FIXTURE_BASE_VAULT;
-        let quote_vault = FIXTURE_QUOTE_VAULT;
         let preparation = build_goonfi_liquidity_scenario(
             MARKET,
-            &market_account(&base_vault, &quote_vault),
+            &market_account(),
             (FIXTURE_BASE_VAULT, &vault(&WSOL, 1_000)),
             (FIXTURE_QUOTE_VAULT, &vault(&USDC, 999)),
-            (FIXTURE_ORACLE, &oracle()),
+            (FIXTURE_ORACLE, &oracle_account()),
             2_500,
             FULL_BPS,
         )
@@ -388,7 +320,10 @@ mod tests {
         let [base, freshness] = &preparation.scenario.overrides[..] else {
             panic!("the unchanged quote side must not get an override");
         };
-        assert_eq!(base.account, AccountAddress::Pubkey(base_vault.to_string()));
+        assert_eq!(
+            base.account,
+            AccountAddress::Pubkey(FIXTURE_BASE_VAULT.to_string())
+        );
         // 1000 * 2500 / 10000, exact integer arithmetic.
         assert_eq!(base.values.get("amount"), Some(&serde_json::json!("250")));
         assert_eq!(freshness.values.len(), 1);
@@ -396,127 +331,126 @@ mod tests {
 
     #[test]
     fn rejects_bad_basis_points_and_accounts() {
-        let base_vault = FIXTURE_BASE_VAULT;
-        let quote_vault = FIXTURE_QUOTE_VAULT;
-        let good_market = market_account(&base_vault, &quote_vault);
-
-        // Out of range and a no-op leave nothing to prepare.
-        assert!(
-            build_goonfi_liquidity_scenario(
-                MARKET,
-                &good_market,
-                (FIXTURE_BASE_VAULT, &vault(&WSOL, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
-                10_001,
-                0,
-            )
-            .is_err()
-        );
-        assert!(
-            build_goonfi_liquidity_scenario(
-                MARKET,
-                &good_market,
-                (FIXTURE_BASE_VAULT, &vault(&WSOL, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
-                FULL_BPS,
-                FULL_BPS,
-            )
-            .is_err()
-        );
-
-        // A foreign account of the same size passes the raw guard, so the owner check must reject.
+        let good_market = market_account();
         let foreign_market = Account {
             owner: Pubkey::new_unique(),
-            ..market_account(&base_vault, &quote_vault)
+            ..market_account()
         };
-        assert!(
-            build_goonfi_liquidity_scenario(
-                MARKET,
-                &foreign_market,
-                (FIXTURE_BASE_VAULT, &vault(&WSOL, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
-                0,
-                0,
-            )
-            .is_err()
-        );
-
-        // A vault not owned by a token program is not a real vault.
+        let base = vault(&WSOL, 1);
         let foreign_vault = Account {
             owner: Pubkey::new_unique(),
             ..vault(&WSOL, 1)
         };
-        assert!(
-            build_goonfi_liquidity_scenario(
-                MARKET,
-                &good_market,
-                (FIXTURE_BASE_VAULT, &foreign_vault),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
-                0,
-                0,
-            )
-            .is_err()
-        );
-
-        // A foreign oracle carries no magic, so its owner is the only discriminator.
-        let foreign_oracle = Account {
-            owner: Pubkey::new_unique(),
-            ..oracle()
-        };
-        assert!(
-            build_goonfi_liquidity_scenario(
-                MARKET,
-                &good_market,
-                (FIXTURE_BASE_VAULT, &vault(&WSOL, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &foreign_oracle),
-                0,
-                0,
-            )
-            .is_err()
-        );
-    }
-
-    /// An owner-and-length check would pass a mint: it is token-program-owned and long enough to
-    /// misread an amount out of. Unpacking plus the mint comparison is what rejects it.
-    #[test]
-    fn rejects_a_vault_that_is_not_this_markets_token_account() {
-        let market = market_account(&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT);
+        let quote_mint_vault = vault(&USDC, 1);
         let mint_account = Account {
             data: vec![0u8; 82],
             owner: spl_token_interface::ID,
             ..Account::default()
         };
-        assert!(
-            build_goonfi_liquidity_scenario(
+        let oracle = oracle_account();
+        let foreign_oracle = Account {
+            owner: Pubkey::new_unique(),
+            ..oracle_account()
+        };
+        let rows = [
+            // Out of range and a no-op leave nothing to prepare.
+            (
+                "basis points above 10000",
                 MARKET,
-                &market,
-                (FIXTURE_BASE_VAULT, &mint_account),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
+                &good_market,
+                &base,
+                &oracle,
+                10_001,
                 0,
-                0,
-            )
-            .is_err()
-        );
-
-        // A real token account holding the other side's mint is refused as well.
-        assert!(
-            build_goonfi_liquidity_scenario(
+            ),
+            (
+                "both sides left unchanged",
                 MARKET,
-                &market,
-                (FIXTURE_BASE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
+                &good_market,
+                &base,
+                &oracle,
+                FULL_BPS,
+                FULL_BPS,
+            ),
+            // A foreign account of the same size passes the raw guard, so the owner check must reject.
+            (
+                "market owned by another program",
+                MARKET,
+                &foreign_market,
+                &base,
+                &oracle,
                 0,
                 0,
-            )
-            .is_err()
-        );
+            ),
+            // A vault not owned by a token program is not a real vault.
+            (
+                "vault owned by another program",
+                MARKET,
+                &good_market,
+                &foreign_vault,
+                &oracle,
+                0,
+                0,
+            ),
+            // A foreign oracle carries no magic, so its owner is the only discriminator.
+            (
+                "oracle owned by another program",
+                MARKET,
+                &good_market,
+                &base,
+                &foreign_oracle,
+                0,
+                0,
+            ),
+            // An owner-and-length check would pass a mint: it is token-program-owned and long
+            // enough to misread an amount out of. Unpacking plus the mint comparison is what
+            // rejects it.
+            (
+                "mint account in place of the base vault",
+                MARKET,
+                &good_market,
+                &mint_account,
+                &oracle,
+                0,
+                0,
+            ),
+            // A real token account holding the other side's mint is refused as well.
+            (
+                "base vault holding the quote mint",
+                MARKET,
+                &good_market,
+                &quote_mint_vault,
+                &oracle,
+                0,
+                0,
+            ),
+            // The market account carries no self-address, so the vault's authority is what ties
+            // the requested market to these bytes.
+            (
+                "market address that does not hold the vault",
+                Pubkey::new_unique(),
+                &good_market,
+                &base,
+                &oracle,
+                0,
+                0,
+            ),
+        ];
+        for (label, market, market_data, base, oracle, base_bps, quote_bps) in rows {
+            assert!(
+                build_goonfi_liquidity_scenario(
+                    market,
+                    market_data,
+                    (FIXTURE_BASE_VAULT, base),
+                    (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
+                    (FIXTURE_ORACLE, oracle),
+                    base_bps,
+                    quote_bps,
+                )
+                .is_err(),
+                "{label}"
+            );
+        }
     }
 
     /// The balance is read from the passed account but written to the vault the market names, so a
@@ -532,10 +466,10 @@ mod tests {
         };
         let error = build_goonfi_liquidity_scenario(
             MARKET,
-            &market_account(&FIXTURE_BASE_VAULT, &FIXTURE_QUOTE_VAULT),
+            &market_account(),
             (FIXTURE_BASE_VAULT, &vault(&WSOL, 1_000)),
             (FIXTURE_QUOTE_VAULT, &foreign_quote),
-            (FIXTURE_ORACLE, &oracle()),
+            (FIXTURE_ORACLE, &oracle_account()),
             0,
             0,
         )
@@ -546,35 +480,13 @@ mod tests {
         );
     }
 
-    /// The market account carries no self-address, so the vault's authority is what ties the
-    /// requested market to these bytes.
-    #[test]
-    fn rejects_a_market_address_that_does_not_hold_the_vault() {
-        let base_vault = FIXTURE_BASE_VAULT;
-        let quote_vault = FIXTURE_QUOTE_VAULT;
-        assert!(
-            build_goonfi_liquidity_scenario(
-                Pubkey::new_unique(),
-                &market_account(&base_vault, &quote_vault),
-                (FIXTURE_BASE_VAULT, &vault(&WSOL, 1)),
-                (FIXTURE_QUOTE_VAULT, &vault(&USDC, 1)),
-                (FIXTURE_ORACLE, &oracle()),
-                0,
-                0,
-            )
-            .is_err()
-        );
-    }
-
     #[test]
     fn resolves_vault_addresses_from_the_market() {
-        let base_vault = FIXTURE_BASE_VAULT;
-        let quote_vault = FIXTURE_QUOTE_VAULT;
-        let [base, quote] = vault_addresses(&market_account(&base_vault, &quote_vault)).unwrap();
-        assert_eq!(base, base_vault);
-        assert_eq!(quote, quote_vault);
+        let [base, quote] = vault_addresses(&market_account()).unwrap();
+        assert_eq!(base, FIXTURE_BASE_VAULT);
+        assert_eq!(quote, FIXTURE_QUOTE_VAULT);
 
-        let mut zero_pointer = market_account(&base_vault, &quote_vault);
+        let mut zero_pointer = market_account();
         zero_pointer.data[BASE_VAULT_OFFSET..BASE_VAULT_OFFSET + 32].fill(0);
         assert!(vault_addresses(&zero_pointer).is_err());
     }

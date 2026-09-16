@@ -4536,6 +4536,10 @@ impl SurfnetSvm {
         Ok(fixtures)
     }
 
+    /// Registers a scenario for execution by scheduling its overrides
+    ///
+    /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
+    /// If not provided, uses the current slot.
     pub fn register_scenario(
         &mut self,
         scenario: surfpool_types::Scenario,

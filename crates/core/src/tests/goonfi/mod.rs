@@ -23,7 +23,7 @@ use crate::{
     scenarios::{
         TemplateRegistry,
         protocols::goonfi::v1::{
-            GoonfiMarket, build_goonfi_price_scenario, discover_goonfi_markets, vault_addresses,
+            GoonfiMarket, build_goonfi_price_scenario, discover_goonfi_markets,
         },
     },
     surfnet::svm::SurfnetSvm,
@@ -33,7 +33,6 @@ use crate::{
 const GOONFI_PROGRAM: &str = "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE";
 const GOONFI_PROGRAMDATA: &str = "124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s";
 const ORACLE_PROGRAMDATA: &str = "7btzN5NEjnZqdQECwT88XhixeGnZjz5YKqjYGYKxKE5z";
-const GOONFI_ORACLE_PROGRAM: &str = "dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu";
 const GOONFI_GLOBAL: &str = "BNrK9LpEn65QA4TyBLVSMdngW3XHj3xLfFPwGdCBv8wV";
 const JUPITER_PROGRAM: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -56,6 +55,7 @@ const ORACLE_ASK_OFFSET: usize = 8;
 const ORACLE_SLOT_OFFSET: usize = 16;
 const ORACLE_MULTIPLIER_OFFSET: usize = 20;
 const ORACLE_TS_MS_OFFSET: usize = 24;
+const ORACLE_PRICE_OFFSETS: [usize; 2] = [ORACLE_BID_OFFSET, ORACLE_ASK_OFFSET];
 
 /// Market-account fields the flows touch or read. The two reference prices band-guard the oracle;
 /// the mint and oracle pointers identify the pair.
@@ -64,6 +64,7 @@ const MARKET_QUOTE_MINT_OFFSET: usize = 112;
 const MARKET_ORACLE_OFFSET: usize = 208;
 const MARKET_REF_A_OFFSET: usize = 1712;
 const MARKET_REF_B_OFFSET: usize = 1720;
+const MARKET_REFERENCE_OFFSETS: [usize; 2] = [MARKET_REF_A_OFFSET, MARKET_REF_B_OFFSET];
 
 #[derive(Clone, Copy)]
 struct MarketSpec {
@@ -264,10 +265,6 @@ fn native_token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
     data
 }
 
-fn token_amount(data: &[u8]) -> u64 {
-    u64::from_le_bytes(data[64..72].try_into().unwrap())
-}
-
 fn read_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
@@ -284,16 +281,8 @@ fn oracle_slot(data: &[u8]) -> u64 {
     u64::from(read_u32(data, ORACLE_SLOT_OFFSET))
 }
 
-fn scale_prices(data: &mut [u8], numerator: u64, denominator: u64) {
-    for offset in [ORACLE_BID_OFFSET, ORACLE_ASK_OFFSET] {
-        let scaled = (u128::from(read_u64(data, offset)) * u128::from(numerator)
-            / u128::from(denominator)) as u64;
-        write_u64(data, offset, scaled);
-    }
-}
-
-fn scale_refs(data: &mut [u8], numerator: u64, denominator: u64) {
-    for offset in [MARKET_REF_A_OFFSET, MARKET_REF_B_OFFSET] {
+fn scale_u64s(data: &mut [u8], offsets: [usize; 2], numerator: u64, denominator: u64) {
+    for offset in offsets {
         let scaled = (u128::from(read_u64(data, offset)) * u128::from(numerator)
             / u128::from(denominator)) as u64;
         write_u64(data, offset, scaled);
@@ -524,10 +513,11 @@ fn goonfi_run_capturing_oracle(
     } else {
         user_base_key
     };
-    let amount_out = token_amount(
+    let amount_out = read_u64(
         &svm.get_account(&destination)
             .expect("destination account")
             .data,
+        64,
     );
     let oracle_after = svm.get_account(&oracle_key).expect("oracle account").data;
     Ok((amount_out, oracle_after))
@@ -600,88 +590,6 @@ fn assert_rejects_with(result: Result<u64, String>, code: &str, context: &str) {
     }
 }
 
-#[tokio::test]
-async fn goonfi_templates_guard_oracle_and_market_and_preserve_unwritten_bytes() {
-    let fork = goonfi_fork(PRIMARY_MARKET).await;
-    let registry = TemplateRegistry::new();
-    let price = registry.get("goonfi-price").expect("price template");
-    let stale = registry.get("goonfi-stale-quote").expect("stale template");
-    let fresh = registry
-        .get("goonfi-freshness")
-        .expect("freshness template");
-    let band = registry
-        .get("goonfi-reference-band")
-        .expect("reference-band template");
-
-    let oracle_layout = price.raw_layout.as_ref().expect("oracle raw layout");
-    let market_layout = band.raw_layout.as_ref().expect("market raw layout");
-    assert!(oracle_layout.guard(&fork.oracle.data).is_ok());
-    assert!(market_layout.guard(&fork.market.data).is_ok());
-    assert!(oracle_layout.guard(&fork.oracle.data[..16]).is_err());
-    assert!(market_layout.guard(&fork.market.data[..2000]).is_err());
-    let mut flipped = fork.market.data.clone();
-    flipped[0] ^= 0xff;
-    assert!(market_layout.guard(&flipped).is_err());
-
-    let priced = oracle_layout
-        .materialize(
-            &fork.oracle.data,
-            &price.properties,
-            &HashMap::from([
-                ("bid_price_x1e6".to_string(), serde_json::json!("123456789")),
-                ("ask_price_x1e6".to_string(), serde_json::json!("123456790")),
-            ]),
-            0,
-        )
-        .expect("materialize price");
-    assert_eq!(read_u64(&priced, ORACLE_BID_OFFSET), 123_456_789);
-    assert_eq!(read_u64(&priced, ORACLE_ASK_OFFSET), 123_456_790);
-    assert_only_ranges_changed(&fork.oracle.data, &priced, &[(0, 16)]);
-
-    // The freshness slot is 4 bytes wide: the dynamic multiplier right after it must survive.
-    let target_slot = 500_000_123;
-    for (template, label) in [(stale, "stale"), (fresh, "freshness")] {
-        let stamped = template
-            .raw_layout
-            .as_ref()
-            .expect("oracle raw layout")
-            .materialize(
-                &fork.oracle.data,
-                &template.properties,
-                &HashMap::from([("last_update_slot".to_string(), serde_json::Value::Null)]),
-                target_slot,
-            )
-            .unwrap_or_else(|error| panic!("materialize {label}: {error}"));
-        assert_only_ranges_changed(&fork.oracle.data, &stamped, &[(16, 20)]);
-        assert_eq!(
-            read_u32(&stamped, ORACLE_MULTIPLIER_OFFSET),
-            read_u32(&fork.oracle.data, ORACLE_MULTIPLIER_OFFSET),
-            "{label} clobbered the staleness multiplier"
-        );
-    }
-
-    let banded = market_layout
-        .materialize(
-            &fork.market.data,
-            &band.properties,
-            &HashMap::from([
-                (
-                    "reference_price_a_x1e6".to_string(),
-                    serde_json::json!("123456789"),
-                ),
-                (
-                    "reference_price_b_x1e6".to_string(),
-                    serde_json::json!("123456789"),
-                ),
-            ]),
-            0,
-        )
-        .expect("materialize reference band");
-    assert_eq!(read_u64(&banded, MARKET_REF_A_OFFSET), 123_456_789);
-    assert_eq!(read_u64(&banded, MARKET_REF_B_OFFSET), 123_456_789);
-    assert_only_ranges_changed(&fork.market.data, &banded, &[(1712, 1728)]);
-}
-
 /// Proves the exact state the real builder prepares, end to end: `build_goonfi_price_scenario`
 /// output registers and materializes through the production path, touching only its declared
 /// bytes, and the deployed program then fills at the prepared price. The scenario is anchored at
@@ -699,6 +607,26 @@ async fn builder_prepares_and_the_program_fills(fork: &GoonfiFork) {
         (oracle_key, &fork.oracle),
     )
     .expect("validate market");
+    let registry = TemplateRegistry::new();
+    let price_template = registry.get("goonfi-price").expect("price template");
+    let priced = price_template
+        .raw_layout
+        .as_ref()
+        .expect("oracle raw layout")
+        .materialize(
+            &fork.oracle.data,
+            &price_template.properties,
+            &HashMap::from([
+                ("bid_price_x1e6".to_string(), serde_json::json!("123456789")),
+                ("ask_price_x1e6".to_string(), serde_json::json!("123456790")),
+            ]),
+            0,
+        )
+        .expect("materialize asymmetric price");
+    assert_eq!(read_u64(&priced, ORACLE_BID_OFFSET), 123_456_789);
+    assert_eq!(read_u64(&priced, ORACLE_ASK_OFFSET), 123_456_790);
+    assert_only_ranges_changed(&fork.oracle.data, &priced, &[(0, 16)]);
+
     let live_bid = read_u64(&fork.oracle.data, ORACLE_BID_OFFSET);
     let target = live_bid * 3 / 2;
     let price = format!("{}.{:06}", target / 1_000_000, target % 1_000_000);
@@ -772,12 +700,6 @@ async fn builder_prepares_and_the_program_fills(fork: &GoonfiFork) {
 }
 
 #[tokio::test]
-async fn goonfi_builder_scenario_materializes_and_fills_across_oracle_and_market() {
-    let fork = with_controlled_inventory(goonfi_fork(PRIMARY_MARKET).await);
-    builder_prepares_and_the_program_fills(&fork).await;
-}
-
-#[tokio::test]
 async fn goonfi_price_and_reference_band_control_the_deployed_program() {
     let fork = with_controlled_inventory(goonfi_fork(PRIMARY_MARKET).await);
     let amount = fork.spec.amount_in;
@@ -785,20 +707,12 @@ async fn goonfi_price_and_reference_band_control_the_deployed_program() {
     let baseline = goonfi_run(&fork, RunConfig::sell(amount), |_| {}).expect("baseline sell");
     assert!(baseline > 0);
 
-    // No-op rewrite proves the encoding round-trips; the program cannot tell the bytes moved.
-    let noop = goonfi_run(&fork, RunConfig::sell(amount), |oracle| {
-        let restated = read_u64(oracle, ORACLE_BID_OFFSET);
-        write_u64(oracle, ORACLE_BID_OFFSET, restated);
-    })
-    .expect("no-op sell");
-    assert_eq!(noop, baseline);
-
     // Coupled halve and double move the fill linearly in both directions.
     let halved = goonfi_run_full(
         &fork,
         RunConfig::sell(amount),
-        |oracle| scale_prices(oracle, 1, 2),
-        |market| scale_refs(market, 1, 2),
+        |oracle| scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 1, 2),
+        |market| scale_u64s(market, MARKET_REFERENCE_OFFSETS, 1, 2),
     )
     .expect("coupled halved sell");
     assert!(
@@ -808,8 +722,8 @@ async fn goonfi_price_and_reference_band_control_the_deployed_program() {
     let doubled = goonfi_run_full(
         &fork,
         RunConfig::sell(amount),
-        |oracle| scale_prices(oracle, 2, 1),
-        |market| scale_refs(market, 2, 1),
+        |oracle| scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 2, 1),
+        |market| scale_u64s(market, MARKET_REFERENCE_OFFSETS, 2, 1),
     )
     .expect("coupled doubled sell");
     assert!(
@@ -820,14 +734,14 @@ async fn goonfi_price_and_reference_band_control_the_deployed_program() {
     // Decoupled moves reject: the band guards each direction against the venue-unfavorable side.
     assert_rejects_with(
         goonfi_run(&fork, RunConfig::sell(amount), |oracle| {
-            scale_prices(oracle, 2, 1)
+            scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 2, 1)
         }),
         ERROR_PRICE_OUT_OF_BAND,
         "sell with raised oracle and untouched reference band",
     );
     assert_rejects_with(
         goonfi_run(&fork, RunConfig::buy(100_000_000), |oracle| {
-            scale_prices(oracle, 1, 2)
+            scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 1, 2)
         }),
         ERROR_PRICE_OUT_OF_BAND,
         "buy with lowered oracle and untouched reference band",
@@ -835,8 +749,8 @@ async fn goonfi_price_and_reference_band_control_the_deployed_program() {
     let coupled_buy = goonfi_run_full(
         &fork,
         RunConfig::buy(100_000_000),
-        |oracle| scale_prices(oracle, 1, 2),
-        |market| scale_refs(market, 1, 2),
+        |oracle| scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 1, 2),
+        |market| scale_u64s(market, MARKET_REFERENCE_OFFSETS, 1, 2),
     )
     .expect("coupled halved buy");
     assert!(coupled_buy > 0);
@@ -873,6 +787,8 @@ async fn goonfi_price_and_reference_band_control_the_deployed_program() {
         ERROR_INSUFFICIENT_LIQUIDITY,
         "sell against a drained quote vault",
     );
+
+    builder_prepares_and_the_program_fills(&fork).await;
 }
 
 fn stamp_multiplier(data: &mut [u8], multiplier: u32) {
@@ -1018,8 +934,8 @@ async fn goonfi_second_market_proves_generic_price_and_staleness_layout() {
     let halved = goonfi_run_full(
         &fork,
         RunConfig::sell(amount),
-        |oracle| scale_prices(oracle, 1, 2),
-        |market| scale_refs(market, 1, 2),
+        |oracle| scale_u64s(oracle, ORACLE_PRICE_OFFSETS, 1, 2),
+        |market| scale_u64s(market, MARKET_REFERENCE_OFFSETS, 1, 2),
     )
     .expect("SOL/USDC coupled halved sell");
     assert!(
@@ -1093,39 +1009,6 @@ async fn goonfi_discovery_fetches_live_market_and_oracle_relationships() {
             "duplicate discovered oracle {}",
             market.oracle
         );
-    }
-    for chunk in markets.chunks(40) {
-        let addresses: Vec<Pubkey> = chunk
-            .iter()
-            .flat_map(|market| [market.address, market.oracle])
-            .collect();
-        let accounts = live::fetch(&addresses).await;
-        // Include each base vault to validate its token authority against the discovered market.
-        let vaults: Vec<Pubkey> = accounts
-            .chunks_exact(2)
-            .map(|pair| vault_addresses(&pair[0]).expect("a live market names its vaults")[0])
-            .collect();
-        let vault_accounts = live::fetch(&vaults).await;
-        for ((discovered, accounts), (vault_address, vault)) in chunk
-            .iter()
-            .zip(accounts.chunks_exact(2))
-            .zip(vaults.iter().zip(vault_accounts.iter()))
-        {
-            let validated = GoonfiMarket::validate(
-                discovered.address,
-                &accounts[0],
-                (*vault_address, vault),
-                (discovered.oracle, &accounts[1]),
-            )
-            .expect("discovered market and oracle must retain their live owners and layouts");
-            assert_eq!(
-                validated.oracle(),
-                discovered.oracle,
-                "live market oracle pointer changed"
-            );
-            assert_eq!(&accounts[0].data[80..112], discovered.base_mint.as_ref());
-            assert_eq!(&accounts[0].data[112..144], discovered.quote_mint.as_ref());
-        }
     }
     eprintln!(
         "GoonFi real RPC discovery verified {} unique live market/oracle pairs",

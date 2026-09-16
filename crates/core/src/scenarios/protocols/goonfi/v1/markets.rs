@@ -52,7 +52,7 @@ pub fn market_label(base_mint: &Pubkey, quote_mint: &Pubkey) -> String {
 
 /// The accounts a market points at: its two mints, its oracle, and its base vault. The vault comes
 /// along to check that its token authority is the market.
-fn market_references(account: &Account) -> SurfpoolResult<[Pubkey; 4]> {
+pub(super) fn market_references(account: &Account) -> SurfpoolResult<[Pubkey; 4]> {
     let oracle = GoonfiMarket::oracle_address(account)?;
     let base = Pubkey::new_from_array(account.data[80..112].try_into().unwrap());
     let quote = Pubkey::new_from_array(account.data[112..144].try_into().unwrap());
@@ -190,7 +190,9 @@ mod tests {
     use solana_program_pack::Pack;
 
     use super::*;
-    use crate::scenarios::protocols::goonfi::v1::GOONFI_ORACLE_PROGRAM_ID;
+    use crate::scenarios::protocols::goonfi::v1::fixtures::{
+        market_account, oracle_account, token_account,
+    };
 
     fn fixture() -> (Pubkey, Account, HashMap<Pubkey, Account>) {
         let address = Pubkey::new_unique();
@@ -199,25 +201,7 @@ mod tests {
         let oracle = Pubkey::new_unique();
         let base_vault = Pubkey::new_unique();
         let quote_vault = Pubkey::new_unique();
-        let registry = TemplateRegistry::new();
-        let layout = registry
-            .get("goonfi-reference-band")
-            .unwrap()
-            .raw_layout
-            .as_ref()
-            .unwrap();
-        let mut market = Account {
-            owner: GOONFI_PROGRAM_ID,
-            data: vec![0; layout.account_size],
-            ..Account::default()
-        };
-        let magic = layout.magic.as_ref().unwrap();
-        market.data[magic.offset..magic.offset + magic.bytes.len()].copy_from_slice(&magic.bytes);
-        market.data[80..112].copy_from_slice(base.as_ref());
-        market.data[112..144].copy_from_slice(quote.as_ref());
-        market.data[144..176].copy_from_slice(base_vault.as_ref());
-        market.data[176..208].copy_from_slice(quote_vault.as_ref());
-        market.data[208..240].copy_from_slice(oracle.as_ref());
+        let market = market_account([&base, &quote], [&base_vault, &quote_vault], &oracle);
         let mint = |decimals| {
             let mut account = Account {
                 owner: spl_token_interface::ID,
@@ -232,32 +216,14 @@ mod tests {
             .pack_into_slice(&mut account.data);
             account
         };
-        let vault = {
-            let mut data = vec![0u8; 165];
-            data[0..32].copy_from_slice(base.as_ref());
-            data[32..64].copy_from_slice(address.as_ref());
-            data[108] = 1;
-            Account {
-                owner: spl_token_interface::ID,
-                data,
-                ..Account::default()
-            }
-        };
         (
             address,
             market,
             HashMap::from([
                 (base, mint(9)),
                 (quote, mint(6)),
-                (base_vault, vault),
-                (
-                    oracle,
-                    Account {
-                        owner: GOONFI_ORACLE_PROGRAM_ID,
-                        data: vec![0; 32],
-                        ..Account::default()
-                    },
-                ),
+                (base_vault, token_account(&base, &address, 0)),
+                (oracle, oracle_account()),
             ]),
         )
     }

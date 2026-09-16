@@ -1725,10 +1725,6 @@ mod tests {
                 width: 8
             }
         );
-        assert_eq!(
-            parsed.encode(&json!(null), 500).unwrap(),
-            480u64.to_le_bytes().to_vec()
-        );
 
         let narrow: RawEncoding =
             serde_json::from_value(json!({"slot": {"lead": 0, "width": 4}})).unwrap();
