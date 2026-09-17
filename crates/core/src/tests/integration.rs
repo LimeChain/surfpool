@@ -6415,6 +6415,48 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
             "scenario E: a non-local `before` must be forwarded to the remote unchanged"
         );
     }
+
+    // Scenario F: signatures created on the datasource after this surfnet forked must not
+    // displace valid pre-fork history. `limit = 1` also proves that the remote leg reads past
+    // newer datasource rows instead of filtering a caller-sized page down to nothing.
+    datasource_rpc
+        .request_airdrop(&target, LAMPORTS_PER_SOL + 200)
+        .await
+        .expect("post-fork datasource airdrop");
+    let result = local_rpc
+        .get_signatures_for_address_with_config(
+            &target,
+            GetConfirmedSignaturesForAddress2Config {
+                before: Some(local_sigs[1]),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("scenario F: getSignaturesForAddress must succeed");
+    assert_eq!(
+        result
+            .iter()
+            .map(|result| result.signature.clone())
+            .collect::<Vec<_>>(),
+        vec![datasource_sigs[0].to_string()],
+        "scenario F: return the newest pre-fork signature"
+    );
+
+    let error = local_rpc
+        .get_signatures_for_address_with_config(
+            &target,
+            GetConfirmedSignaturesForAddress2Config {
+                limit: Some(1_001),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a limit above the RPC maximum must be rejected");
+    assert!(
+        error.to_string().contains("Invalid limit; max 1000"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
