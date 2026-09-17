@@ -79,8 +79,8 @@ templates:
 
       Price and liveness are independent: changing the coefficient alone reprices immediately, while
       an expired validity horizon rejects the swap before the new price can be used. For scenarios
-      that run for many slots, also apply solfi-freshness. Prefer persist: { slots: N } when bounded
-      persistence is available; otherwise use persist: true.
+      that run for many slots, also apply solfi-freshness. If the scenario runs beyond that validity
+      horizon, schedule another freshness override in each later slot where a quote is needed.
 
       DIRECTION: raising the price increases base-to-quote output and reduces the amount of base paid
       by quote-to-base. The deployed-program test confirms the reciprocal response in both directions.
@@ -119,8 +119,8 @@ templates:
 
       Both fields are relative slot offsets even though the stored words are absolute slots hidden by
       XOR masks. Set publication_slot to 0 and validity_horizon to 200 to emulate a current maker.
-      For a finite scenario, prefer persist: { slots: N } when bounded persistence is available;
-      otherwise use persist: true and stop it when the scenario no longer needs a current quote.
+      This keeps the quote valid for 200 slots from the slot where the override materializes. For a
+      longer scenario, schedule the same override again in each later slot where a quote is needed.
 
       The boundary is inclusive: validity_horizon 0 is valid in the materialization slot, while -1
       is expired and both swap directions revert with SolFi error 23.
@@ -128,5 +128,4 @@ templates:
       HOW TO USE:
       1. Set publication_slot to 0
       2. Set validity_horizon to 200
-      3. Reapply both offsets each slot: use persist: { slots: N } when bounded persistence is
-         available, or persist: true as the raw-layout-compatible fallback
+      3. If a quote is needed after those 200 slots, schedule this template again in that later slot

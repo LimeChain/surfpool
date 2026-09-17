@@ -77,8 +77,9 @@ templates:
       Vault balances also enter SolFi's nonlinear inventory policy, so changing the input-side vault
       can move a quote even though that vault is not paying out. This does not set SolFi's mid-price.
 
-      Do not persist this override across swaps. A persistent vault override can manufacture or erase
-      inventory after each transaction by undoing transaction-owned balance changes.
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
 
       LOWER FOR STRESS TESTS. A moderate reduction can move nonlinear inventory policy; a severe
       reduction of the payout vault produces error 18. Raising a wrapped-native vault amount without

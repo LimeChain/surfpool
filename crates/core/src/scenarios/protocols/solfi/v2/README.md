@@ -56,13 +56,13 @@ Do not reuse an oracle or vault merely because the token pair looks similar. Use
 
 **1. Keep the oracle current while testing price or widening.** A price can be encoded correctly and
 still never reach the quote if the oracle has expired. Apply `solfi-freshness` with
-`publication_slot: 0` and `validity_horizon: 200` when setup spans multiple slots. If bounded
-persistence is installed, prefer `persist: { slots: N }` for the scenario window. On a raw-layout-only
-installation, use `persist: true` and stop it when the scenario no longer needs a current quote.
+`publication_slot: 0` and `validity_horizon: 200` when setup spans multiple slots. That keeps the
+quote valid for 200 slots. For a longer scenario, schedule the same freshness override again in each
+later slot where a quote is needed.
 
-**2. Persist configuration, not transaction-owned inventory.** Price, freshness and spline settings
-are inputs and may be reapplied for the scenario window. A vault balance is state that swaps modify.
-Persisting it can undo a swap after every slot and manufacture or erase inventory.
+**2. Do not repeatedly reset transaction-owned inventory.** Price, freshness and spline settings are
+configuration inputs. A vault balance is state that swaps modify. Reapplying a vault override after
+every swap can undo the swap and manufacture or erase inventory.
 
 ## Scenario ideas
 
@@ -77,8 +77,8 @@ SOL, and limits its USDC payout inventory to 25 USDC.
    usable.
 3. Use `solfi-spread` with buy-base widening `1000`, sell-base widening `10000`, age multiplier
    `1000`, additional widening `0`, and maximum widening `100000`.
-4. Use `solfi-vault-balance` on the WSOL/USDC **USDC vault** with amount `25000000`. Do not persist
-   this transaction-owned balance.
+4. Use `solfi-vault-balance` on the WSOL/USDC **USDC vault** with amount `25000000`. Apply this
+   transaction-owned balance once before the swaps being tested.
 
 The deployed-program integration test confirms the complete four-template scenario: a 0.1 SOL sale
 still fills near 4.95 USDC, the opposite direction is not widened, a 1 SOL control sale fills with
@@ -93,7 +93,7 @@ price moves suddenly.
 2. Set both price fields to the new price. For example, exponent `-10` and coefficient `500000000`
    means $50 per SOL.
 3. Add `solfi-freshness` for **WSOL / USDC** with publication slot `0` and validity horizon `200`.
-4. Persist both overrides if the test runs for more than one slot.
+4. If the swap executes more than 200 slots later, schedule another freshness override in that slot.
 5. Compare a swap before and after the price change. Also keep a run with the original price as a
    control.
 
@@ -137,8 +137,8 @@ token it must pay.
 1. In `solfi-vault-balance`, choose the WSOL or USDT vault to block users buying the base asset, or
    choose the USDC vault to block users selling the base asset.
 2. Lower the balance enough that the requested swap cannot be paid.
-3. Do not persist the vault balance unless resetting inventory after every transaction is explicitly
-   part of the test.
+3. Do not schedule repeated vault resets unless restoring inventory after every transaction is
+   explicitly part of the test.
 4. Confirm the affected swap fails with SolFi error 18 and that the opposite direction or an
    alternative venue still works.
 
@@ -156,8 +156,9 @@ Set both fields. Doubling the coefficient doubles base-to-quote output and halve
 output, subject to spread and rounding. The price-looking word in the market account is not the
 authoritative input, but changing the external oracle is what reprices a fill.
 
-For a multi-slot scenario, reapply both `solfi-price` and `solfi-freshness` for the required window.
-Use bounded persistence when that generic feature is installed; otherwise use `persist: true`.
+For a multi-slot scenario, `solfi-freshness` keeps the quote valid for its configured horizon. If a
+swap executes after that horizon, schedule another freshness override in the execution slot. The
+price remains set unless another override or transaction writes the oracle account.
 Repricing only SolFi while leaving another venue unchanged creates a real cross-venue dislocation
 suitable for router, arbitrage and liquidation-path testing. Always include an undislocated control leg.
 
@@ -167,11 +168,11 @@ suitable for router, arbitrage and liquidation-path testing. Always include an u
 template: solfi-freshness
 publication_slot: 0
 validity_horizon:  200
-persist: { slots: 200 } # when bounded persistence is available; otherwise use true
 ```
 
 Both inputs are relative offsets even though the account stores XOR-obfuscated absolute slots.
-Re-stamp both fields to model a continuously publishing maker.
+This keeps the quote valid for 200 slots from materialization. For a longer scenario, schedule this
+template again in each later slot where a quote is needed.
 
 An expired SolFi oracle rejects the transaction with error 23.
 
@@ -263,8 +264,8 @@ The base vault pays quote-to-base swaps, the quote vault pays base-to-quote swap
 payout vault far enough makes that direction reject with SolFi error 18. Vaults also enter nonlinear
 inventory policy, so changing the input-side vault can move a quote even though it is not paying out.
 
-This is not an AMM reserve-price formula. Use `solfi-price` to change the mid. Do not persist a vault
-override unless restoring the same inventory after every transaction is deliberately the scenario.
+This is not an AMM reserve-price formula. Use `solfi-price` to change the mid. Do not repeatedly
+reset a vault unless restoring the same inventory after every transaction is deliberately the scenario.
 
 # Troubleshooting
 
@@ -276,4 +277,4 @@ override unless restoring the same inventory after every transaction is delibera
 | Constant spread is smaller than requested                      | Account for `oracle_scale`, neutralize the age/additional curves, and raise `max_widening` |
 | Size impact appears at the wrong base amount                   | Breakpoints are quote notional. Base input is converted at the oracle price first          |
 | One direction widened instead of the other                     | Quote-to-base is buying base. Base-to-quote is selling base                                |
-| A vault balance returns after a swap                           | Remove persistence. Repeated application is undoing transaction-owned state                |
+| A vault balance returns after a swap                           | Remove the later vault reset; it is undoing transaction-owned state                        |
