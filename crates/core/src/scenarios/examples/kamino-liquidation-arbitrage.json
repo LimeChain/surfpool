@@ -11,7 +11,6 @@
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
-      "persist": true,
       "account": {
         "pubkey": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C"
       },

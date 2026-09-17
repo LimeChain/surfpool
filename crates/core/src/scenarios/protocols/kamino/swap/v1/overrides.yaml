@@ -65,9 +65,6 @@ templates:
       remaining_input_amount: 500000000
       expected_output_amount: 100000000
 
-      DO NOT set persist: true here - transactions write these fields, and re-applying the
-      override reverts their writes at the start of every following slot.
-
   - id: kamino-swap-global-config
     name: Override Swap Global Config
     description: Override Kamino limit order global switches and fees
