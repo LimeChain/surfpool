@@ -48,9 +48,6 @@ templates:
       EXAMPLE - "the strategy collected 1 SOL of fees":
       token_a_amounts: 1000000000
 
-      DO NOT set persist: true here - transactions write these fields, and re-applying the
-      override reverts their writes at the start of every following slot.
-
   - id: kamino-liquidity-strategy-rewards
     name: Override Liquidity Strategy Rewards
     description: Override Kamino Liquidity strategy reward balances
@@ -106,9 +103,6 @@ templates:
       EXAMPLE - "strategy has rewards ready to distribute":
       kamino_rewards.0.amount_uncollected: 5000000
       kamino_rewards.0.amount_available: 1000000000
-
-      DO NOT set persist: true here - transactions write these fields, and re-applying the
-      override reverts their writes at the start of every following slot.
 
   - id: kamino-liquidity-strategy-guards
     name: Override Liquidity Strategy Guards
