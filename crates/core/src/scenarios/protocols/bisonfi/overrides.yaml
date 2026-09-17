@@ -1,6 +1,6 @@
 protocol: BisonFi
 # The pool-account version this layout describes, and the only one supported. BisonFi ships no
-# program semver; the guard below rejects the one remaining version-2 account outright.
+# program semver; the guard below rejects accounts with a different layout version outright.
 version: v3
 account_type: PoolStat
 
@@ -23,7 +23,8 @@ tags:
 templates:
   - id: bisonfi-fair-value
     name: Override Fair Value
-    description: Override the mid price BisonFi quotes around
+    description: >-
+      Set the maker's mid price. For a swap in a later slot, also add Keep Quote Live to that slot.
     idl_account_name: PoolStat
     address:
       type: pubkey
@@ -41,9 +42,8 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
-      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
-      applications including the first. Otherwise use persist: true and stop it after the scenario.
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote.
 
       This is the only price lever. The reserves control depth, not price: BisonFi quotes around a mid
       the operator publishes, so changing vault balances will not move the quote.
@@ -71,7 +71,9 @@ templates:
       fair_value: "15474250491067253436239052800"
   - id: bisonfi-depth
     name: Override Depth
-    description: Make BisonFi shallower so large trades move its price
+    description: >-
+      Make large trades move the price. For a swap in a later slot, also add Keep Quote Live to that
+      slot.
     idl_account_name: PoolStat
     address:
       type: pubkey
@@ -96,9 +98,8 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
-      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
-      applications including the first. Otherwise use persist: true and stop it after the scenario.
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote.
 
       The depth lever: how far a trade moves the price. For how wide the venue quotes around its mid,
       use bisonfi-spread instead.
@@ -124,7 +125,8 @@ templates:
       quote_reserve: 1100446538524
   - id: bisonfi-spread
     name: Override Spread
-    description: Widen or tighten the spread BisonFi quotes around its mid
+    description: >-
+      Widen or tighten the quote. For a swap in a later slot, also add Keep Quote Live to that slot.
     idl_account_name: PoolStat
     address:
       type: pubkey
@@ -207,9 +209,8 @@ templates:
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because nothing in a fork republishes the mid, refresh
-      last_update_slot with bisonfi-freshness before executing a multi-slot scenario. For a finite
-      run, prefer persist: { slots: N } when bounded persistence is available; N counts total
-      applications including the first. Otherwise use persist: true and stop it after the scenario.
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote.
 
       The spread lever: how wide the venue quotes around its mid, independently of how much inventory
       it holds. Use bisonfi-depth to make a venue THIN and this one to make it EXPENSIVE.
@@ -236,8 +237,10 @@ templates:
       continuation_levels.0.tick_offset: -25600
       continuation_source_levels.0.tick_offset: -25600
   - id: bisonfi-freshness
-    name: Override Quote Freshness
-    description: Keep BisonFi's published quote live
+    name: Keep Quote Live
+    description: >-
+      Keep the maker quoting in this slot. Set Slots behind the chain to 0, and add this action to
+      every later slot containing a swap.
     idl_account_name: PoolStat
     address:
       type: pubkey
@@ -250,8 +253,8 @@ templates:
             lead: 0
         label: Slots behind the chain
         description: >-
-          How far behind the executing slot the quote was published, as a signed offset. 0 is live.
-          A large negative value models a maker that stopped publishing.
+          Set this to 0 in every slot containing a swap to keep the quote live. It is a signed offset
+          from that slot; a large negative value models a maker that stopped publishing.
     llm_context: |
       This field is the venue's liveness signal.
 
@@ -270,16 +273,14 @@ templates:
       HOW TO USE THIS TEMPLATE:
       1. Set last_update_slot to 0. The venue resumes quoting the price it already held - a fresh
          timestamp is enough, no new price is needed
-      2. For a finite scenario, prefer persist: { slots: N } when bounded persistence is available,
-         choosing N as the total number of application slots, counting the first. Otherwise use
-         persist: true and stop it when the scenario no longer needs the quote refreshed
+      2. If the scenario spans enough slots for the quote to become stale again, schedule another
+         freshness override in every slot where the quote must be usable
 
       A scenario that executes immediately after forking may not need this. A multi-slot scenario
       should keep the publication fresh explicitly rather than depending on the current tolerance.
 
       EXAMPLE - "keep the maker quoting for the whole run":
-      last_update_slot: 0, persist: { slots: N }
-      If bounded persistence is unavailable, use persist: true as the fallback.
+      Add last_update_slot: 0 at each slot where a transaction needs a live quote.
 
       EXAMPLE - "the maker stopped publishing long ago":
       last_update_slot: -1000000

@@ -309,7 +309,7 @@ async fn bisonfi_fair_value_override_writes_expected_bytes() {
     );
 }
 
-/// The size and magic guard is all that stands in for a discriminator, so it has to actually bite.
+/// The size, magic and version guard stands in for a discriminator, so every part has to bite.
 #[tokio::test]
 async fn bisonfi_raw_layout_refuses_the_wrong_account() {
     let data = fetch(&[BISONFI_POOL]).await.remove(0);
@@ -325,6 +325,31 @@ async fn bisonfi_raw_layout_refuses_the_wrong_account() {
         .guard(&wrong_magic)
         .expect_err("a changed magic must be refused");
     assert!(err.contains("magic"), "unexpected error: {err}");
+
+    // The former live v2 fixture was closed on mainnet. Mutating a current v3 account exercises the
+    // same guard deterministically without pinning this safety check to an account's lifetime.
+    let mut wrong_version = data.clone();
+    wrong_version[8..16].copy_from_slice(&2u64.to_le_bytes());
+    let err = raw_layout
+        .guard(&wrong_version)
+        .expect_err("a different layout version must be refused");
+    assert!(err.contains("magic"), "unexpected error: {err}");
+    for template in registry
+        .all()
+        .into_iter()
+        .filter(|template| template.id.starts_with("bisonfi-"))
+    {
+        assert!(
+            template
+                .raw_layout
+                .as_ref()
+                .expect("BisonFi template must carry a raw layout")
+                .guard(&wrong_version)
+                .is_err(),
+            "{} must reject a pool with another layout version",
+            template.id
+        );
+    }
 
     let err = raw_layout
         .guard(&data[..2047])
@@ -420,11 +445,6 @@ const BISONFI_ALL_POOLS: [&str; 17] = [
     "6U1kWANmyBuJRTZGRuPb9o2EJ6KRui3QpqrWDZoZ4bnG",
     "FC9pWtfdtbyGZ5WHTLneoMSUx6jmTDgqKaxDcm2trsND",
 ];
-
-/// AVAX-USDC-Pool1. Also 2048 bytes and also carries the POOLSTAT magic, but its version word is 2
-/// and its fields are not where the v3 layout says: offset 832 holds 2^32+1, not a price. It exists
-/// to prove the guard refuses it.
-const BISONFI_V2_POOL: &str = "9fLzyySS73UnecJRzx2AKcgoSQ1qigzU3b6m9e2iVq6";
 
 /// The reconstruction has to describe all 2048 bytes of *every* v3 pool, not just the busy one the
 /// templates point at. A dormant pool exercises regions the live pool leaves zeroed, so a field
@@ -1527,6 +1547,114 @@ async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
     );
 }
 
+/// A long-running simulation keeps the maker available by scheduling another freshness
+/// write when it needs a quote. This is the explicit-scheduling replacement for persistence.
+#[tokio::test]
+async fn bisonfi_scenario_scheduled_refresh_keeps_a_long_run_quoting() {
+    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+
+    const EXECUTE_AFTER: u64 = 4_096;
+
+    let rig = bisonfi_rig().await;
+    let (pool, data, tp) = rig.quoting.first().expect("a quoting market");
+    let pool_key = pool.parse::<Pubkey>().expect("pool address");
+    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
+    let execute_slot = base_slot
+        .checked_add(EXECUTE_AFTER)
+        .expect("live slot plus scenario duration");
+    let size = BisonfiRig::sell_size(data);
+
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.inner
+        .set_account(pool_key, solana_account::Account {
+            lamports: 1_000_000,
+            data: data.clone(),
+            owner: Pubkey::from_str_const(BISONFI_PROGRAM),
+            executable: false,
+            rent_epoch: 0,
+        })
+        .expect("seed the pool account");
+
+    let mut scenario = Scenario::new(
+        "BisonFi stays live during a long run".to_string(),
+        "Refreshes the maker again in the later slot where its quote is needed".to_string(),
+    );
+    for relative_slot in [0, EXECUTE_AFTER] {
+        scenario.add_override(
+            OverrideInstance::new(
+                "bisonfi-freshness".to_string(),
+                relative_slot,
+                AccountAddress::Pubkey(pool_key.to_string()),
+            )
+            .with_values(HashMap::from([(
+                "last_update_slot".to_string(),
+                serde_json::json!(0),
+            )])),
+        );
+    }
+    svm.register_scenario(scenario, Some(base_slot))
+        .expect("register scenario");
+
+    svm.materialize_overrides_for_slot(&None, base_slot)
+        .await
+        .expect("materialize initial refresh");
+    let initial = svm
+        .inner
+        .get_account(&pool_key)
+        .expect("get_account")
+        .expect("account present")
+        .data;
+    assert_eq!(
+        u64::from_le_bytes(initial[72..80].try_into().unwrap()),
+        base_slot,
+        "the first refresh must resolve relative to its own slot"
+    );
+
+    svm.materialize_overrides_for_slot(&None, execute_slot)
+        .await
+        .expect("materialize later refresh");
+    let refreshed = svm
+        .inner
+        .get_account(&pool_key)
+        .expect("get_account")
+        .expect("account present")
+        .data;
+    assert_eq!(
+        u64::from_le_bytes(refreshed[72..80].try_into().unwrap()),
+        execute_slot,
+        "the later refresh must resolve relative to the slot where the quote is needed"
+    );
+
+    // `bisonfi_replay` takes its clock before applying the mutation. Give it the later execution
+    // slot as the clock source, then install either account image to test the deployed program.
+    let mut clock_source = data.clone();
+    clock_source[72..80].copy_from_slice(&execute_slot.to_le_bytes());
+    let stale = bisonfi_replay(&rig.elf, pool, &clock_source, *tp, size, 0, {
+        let initial = initial.clone();
+        move |account| *account = initial
+    });
+    assert_eq!(
+        stale,
+        Ok(0),
+        "a quote refreshed only at the start must be stale {EXECUTE_AFTER} slots later"
+    );
+
+    let live = bisonfi_replay(
+        &rig.elf,
+        pool,
+        &clock_source,
+        *tp,
+        size,
+        0,
+        move |account| *account = refreshed,
+    )
+    .expect("the explicitly refreshed market must execute");
+    assert!(
+        live > 0,
+        "scheduling freshness again at the execution slot must keep the maker quoting"
+    );
+}
+
 /// SCENARIO: the mid MOVES between the quote and the fill - adverse selection.
 ///
 /// The other half of the mid-flight pair, and the contrast is the point. When the maker goes dark the
@@ -1982,47 +2110,6 @@ async fn bisonfi_replay_rig_propagates_signers() {
         res.err().map(|e| (e.err, e.meta.logs))
     );
     assert_eq!(spl_amount(&svm.get_account(&b).unwrap().data), 500_000);
-}
-
-/// The guard must refuse the one pool that is the right size and carries the right magic but is a
-/// different layout version. Without the version in the guard this write would land at offset 832
-/// of a v2 account and corrupt whatever lives there.
-#[tokio::test]
-async fn bisonfi_guard_refuses_the_v2_pool() {
-    let data = fetch(&[BISONFI_V2_POOL]).await.remove(0);
-    assert_eq!(
-        data.len(),
-        2048,
-        "the v2 pool is the same size as a v3 pool"
-    );
-    assert_eq!(&data[..8], b"POOLSTAT", "and carries the same magic");
-    assert_eq!(
-        u64::from_le_bytes(data[8..16].try_into().unwrap()),
-        2,
-        "this test only means anything while that pool is still version 2"
-    );
-
-    // Every BisonFi template, taken from the registry rather than a hand-written list, so a template
-    // added later cannot quietly escape the guard check.
-    let registry = TemplateRegistry::new();
-    let ids: Vec<String> = registry
-        .all()
-        .iter()
-        .filter(|t| t.id.starts_with("bisonfi-"))
-        .map(|t| t.id.clone())
-        .collect();
-    assert!(
-        ids.len() >= 4,
-        "expected every BisonFi template, found {ids:?}"
-    );
-    for id in ids {
-        let template = registry.get(&id).unwrap();
-        let raw_layout = template.raw_layout.as_ref().unwrap();
-        assert!(
-            raw_layout.guard(&data).is_err(),
-            "{id} must refuse a v2 pool: size and magic match, but the layout does not"
-        );
-    }
 }
 
 /// And it must still accept every v3 pool, so the tightened guard has not over-fitted.
