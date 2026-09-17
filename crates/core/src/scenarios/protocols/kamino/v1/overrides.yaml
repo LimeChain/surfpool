@@ -382,9 +382,6 @@ templates:
       EXAMPLE - "liquidate SOL collateral above 50% LTV":
       config.liquidation_threshold_pct: 50
 
-      Leave persist unset unless a known later write or fetch would replace config.* and the
-      scenario must keep that configuration pinned. If persistence is needed, override config.*
-      fields only; liquidity.* and last_update.* are transaction-owned state.
   - id: kamino-reserve-main-usdc
     name: Override USDC Reserve (Main Market)
     description: Override the USDC reserve of Kamino's Main Market
@@ -417,9 +414,6 @@ templates:
       EXAMPLE - "USDC depegs to $0.90":
       use kamino-scope-price with prices.13.price.value: 90000000 and prices.13.price.exp: 8
 
-      Leave persist unset unless a known later write or fetch would replace config.* and the
-      scenario must keep that configuration pinned. If persistence is needed, override config.*
-      fields only; liquidity.* and last_update.* are transaction-owned state.
   # ==========================================
   # Obligation
   # ==========================================

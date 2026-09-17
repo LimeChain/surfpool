@@ -45,10 +45,6 @@ templates:
          [210, 3] means price = prices[210] * prices[3]
       4. Set price.value = usd_price * 10^exp, keeping exp as you found it
       5. Set last_updated_slot and unix_timestamp to now, or Kamino rejects the price as stale
-      6. Leave persist unset unless a known later Scope update or full-account fetch would restore
-         the real price. If that happens and the simulated price must remain pinned, set persist: true;
-         Surfpool will restore it at the beginning of each following slot
-
       SCOPE INDICES (verified 2026-08-06, do not guess these):
       - 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH (Main Market):
         SOL=3, USDC=13, PYUSD=148, cbBTC=175, JitoSOL=[210,3]

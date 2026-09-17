@@ -35,15 +35,8 @@ whole struct or array) also works, but it must be **complete** - every field of 
 padding included - because the account is re-encoded with Borsh. An out-of-range index or a
 non-numeric segment on an array is a hard error, never a silent write elsewhere.
 
-By default an override is applied once, and the resulting account state naturally remains in later
-slots. Leave `"persist"` unset unless a known later transaction, account fetch, or override will
-replace a scenario-controlled input that must stay pinned. With `"persist": true`, Surfpool
-re-applies the values at the beginning of every following slot. It does not continuously protect
-them from writes within a slot. Never pin state whose transaction-driven evolution the scenario is
-measuring: re-applying a balance, position, or accumulator undoes those writes at the next slot, so
-a pool could refill itself after every swap. Only one entry is queued per override, so it is never
-applied twice to one slot, and `fetchBeforeUse` applies to the first slot only - later slots re-pin
-the fields without re-fetching the account.
+An override is applied once. Its resulting account state remains in later slots until a transaction
+or another override writes that account again.
 
 ### Kamino integration tests
 

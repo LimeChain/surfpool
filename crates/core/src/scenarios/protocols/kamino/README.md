@@ -7,9 +7,9 @@ This is a how-to. For how scenarios work in general see the [scenarios README](.
 Every field's own purpose and units are on the template itself, visible in Studio and via
 `get_override_templates`.
 
-## Two rules that decide whether an override sticks
+## Override inputs, not results
 
-**1. Override inputs, not results.** Kamino stores settings someone chose (`liquidation_threshold_pct`)
+Kamino stores settings someone chose (`liquidation_threshold_pct`)
 and values it computed from them (`market_price_sf`, the Obligation's `*_value_sf`). Before a
 liquidation it runs `refresh_reserve` and `refresh_obligation`, which recompute every computed value.
 So overriding a computed value is discarded moments later.
@@ -18,12 +18,6 @@ So overriding a computed value is discarded moments later.
 |---|---|---|
 | A price | `kamino-scope-price` | `liquidity.market_price_sf` |
 | Position health | `kamino-reserve-config` → `liquidation_threshold_pct` | `kamino-obligation-health` |
-
-**2. Do not persist by default.** An override applied once already remains in later slots. Add
-`"persist": true` only when a known later update or fetch would overwrite a scenario-controlled
-input that must stay pinned, such as an oracle price while its updater continues running. Never pin
-state whose changes you are testing (reserve liquidity, obligations, farm rewards, or vault
-balances): re-applying it undoes those changes at the beginning of the next slot.
 
 ## Number formats
 
@@ -202,7 +196,6 @@ kamino-swap-order
 | `exceeds what a JSON number can hold exactly` | Pass large `u128`/`i128` values as decimal strings, e.g. `"1152921504606846976000"`. Plain JSON numbers are fine below 2^53 |
 | `Account with discriminator ... not found in IDL` | The account is not Anchor-based (e.g. Raydium AMM v4). It cannot be overridden through the IDL path |
 | `Failed to resolve account address` | The `pubkey` is not valid base58 |
-| A later update replaced a scenario-controlled input | Add `"persist": true` only when that input must stay pinned; do not use it merely because the scenario spans multiple slots |
 | A value the program recomputes will not stay put | Pin the input it reads instead: Scope price over a Reserve's cached price, `liquidation_threshold_pct` over the Obligation's health fields |
 
 ---
