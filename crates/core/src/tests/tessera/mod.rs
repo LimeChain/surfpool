@@ -763,16 +763,24 @@ async fn tessera_builders_materialize_and_keep_quotes_fresh() {
         &[(120, 128), (128, 136), (144, 152)],
     );
 
+    // The builder queues nothing past its preparation slot: the prepared bytes stay as written.
+    assert!(
+        svm.scheduled_overrides
+            .get(&(BASE_SLOT + 1))
+            .expect("read the next slot's queue")
+            .is_none(),
+        "the builder must not queue an override past its preparation slot"
+    );
     svm.materialize_overrides_for_slot(&None, BASE_SLOT + 1)
         .await
-        .expect("materialize persistent Tessera freshness");
+        .expect("materialize the next Tessera slot");
     let next_slot = svm
         .inner
         .get_account(&market_key)
         .expect("get Tessera market")
         .expect("Tessera market present")
         .data;
-    assert_eq!(read_u64(&next_slot, 120), BASE_SLOT + 1);
+    assert_eq!(read_u64(&next_slot, 120), BASE_SLOT);
     assert_eq!(
         read_u64(&next_slot, 128),
         preparation.quote_atoms_per_base_atom_x1e15
@@ -781,7 +789,10 @@ async fn tessera_builders_materialize_and_keep_quotes_fresh() {
         read_u64(&next_slot, 144),
         preparation.base_atoms_per_quote_atom_x1e15
     );
-    assert_only_ranges_changed(&materialized, &next_slot, &[(120, 128)]);
+    assert_eq!(
+        next_slot, materialized,
+        "an unpersisted override leaves the account alone"
+    );
 }
 
 #[tokio::test]

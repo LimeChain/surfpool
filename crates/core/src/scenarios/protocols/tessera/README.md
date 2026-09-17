@@ -97,14 +97,15 @@ stages the scenario through the shared path.
 Builder-created overrides keep `fetchBeforeUse: false`: creation has already read and hydrated
 the target account, and the scenario must use that prepared local snapshot. When composing a
 direct template scenario, set `fetchBeforeUse: true` on the first override for each account not
-yet in local state. Freshness overrides use `persist: true` and `last_update_slot: null` to write
-the current materialization slot on every application.
+yet in local state. Freshness overrides pass `last_update_slot: null` to write the materialization
+slot itself. They are applied once; a scenario that runs past the market's freshness window sets
+`persist` itself.
 
 The `create_tessera_depth_scenario` tool reads current Surfnet state and takes remaining basis points
 per direction: 1000 retains 10%, 10000 leaves that direction unchanged. It scales only enabled
 capacities, with integer-floor rounding, and rejects zero capacities or increases. Prices, factors
-and disabled levels are preserved. The scenario combines `tessera-depth` with persisted freshness;
-depth itself is applied once. Creating another scenario reads the then-current state again.
+and disabled levels are preserved. The scenario combines `tessera-depth` with a freshness override,
+both applied once. Creating another scenario reads the then-current state again.
 Curve changes remain available through the raw template.
 
 ## Behavioral evidence

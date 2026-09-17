@@ -229,7 +229,7 @@ templates:
       Use list_tessera_markets to select the override account.
       For percentage reductions, use create_tessera_depth_scenario, which reads the current Surfnet
       account and scales enabled levels exactly. Pass remaining basis points: 1000 keeps 10%,
-      10000 leaves a direction unchanged. It also adds persistent freshness.
+      10000 leaves a direction unchanged. It also refreshes the quote once.
       These are directional capacities, not token vault balances. Do not assume they
       are monotonic cumulative breakpoints. To make one direction shallower, scale the currently
       enabled amount fields for that direction by the same ratio. Lower sell_levels for a large

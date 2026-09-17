@@ -137,7 +137,7 @@ mod tests {
             }
             assert_eq!(actual, expected);
             assert!(!scenario.overrides[0].persist);
-            assert!(scenario.overrides[1].persist);
+            assert!(!scenario.overrides[1].persist);
             assert!(
                 scenario.overrides[0]
                     .values
