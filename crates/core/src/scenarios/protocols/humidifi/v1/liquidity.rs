@@ -320,13 +320,11 @@ mod tests {
         );
         assert_eq!(amount_of(base), 5_000);
         assert!(!base.fetch_before_use);
-        assert!(!base.persist);
         assert_eq!(freshness.template_id, FRESHNESS_TEMPLATE);
         assert_eq!(
             freshness.account,
             AccountAddress::Pubkey(fixture.market.address.to_string())
         );
-        assert!(freshness.persist);
         assert_eq!(
             freshness.values.get("last_update_slot"),
             Some(&serde_json::Value::Null)

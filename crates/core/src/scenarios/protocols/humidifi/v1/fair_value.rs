@@ -235,9 +235,9 @@ pub fn build_humidifi_fair_value_scenario(
     })
 }
 
-/// Null, not zero: the slot encoder reads a supplied number as the lead, so only null takes the
-/// template's own lead of zero. Persisted, so the prepared price stays inside the market's
-/// freshness window however long the scenario is left running.
+/// Applied once, at the scenario's own slot: nothing on a fork republishes the quote, and nothing
+/// overwrites it either. A scenario that spans enough slots to age past the market's window
+/// refreshes it again at a later slot.
 pub(super) fn freshness_override(
     registry: &TemplateRegistry,
     market: &Pubkey,
@@ -252,8 +252,7 @@ pub(super) fn freshness_override(
         "last_update_slot".to_string(),
         serde_json::Value::Null,
     )]))
-    .with_label("Keep HumidiFi quote fresh".to_string())
-    .with_persist(true))
+    .with_label("Keep HumidiFi quote fresh".to_string()))
 }
 
 /// Validates the market, then unmasks a `[base, quote]` pubkey pair that must be set and distinct.
@@ -509,9 +508,7 @@ mod tests {
                 Some(&serde_json::json!(expected.to_string()))
             );
             assert!(!price_override.fetch_before_use);
-            assert!(!price_override.persist);
             assert!(!freshness.fetch_before_use);
-            assert!(freshness.persist);
             assert_eq!(
                 freshness.values.get("last_update_slot"),
                 Some(&serde_json::Value::Null)

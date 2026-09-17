@@ -288,7 +288,7 @@ async fn humidifi_discovers_live_markets() {
 
 /// The builder's materialization path: prepare the live market locally, build the scenario, then
 /// register and materialize it through the real materializer. The fair value lands from the human
-/// price and the persisted freshness re-stamps itself on the next slot without remote replacement.
+/// price and queues nothing for the next slot, leaving the prepared bytes untouched.
 #[tokio::test]
 async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh() {
     let market_account = fetch(&[SOL_USDC_MARKET]).await.remove(0);
@@ -339,15 +339,14 @@ async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh(
         ],
         "prepared local market",
     );
-    // Next slot: the persisted freshness re-stamps offset 616 to the new slot, and nothing else.
-    let scheduled = svm
-        .scheduled_overrides
-        .get(&(base_slot + 1))
-        .expect("read scheduled freshness")
-        .expect("persisted freshness");
-    assert_eq!(scheduled.len(), 1);
-    assert!(scheduled[0].persist);
-    assert!(!scheduled[0].fetch_before_use);
+    // Next slot: the builder queues nothing, so the prepared bytes stay exactly as written.
+    assert!(
+        svm.scheduled_overrides
+            .get(&(base_slot + 1))
+            .expect("read the next slot's queue")
+            .is_none(),
+        "the builder must not queue an override past its preparation slot"
+    );
     svm.materialize_overrides_for_slot(&remote, base_slot + 1)
         .await
         .expect("materialize next slot");
@@ -359,17 +358,16 @@ async fn humidifi_builder_scenario_preserves_local_market_and_keeps_quote_fresh(
     assert_eq!(
         decode_u64(&next, FAIR_VALUE_OFFSET, FAIR_VALUE_KEY),
         expected_fair_value,
-        "persisted freshness must preserve the prepared price"
+        "the prepared price must survive the slot"
     );
     assert_eq!(
         decode_u64(&next, LAST_UPDATE_SLOT_OFFSET, STATE_KEY),
-        base_slot + 1,
-        "the persisted freshness must track the slot"
+        base_slot,
+        "the stamp stays at the preparation slot"
     );
-    assert_only_within(
-        &diff_indices(&next, applied),
-        std::slice::from_ref(&(LAST_UPDATE_SLOT_OFFSET..LAST_UPDATE_SLOT_OFFSET + 8)),
-        "persisted freshness next slot",
+    assert!(
+        diff_indices(&next, applied).is_empty(),
+        "an override that is not scheduled again must leave the account alone"
     );
 }
 

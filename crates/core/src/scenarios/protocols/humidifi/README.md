@@ -82,14 +82,15 @@ datasource. It stages the result through the shared scenario path.
 
 Both builders leave every override at `fetchBeforeUse: false`: the creation reads already cached
 the accounts in Surfnet, and Play applies the values to that local state. Refetching would replace
-earlier local edits and the state the amounts were calculated from. Freshness is persisted with a
-`null` value, so the encoder uses its zero lead at every materialization slot without fetching over
-the price. When composing templates directly, set `fetchBeforeUse: true` on the first override for
-each account that has not already been prepared.
+earlier local edits and the state the amounts were calculated from. Freshness passes a `null`
+value, so the encoder uses its zero lead and writes the preparation slot itself; it is applied once,
+and a scenario that runs past the market's staleness window refreshes it again at a later slot. When composing
+templates directly, set `fetchBeforeUse: true` on the first override for each account that has not
+already been prepared.
 
 `build_humidifi_liquidity_scenario` scales the market's vault balances through the generic
 `spl-token-account-balance` template, one override per side that changes, from 0 to 10000 remaining
-basis points with integer floor, and pairs them with persisted freshness. The vault addresses come
+basis points with integer floor, and pairs them with a freshness override. The vault addresses come
 from the market's masked words at offsets 448 (quote) and 480 (base); each vault must be a token
 account for the market's mint on that side, owned by that mint's token program, initialized and
 controlled by the market. `create_humidifi_liquidity_scenario`
@@ -104,7 +105,7 @@ request editable state scenarios.
 ## Behavioral evidence
 
 The live suite checks byte-limited template writes on two markets, guarded layout rejection,
-discovered metadata, and scenario materialization with persisted freshness. The swap replay's
+discovered metadata, and scenario materialization that queues nothing past its slot. The swap replay's
 setup is described in `crates/core/src/tests/humidifi/mod.rs`.
 
 The fair-value replay checks unchanged output after re-encoding the current ratio, increased
