@@ -151,9 +151,18 @@ pub async fn discover_goonfi_markets(
     addresses.dedup();
     let mut references = HashMap::new();
     for batch in addresses.chunks(100) {
-        let fetched = client
+        // A datasource failure disqualifies only the markets whose references were in this batch,
+        // the same way a reference the fork cannot serve does.
+        let fetched = match client
             .get_multiple_accounts(batch, CommitmentConfig::confirmed())
-            .await?;
+            .await
+        {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                warn!("Skipping {} GoonFi references: {error}", batch.len());
+                continue;
+            }
+        };
         for (address, account) in batch.iter().zip(fetched) {
             // A reference the fork cannot serve disqualifies only the markets pointing at it,
             // which `resolve_market` reports below.
