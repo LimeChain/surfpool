@@ -481,11 +481,8 @@ mod tests {
             Some(&serde_json::json!("99740000"))
         );
         assert!(!price.fetch_before_use);
-        assert!(!price.persist);
         assert!(!reference.fetch_before_use);
-        assert!(!reference.persist);
         assert!(!freshness.fetch_before_use);
-        assert!(freshness.persist);
         assert_eq!(
             freshness.values.get("last_update_slot"),
             Some(&serde_json::Value::Null)

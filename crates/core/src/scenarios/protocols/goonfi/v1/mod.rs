@@ -40,9 +40,9 @@ fn read_pubkey(data: &[u8], offset: usize) -> Option<Pubkey> {
         .map(Pubkey::new_from_array)
 }
 
-/// Null, not zero: the slot encoder reads a supplied number AS the lead, so only null takes the
-/// template's own lead of zero. Persisted, so the prepared quote stays inside the oracle's
-/// staleness window however long the scenario is left running.
+/// Applied once, at the scenario's own slot: nothing on a fork republishes the quote, and nothing
+/// overwrites it either. A scenario that spans enough slots to age past the oracle's window
+/// refreshes it again at a later slot.
 fn freshness_override(template_id: String, oracle: &Pubkey) -> OverrideInstance {
     OverrideInstance::new(
         template_id,
@@ -54,7 +54,6 @@ fn freshness_override(template_id: String, oracle: &Pubkey) -> OverrideInstance 
         serde_json::Value::Null,
     )]))
     .with_label("Keep GoonFi quote fresh".to_string())
-    .with_persist(true)
 }
 
 #[cfg(test)]

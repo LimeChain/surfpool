@@ -684,19 +684,29 @@ async fn builder_prepares_and_the_program_fills(fork: &GoonfiFork) {
         "the prepared price must set the fill: {prepared} vs ~{expected}"
     );
 
-    // Only the persistent freshness override re-applies on the next slot.
+    // Nothing is queued for the next slot: the prepared bytes stay as written.
+    assert!(
+        svm.scheduled_overrides
+            .get(&(base_slot + 1))
+            .expect("read the next slot's queue")
+            .is_none(),
+        "the builder must not queue an override past its preparation slot"
+    );
     svm.materialize_overrides_for_slot(&None, base_slot + 1)
         .await
-        .expect("materialize persistent GoonFi freshness");
+        .expect("materialize the next GoonFi slot");
     let next = svm
         .inner
         .get_account(&oracle_key)
         .expect("get oracle")
         .expect("oracle present")
         .data;
-    assert_eq!(oracle_slot(&next), base_slot + 1);
+    assert_eq!(
+        next, oracle,
+        "an override that is not scheduled again leaves the account alone"
+    );
+    assert_eq!(oracle_slot(&next), base_slot);
     assert_eq!(read_u64(&next, ORACLE_BID_OFFSET), target);
-    assert_only_ranges_changed(&oracle, &next, &[(16, 20)]);
 }
 
 #[tokio::test]

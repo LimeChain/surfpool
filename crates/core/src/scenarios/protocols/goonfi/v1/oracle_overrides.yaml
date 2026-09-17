@@ -87,13 +87,13 @@ templates:
       custom error 0x15, so a small negative lead prepares a degraded-but-fillable quote and
       the -2000 default prepares a rejected one on every observed market.
 
-      Do not persist this override: the quote should stay stale. For a standalone stale quote on a
+      Do not refresh the oracle afterwards: the quote should stay stale. For a standalone stale quote on a
       fresh fork, set fetchBeforeUse: true so the live oracle is forked before the ageing applies;
       an override on an account not yet local is skipped. In a lifecycle where an earlier
       goonfi-freshness override already forked and edited the oracle locally, use false so this
       override does not refetch remote bytes over that local edit: refresh once at slot zero, age
-      at the requested relative slot, then optionally refresh with persist at a later recovery
-      slot. The initial refresh must not persist or it will erase the stale event. Before a
+      at the requested relative slot, then optionally refresh again at a later recovery slot.
+      Do not schedule a refresh over the ageing interval or it will erase the stale event. Before a
       delayed event, the initial quote naturally ages. Keep override labels short ("SOL/USDC stale
       quote").
 
@@ -121,9 +121,9 @@ templates:
       freshness.
 
       Pass null for last_update_slot to take this template's lead of zero, which writes the
-      exact materialization slot. A number would be read as the lead instead. Use persist: true
-      when the prepared state must remain executable beyond the window; each application then
-      writes its own slot.
+      exact materialization slot. A number would be read as the lead instead. To keep the quote
+      live past the window, schedule this override again at a later slot of the same scenario;
+      each application writes the slot it materializes at.
 
       Set fetchBeforeUse: true when this is the first override to touch the oracle on a fresh fork,
       so the live account is forked before the stamp; an override on an account not yet local is

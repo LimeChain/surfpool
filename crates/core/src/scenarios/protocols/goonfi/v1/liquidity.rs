@@ -292,12 +292,10 @@ mod tests {
         assert_eq!(base.values.get("amount"), Some(&serde_json::json!("0")));
         assert_eq!(quote.values.get("amount"), Some(&serde_json::json!("0")));
         assert!(!base.fetch_before_use);
-        assert!(!base.persist);
         assert_eq!(
             freshness.account,
             AccountAddress::Pubkey(FIXTURE_ORACLE.to_string())
         );
-        assert!(freshness.persist);
         assert_eq!(
             freshness.values.get("last_update_slot"),
             Some(&serde_json::Value::Null)

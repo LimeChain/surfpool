@@ -42,9 +42,12 @@ that a caller deliberately labels with an unrelated address. RPC reads remain ou
 the pure builders, as in Pump's graduation preparation.
 
 The price builder does not set `fetchBeforeUse`: the accounts read at creation retain
-local edits, and only the specified fields are changed. Freshness uses `persist: true`
-to stamp each subsequent materialization slot. These settings do not establish
-transactional atomicity across all overrides in a scenario.
+local edits, and only the specified fields are changed. Freshness writes the
+materialization slot once, like every other override: a forked oracle is not
+republished, so the stamp only has to be recent enough for the scenario's own slots.
+A scenario that runs past the staleness window schedules another refresh at a later
+slot. These settings do not establish transactional atomicity across all overrides in
+a scenario.
 
 ## Composing other prepared states
 
@@ -52,7 +55,7 @@ The four templates remain available through the generic scenario editor and AI f
 There are no dedicated GoonFi spread or delayed-event builders.
 
 For a stale quote, target the oracle returned by `list_goonfi_markets` with
-`goonfi-stale-quote`. Do not run a persistent freshness override over the same interval:
+`goonfi-stale-quote`. Do not schedule a freshness override over the same interval:
 it would erase the stale state. Recovery can use `goonfi-freshness` at a later relative
 slot. The Studio AI chip requests a stale-quote scenario through this generic flow.
 

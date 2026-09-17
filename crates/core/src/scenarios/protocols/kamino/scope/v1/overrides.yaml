@@ -45,9 +45,6 @@ templates:
          [210, 3] means price = prices[210] * prices[3]
       4. Set price.value = usd_price * 10^exp, keeping exp as you found it
       5. Set last_updated_slot and unix_timestamp to now, or Kamino rejects the price as stale
-      6. Set persist: true if the scenario runs past one slot, so a transaction that writes
-         this account cannot restore the real price. Safe here: nothing in a fork cranks Scope
-
       SCOPE INDICES (verified 2026-08-06, do not guess these):
       - 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH (Main Market):
         SOL=3, USDC=13, PYUSD=148, cbBTC=175, JitoSOL=[210,3]
