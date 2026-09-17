@@ -455,7 +455,7 @@ templates:
       direction with custom error 0xffff when every level is disabled. The existing field names
       address the start of each twenty-level write. Disabling only level zero is insufficient:
       consumed depth or the selected configuration may start a quote at a later level. Use only
-      zero; enabling previously disabled levels is not supported. Do not persist this scenario.
+      zero; enabling previously disabled levels is not supported.
 
   - id: tessera-stale-quote
     name: Make Tessera Quote Stale
@@ -488,7 +488,7 @@ templates:
       account stores the same limit; do not assume all markets share a limit.
 
       At the boundary the current deployed program rejects the swap with custom error 65535, while
-      one slot younger succeeds. Do not persist this override: the quote should stay stale.
+      one slot younger succeeds. Do not refresh the quote afterwards: it should stay stale.
 
       Keep override labels short ("SOL/USDC stale quote").
 
@@ -519,5 +519,5 @@ templates:
       materialization slot. A number would be read as the lead instead, so passing 0 happens to mean
       the same thing here and -5 would quietly age the quote by five slots.
 
-      Use persist: true when the prepared state must remain executable beyond the market's freshness
-      window; each application then writes its own slot rather than repeating the first one.
+      To keep a quote live past the market's freshness window, schedule this override again at a
+      later slot of the same scenario; each application writes the slot it materializes at.

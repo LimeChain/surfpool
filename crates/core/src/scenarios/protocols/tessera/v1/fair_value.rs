@@ -195,9 +195,9 @@ pub fn build_tessera_fair_value_scenario(
     })
 }
 
-/// Applied once, like every other override: nothing on a fork republishes the quote, but nothing
-/// overwrites it either. A scenario that spans enough slots to age past the market's window sets
-/// persist itself.
+/// Applied once, at the scenario's own slot: nothing on a fork republishes the quote, and nothing
+/// overwrites it either. A scenario that spans enough slots to age past the market's window
+/// refreshes it again at a later slot.
 pub(super) fn freshness_override(target: AccountAddress) -> OverrideInstance {
     OverrideInstance::new(FRESHNESS_TEMPLATE.to_string(), PREPARATION_SLOT, target)
         .with_values(HashMap::from([(
@@ -371,9 +371,7 @@ mod tests {
                 AccountAddress::Pubkey(market.address.to_string())
             );
             assert!(!price.fetch_before_use);
-            assert!(!price.persist);
             assert!(!freshness.fetch_before_use);
-            assert!(!freshness.persist);
             assert_eq!(
                 freshness.values.get("last_update_slot"),
                 Some(&serde_json::Value::Null)

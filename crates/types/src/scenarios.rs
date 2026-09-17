@@ -532,13 +532,6 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
-    /// Whether to re-apply this override on every subsequent slot, rather than only once
-    #[schemars(
-        description = "If true, re-applies this override every following slot. Use only for values no transaction writes: it reverts transaction writes to the same fields."
-    )]
-    #[serde(default)]
-    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
-    pub persist: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
@@ -556,7 +549,6 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
-            persist: false,
             account,
         }
     }
@@ -568,11 +560,6 @@ impl OverrideInstance {
 
     pub fn with_label(mut self, label: String) -> Self {
         self.label = Some(label);
-        self
-    }
-
-    pub fn with_persist(mut self, persist: bool) -> Self {
-        self.persist = persist;
         self
     }
 }

@@ -63,9 +63,6 @@ templates:
       EXAMPLE - "the vault earned 1000 USDC of yield" (6 decimals):
       token_available: 1000000000
 
-      DO NOT set persist: true here - transactions write these fields, and re-applying the
-      override reverts their writes at the start of every following slot.
-
   - id: kamino-vault-fees
     name: Override Earn Vault Fees
     description: Override Kamino Earn vault performance, management and exit fees

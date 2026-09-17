@@ -791,7 +791,7 @@ async fn tessera_builders_materialize_and_keep_quotes_fresh() {
     );
     assert_eq!(
         next_slot, materialized,
-        "an unpersisted override leaves the account alone"
+        "an override that is not scheduled again leaves the account alone"
     );
 }
 
