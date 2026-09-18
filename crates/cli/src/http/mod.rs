@@ -55,7 +55,7 @@ fn configure_api(cfg: &mut web::ServiceConfig) {
 }
 
 pub async fn start_studio_and_scenario_server(
-    network_binding: String,
+    studio_bind_addr: String,
     config: SanitizedConfig,
     subgraph_events_tx: Sender<SubgraphEvent>,
     ctx: &Context,
@@ -75,6 +75,7 @@ pub async fn start_studio_and_scenario_server(
         .sse_keep_alive(Duration::from_secs(30))
         .build();
 
+    info!("Binding studio server to {}", studio_bind_addr);
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
@@ -102,7 +103,7 @@ pub async fn start_studio_and_scenario_server(
         app
     })
     .workers(5)
-    .bind(network_binding)?
+    .bind(studio_bind_addr)?
     .run();
     let handle = server.handle();
     tokio::spawn(server);

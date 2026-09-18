@@ -27,7 +27,9 @@ use crate::{
     tui::{self, simnet::DisplayedUrl},
 };
 
+mod endpoints;
 mod startup;
+use endpoints::resolve_endpoints;
 use startup::{
     SealFailure, StartupPlanFailure, plan_and_dispatch_startup, seal_startup_plan,
     spawn_startup_watchdog,
@@ -38,26 +40,6 @@ use startup::{
 struct CheckVersionResponse {
     pub latest: String,
     pub deprecation_notice: Option<String>,
-}
-
-fn default_public_host(bind_host: &str) -> &str {
-    match bind_host {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        _ => bind_host,
-    }
-}
-
-fn public_service_url(
-    explicit_url: Option<String>,
-    public_host: Option<&str>,
-    scheme: &str,
-    bind_host: &str,
-    port: u16,
-) -> String {
-    explicit_url.unwrap_or_else(|| {
-        let host = public_host.unwrap_or_else(|| default_public_host(bind_host));
-        format!("{scheme}://{host}:{port}")
-    })
 }
 
 pub async fn handle_start_local_surfnet_command(
@@ -145,48 +127,26 @@ pub async fn handle_start_local_surfnet_command(
     // Build config
     let config = cmd.surfpool_config(airdrop_addresses, snapshot);
 
-    let studio_binding_address = config.studio.get_studio_base_url();
-    let public_host = std::env::var("SURFPOOL_PUBLIC_HOST").ok();
+    let endpoints = resolve_endpoints(&config)?;
 
-    // Allow overriding public-facing URLs via environment variables
-    // This is useful when running behind a reverse proxy (e.g., Caddy, nginx)
-    let rpc_url = public_service_url(
-        std::env::var("SURFPOOL_PUBLIC_RPC_URL").ok(),
-        public_host.as_deref(),
-        "http",
-        &config.rpc.bind_host,
-        config.rpc.bind_port,
+    let graphql_query_route_url = format!(
+        "{}/workspace/v1/graphql",
+        endpoints.studio_url.trim_end_matches('/')
     );
-    let ws_url = public_service_url(
-        std::env::var("SURFPOOL_PUBLIC_WS_URL").ok(),
-        public_host.as_deref(),
-        "ws",
-        &config.rpc.bind_host,
-        config.rpc.ws_port,
-    );
-    let studio_url = public_service_url(
-        std::env::var("SURFPOOL_PUBLIC_STUDIO_URL").ok(),
-        public_host.as_deref(),
-        "http",
-        &config.studio.bind_host,
-        config.studio.bind_port,
-    );
-
-    let graphql_query_route_url = format!("{}/workspace/v1/graphql", studio_url);
     let rpc_datasource_url = config.simnets[0].get_sanitized_datasource_url();
 
     let sanitized_config = SanitizedConfig {
-        rpc_url,
-        ws_url,
+        rpc_url: endpoints.rpc_url,
+        ws_url: endpoints.ws_url,
         rpc_datasource_url,
-        studio_url,
+        studio_url: endpoints.studio_url,
         graphql_query_route_url,
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace: None,
     };
 
     let explorer_handle = match start_studio_and_scenario_server(
-        studio_binding_address,
+        endpoints.studio_bind_addr,
         sanitized_config.clone(),
         subgraph_events_tx.clone(),
         ctx,
@@ -573,53 +533,6 @@ fn log_events(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{default_public_host, public_service_url};
-
-    #[test]
-    fn default_public_host_maps_wildcard_binds_to_loopback() {
-        assert_eq!(default_public_host("0.0.0.0"), "127.0.0.1");
-        assert_eq!(default_public_host("::"), "127.0.0.1");
-    }
-
-    #[test]
-    fn default_public_host_preserves_specific_hosts() {
-        assert_eq!(default_public_host("127.0.0.1"), "127.0.0.1");
-        assert_eq!(default_public_host("10.0.0.5"), "10.0.0.5");
-    }
-
-    #[test]
-    fn public_service_url_prefers_explicit_url_over_everything_else() {
-        assert_eq!(
-            public_service_url(
-                Some("https://rpc.example.com".to_string()),
-                Some("staging.example.com"),
-                "http",
-                "0.0.0.0",
-                8899,
-            ),
-            "https://rpc.example.com"
-        );
-    }
-
-    #[test]
-    fn public_service_url_uses_public_host_when_present() {
-        assert_eq!(
-            public_service_url(None, Some("staging.example.com"), "http", "0.0.0.0", 8899),
-            "http://staging.example.com:8899"
-        );
-    }
-
-    #[test]
-    fn public_service_url_uses_loopback_for_wildcard_bind_when_unset() {
-        assert_eq!(
-            public_service_url(None, None, "http", "0.0.0.0", 8899),
-            "http://127.0.0.1:8899"
-        );
-    }
 }
 
 /// Re-send events buffered before `CoreStarted` (and the airdrop
