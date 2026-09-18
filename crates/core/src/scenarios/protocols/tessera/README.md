@@ -98,8 +98,8 @@ Builder-created overrides keep `fetchBeforeUse: false`: creation has already rea
 the target account, and the scenario must use that prepared local snapshot. When composing a
 direct template scenario, set `fetchBeforeUse: true` on the first override for each account not
 yet in local state. Freshness overrides pass `last_update_slot: null` to write the materialization
-slot itself. They are applied once; a scenario that runs past the market's freshness window
-schedules another refresh at a later slot.
+slot itself. They are applied once; a scenario extended past the market's freshness window needs
+another freshness override of its own.
 
 The `create_tessera_depth_scenario` tool reads current Surfnet state and takes remaining basis points
 per direction: 1000 retains 10%, 10000 leaves that direction unchanged. It scales only enabled
