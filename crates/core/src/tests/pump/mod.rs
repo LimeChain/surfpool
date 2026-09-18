@@ -38,7 +38,6 @@ use solana_transaction::Transaction;
 use surfpool_types::{OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig};
 
 use crate::{
-    helpers::test_utils::{DEFAULT_RPC_URL, RPC_URL_ENV, diff_indices, fetch},
     scenarios::{
         TemplateRegistry,
         protocols::pump::v1::graduation_builder::{
@@ -48,7 +47,10 @@ use crate::{
     storage::tests::TestType,
     surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
     tests::{
-        helpers::get_free_port,
+        helpers::{
+            diff_indices, get_free_port,
+            remote::{client, fetch, url},
+        },
         integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
     },
 };
@@ -450,9 +452,7 @@ fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     let ws_port = get_free_port().unwrap();
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
-            remote_rpc_url: Some(
-                std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
-            ),
+            remote_rpc_url: Some(url()),
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -489,8 +489,7 @@ fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
 async fn find_live_graduation_candidate(
     surfnet: &RpcClient,
 ) -> (Pubkey, PumpGraduationPreparation) {
-    let mainnet =
-        RpcClient::new(std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()));
+    let mainnet = client().client;
     let signatures: serde_json::Value = mainnet
         .send(
             RpcRequest::GetSignaturesForAddress,
