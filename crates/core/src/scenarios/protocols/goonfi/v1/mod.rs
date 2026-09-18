@@ -41,8 +41,8 @@ fn read_pubkey(data: &[u8], offset: usize) -> Option<Pubkey> {
 }
 
 /// Applied once, at the scenario's own slot: nothing on a fork republishes the quote, and nothing
-/// overwrites it either. A scenario that spans enough slots to age past the oracle's window
-/// refreshes it again at a later slot.
+/// overwrites it either. Play pauses the clock there, so a swap in that slot reads a fresh quote.
+/// Running past the oracle's window takes a second freshness override; the builder adds only one.
 fn freshness_override(template_id: String, oracle: &Pubkey) -> OverrideInstance {
     OverrideInstance::new(
         template_id,

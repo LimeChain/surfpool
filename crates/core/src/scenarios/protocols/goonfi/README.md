@@ -45,9 +45,9 @@ The price builder does not set `fetchBeforeUse`: the accounts read at creation r
 local edits, and only the specified fields are changed. Freshness writes the
 materialization slot once, like every other override: a forked oracle is not
 republished, so the stamp only has to be recent enough for the scenario's own slots.
-A scenario that runs past the staleness window schedules another refresh at a later
-slot. These settings do not establish transactional atomicity across all overrides in
-a scenario.
+A scenario extended past the staleness window needs another freshness override of
+its own at a later slot. These settings do not establish transactional atomicity
+across all overrides in a scenario.
 
 ## Composing other prepared states
 
