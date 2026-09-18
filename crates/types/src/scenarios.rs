@@ -283,6 +283,9 @@ pub struct Property {
     /// Raw-layout only: how this field's bytes are produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<RawEncoding>,
+    /// XOR key applied before writing; only 8-byte raw encodings can be masked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xor_mask: Option<u64>,
 }
 
 impl Property {
@@ -296,6 +299,7 @@ impl Property {
             constant: None,
             offset: None,
             encoding: None,
+            xor_mask: None,
         }
     }
 
@@ -309,6 +313,7 @@ impl Property {
             constant: Some(constant.into()),
             offset: None,
             encoding: None,
+            xor_mask: None,
         }
     }
 
@@ -877,6 +882,9 @@ pub enum YamlProperty {
         /// Raw-layout only: how this field's bytes are produced
         #[serde(default)]
         encoding: Option<RawEncoding>,
+        /// Raw-layout only: XOR key applied to the encoded word before writing
+        #[serde(default)]
+        xor_mask: Option<u64>,
     },
 }
 
@@ -892,6 +900,7 @@ impl From<YamlProperty> for Property {
                 constant,
                 offset,
                 encoding,
+                xor_mask,
             } => {
                 let kind = match kind.as_deref() {
                     Some("constant_ref") => PropertyKind::ConstantRef,
@@ -905,6 +914,7 @@ impl From<YamlProperty> for Property {
                     constant,
                     offset,
                     encoding,
+                    xor_mask,
                 }
             }
         }
@@ -1257,7 +1267,19 @@ impl RawLayout {
             else {
                 return Err(format!("property '{name}' has no offset or encoding"));
             };
-            let bytes = encoding.encode(value, target_slot)?;
+            let mut bytes = encoding.encode(value, target_slot)?;
+            if let Some(mask) = property.xor_mask {
+                if bytes.len() != 8 {
+                    return Err(format!(
+                        "property '{name}' declares an xor_mask but its encoding is {} bytes; only \
+                         8-byte encodings can be masked",
+                        bytes.len()
+                    ));
+                }
+                for (byte, key) in bytes.iter_mut().zip(mask.to_le_bytes()) {
+                    *byte ^= key;
+                }
+            }
             let (count, stride) = encoding.placements();
             for i in 0..count {
                 let at = offset
@@ -1660,6 +1682,91 @@ mod tests {
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn xor_mask_stores_the_masked_word_and_reads_back_plaintext() {
+        use super::{Property, RawEncoding, RawLayout};
+
+        // A program that keeps every word as `plaintext XOR key`. The template value stays
+        // plaintext; the engine masks it on write, so the account holds value ^ key.
+        fn masked_property(encoding: RawEncoding, key: u64) -> Property {
+            let mut property = Property::field("word".to_string());
+            property.offset = Some(0);
+            property.encoding = Some(encoding);
+            property.xor_mask = Some(key);
+            property
+        }
+
+        let layout = RawLayout {
+            account_size: 8,
+            magic: None,
+        };
+        let fair_value_key: u64 = 0xb957_ed15_dc87_7426;
+        let state_key: u64 = 0x6e9d_e2b3_0b19_f1ea;
+        for (encoding, key, value, slot, plaintext) in [
+            (
+                RawEncoding::U64,
+                fair_value_key,
+                json!("29278243997902"),
+                0,
+                29_278_243_997_902u64,
+            ),
+            (
+                RawEncoding::Slot { lead: 0 },
+                state_key,
+                serde_json::Value::Null,
+                444_223_940,
+                444_223_940,
+            ),
+            // A negative lead ages the quote, still masked.
+            (
+                RawEncoding::Slot { lead: -3 },
+                state_key,
+                serde_json::Value::Null,
+                444_223_940,
+                444_223_937,
+            ),
+        ] {
+            let out = layout
+                .materialize(
+                    &[0u8; 8],
+                    &[masked_property(encoding, key)],
+                    &HashMap::from([("word".to_string(), value)]),
+                    slot,
+                )
+                .expect("masked write");
+            assert_eq!(
+                u64::from_le_bytes(out[0..8].try_into().unwrap()),
+                plaintext ^ key,
+                "the account must hold the masked word for {plaintext}"
+            );
+        }
+    }
+
+    #[test]
+    fn xor_mask_rejects_narrow_encodings() {
+        use super::{Property, RawEncoding, RawLayout};
+
+        let layout = RawLayout {
+            account_size: 16,
+            magic: None,
+        };
+
+        // A mask on a non-8-byte encoding is a template error, not a silent half-write.
+        let mut narrow = Property::field("small".to_string());
+        narrow.offset = Some(0);
+        narrow.encoding = Some(RawEncoding::U32);
+        narrow.xor_mask = Some(0xdead_beef);
+        let err = layout
+            .materialize(
+                &[0u8; 16],
+                &[narrow],
+                &HashMap::from([("small".to_string(), json!(1))]),
+                0,
+            )
+            .expect_err("a mask on a 4-byte encoding must be refused");
+        assert!(err.contains("8-byte"), "unexpected error: {err}");
     }
 
     #[test]

@@ -1,0 +1,130 @@
+protocol: HumidiFi
+version: deployed-446544344
+account_type: MarketState
+
+# HumidiFi publishes no IDL and none is reconstructed here. Every write goes through the byte
+# layout below. The quoted price and state fields store each word as `plaintext XOR key`,
+# with a fixed per-offset key compiled into the program. The templates keep their values plaintext
+# and declare the key as `xor_mask`; the engine masks on write. See ../README.md.
+raw_layout:
+  account_size: 1728
+  magic:
+    # Masked structural word at offset 8, shared by the program's market accounts. Size 1728
+    # separates them from its 2440- and 560-byte accounts.
+    # The separate schema word at 1720 is gated in Rust and discovery; raw magic is contiguous.
+    offset: 8
+    bytes: [44, 90, 19, 124, 56, 111, 47, 150]
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: humidifi-fair-value
+    name: Override HumidiFi Fair Value
+    description: Move a HumidiFi market's quoted price
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: fair_value
+        offset: 576
+        encoding: u64
+        # 0xb957ed15dc877426, the fixed key HumidiFi XORs this word with. Fair value = quote-per-base ratio x 2^48.
+        xor_mask: 13355403898140455974
+        label: Fair value
+        description: >-
+          Quote atomic units per base atomic unit, multiplied by 2^48, as a decimal string. Use the
+          HumidiFi fair-value builder to derive this from a human price and the market's mint decimals.
+    llm_context: |
+      PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote once its age exceeds the market's
+      staleness limit. Discover that limit with list_humidifi_markets. A forked market goes stale
+      on its own, because nothing in a fork republishes the quote, and then this override sits
+      correctly in the account but the swap fails on staleness. Pair it with humidifi-freshness
+      whenever the scenario spends more than a slot before executing.
+
+      THE VALUE IS A RAW RATIO, NOT A HUMAN PRICE. It is quote atoms per base atom times 2^48. To go
+      from a human price: raw = price * 2^48 * 10^(quote_decimals - base_decimals), floored. Because
+      that needs both mints' decimals, prefer the fair-value builder, which reads them from the
+      market and does the conversion exactly. If composing the raw template directly, pass the ratio
+      as a decimal STRING, since it can exceed what a JSON number holds exactly.
+
+      Discover markets with list_humidifi_markets and set the override account to the chosen address.
+      A market address is required; there is no default. When composing this template directly, set
+      fetchBeforeUse: true so the live market is forked before the write. The fair-value builder
+      leaves it false because creation already read and cached the market through Surfnet.
+      The following humidifi-freshness override uses fetchBeforeUse: false to preserve that price
+      while refreshing the quote.
+
+      EXAMPLE - SOL/USDC at 208 quote tokens per base token (9 base decimals, 6 quote):
+      fair_value: "58546795155816"
+  - id: humidifi-freshness
+    name: Refresh HumidiFi Quote
+    description: Publish the materialization slot into HumidiFi's freshness field
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 616
+        encoding:
+          slot:
+            lead: 0
+        # 0x6e9de2b30b19f1ea, the market's state-word key.
+        xor_mask: 7970776174128919018
+        label: Slot lead
+        description: >-
+          Slot lead, as an integer. Pass null to take the lead of zero and write the materialization
+          slot itself, which keeps the quote live.
+    llm_context: |
+      This field is the venue's liveness signal, compared against the chain slot. HumidiFi accepts a
+      quote through the market's staleness limit (maxStalenessSlots in list_humidifi_markets) and
+      rejects it after. Set the override account to a market address from that list; there is no default.
+
+      A FORKED MARKET GOES STALE BY ITSELF. Surfpool caches fetched accounts and does not republish
+      the quote, so once past the limit the swap fails on staleness and any humidifi-fair-value
+      override is silently ineffective. This template is that override's precondition.
+
+      THE VALUE IS A LEAD, NOT A SLOT NUMBER. It is resolved against the slot the override
+      materializes at, so 0 means "published this slot". Pass null to take the lead of zero.
+
+      HOW TO USE:
+      1. Set last_update_slot to null (or 0). The venue resumes quoting the price it already holds.
+      2. Set fetchBeforeUse: true so the live market is forked first. Use false when the market was
+         already prepared by a builder or an earlier override, so its local changes are preserved.
+      3. One application covers a scenario that executes within the market's staleness window. To
+         stay executable beyond it, schedule this override again at a later slot; each application
+         writes the slot it materializes at.
+
+      EXAMPLE - refresh the maker's quote for this slot:
+      last_update_slot: null, fetchBeforeUse: true
+  - id: humidifi-stale-quote
+    name: Make HumidiFi Quote Stale
+    description: Age a HumidiFi quote to its market's rejection boundary
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 616
+        encoding:
+          slot:
+            lead: -3
+        xor_mask: 7970776174128919018
+        label: Slot lead
+        description: >-
+          How far behind the materialization slot to place the quote, as a negative integer. Pass
+          null to use -3. Use -(maxStalenessSlots + 1) for the chosen market's rejection boundary.
+    llm_context: |
+      The value you pass IS the lead: Surfpool writes the materialization slot plus it, clamped at
+      zero. Pass null to take the -3 default. This is one template for every market, not one per limit.
+
+      Rejection is at age strictly greater than the market's own limit. Set the override account to
+      a market address from list_humidifi_markets; there is no default. Read its maxStalenessSlots
+      (the market's masked word at offset 608) and pass -(maxStalenessSlots + 1) to reach the first
+      rejection slot. At that age the swap fails with Custom(1027565), or 0xfaded; one slot younger
+      it fills.
+
+      Do not refresh the quote afterwards: it should stay stale. Set fetchBeforeUse: true so the live
+      market is forked first. Keep override labels short ("SOL/USDC stale quote").

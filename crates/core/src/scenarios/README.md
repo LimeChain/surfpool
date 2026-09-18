@@ -18,6 +18,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
+- **HumidiFi** - Proprietary market maker with XOR-obfuscated accounts, fair-value, freshness and stale-quote templates, live market discovery, and a vault liquidity builder. See [protocols/humidifi/README.md](./protocols/humidifi/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 
@@ -49,6 +50,15 @@ cargo test -p surfpool-core --features integration-tests kamino
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
 run needs no network.
+
+### HumidiFi integration tests
+
+HumidiFi coverage that forks real mainnet state lives in `crates/core/src/tests/humidifi/`.
+Run HumidiFi serially because public RPC endpoints can shed requests after market discovery.
+
+```
+cargo test -p surfpool-core --features integration-tests tests::humidifi -- --test-threads=1 --nocapture
+```
 
 ### Programs with no IDL
 
