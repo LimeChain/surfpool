@@ -83,10 +83,10 @@ datasource. It stages the result through the shared scenario path.
 Both builders leave every override at `fetchBeforeUse: false`: the creation reads already cached
 the accounts in Surfnet, and Play applies the values to that local state. Refetching would replace
 earlier local edits and the state the amounts were calculated from. Freshness passes a `null`
-value, so the encoder uses its zero lead and writes the preparation slot itself; it is applied once,
-and a scenario that runs past the market's staleness window refreshes it again at a later slot. When composing
-templates directly, set `fetchBeforeUse: true` on the first override for each account that has not
-already been prepared.
+value, so the encoder uses its zero lead and writes the preparation slot itself. The builder applies
+it once, and a scenario extended past the market's staleness window needs another freshness override
+of its own. When composing templates directly, set `fetchBeforeUse: true` on the first override for
+each account that has not already been prepared.
 
 `build_humidifi_liquidity_scenario` scales the market's vault balances through the generic
 `spl-token-account-balance` template, one override per side that changes, from 0 to 10000 remaining
