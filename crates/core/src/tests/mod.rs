@@ -2,7 +2,11 @@ pub mod helpers;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
+#[cfg(feature = "integration-tests")]
+pub mod live;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
 pub mod simnet_events;
+#[cfg(feature = "integration-tests")]
+pub mod tessera;
