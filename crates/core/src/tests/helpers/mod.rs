@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[cfg(feature = "integration-tests")]
+pub mod remote;
+
 use std::net::TcpListener;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -21,6 +24,16 @@ pub fn get_free_port() -> Result<u16, String> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+/// The offsets at which two buffers differ.
+pub fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
+    left.iter()
+        .zip(right)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 #[derive(Clone)]
