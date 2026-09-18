@@ -44,6 +44,7 @@ use solana_transaction::Transaction;
 use surfpool_types::AccountAddress;
 
 use crate::{
+    helpers::test_utils::{RPC_URL_ENV, client, diff_indices, fetch},
     scenarios::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::state_builder::{
@@ -52,7 +53,6 @@ use crate::{
         },
     },
     surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
-    tests::live::{RPC_URL_ENV, client, diff_indices, fetch},
     types::RemoteRpcResult,
 };
 
