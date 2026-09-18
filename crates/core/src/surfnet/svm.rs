@@ -3099,6 +3099,13 @@ impl SurfnetSvm {
                     .cloned();
                 if let Some(template) = raw_template {
                     let raw_layout = template.raw_layout.expect("filtered above");
+                    if let Err(e) = raw_layout.guard_owner(account.owner()) {
+                        warn!(
+                            "Raw-layout override {} refused on {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        continue;
+                    }
                     let properties = template.properties;
                     match raw_layout.materialize(
                         account.data(),
