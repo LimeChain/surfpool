@@ -38,6 +38,7 @@ use solana_transaction::Transaction;
 use surfpool_types::{OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig};
 
 use crate::{
+    helpers::test_utils::{DEFAULT_RPC_URL, RPC_URL_ENV, diff_indices, fetch},
     scenarios::{
         TemplateRegistry,
         protocols::pump::v1::graduation_builder::{
@@ -49,7 +50,6 @@ use crate::{
     tests::{
         helpers::get_free_port,
         integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
-        live::{DEFAULT_RPC_URL, RPC_URL_ENV, diff_indices, fetch},
     },
 };
 
