@@ -1,0 +1,20 @@
+# Profile for the scheduled protocol monitoring. Not used by ordinary CI.
+[profile.monitoring]
+# One retry separates a throttled endpoint from a protocol that actually changed. A real drift
+# fails twice; a 429 usually does not.
+retries = 1
+# Every check must run even after one has failed: the known Jupiter red would otherwise cancel
+# the layout and market checks behind it and the report would read as incomplete every day.
+fail-fast = false
+failure-output = "immediate-final"
+# Mainnet-reading tests run one at a time: the public endpoint sheds queued requests right after
+# a heavy scan, and a shed request is indistinguishable from a finding.
+test-threads = 1
+# A network-bound test that stops answering must not hold the job open until the runner times
+# out with no report to show for it.
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Machine-readable results, so the report can list which suites failed rather than pointing at a
+# log nobody can link to.
+[profile.monitoring.junit]
+path = "junit.xml"

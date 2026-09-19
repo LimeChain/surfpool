@@ -1,0 +1,141 @@
+name: Protocol monitoring
+
+# Protocols change on their own schedule, not on ours. Twice a day this asks whether the state
+# preparation we ship still matches what is deployed, and commits the answer to a branch so the
+# runs can be diffed against each other.
+#
+# Scheduled workflows fire only from the default branch, so this file has to reach it to run at
+# all. SURFPOOL_TEST_RPC_URL is optional: without it the public endpoint is used, which is enough
+# for the drift checks but times out under the protocol suites, and those then report themselves
+# as unverified rather than as drift.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: protocol-monitoring
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    name: Monitor
+    runs-on: ubuntu-latest
+    # Measured locally at under six minutes for both runs; the limit is headroom for a cold build.
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+      REPORT_BRANCH: scenarios/monitoring
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: monitoring-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: monitoring-${{ runner.os }}-
+
+      - name: Stamp the run
+        id: stamp
+        run: echo "at=$(date -u +%Y-%m-%dT%H-%MZ)" >> "$GITHUB_OUTPUT"
+
+      # The secret is scoped to the steps that read mainnet. Nothing else needs it, and a value
+      # that is not in the environment cannot be printed by something that goes wrong.
+      - name: Drift checks
+        id: checks
+        env:
+          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
+        run: |
+          set +e
+          rm -f target/nextest/monitoring/junit.xml
+          cargo nextest run --profile monitoring \
+            -p surfpool-core --features "integration-tests,ignore_tests_ci" \
+            -E 'test(/^tests::monitoring::/)'
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          mkdir -p junit
+          cp target/nextest/monitoring/junit.xml junit/checks.xml 2>/dev/null || true
+          exit 0
+
+      - name: Integration suites
+        id: suites
+        env:
+          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
+        run: |
+          set +e
+          # Every test under tests:: except tests::monitoring:: (the drift checks above). Naming
+          # no protocol means a suite added later is picked up without anyone editing this file.
+          rm -f target/nextest/monitoring/junit.xml
+          cargo nextest run --profile monitoring \
+            -p surfpool-core --features "integration-tests,ignore_tests_ci" \
+            -E 'test(/^tests::/) - test(/^tests::monitoring::/)'
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          cp target/nextest/monitoring/junit.xml junit/suites.xml 2>/dev/null || true
+          exit 0
+
+      - name: Render the report
+        if: always()
+        run: |
+          python3 .github/scripts/render_monitoring_report.py \
+            --checks-dir target/monitoring \
+            --junit junit/checks.xml --junit junit/suites.xml \
+            --out rendered/report.md \
+            --timestamp "${{ steps.stamp.outputs.at }}" \
+            --commit "${GITHUB_SHA}" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Publish the report
+        if: always()
+        env:
+          # Through the environment rather than interpolated into the script: an expression is
+          # substituted into the shell source, which is the usual way a token ends up somewhere
+          # it was never meant to be.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="scenarios/monitoring/reports/${{ steps.stamp.outputs.at }}"
+          work=$(mktemp -d)
+          git -C "$work" init -q
+          git -C "$work" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$work" config http.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -C "$work" config user.name "surfpool-monitoring"
+          git -C "$work" config user.email "noreply@github.com"
+
+          # The branch holds reports and nothing else, so it starts as an orphan: no code history
+          # to conflict with and nothing to rebase when develop moves.
+          if git -C "$work" fetch -q --depth 1 origin "$REPORT_BRANCH" 2>/dev/null; then
+            git -C "$work" checkout -q -b "$REPORT_BRANCH" FETCH_HEAD
+          else
+            git -C "$work" checkout -q --orphan "$REPORT_BRANCH"
+          fi
+
+          mkdir -p "$work/$dir"
+          cp rendered/* "$work/$dir/"
+          git -C "$work" add -A "$dir"
+          if git -C "$work" commit -q -m "monitoring: report ${{ steps.stamp.outputs.at }}"; then
+            git -C "$work" push -q origin "HEAD:$REPORT_BRANCH"
+            echo "published $dir"
+          else
+            echo "nothing new to publish for $dir"
+          fi
+
+      - name: Summarise
+        if: always()
+        run: cat rendered/report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Last, so that a red run has still left its report behind. A run that fails before
+      # publishing is the one run whose output somebody actually needed.
+      - name: Fail when a protocol drifted
+        if: steps.checks.outputs.exit != '0' || steps.suites.outputs.exit != '0'
+        run: |
+          echo "::error::a monitored protocol no longer matches what we ship; see the report"
+          exit 1
