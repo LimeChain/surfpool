@@ -12103,6 +12103,7 @@ dependencies = [
  "crossbeam-channel",
  "ed25519-dalek 1.0.1",
  "env_logger",
+ "flate2",
  "hex",
  "hiro-system-kit",
  "ipc-channel",

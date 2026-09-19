@@ -1,0 +1,15 @@
+# Profile for the scheduled protocol monitoring. Not used by ordinary CI.
+[profile.monitoring]
+# One retry separates a throttled endpoint from a protocol that actually changed.
+retries = 1
+# Lets every check run even after one fails, so the report isn't incomplete.
+fail-fast = false
+failure-output = "immediate-final"
+# Mainnet reads run one at a time — the public endpoint sheds queued requests after a heavy scan.
+test-threads = 1
+# Terminates a test that stops answering instead of holding the job open.
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Machine-readable results so the report can list which suites failed.
+[profile.monitoring.junit]
+path = "junit.xml"
