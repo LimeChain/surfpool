@@ -244,12 +244,30 @@ def render(
             parts.append(f"{total} test(s) failed in {', '.join(s.name for s in failed_suites)}")
         return parts
 
-    status = "clean"
+    # Confirmed findings come first. A check that could not reach the endpoint says nothing about
+    # the protocols it covers, but it must not silence what the other checks did establish.
+    caveats = []
     if unverified:
+        caveats.append("at least one check could not reach the endpoint and is unverified")
+    if missing_checks:
+        caveats.append(f"no results from: {', '.join(missing_checks)}")
+
+    if new_errors or failed_suites:
+        status = "drift"
+        known = len(errors) - len(new_errors)
+        tail = f", {known} already known" if known else ""
+        verdict = f"**Drift.** {'; '.join(issue_parts())}{tail}."
+    elif errors:
+        status = "no-new-drift"
+        verdict = (
+            f"**No new drift.** {len(errors)} known finding(s) still open, nothing new since "
+            "the last run."
+        )
+    elif unverified:
         status = "unverified"
         verdict = (
-            "**Unverified.** The endpoint refused reads, so this run says nothing about any "
-            "protocol. Nothing below should be acted on."
+            "**Unverified.** The endpoint refused reads and no check reported drift, so this run "
+            "establishes nothing. Nothing below should be acted on."
         )
     elif missing_checks:
         status = "incomplete"
@@ -257,22 +275,12 @@ def render(
             f"**Incomplete.** These checks produced no results: {', '.join(missing_checks)}. "
             "Nothing they cover can be considered verified this run."
         )
-        parts = issue_parts()
-        if parts:
-            verdict += f" {'; '.join(parts)}."
-    elif new_errors or failed_suites:
-        status = "drift"
-        known = len(errors) - len(new_errors)
-        tail = f", {known} already known." if known else "."
-        verdict = f"**Drift.** {'; '.join(issue_parts())}{tail}"
-    elif errors:
-        status = "no-new-drift"
-        verdict = (
-            f"**No new drift.** {len(errors)} known finding(s) still open, nothing new since "
-            "the last run."
-        )
     else:
+        status = "clean"
         verdict = "**Clean.** Every monitored protocol matches what this repository ships."
+
+    if caveats and status in ("drift", "no-new-drift"):
+        verdict += " Coverage is partial: " + "; ".join(caveats) + "."
 
     out = [f"# Protocol monitoring — {timestamp}\n", verdict + "\n"]
 
