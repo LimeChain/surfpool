@@ -105,9 +105,10 @@ def load_findings(directory: Path) -> tuple[list[Finding], set[str]]:
     return findings, ran
 
 
-def load_suites(paths: list[Path]) -> list[SuiteResult]:
+def load_suites(paths: list[Path]) -> tuple[list[SuiteResult], bool]:
     """Groups JUnit cases by their protocol module, which is the unit anybody cares about."""
     grouped: dict[str, SuiteResult] = {}
+    checks_hit_environment = False
     for path in paths:
         if not path.exists():
             continue
@@ -117,9 +118,27 @@ def load_suites(paths: list[Path]) -> list[SuiteResult]:
             continue
         for case in root.iter("testcase"):
             name = case.get("name", "")
-            # The drift checks are tests too, but they report through their own JSON and the
-            # summary table above; listing them again here would count every finding twice.
+            # The drift checks report through their own JSON and the summary table, so they are
+            # not listed as suites. But a check that could not reach mainnet panics before it
+            # writes any JSON, and its JUnit failure text is then the only place the environment
+            # marker survives. Read it before skipping.
             if name.startswith("tests::monitoring::"):
+                failure = case.find("failure")
+                if failure is None:
+                    failure = case.find("error")
+                if failure is not None:
+                    system_err = case.find("system-err")
+                    blob = "\n".join(
+                        part
+                        for part in (
+                            failure.get("message"),
+                            failure.text,
+                            system_err.text if system_err is not None else None,
+                        )
+                        if part
+                    )
+                    if ENV_FAILURE_MARKER in blob:
+                        checks_hit_environment = True
                 continue
             module = name.split("::")[1] if name.startswith("tests::") else "other"
             suite = grouped.setdefault(module, SuiteResult(module, 0, 0, 0, []))
@@ -155,7 +174,7 @@ def load_suites(paths: list[Path]) -> list[SuiteResult]:
                 )
             else:
                 suite.passed += 1
-    return [grouped[key] for key in sorted(grouped)]
+    return [grouped[key] for key in sorted(grouped)], checks_hit_environment
 
 
 def bullets(findings: list[Finding]) -> list[str]:
@@ -225,12 +244,15 @@ def render(
             parts.append(f"{total} test(s) failed in {', '.join(s.name for s in failed_suites)}")
         return parts
 
+    status = "clean"
     if unverified:
+        status = "unverified"
         verdict = (
             "**Unverified.** The endpoint refused reads, so this run says nothing about any "
             "protocol. Nothing below should be acted on."
         )
     elif missing_checks:
+        status = "incomplete"
         verdict = (
             f"**Incomplete.** These checks produced no results: {', '.join(missing_checks)}. "
             "Nothing they cover can be considered verified this run."
@@ -239,10 +261,12 @@ def render(
         if parts:
             verdict += f" {'; '.join(parts)}."
     elif new_errors or failed_suites:
+        status = "drift"
         known = len(errors) - len(new_errors)
         tail = f", {known} already known." if known else "."
         verdict = f"**Drift.** {'; '.join(issue_parts())}{tail}"
     elif errors:
+        status = "no-new-drift"
         verdict = (
             f"**No new drift.** {len(errors)} known finding(s) still open, nothing new since "
             "the last run."
@@ -371,7 +395,7 @@ def render(
         )
     )
 
-    return "\n".join(out)
+    return "\n".join(out), status
 
 
 def main() -> int:
@@ -382,17 +406,23 @@ def main() -> int:
     parser.add_argument("--timestamp", default="")
     parser.add_argument("--commit", default="")
     parser.add_argument("--run-url", default="")
+    parser.add_argument(
+        "--status-out",
+        type=Path,
+        default=None,
+        help="write the one-word verdict (clean, no-new-drift, drift, incomplete, unverified)",
+    )
     args = parser.parse_args()
 
     findings, ran = load_findings(args.checks_dir)
-    suites = load_suites(args.junit)
+    suites, checks_hit_environment = load_suites(args.junit)
 
     # The whole run is unverified only when the endpoint refused the reads the checks depend on.
     # A suite that timed out is reported as unverified on its own line without discrediting
     # everything else the run established.
-    unverified = any(ENV_FAILURE_MARKER in f.message for f in findings)
+    unverified = checks_hit_environment or any(ENV_FAILURE_MARKER in f.message for f in findings)
 
-    report = render(
+    report, status = render(
         findings,
         suites,
         ran=ran,
@@ -403,6 +433,9 @@ def main() -> int:
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report)
+    if args.status_out:
+        args.status_out.parent.mkdir(parents=True, exist_ok=True)
+        args.status_out.write_text(status + "\n")
     print(f"wrote {args.out} ({len(report)} bytes, {len(findings)} findings)")
     return 0
 

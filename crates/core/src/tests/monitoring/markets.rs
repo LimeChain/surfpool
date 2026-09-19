@@ -1,12 +1,5 @@
-//! Deprecation: are the markets our templates name still worth pointing a scenario at?
-//!
-//! A template that addresses a pool nobody trades any more still applies cleanly and still
-//! produces a swap, so nothing in the test suite notices. The user finds out when their scenario
-//! reproduces a market that stopped existing economically. Two signals together say that:
-//! whether the account is still there, and whether anything has touched it lately.
-//!
-//! An RPC error is not zero activity. Every failed read is reported as unknown rather than dead,
-//! because the opposite mistake deletes a working market from the product.
+//! Deprecation: is a market our templates address still alive? An RPC error reads as unknown,
+//! never dead — misreading it would delete a live market from the product.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,9 +14,8 @@ use crate::scenarios::TemplateRegistry;
 
 const CHECK: &str = "market-deprecation";
 
-/// How long a market may sit untouched before it is worth asking whether it still belongs in the
-/// product. Three days is the milestone's figure: long enough to survive a quiet weekend on a
-/// minor pair, short enough to catch a venue that has actually stopped.
+/// Days a market may sit untouched before it's worth flagging — long enough to survive a quiet
+/// weekend, short enough to catch one that's actually stopped.
 const STALE_AFTER_DAYS: i64 = 3;
 
 /// Constants that hold token mints rather than venues. A mint is not a market, so it gets an

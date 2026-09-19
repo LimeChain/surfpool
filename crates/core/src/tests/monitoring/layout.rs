@@ -1,15 +1,5 @@
-//! Layout drift: does a real mainnet account still survive a decode and re-encode through the
-//! IDL we ship?
-//!
-//! This, not the IDL document diff, is the check that fails when a protocol changes an account.
-//! The override engine does not splice bytes at offsets: `apply_override_to_decoded_account`
-//! decodes the whole account into a value tree, mutates one path and re-encodes with Borsh. A
-//! field added, removed, reordered or retyped anywhere in the struct therefore breaks the decode
-//! or shifts the re-encode, whether or not we touch that field. Round-tripping a live account is
-//! the direct test of that, against the only authority that counts.
-//!
-//! A synthetic account cannot do this job: it is built *by* the bundled IDL, so it can never
-//! disagree with it.
+//! Layout drift: does a real mainnet account still round-trip through the IDL we ship? A
+//! synthetic account can't do this job — it's built *by* the IDL, so it can never disagree.
 
 use std::collections::HashMap;
 
@@ -44,18 +34,15 @@ enum Sample {
     Resolved {
         label: String,
         address: Pubkey,
-        /// True when the address came from one entry of a constant list rather than from the
-        /// template itself. One bad entry in a menu of markets is a stale option; every entry
-        /// failing is the layout having moved.
+        /// True when the address came from a constant-list entry rather than the template itself
+        /// — one bad entry is a stale option, but every entry failing means the layout moved.
         from_options: bool,
     },
     Unresolvable(String),
 }
 
-/// Picks live accounts to test a template against, using only what the template already carries.
-///
-/// Deliberately does not fall back to `getProgramAccounts`: it is heavy, providers restrict it,
-/// and an arbitrary account of the right type is not necessarily one the template can address.
+/// Picks live accounts to test against, using only what the template carries — no
+/// `getProgramAccounts` fallback, since that's heavy and a same-type account may be unaddressable.
 fn samples(template: &OverrideTemplate) -> Vec<Sample> {
     if let AccountAddress::Pubkey(literal) = &template.address {
         return match Pubkey::try_from(literal.as_str()) {
@@ -141,14 +128,8 @@ fn samples(template: &OverrideTemplate) -> Vec<Sample> {
         .collect()
 }
 
-/// The number of bytes the bundled IDL says this account's body occupies, or `None` when the
-/// type contains something of variable width and makes no such claim.
-///
-/// This is the leg that makes the round trip mean something. The engine decodes what the IDL
-/// describes and copies whatever is left over back unchanged, so a field that shrank - `u128`
-/// read as `u64`, say - shifts every later field yet still reassembles to the identical bytes.
-/// The round trip cannot see that. The declared size can: the chain says how long the account
-/// is, the IDL says how long it should be, and the two are arrived at independently.
+/// The IDL-declared byte size of this account's body, or `None` for variable-width types —
+/// catches a same-size field swap (e.g. `u128` misread as `u64`) the round trip alone would miss.
 fn declared_body_size(idl: &Idl, type_name: &str) -> Option<usize> {
     fn size_of_type(idl: &Idl, ty: &IdlType, depth: usize) -> Option<usize> {
         if depth > 32 {
@@ -321,9 +302,8 @@ async fn every_idl_template_round_trips_over_a_live_account() {
                 Ok(surplus) => {
                     passes += 1;
                     covered += 1;
-                    // The engine copies bytes the IDL does not describe back untouched, so a
-                    // surplus does not break the override. It does mean we model a prefix of the
-                    // account, and a field the protocol added there is one we cannot reach.
+                    // The engine copies undescribed bytes back untouched, so surplus doesn't break
+                    // the override — it just means a field the protocol added there is unreachable.
                     if surplus > 0 {
                         report.info(
                             &protocol,
@@ -341,10 +321,8 @@ async fn every_idl_template_round_trips_over_a_live_account() {
             }
         }
 
-        // A template's own address failing is the integration being broken. One entry of a
-        // constant list failing while its siblings pass is that entry being stale - typically a
-        // market created before the protocol last changed its account - and saying "the layout
-        // drifted" there would be wrong.
+        // A template's own address failing means the integration is broken; one stale entry in a
+        // constant list failing while siblings pass is just a stale market, not layout drift.
         for (reason, from_options) in &failures {
             if *from_options && passes > 0 {
                 report.warn(

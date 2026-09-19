@@ -1,15 +1,5 @@
-//! IDL drift: has the protocol published a description of itself that no longer matches ours?
-//!
-//! This is the informational half of the monitoring. It reads the IDL the program publishes on
-//! chain and compares it with the one we bundle, so the team hears about a new instruction or a
-//! reshaped account before a user does.
-//!
-//! It is deliberately not the authority. A published IDL can run ahead of the deployed program,
-//! and our committed IDLs are trimmed on purpose — Kamino's ships with an empty instruction list
-//! — so a literal document diff would both cry wolf and drown the real signal in additions we
-//! never cared about. The comparison is therefore scoped to the account types our templates
-//! actually decode, and it raises an error only where no live account is reachable and the
-//! document is consequently the only signal there is.
+//! IDL drift: does the published on-chain IDL still match ours? Informational only, since a
+//! published IDL can run ahead of deployment; it errors only when no live account exists instead.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,20 +16,8 @@ use crate::scenarios::TemplateRegistry;
 
 const CHECK: &str = "idl-document";
 
-/// Rewrites a pre-0.30 Anchor IDL into the shape this crate's `Idl` type reads.
-///
-/// The two formats carry the same information arranged differently: the older one keeps a
-/// program's name and version at the top rather than under `metadata`, stores each account's
-/// fields inline instead of in `types`, spells a defined type as a bare string, and omits
-/// discriminators because Anchor derived them at compile time. Every one of those is mechanical
-/// to undo, which is the difference between comparing six of our seventeen programs and
-/// comparing fifteen.
-///
-/// Discriminators have to be filled in because the type requires them, but they are *ours*, not
-/// the document's, and the returned flag says so. Pyth is the reason: its published document
-/// spells the account `priceUpdateV2` while Anchor derives the discriminator from the Rust name
-/// `PriceUpdateV2`, so comparing a value we computed here against the one we ship reports a
-/// difference that exists only because we invented one side of it.
+/// Rewrites a pre-0.30 Anchor IDL into the current shape. The returned flag says whether
+/// discriminators are original or invented here (Pyth's casing means ours would falsely diff).
 fn modernise(mut value: serde_json::Value, program_id: &str) -> (serde_json::Value, bool) {
     let Some(root) = value.as_object_mut() else {
         return (value, false);
@@ -121,12 +99,8 @@ fn anchor_discriminator(namespace: &str, name: &str) -> Vec<u8> {
     Sha256::digest(format!("{namespace}:{name}").as_bytes())[..8].to_vec()
 }
 
-/// Renames the type spellings the old schema used.
-///
-/// `{"defined": "Foo"}` became `{"defined": {"name": "Foo"}}`, and `publicKey` became `pubkey`.
-/// The latter turns up as a bare value in more places than is worth enumerating - a field type,
-/// a vector element, an array element, an instruction argument - so every string that spells it
-/// is rewritten wherever it sits.
+/// Renames old-schema type spellings: `{"defined": "Foo"}` → `{"defined": {"name": "Foo"}}`,
+/// `publicKey` → `pubkey`, rewritten recursively since either can appear anywhere in the tree.
 fn rewrite_types(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) if text == "publicKey" => {
@@ -146,9 +120,8 @@ fn rewrite_types(value: &mut serde_json::Value) {
     }
 }
 
-/// Parses an IDL document, converting a pre-0.30 one on the way in.
-///
-/// The flag says whether the discriminators in the result came from the document or from us.
+/// Parses an IDL document, converting a pre-0.30 one on the way in. The flag says whether the
+/// discriminators came from the document or were invented here.
 fn parse_idl(json: &str, program_id: &str) -> Result<(Idl, bool), String> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|error| format!("it is not JSON: {error}"))?;
@@ -180,17 +153,24 @@ fn decode_published_idl(data: &[u8], program_id: &str) -> Result<(Idl, bool), St
         .get(HEADER + 4..HEADER + 4 + length)
         .ok_or_else(|| format!("the IDL account claims {length} bytes it does not hold"))?;
 
+    // The account is controlled by whoever holds the program's IDL authority. A bounded read
+    // keeps a hostile or broken payload from taking the whole run down with it.
+    const MAX_INFLATED: u64 = 16 * 1024 * 1024;
     let mut json = String::new();
     flate2::read::ZlibDecoder::new(body)
+        .take(MAX_INFLATED)
         .read_to_string(&mut json)
         .map_err(|error| format!("the IDL payload did not inflate: {error}"))?;
+    if json.len() as u64 >= MAX_INFLATED {
+        return Err(format!(
+            "the IDL payload inflates past {MAX_INFLATED} bytes"
+        ));
+    }
     parse_idl(&json, program_id)
 }
 
-/// Anchor emits field names in camelCase, while several of the IDLs we committed were converted
-/// to snake_case. The casing is a presentation choice with no effect on the bytes, so both sides
-/// are folded to one spelling before anything is compared - otherwise every field of every
-/// converted IDL reads as renamed.
+/// Folds camelCase/snake_case to one spelling before comparing — casing has no effect on the
+/// bytes, but an unfolded mismatch would read every converted field as renamed.
 fn snake(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 4);
     for (index, character) in name.chars().enumerate() {
@@ -206,11 +186,8 @@ fn snake(name: &str) -> String {
     out
 }
 
-/// Follows a template property path through the type graph and returns the type it lands on.
-///
-/// Paths index into arrays with a bare number (`prices.0.price.value`), which is how the
-/// templates are written, so a numeric segment steps into the element type rather than looking
-/// for a field with that name.
+/// Follows a template property path through the type graph. A bare numeric segment
+/// (`prices.0.price.value`) steps into the array element type rather than a named field.
 fn resolve_path(idl: &Idl, root: &str, path: &str) -> Option<IdlType> {
     let mut resolved: Option<IdlType> = None;
     for segment in path.split('.') {
@@ -381,12 +358,8 @@ fn compare(
     }
 
     for (account_type, used_paths) in &program.used {
-        // Only one thing here is version-invariant. A discriminator is derived from the account's
-        // name alone, so it does not move between releases: if ours differs from the published
-        // one, ours is simply wrong and no template can match a real account. Everything else -
-        // a field added, removed or retyped - can legitimately differ in either direction,
-        // because a published IDL can run ahead of or behind the program that is deployed. Those
-        // are reported, not failed; the live round trip is what decides them.
+        // A discriminator is derived from the account's name alone, so a mismatch means ours is
+        // simply wrong. Everything else can legitimately differ by version, so only this is an error.
         let committed_disc = committed
             .accounts
             .iter()
@@ -487,10 +460,8 @@ fn compare(
     }
 }
 
-/// Every property path a template writes must exist in the IDL that template carries.
-///
-/// This runs offline, so it catches a template naming a field the bundled IDL does not have -
-/// which the live round trip cannot see, because it never writes anything.
+/// Every property path a template writes must exist in its own bundled IDL. Runs offline, so
+/// it catches what the live round trip can't — that check never writes anything.
 #[test]
 fn every_template_property_resolves_in_its_own_idl() {
     let registry = TemplateRegistry::new();

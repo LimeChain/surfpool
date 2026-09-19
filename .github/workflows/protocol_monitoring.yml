@@ -1,13 +1,8 @@
 name: Protocol monitoring
 
-# Protocols change on their own schedule, not on ours. Twice a day this asks whether the state
-# preparation we ship still matches what is deployed, and commits the answer to a branch so the
-# runs can be diffed against each other.
-#
-# Scheduled workflows fire only from the default branch, so this file has to reach it to run at
-# all. SURFPOOL_TEST_RPC_URL is optional: without it the public endpoint is used, which is enough
-# for the drift checks but times out under the protocol suites, and those then report themselves
-# as unverified rather than as drift.
+# Twice a day, checks whether shipped state preparation still matches deployment and commits
+# the result to a branch. SURFPOOL_TEST_RPC_URL is optional; without it, protocol suites may
+# time out and report themselves as unverified rather than as drift.
 on:
   schedule:
     - cron: "0 3 * * *"
@@ -32,6 +27,10 @@ jobs:
       REPORT_BRANCH: scenarios/monitoring
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Only the publish step needs a token, and it brings its own; nothing that runs
+          # before it should have write access lying around.
+          persist-credentials: false
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
@@ -91,7 +90,8 @@ jobs:
             --out rendered/report.md \
             --timestamp "${{ steps.stamp.outputs.at }}" \
             --commit "${GITHUB_SHA}" \
-            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --status-out rendered/status
 
       - name: Publish the report
         if: always()
@@ -132,10 +132,15 @@ jobs:
         if: always()
         run: cat rendered/report.md >> "$GITHUB_STEP_SUMMARY" || true
 
-      # Last, so that a red run has still left its report behind. A run that fails before
-      # publishing is the one run whose output somebody actually needed.
+      # Last, so a red run still leaves its report published before this step fails it.
       - name: Fail when a protocol drifted
-        if: steps.checks.outputs.exit != '0' || steps.suites.outputs.exit != '0'
+        if: always()
         run: |
-          echo "::error::a monitored protocol no longer matches what we ship; see the report"
-          exit 1
+          # The verdict comes from the report, not from nextest's exit code: a suite that timed
+          # out against the endpoint is unverified, not drift, and must not turn the run red.
+          status=$(cat rendered/status 2>/dev/null || echo incomplete)
+          echo "verdict: $status"
+          case "$status" in
+            clean|unverified) exit 0 ;;
+            *) echo "::error::a monitored protocol no longer matches what we ship ($status); see the report"; exit 1 ;;
+          esac

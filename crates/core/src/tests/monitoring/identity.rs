@@ -1,10 +1,5 @@
-//! Upgrade detection: is the deployed bytecode still the one we reverse-engineered against?
-//!
-//! This is the only check that covers every integration, IDL or not. A raw layout's offsets, a
-//! bundled IDL's field order and a behavioural test's expected swap output are all claims about
-//! one specific build of one specific program. When that build changes, all of them are
-//! unverified until someone re-establishes them, which is why any difference here is an error
-//! rather than a warning.
+//! Upgrade detection: is the deployed bytecode still what we reverse-engineered against? Any
+//! difference is an error, not a warning — a redeploy invalidates every offset and behavior.
 
 use std::{collections::BTreeMap, str::FromStr};
 
@@ -37,9 +32,8 @@ pub struct BaselineEntry {
     pub last_deployed_slot: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_authority: Option<String>,
-    /// Empty until a run has observed the program and a human has copied the result back. An
-    /// entry with only `program_id` and `label` is how a protocol without an IDL is put on the
-    /// list; the first run reports the fingerprint to pin.
+    /// Empty until a run observes the program and a human copies the result back — an entry with
+    /// only `program_id`/`label` is how an IDL-less protocol gets watched.
     #[serde(default)]
     pub elf_sha256: String,
     #[serde(default)]
@@ -189,9 +183,8 @@ async fn programs_match_the_pinned_deployment_baseline() {
                 continue;
             }
         };
-        // Every finding below carries the deployment as it is now, in the shape of a baseline
-        // entry, so accepting it is copying that block into baseline.json and filling in the
-        // review fields. Nothing here writes the file: that edit is the claim that somebody looked.
+        // Every finding carries the deployment as a baseline-entry shape; accepting it means
+        // copying that block into baseline.json — nothing here writes the file itself.
         let as_entry =
             serde_json::to_value(observed.clone().into_entry(program_id, protocol.clone()))
                 .unwrap_or_default();

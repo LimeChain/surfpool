@@ -1,80 +1,11 @@
-//! Scheduled protocol-drift monitoring.
-//!
-//! These checks answer one question per integrated protocol: is what we committed still true of
-//! what is deployed? They run on a schedule rather than per commit, because the thing they watch
-//! changes on the protocol team's clock, not on ours.
+//! Scheduled protocol-drift monitoring: does what we ship still match what is deployed?
 //!
 //! ```text
-//! cargo test -p surfpool-core --features integration-tests monitoring -- --test-threads=1
+//! cargo test -p surfpool-core --features integration-tests --lib -- --test-threads=1 monitoring::
 //! ```
 //!
-//! Each check writes its findings to `target/monitoring/<check>.json` and fails only on
-//! [`Severity::Error`]. Warnings and notes are reported without failing, so a protocol shipping a
-//! new instruction does not page anyone.
-//!
-//! A failure caused by the endpoint rather than by the protocol carries
-//! [`live::ENV_FAILURE_MARKER`](self::live::ENV_FAILURE_MARKER); the workflow reads a run
-//! containing it as unverified rather than as drift.
-//!
-//! ## What the layout check can and cannot see
-//!
-//! It does two independent things to one live account.
-//!
-//! The **round trip** decodes and re-encodes it through the bundled IDL and demands the bytes come
-//! back identical. That catches a decode failing outright: a pubkey with too few bytes left, a bool
-//! that is neither 0 nor 1, a discriminator the IDL does not know.
-//!
-//! It does **not** catch every reshaping on its own, and it is worth knowing why. The engine copies
-//! back any bytes the IDL did not describe, so a field that shrank shifts every later field yet
-//! still reassembles to the same string of bytes. The round trip is blind to that by construction.
-//!
-//! The **declared size** is the answer to it, in one direction. The chain says how long the account
-//! is; the IDL says how long it should be; the two are arrived at independently. When the IDL claims
-//! more bytes than exist, nothing can read that account correctly and the check fails. When the
-//! account carries more than the IDL describes, the overrides still work - the engine preserves the
-//! surplus - so it is a warning saying we model a prefix. Pump's `Global` and `BondingCurve` and
-//! PumpSwap's `GlobalConfig` sit there today.
-//!
-//! What is left uncovered is a same-size reshaping: two fields swapped, or one shrinking while
-//! another grows. Nothing here sees that, and nothing cheap would. The `identity` check is what
-//! covers it, from the other end: such a change requires a redeploy, and a redeploy is an error on
-//! its own.
-//!
-//! ## What each severity means
-//!
-//! **Error** — something we depend on is wrong now. The run is red until it is fixed or the
-//! deployment is re-reviewed. Known defects stay errors; they are annotated, not downgraded, so the
-//! red line is also the list of what is still outstanding.
-//!
-//! **Warning** — something next to what we depend on moved. A published IDL can run ahead of or
-//! behind the program that is deployed, and one stale entry in a list of markets is not the layout
-//! having changed, so these are reported rather than failed.
-//!
-//! **Note** — coverage and context: which templates no protocol account could be sampled for, what
-//! the protocol has added that we do not model, which baseline entries no template needs any more.
-//!
-//! ## When the identity check goes red
-//!
-//! The bytecode moved, so every offset, every IDL field order and every behavioural expectation for
-//! that protocol is unverified. In order:
-//!
-//! 1. Read the finding. Its `observed` block carries the deployment as it is now, in the shape
-//!    of a baseline entry.
-//! 2. Run that protocol's own suite. If it passes, the upgrade did not touch what we rely on.
-//! 3. If it fails, the integration needs re-establishing. **Never** rewrite offsets to make the
-//!    suite green again — re-derive them, then prove the result with a real transaction.
-//! 4. Only then copy the observed entry into `baseline.json`, filling in `reviewed_on` and a
-//!    `note` saying what was checked. That edit is the claim that somebody looked.
-//!
-//! ## Adding a protocol
-//!
-//! An IDL protocol is watched automatically once its templates are registered. A protocol without
-//! an IDL is watched once its program has an entry in `baseline.json` with a `label` naming the
-//! protocol; until then, the identity check warns every run rather than staying silent about it.
-//!
-//! `KNOWN_ISSUES`, in `mod.rs`, is the one list maintained by hand: defects already scheduled into
-//! a later milestone. These still fail; the entry only marks the finding as old news. An entry
-//! that stops matching is reported so it cannot outlive what it described.
+//! Findings go to `target/monitoring/<check>.json`; only [`Severity::Error`] fails the run.
+//! A protocol without an IDL is watched once it has a `baseline.json` entry with a `label`.
 
 pub mod identity;
 pub mod idl_document;
@@ -93,12 +24,8 @@ use surfpool_types::{AccountAddress, PdaSeed};
 
 use crate::scenarios::TemplateRegistry;
 
-/// Findings the team has already seen and placed in a later milestone.
-///
-/// These do not change the outcome: a known defect still fails the run, because the list of what
-/// is still wrong is the point. What an entry adds is a note on the finding saying it is already
-/// understood and where it is scheduled, so a run can be read at a glance as "the same two we
-/// know about" or "one of these is new".
+/// Findings the team already knows about. A known defect still fails the run — the entry only
+/// annotates it, so the red line stays the list of what's still outstanding.
 const KNOWN_ISSUES: &[KnownIssue] = &[
     KnownIssue {
         check: "idl-document",
@@ -135,10 +62,8 @@ impl KnownIssue {
     }
 }
 
-/// Mainnet reads for these checks.
-///
-/// Deliberately private to this module. The protocol suites each carry their own copy of
-/// this wrapper; unifying them is not this milestone's business.
+/// Mainnet reads for these checks, deliberately private to this module — the protocol suites
+/// each carry their own copy; unifying them is not this milestone's business.
 pub mod live {
     use solana_account::Account;
     use solana_commitment_config::CommitmentConfig;
@@ -149,21 +74,16 @@ pub mod live {
     pub const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
     pub const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
-    /// Printed by every panic caused by the endpoint rather than by the protocol. The monitoring
-    /// workflow greps for it to report a run as unverified instead of opening a drift alert, so a
-    /// throttled endpoint never reads as a protocol regression.
+    /// Printed by a panic caused by the endpoint, not the protocol. The monitoring workflow greps
+    /// for it to report the run as unverified instead of drift.
     pub const ENV_FAILURE_MARKER: &str = "SURFPOOL_MONITOR_ENV_FAILURE";
 
     pub fn client() -> SurfnetRemoteClient {
         SurfnetRemoteClient::new(endpoint())
     }
 
-    /// The endpoint to read mainnet through, falling back to the public one.
-    ///
-    /// An unset GitHub secret is not absent, it is present and empty, and `env::var` answers
-    /// `Ok("")` for that. Treating empty as unset is what makes the workflow work before anyone has
-    /// configured a private endpoint; without it every read fails against an empty URL and the
-    /// fallback here never runs.
+    /// Falls back to the public endpoint. An unset GitHub secret arrives as `Ok("")`, not absent,
+    /// so empty is treated as unset — otherwise the fallback here never runs.
     pub fn endpoint() -> String {
         match std::env::var(RPC_URL_ENV) {
             Ok(url) if !url.trim().is_empty() => url,
@@ -171,15 +91,11 @@ pub mod live {
         }
     }
 
-    /// Fetches the accounts in one request, so every account returned is from the same slot.
-    ///
-    /// A missing account comes back as `None` rather than panicking: for these checks that is a
-    /// finding, not a crash. Panics with [`ENV_FAILURE_MARKER`] when the endpoint never answers at
-    /// all, which is the workflow's cue to call the run unverified instead of reporting drift.
+    /// A missing account is `None`, not a panic — that's a finding here, not a crash. Panics with
+    /// [`ENV_FAILURE_MARKER`] only when the endpoint itself never answers.
     pub async fn try_fetch(addresses: &[Pubkey]) -> Vec<Option<Account>> {
-        // The public endpoint throttles and intermittently 503s, which has nothing to do with what
-        // the callers assert. Retry a few times with backoff so a transient refusal is not read as a
-        // failure.
+        // The public endpoint throttles and intermittently 503s; retry with backoff so that isn't
+        // mistaken for a finding.
         let mut attempt = 0;
         let mut errors = Vec::new();
         let results = loop {
@@ -220,7 +136,6 @@ pub mod live {
             .collect()
     }
 
-    /// The offsets at which two buffers differ.
     pub fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
         left.iter()
             .zip(right)
@@ -377,10 +292,8 @@ impl Report {
         ));
     }
 
-    /// Writes the findings and panics when any of them is an error.
-    ///
-    /// Always writes first: a check that found drift must still leave its report behind for the
-    /// workflow to render, and a panic would otherwise take the evidence with it.
+    /// Writes the findings first, then panics if any is an error — otherwise a panic would take
+    /// the evidence with it before the workflow could render it.
     pub fn finish(mut self) {
         self.annotate_known_issues();
 
@@ -424,10 +337,8 @@ impl Report {
         );
     }
 
-    /// Marks findings the team already knows about.
-    ///
-    /// Deliberately does not change severity. A known defect is still a defect, and the run stays
-    /// red until it is fixed; the note only says which of the red lines are old news.
+    /// Marks known findings without changing severity — a known defect still fails the run; the
+    /// note only flags it as already understood.
     fn annotate_known_issues(&mut self) {
         for finding in &mut self.findings {
             if let Some(known) = KNOWN_ISSUES.iter().find(|known| known.matches(finding)) {
@@ -475,14 +386,8 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The program ids the monitoring checks watch, mapped to the protocols that depend on them.
-///
-/// Two sources, unioned. The registry gives what can be derived: a template's IDL names the
-/// program whose layout we decode, and a PDA spec names the program we derive against (for Pyth
-/// those differ, and only the second can be redeployed under our templates). The baseline gives
-/// what cannot be derived: a protocol without an IDL leaves no program id in its templates, so
-/// its entry in `baseline.json` - which has to exist anyway, to pin the fingerprint - is what
-/// puts it on the list. Nothing in a protocol's own files has to change for it to be watched.
+/// Unions two sources: template IDLs/PDA specs (Pyth's receiver and derivation programs differ,
+/// so both matter) and `baseline.json` entries, which is how an IDL-less protocol gets watched.
 pub fn monitored_programs(
     registry: &TemplateRegistry,
     baseline: &identity::Baseline,
@@ -556,9 +461,8 @@ fn monitored_programs_cover_both_the_idl_and_the_derivation_program() {
     let registry = TemplateRegistry::new();
     let programs = monitored_programs(&registry, &identity::baseline());
 
-    // Pyth is the case the derivation source exists for: its IDL names the receiver program while
-    // its templates derive price accounts against a different one. Watching only the IDL address
-    // would leave the program our templates actually address unmonitored.
+    // Pyth's IDL names the receiver program, but its templates derive prices against a different
+    // one; watching only the IDL address would leave that one unmonitored.
     let derivation_program = Pubkey::from_str("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT")
         .expect("a valid pubkey literal");
     assert!(
