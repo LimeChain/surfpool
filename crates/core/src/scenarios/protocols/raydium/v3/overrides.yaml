@@ -80,13 +80,23 @@ templates:
     properties:
       - path: liquidity
         label: Liquidity
-        description: Total liquidity in the current tick range
+        description: Total liquidity in the current tick range (raw u128, no decimals)
       - path: sqrt_price_x64
         label: Square Root Price (Q64.64)
-        description: Current price as sqrt(price) * 2^64
+        description: |
+          Current price as sqrt(token_1/token_0) in Q64.64 fixed point (raw u128).
+          Coupled to tick_current; see llm_context for the conversion formula.
       - path: tick_current
         label: Current Tick
-        description: Current tick index representing the price
+        description: |
+          Tick index of the last price transition (i32). Coupled to sqrt_price_x64;
+          see llm_context for the conversion formula and how they can disagree.
+      - path: status
+        label: Pool Status
+        description: |
+          Bitmask (u8). bit0: disable open position/increase liquidity, bit1: disable
+          decrease liquidity, bit2: disable collect fee, bit3: disable collect reward,
+          bit4: disable swap. 0 means fully normal.
       - path: config_index
         type: constant_ref
         label: Fee Tier
@@ -100,6 +110,10 @@ templates:
         label: Token 1 Mint
         constant: token_mint
     llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override keeps its live value; set it to false only for a later override
+      that builds on state an earlier override in the same scenario already prepared.
+
       CRITICAL: token_mint_0 and token_mint_1 must be SPL TOKEN MINT addresses, NOT program IDs!
 
       CORRECT examples of token mints:
@@ -112,7 +126,32 @@ templates:
       - CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK (Raydium CLMM)
 
       Always use get_token_address tool to look up token mints by symbol (e.g., "SOL", "USDC", "JTO").
-      The pool PDA is derived using token mints in specific order, so using wrong addresses will derive the wrong pool.
+
+      MINT ORDER: token_mint_0 must be the mint whose raw 32-byte pubkey is numerically
+      smaller than token_mint_1's (compare the decoded bytes, not the base58 string).
+      The pool PDA is ["pool", amm_config, token_mint_0, token_mint_1] in that exact
+      order, so swapping the two mints derives a different, almost certainly empty,
+      address. token_mint_0/token_mint_1 are plain property_ref seeds here and the
+      caller is responsible for the ordering; a sorted-pair seed kind that enforces
+      this automatically is being added to the engine separately and should replace
+      these two property_ref seeds once available.
+
+      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
+      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
+        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
+        human-readable price
+      - tick_current = floor(log(raw price) / log(1.0001))
+      - a swap walks TickArrayState accounts starting from tick_current; if
+        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
+        never initialized, the swap fails. Overriding one of the pair without
+        recomputing the other from the formula above leaves the pool in a state no
+        real swap can trade against.
+
+      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
+      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
+      price is still bounded by what the vaults actually hold, so fund the vaults (or
+      accept that only small trades succeed) when the override should support a real
+      swap at depth.
     address:
       type: pda
       program_id: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
@@ -131,3 +170,128 @@ templates:
           value: token_mint_0
         - type: property_ref
           value: token_mint_1
+
+  - id: raydium-clmm-pool-state
+    name: Override CLMM Pool State (By Address)
+    description: |
+      Override any Raydium CLMM v3 pool by its own address, for a pubkey the caller
+      already has (no mint/config lookup).
+    idl_account_name: PoolState
+    properties:
+      - path: liquidity
+        label: Liquidity
+        description: Total liquidity in the current tick range (raw u128, no decimals)
+      - path: sqrt_price_x64
+        label: Square Root Price (Q64.64)
+        description: |
+          Current price as sqrt(token_1/token_0) in Q64.64 fixed point (raw u128).
+          Coupled to tick_current; see llm_context for the conversion formula.
+      - path: tick_current
+        label: Current Tick
+        description: |
+          Tick index of the last price transition (i32). Coupled to sqrt_price_x64;
+          see llm_context for the conversion formula and how they can disagree.
+      - path: status
+        label: Pool Status
+        description: |
+          Bitmask (u8). bit0: disable open position/increase liquidity, bit1: disable
+          decrease liquidity, bit2: disable collect fee, bit3: disable collect reward,
+          bit4: disable swap. 0 means fully normal.
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override keeps its live value; set it to false only for a later override
+      that builds on state an earlier override in the same scenario already prepared.
+
+      This template takes the pool's own address directly (no PDA derivation): supply a
+      pubkey you already have. If you only have the config index and the two mints, use
+      raydium-clmm-custom instead, which derives the address for you.
+
+      MINT ORDER (for context, not an input here): on-chain, token_mint_0 is always the
+      mint whose raw 32-byte pubkey is numerically smaller than token_mint_1's; this is
+      how the address you're overriding was originally derived.
+
+      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
+      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
+        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
+        human-readable price
+      - tick_current = floor(log(raw price) / log(1.0001))
+      - a swap walks TickArrayState accounts starting from tick_current; if
+        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
+        never initialized, the swap fails. Overriding one of the pair without
+        recomputing the other from the formula above leaves the pool in a state no
+        real swap can trade against.
+
+      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
+      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
+      price is still bounded by what the vaults actually hold, so fund the vaults (or
+      accept that only small trades succeed) when the override should support a real
+      swap at depth.
+    address:
+      type: pubkey
+
+  - id: raydium-clmm-amm-config
+    name: Override CLMM Fee Tier (AmmConfig)
+    description: |
+      Override an AmmConfig fee tier for Raydium CLMM. The address is a PDA derived
+      from ["amm_config", index.to_be_bytes()]. Every pool created with this config
+      index shares these fee rates.
+    idl_account_name: AmmConfig
+    properties:
+      - path: trade_fee_rate
+        label: Trade Fee Rate
+        description: |
+          Fee charged on trade volume, in hundredths of a bip (parts per million of
+          the input amount; denominator 1,000,000). E.g. 2500 = 0.25% (25 bps). The
+          program requires trade_fee_rate to stay strictly below 1,000,000.
+      - path: protocol_fee_rate
+        label: Protocol Fee Rate
+        description: |
+          Share of the trade fee ALREADY COLLECTED by trade_fee_rate (not of trade
+          volume) routed to the protocol treasury, in parts per million (denominator
+          1,000,000). E.g. 120000 means 12% of the trade fee, not 12% of the trade.
+          See llm_context for the exact formula.
+      - path: fund_fee_rate
+        label: Fund Fee Rate
+        description: |
+          Share of the trade fee ALREADY COLLECTED by trade_fee_rate (not of trade
+          volume) routed to the fund owner, in parts per million (denominator
+          1,000,000). The program requires protocol_fee_rate + fund_fee_rate to stay
+          at or below 1,000,000.
+      - path: config_index
+        type: constant_ref
+        label: Fee Tier Index
+        constant: amm_config_index
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override (owner, fund_owner, tick_spacing, bump) keeps its live value; set
+      it to false only for a later override that builds on state an earlier override in
+      the same scenario already prepared.
+
+      BLAST RADIUS: this AmmConfig is shared by every pool created with the same index
+      - overriding it changes fees for all of them at once, not one pool. To change a
+      single pool's price instead, use raydium-clmm-pool-state or raydium-clmm-custom.
+
+      UNITS AND DENOMINATOR (all three fields use FEE_RATE_DENOMINATOR_VALUE =
+      1,000,000, verified against the raydium-io/raydium-clmm source):
+      - trade_fee_rate is a fraction of TRADE VOLUME: fee = amount_in * trade_fee_rate
+        / 1,000,000. E.g. 2500 = 0.25% (25 bps). The program requires trade_fee_rate to
+        stay strictly below 1,000,000.
+      - protocol_fee_rate and fund_fee_rate are fractions of the FEE trade_fee_rate
+        ALREADY COLLECTED, not of trade volume: protocol_cut = trade_fee *
+        protocol_fee_rate / 1,000,000 (and likewise for fund_fee_rate). E.g. 120000
+        means 12% of the trade fee goes to the protocol treasury, not 12% of the trade.
+        The program requires protocol_fee_rate + fund_fee_rate to stay at or below
+        1,000,000.
+
+      This template has no sqrt_price_x64/tick_current or mint fields of its own; for
+      an actual price or tick override on a specific pool use raydium-clmm-pool-state
+      or raydium-clmm-custom, and keep this config's fee-rate change and that pool's
+      price change in the same scenario when both need to move together.
+    address:
+      type: pda
+      program_id: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
+      seeds:
+        - type: string
+          value: amm_config
+        - type: u16_be_ref
+          value: config_index

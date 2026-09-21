@@ -7,7 +7,9 @@ use std::{
 };
 
 use agave_feature_set::FeatureSet;
-use anchor_lang_idl::types::{IdlDefinedFields, IdlGenericArg, IdlType, IdlTypeDef, IdlTypeDefTy};
+use anchor_lang_idl::types::{
+    IdlAccount, IdlArrayLen, IdlDefinedFields, IdlGenericArg, IdlType, IdlTypeDef, IdlTypeDefTy,
+};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
@@ -154,6 +156,135 @@ impl AccountUpdatePolicy {
         match source {
             AccountSource::Database | AccountSource::Remote => Some(Self::HydrateIfAbsent),
             AccountSource::Svm | AccountSource::Generated => None,
+        }
+    }
+}
+
+/// The discriminator length an Anchor IDL uses, and the fallback when an IDL declares no accounts.
+const ANCHOR_DISCRIMINATOR_LEN: usize = 8;
+
+/// The shortest discriminator any account type in `idl` declares.
+///
+/// Account data shorter than this cannot be any of them, whatever its contents.
+fn min_discriminator_len(idl: &Idl) -> usize {
+    idl.accounts
+        .iter()
+        .map(|account| account.discriminator.len())
+        .min()
+        .unwrap_or(ANCHOR_DISCRIMINATOR_LEN)
+}
+
+/// The Borsh size of `ty`, or `None` when the type has no single size.
+///
+/// `visiting` carries the `defined` names currently on the stack, so a type that refers back to
+/// itself reports no fixed size instead of recursing forever.
+fn fixed_borsh_size<'a>(
+    ty: &'a IdlType,
+    types: &'a [IdlTypeDef],
+    visiting: &mut Vec<&'a str>,
+) -> Option<usize> {
+    match ty {
+        IdlType::Bool | IdlType::U8 | IdlType::I8 => Some(1),
+        IdlType::U16 | IdlType::I16 => Some(2),
+        IdlType::U32 | IdlType::I32 | IdlType::F32 => Some(4),
+        IdlType::U64 | IdlType::I64 | IdlType::F64 => Some(8),
+        IdlType::U128 | IdlType::I128 => Some(16),
+        IdlType::U256 | IdlType::I256 => Some(32),
+        IdlType::Pubkey => Some(32),
+        IdlType::Array(inner, IdlArrayLen::Value(len)) => {
+            fixed_borsh_size(inner, types, visiting)?.checked_mul(*len)
+        }
+        IdlType::Defined { name, generics } if generics.is_empty() => {
+            fixed_defined_borsh_size(name, types, visiting)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn fixed_defined_borsh_size<'a>(
+    name: &'a str,
+    types: &'a [IdlTypeDef],
+    visiting: &mut Vec<&'a str>,
+) -> Option<usize> {
+    if visiting.contains(&name) {
+        return None;
+    }
+    let type_def = types.iter().find(|t| t.name == name)?;
+    if !type_def.generics.is_empty() {
+        return None;
+    }
+
+    visiting.push(&type_def.name);
+    let size = match &type_def.ty {
+        IdlTypeDefTy::Struct { fields: None } => Some(0),
+        IdlTypeDefTy::Struct {
+            fields: Some(IdlDefinedFields::Named(fields)),
+        } => fields.iter().try_fold(0usize, |total, field| {
+            total.checked_add(fixed_borsh_size(&field.ty, types, visiting)?)
+        }),
+        IdlTypeDefTy::Struct {
+            fields: Some(IdlDefinedFields::Tuple(tys)),
+        } => tys.iter().try_fold(0usize, |total, ty| {
+            total.checked_add(fixed_borsh_size(ty, types, visiting)?)
+        }),
+        IdlTypeDefTy::Type { alias } => fixed_borsh_size(alias, types, visiting),
+        IdlTypeDefTy::Enum { .. } => None,
+    };
+    visiting.pop();
+    size
+}
+
+/// Picks the account type in `idl` that `data` holds.
+///
+/// Anchor gives every account type an 8-byte discriminator, so at most one can match and the
+/// first branch below is the whole story. An IDL written by hand for a program that stores no
+/// discriminator declares an empty one instead, which prefixes every account of that program;
+/// those candidates are separated by the Borsh size their type declares, and a program whose
+/// account types share a size cannot be told apart from the bytes at all.
+fn resolve_idl_account_for_data<'a>(idl: &'a Idl, data: &[u8]) -> Result<&'a IdlAccount, String> {
+    let candidates: Vec<&IdlAccount> = idl
+        .accounts
+        .iter()
+        .filter(|account| {
+            let prefix = account.discriminator.len();
+            data.len() >= prefix && data[..prefix] == account.discriminator[..]
+        })
+        .collect();
+
+    match candidates.as_slice() {
+        [] => Err(
+            "its leading bytes match no account type declared by the owner program's IDL"
+                .to_string(),
+        ),
+        [only] => Ok(only),
+        _ => {
+            let sized: Vec<&IdlAccount> = candidates
+                .iter()
+                .copied()
+                .filter(|account| {
+                    let body_len = data.len() - account.discriminator.len();
+                    fixed_defined_borsh_size(&account.name, &idl.types, &mut Vec::new())
+                        == Some(body_len)
+                })
+                .collect();
+            match sized.as_slice() {
+                [only] => Ok(only),
+                _ => {
+                    let names: Vec<&str> = candidates
+                        .iter()
+                        .map(|account| account.name.as_str())
+                        .collect();
+                    Err(format!(
+                        "its leading bytes match {} account types declared by the owner program's \
+                         IDL ({}); {} of them declare a body size matching this account's {} \
+                         bytes, so the type is ambiguous",
+                        candidates.len(),
+                        names.join(", "),
+                        sized.len(),
+                        data.len(),
+                    ))
+                }
+            }
         }
     }
 }
@@ -3133,12 +3264,15 @@ impl SurfnetSvm {
                 let account_data = account.data();
 
                 // Check if account data is valid (has at least discriminator)
-                if account_data.len() < 8 {
+                let min_prefix_len = min_discriminator_len(idl);
+                if account_data.len() < min_prefix_len {
                     warn!(
-                        "Account {} has insufficient data ({} bytes) for override {}. \
-                        Enable fetchBeforeUse: true to fetch account data from mainnet first.",
+                        "Account {} has insufficient data ({} bytes, {} needed for the \
+                        discriminator) for override {}. Enable fetchBeforeUse: true to fetch \
+                        account data from mainnet first.",
                         account_pubkey,
                         account_data.len(),
+                        min_prefix_len,
                         override_instance.id
                     );
                     continue;
@@ -3154,8 +3288,7 @@ impl SurfnetSvm {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
-                            "Failed to forge account data for {} (override {}): {}. \
-                            If the account doesn't exist locally, enable fetchBeforeUse: true.",
+                            "Failed to forge account data for {} (override {}): {}",
                             account_pubkey, override_instance.id, e
                         );
                         continue;
@@ -3195,13 +3328,12 @@ impl SurfnetSvm {
     /// Forges account data by applying overrides to existing account data
     ///
     /// This function:
-    /// 1. Validates account data size (must be at least 8 bytes for discriminator)
-    /// 2. Splits discriminator and serialized data
-    /// 3. Finds the account type in the IDL using the discriminator
-    /// 4. Deserializes the account data
-    /// 5. Applies field overrides using dot notation
-    /// 6. Re-serializes the modified data
-    /// 7. Reconstructs the account data with the original discriminator
+    /// 1. Validates account data size (must hold the shortest discriminator the IDL declares)
+    /// 2. Resolves the account type, then splits its discriminator off the serialized data
+    /// 3. Deserializes the account data
+    /// 4. Applies field overrides using dot notation
+    /// 5. Re-serializes the modified data
+    /// 6. Reconstructs the account data with the original discriminator
     ///
     /// # Arguments
     /// * `account_pubkey` - The account address (for error messages)
@@ -3219,29 +3351,24 @@ impl SurfnetSvm {
         overrides: &HashMap<String, serde_json::Value>,
     ) -> SurfpoolResult<Vec<u8>> {
         // Validate account data size
-        if account_data.len() < 8 {
+        let min_prefix_len = min_discriminator_len(idl);
+        if account_data.len() < min_prefix_len {
             return Err(SurfpoolError::invalid_account_data(
                 account_pubkey,
-                "Account data too small to be an Anchor account (need at least 8 bytes for discriminator)",
+                format!(
+                    "Account data too small for this program's accounts (need at least {min_prefix_len} bytes for the discriminator)"
+                ),
                 Some("Data length too small"),
             ));
         }
 
-        // Split discriminator and data
-        let discriminator = &account_data[..8];
-        let serialized_data = &account_data[8..];
-
-        // Find the account type using the discriminator
-        let account_def = idl
-            .accounts
-            .iter()
-            .find(|acc| acc.discriminator.eq(discriminator))
-            .ok_or_else(|| {
-                SurfpoolError::internal(format!(
-                    "Account with discriminator '{:?}' not found in IDL",
-                    discriminator
-                ))
-            })?;
+        // Find the account type, then split its discriminator off the data
+        let account_def = resolve_idl_account_for_data(idl, account_data).map_err(|reason| {
+            SurfpoolError::internal(format!("Account {account_pubkey}: {reason}"))
+        })?;
+        let prefix_len = account_def.discriminator.len();
+        let discriminator = &account_data[..prefix_len];
+        let serialized_data = &account_data[prefix_len..];
 
         // Find the corresponding type definition
         let account_type = idl
@@ -3314,7 +3441,7 @@ impl SurfnetSvm {
 
         // Reconstruct the account data with discriminator and preserve any trailing bytes
         let mut new_account_data =
-            Vec::with_capacity(8 + re_encoded_data.len() + leftover_bytes.len());
+            Vec::with_capacity(prefix_len + re_encoded_data.len() + leftover_bytes.len());
         new_account_data.extend_from_slice(discriminator);
         new_account_data.extend_from_slice(&re_encoded_data);
         new_account_data.extend_from_slice(leftover_bytes);
@@ -4169,12 +4296,7 @@ impl SurfnetSvm {
                 // with the most recent one, to see if the account data can be parsed to the IDL type
                 for idl in &ordered_available_idls {
                     // If we have a valid IDL, use it to parse the account data
-                    let discriminator = &data[..8];
-                    if let Some(matching_account) = idl
-                        .accounts
-                        .iter()
-                        .find(|a| a.discriminator.eq(&discriminator))
-                    {
+                    if let Ok(matching_account) = resolve_idl_account_for_data(idl, data) {
                         // If we found a matching account, we can look up the type to parse the account
                         if let Some(account_type) =
                             idl.types.iter().find(|t| t.name == matching_account.name)
@@ -4187,7 +4309,7 @@ impl SurfnetSvm {
                                 .map(|t| &t.generics);
 
                             // If we found a matching account type, we can use it to parse the account data
-                            let rest = data[8..].as_ref();
+                            let rest = data[matching_account.discriminator.len()..].as_ref();
                             if let Ok(parsed_value) =
                                 parse_bytes_to_value_with_expected_idl_type_def_ty(
                                     rest,
@@ -4599,6 +4721,180 @@ mod tests {
         assert_eq!(&patched[64..72], &42u64.to_le_bytes());
         assert_eq!(&patched[..64], &account.data[..64]);
         assert_eq!(&patched[72..], &account.data[72..]);
+    }
+
+    /// An IDL for a program that stores no discriminator: every account type declares an empty
+    /// one, so the leading bytes separate nothing and only the declared body size can.
+    fn undiscriminated_idl(bodies: &[(&str, &str)]) -> Idl {
+        let accounts: Vec<String> = bodies
+            .iter()
+            .map(|(name, _)| format!(r#"{{"name":"{name}","discriminator":[]}}"#))
+            .collect();
+        let types: Vec<String> = bodies
+            .iter()
+            .map(|(name, fields)| {
+                format!(r#"{{"name":"{name}","type":{{"kind":"struct","fields":[{fields}]}}}}"#)
+            })
+            .collect();
+
+        serde_json::from_str(&format!(
+            r#"{{
+                "address": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+                "metadata": {{"name": "undiscriminated", "version": "0.1.0", "spec": "0.1.0"}},
+                "instructions": [],
+                "accounts": [{}],
+                "types": [{}]
+            }}"#,
+            accounts.join(","),
+            types.join(",")
+        ))
+        .expect("synthetic IDL")
+    }
+
+    const TWO_U64: &str = r#"{"name":"first","type":"u64"},{"name":"second","type":"u64"}"#;
+    const THREE_U64: &str = r#"{"name":"alpha","type":"u64"},{"name":"beta","type":"u64"},{"name":"gamma","type":"u64"}"#;
+
+    #[test]
+    fn forge_tells_undiscriminated_accounts_apart_by_their_declared_size() {
+        let idl = undiscriminated_idl(&[("Small", TWO_U64), ("Large", THREE_U64)]);
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let pubkey = Pubkey::new_unique();
+
+        let small: Vec<u8> = [7u64, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let forged = svm
+            .get_forged_account_data(
+                &pubkey,
+                &small,
+                &idl,
+                &HashMap::from([("second".to_string(), serde_json::json!(99u64))]),
+            )
+            .expect("16 bytes must resolve to Small");
+        assert_eq!(forged.len(), small.len());
+        assert_eq!(&forged[..8], &small[..8]);
+        assert_eq!(&forged[8..16], &99u64.to_le_bytes());
+
+        let large: Vec<u8> = [1u64, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let forged = svm
+            .get_forged_account_data(
+                &pubkey,
+                &large,
+                &idl,
+                &HashMap::from([("gamma".to_string(), serde_json::json!(55u64))]),
+            )
+            .expect("24 bytes must resolve to Large");
+        assert_eq!(forged.len(), large.len());
+        assert_eq!(&forged[..16], &large[..16]);
+        assert_eq!(&forged[16..24], &55u64.to_le_bytes());
+    }
+
+    #[test]
+    fn forge_refuses_undiscriminated_accounts_that_share_a_size() {
+        let idl = undiscriminated_idl(&[("Left", TWO_U64), ("Right", TWO_U64)]);
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+
+        let data: Vec<u8> = [7u64, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let error = svm
+            .get_forged_account_data(
+                &Pubkey::new_unique(),
+                &data,
+                &idl,
+                &HashMap::from([("second".to_string(), serde_json::json!(99u64))]),
+            )
+            .expect_err("two 16-byte types cannot be told apart");
+        assert!(
+            error.to_string().contains("ambiguous"),
+            "the error should name the ambiguity, got: {error}"
+        );
+    }
+
+    #[test]
+    fn forge_never_size_matches_a_variable_length_type() {
+        const WITH_VEC: &str =
+            r#"{"name":"first","type":"u64"},{"name":"items","type":{"vec":"u64"}}"#;
+        let idl = undiscriminated_idl(&[("Fixed", TWO_U64), ("Variable", WITH_VEC)]);
+
+        assert_eq!(
+            fixed_defined_borsh_size("Variable", &idl.types, &mut Vec::new()),
+            None,
+            "a type holding a vec has no single size"
+        );
+
+        // 16 bytes would also be a valid Variable (u64 + an empty vec), but only Fixed can be
+        // sized, so the ambiguity resolves instead of failing.
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let data: Vec<u8> = [7u64, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let forged = svm
+            .get_forged_account_data(
+                &Pubkey::new_unique(),
+                &data,
+                &idl,
+                &HashMap::from([("second".to_string(), serde_json::json!(4u64))]),
+            )
+            .expect("only Fixed is size-eligible");
+        assert_eq!(&forged[8..16], &4u64.to_le_bytes());
+    }
+
+    /// The Raydium v4 IDL is the shipped case: two empty-discriminator accounts, 752 and 2208
+    /// bytes, decoded and re-encoded out of the account's first byte.
+    #[test]
+    fn forge_round_trips_a_synthetic_amm_info() {
+        let registry = crate::scenarios::TemplateRegistry::new();
+        let idl = &registry.get("raydium-amm-fees").expect("template").idl;
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+
+        // status 6 (swap only) and a 25/10000 swap fee, at the offsets state.rs declares.
+        let mut data = vec![0u8; 752];
+        data[..8].copy_from_slice(&6u64.to_le_bytes());
+        data[176..184].copy_from_slice(&25u64.to_le_bytes());
+        data[184..192].copy_from_slice(&10_000u64.to_le_bytes());
+
+        let untouched = svm
+            .get_forged_account_data(&Pubkey::new_unique(), &data, idl, &HashMap::new())
+            .expect("a 752-byte account must resolve to AmmInfo");
+        assert_eq!(untouched, data, "a no-op forge must not move a byte");
+
+        let forged = svm
+            .get_forged_account_data(
+                &Pubkey::new_unique(),
+                &data,
+                idl,
+                &HashMap::from([(
+                    "fees.swap_fee_numerator".to_string(),
+                    serde_json::json!(100u64),
+                )]),
+            )
+            .expect("fee override on AmmInfo");
+        let changed: Vec<usize> = (0..data.len()).filter(|i| forged[*i] != data[*i]).collect();
+        assert_eq!(
+            changed,
+            vec![176],
+            "only swap_fee_numerator's low byte changes when 25 becomes 100"
+        );
+    }
+
+    #[test]
+    fn forge_reports_an_unmatched_discriminator_without_the_fetch_hint() {
+        let idl: Idl =
+            serde_json::from_slice(include_bytes!("../tests/assets/idl_v1.json").as_ref()).unwrap();
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+
+        let error = svm
+            .get_forged_account_data(
+                &Pubkey::new_unique(),
+                &[9u8; 64],
+                &idl,
+                &HashMap::from([("my_custom_data".to_string(), serde_json::json!(1u64))]),
+            )
+            .expect_err("no account type starts with those bytes");
+        let message = error.to_string();
+        assert!(
+            message.contains("match no account type declared by the owner program's IDL"),
+            "got: {message}"
+        );
+        assert!(
+            !message.contains("fetchBeforeUse"),
+            "a fetch cannot repair an unrecognised account type: {message}"
+        );
     }
 
     /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
