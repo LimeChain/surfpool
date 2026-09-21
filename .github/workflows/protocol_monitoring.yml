@@ -1,7 +1,8 @@
 name: Protocol monitoring
 
-# Twice a day, checks whether shipped state preparation still matches deployment and commits
-# the result to a branch. SURFPOOL_TEST_RPC_URL is optional; without it, suites report unverified.
+# Twice a day, checks whether the protocols we integrate still look the way our templates assume
+# and commits the report to a branch. SURFPOOL_TEST_RPC_URL is optional; the public endpoint is
+# slow enough that some suites time out against it.
 on:
   schedule:
     - cron: "0 3 * * *"
@@ -25,29 +26,25 @@ jobs:
       contents: read
     outputs:
       at: ${{ steps.stamp.outputs.at }}
+      suites_exit: ${{ steps.suites.outputs.exit }}
     env:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
-        with: { persist-credentials: false }
+        with:
+          persist-credentials: false
       - name: Stamp the run
         id: stamp
         run: echo "at=$(date -u +%Y-%m-%dT%H-%MZ)" >> "$GITHUB_OUTPUT"
       - name: Restore snapshot
         uses: actions/cache/restore@v4
-        with: { path: snapshot, key: "monitoring-snapshot-${{ github.run_id }}", restore-keys: monitoring-snapshot- }
-      # Secret scoped to the two steps that read mainnet.
-      - name: Drift checks
-        id: checks
-        env:
-          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
-        run: |
-          set +e
-          node .github/scripts/monitoring/monitor.mjs check --snapshot snapshot --out out
-          if [ -d out/snapshot.next ]; then echo "snapshot=true" >> "$GITHUB_OUTPUT"; fi
-          exit 0
+        with:
+          path: snapshot
+          key: monitoring-snapshot-${{ github.run_id }}
+          restore-keys: monitoring-snapshot-
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: actions/cache@v4
         with:
           path: |
@@ -55,36 +52,44 @@ jobs:
             ~/.cargo/git
           key: monitoring-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: monitoring-${{ runner.os }}-
+      # Runs before the drift checks so the report can include this run's test log.
       - name: Integration suites
+        id: suites
         env:
           SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
         run: |
           set +e
-          timeout 40m cargo test -p surfpool-core --features "integration-tests,ignore_tests_ci" \
-            --no-fail-fast -- --test-threads=1 2>&1 | tee tests.log
+          timeout 40m cargo nextest run -p surfpool-core --test-threads 1 \
+            --features "integration-tests,ignore_tests_ci" --no-fail-fast 2>&1 | tee tests.log
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           exit 0
-      - name: Render the report
-        if: always()
+      - name: Install Solana CLI
         run: |
-          mkdir -p rendered
-          node .github/scripts/monitoring/monitor.mjs render \
-            --findings out/findings.json --tests tests.log \
-            --out rendered/report.md --status-out rendered/status \
-            --timestamp "${{ steps.stamp.outputs.at }}" \
-            --commit "${GITHUB_SHA}" \
-            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          if [ -d out/idls ]; then cp -r out/idls rendered/idls; fi
-          cat rendered/report.md >> "$GITHUB_STEP_SUMMARY"
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - run: npm install -g @coral-xyz/anchor-cli@0.31.1
+      - name: Drift checks
+        env:
+          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
+        run: bash .github/scripts/monitor.sh snapshot out
+      - if: always()
+        run: cat out/report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: report, path: rendered, if-no-files-found: error }
-      # Never saved when the checker produced nothing, or the next run reports everything as first.
-      - name: Save snapshot
-        if: always() && steps.checks.outputs.snapshot == 'true'
-        run: rm -rf snapshot && mv out/snapshot.next snapshot
-      - if: always() && steps.checks.outputs.snapshot == 'true'
+        with:
+          name: report
+          path: out
+          if-no-files-found: warn
+      # Only when the checker produced a snapshot, or the next run would see an empty cache.
+      - name: Replace the snapshot
+        id: snapshot
+        if: always() && hashFiles('out/snapshot/**') != ''
+        run: rm -rf snapshot && mv out/snapshot snapshot
+      - if: always() && steps.snapshot.outcome == 'success'
         uses: actions/cache/save@v4
-        with: { path: snapshot, key: "monitoring-snapshot-${{ github.run_id }}" }
+        with:
+          path: snapshot
+          key: monitoring-snapshot-${{ github.run_id }}
 
   publish:
     name: Publish
@@ -96,7 +101,10 @@ jobs:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
-        with: { name: report, path: rendered }
+        continue-on-error: true
+        with:
+          name: report
+          path: out
       - name: Publish the report
         # Through the environment, never interpolated into the script.
         env:
@@ -104,6 +112,12 @@ jobs:
           AT: ${{ needs.monitor.outputs.at }}
         run: |
           dir="scenarios/monitoring/reports/${AT:-$(date -u +%Y-%m-%dT%H-%MZ)}"
+          if [ ! -f out/report.md ]; then
+            mkdir -p out
+            echo "# Protocol monitoring — no report; the checks did not finish, see the run log." \
+              > out/report.md
+            echo incomplete > out/status
+          fi
           work=$(mktemp -d)
           git -C "$work" init -q
           git -C "$work" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
@@ -118,8 +132,8 @@ jobs:
             git -C "$work" checkout -q --orphan "$REPORT_BRANCH"
           fi
           mkdir -p "$work/$dir"
-          cp rendered/report.md "$work/$dir/"
-          if [ -d rendered/idls ]; then cp -r rendered/idls "$work/$dir/idls"; fi
+          cp out/report.md "$work/$dir/"
+          if [ -d out/idls ]; then cp -r out/idls "$work/$dir/idls"; fi
           git -C "$work" add -A "$dir"
           if git -C "$work" commit -q -m "monitoring: report ${dir##*/}"; then
             git -C "$work" push -q origin "HEAD:$REPORT_BRANCH"
@@ -128,11 +142,15 @@ jobs:
             echo "nothing new to publish for $dir"
           fi
       # Last, so a red run still leaves its report published before this step fails it.
-      - name: Fail when a protocol drifted
+      - name: Fail when a protocol drifted or a suite failed
+        env:
+          SUITES_EXIT: ${{ needs.monitor.outputs.suites_exit }}
         run: |
-          status=$(cat rendered/status 2>/dev/null || echo incomplete)
+          status=$(cat out/status 2>/dev/null || echo incomplete)
           echo "verdict: $status"
-          case "$status" in
-            clean|unverified) exit 0 ;;
-            *) echo "::error::a monitored protocol no longer matches what we ship ($status); see the report"; exit 1 ;;
-          esac
+          echo "suites exit: ${SUITES_EXIT:-unknown}"
+          if [ "$status" = "clean" ] && [ "${SUITES_EXIT:-1}" = "0" ]; then
+            exit 0
+          fi
+          echo "::error::monitoring failed (verdict=$status, suites exit=${SUITES_EXIT:-unknown})"
+          exit 1
