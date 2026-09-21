@@ -34,9 +34,6 @@ jobs:
         id: snapshot
         uses: actions/cache/restore@v4
         with: { path: snapshot, key: "monitoring-snapshot-${{ github.run_id }}", restore-keys: monitoring-snapshot- }
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm ci --prefix .github/scripts/monitoring
       # Secret scoped to this step only: nothing not in the environment can leak it.
       - name: Drift checks
         id: checks

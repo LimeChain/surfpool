@@ -3,7 +3,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
-import { PublicKey } from "@solana/web3.js";
 
 const RPC_URL =
   process.env.SURFPOOL_TEST_RPC_URL || "https://api.mainnet-beta.solana.com";
@@ -12,13 +11,6 @@ const RATE_LIMIT_CODES = new Set([-32005, -32429]);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function isPubkey(str) {
-  try {
-    return new PublicKey(str).toBytes().length === 32;
-  } catch {
-    return false;
-  }
-}
 
 async function rpc(method, params) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
@@ -76,6 +68,71 @@ async function lastSignatureTime(address) {
   const res = await rpc("getSignaturesForAddress", [address, { limit: 1 }]);
   return res && res.length > 0 ? res[0].blockTime ?? null : null;
 }
+
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function base58Decode(str) {
+  let n = 0n;
+  for (const ch of str) {
+    const digit = BASE58.indexOf(ch);
+    if (digit < 0) throw new Error("not base58");
+    n = n * 58n + BigInt(digit);
+  }
+  const bytes = [];
+  for (; n > 0n; n >>= 8n) bytes.push(Number(n & 255n));
+  for (const ch of str) {
+    if (ch !== "1") break;
+    bytes.push(0);
+  }
+  return Buffer.from(bytes.reverse());
+}
+function base58Encode(buf) {
+  let n = BigInt("0x" + (buf.toString("hex") || "0"));
+  let out = "";
+  for (; n > 0n; n /= 58n) out = BASE58[Number(n % 58n)] + out;
+  for (const b of buf) {
+    if (b !== 0) break;
+    out = "1" + out;
+  }
+  return out;
+}
+const isPubkey = (str) => {
+  try {
+    return base58Decode(str).length === 32;
+  } catch {
+    return false;
+  }
+};
+
+const ED25519_P = 2n ** 255n - 19n;
+const modPow = (base, exp, mod) => {
+  let result = 1n;
+  for (base %= mod; exp > 0n; exp >>= 1n, base = (base * base) % mod) if (exp & 1n) result = (result * base) % mod;
+  return result;
+};
+const modInverse = (a) => modPow(a, ED25519_P - 2n, ED25519_P);
+const ED25519_D = (ED25519_P - 121665n) * modInverse(121666n) % ED25519_P;
+// A PDA must not be a valid curve point; this mirrors curve25519-dalek's decompress succeeding.
+function isOnCurve(bytes) {
+  const signBit = bytes[31] >> 7;
+  const le = Buffer.from(bytes);
+  le[31] &= 0x7f;
+  const y = BigInt("0x" + Buffer.from(le).reverse().toString("hex")) % ED25519_P;
+  const y2 = (y * y) % ED25519_P;
+  const u = (y2 + ED25519_P - 1n) % ED25519_P;
+  const v = (ED25519_D * y2 + 1n) % ED25519_P;
+  const x2 = (u * modInverse(v)) % ED25519_P;
+  if (x2 === 0n) return signBit === 0;
+  return modPow(x2, (ED25519_P - 1n) / 2n, ED25519_P) === 1n;
+}
+const sha256 = (...parts) => crypto.createHash("sha256").update(Buffer.concat(parts)).digest();
+function findProgramAddress(seeds, programId) {
+  for (let bump = 255; bump >= 0; bump--) {
+    const candidate = sha256(...seeds, Buffer.from([bump]), programId, Buffer.from("ProgramDerivedAddress"));
+    if (!isOnCurve(candidate)) return candidate;
+  }
+  throw new Error("no program address found");
+}
+const createWithSeed = (base, seed, programId) => sha256(base, Buffer.from(seed), programId);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_ROOT = path.resolve(HERE, "../../../crates/core/src/scenarios/protocols");
@@ -168,7 +225,7 @@ async function buildProgramObservations(programIds) {
   programIds.forEach((pid, i) => {
     const acc = accounts[i];
     if (!acc) observations.set(pid, null);
-    else if (acc.owner === BPF_UPGRADEABLE_LOADER) programDataNeeded.push({ pid, pdAddress: new PublicKey(acc.data.subarray(4, 36)).toBase58() });
+    else if (acc.owner === BPF_UPGRADEABLE_LOADER) programDataNeeded.push({ pid, pdAddress: base58Encode(acc.data.subarray(4, 36)) });
     else observations.set(pid, elfObservation(pid, "fixed", null, null, acc.data));
   });
   if (programDataNeeded.length > 0) {
@@ -177,7 +234,7 @@ async function buildProgramObservations(programIds) {
       const pdAcc = pdAccounts[i];
       if (!pdAcc) return observations.set(pid, null);
       const slot = Number(pdAcc.data.readBigUInt64LE(4));
-      const authority = pdAcc.data[12] === 1 ? new PublicKey(pdAcc.data.subarray(13, 45)).toBase58() : null;
+      const authority = pdAcc.data[12] === 1 ? base58Encode(pdAcc.data.subarray(13, 45)) : null;
       observations.set(pid, elfObservation(pid, "upgradeable", slot, authority, pdAcc.data.subarray(45)));
     });
   }
@@ -340,10 +397,9 @@ const fetchIdlAccount = (address) => tracked(async () => (await getMultipleAccou
 async function idlFindingForProtocol(key, idl, outDir) {
   const programId = idl.address;
   if (!programId) return idlFinding(key, null, "no_address");
-  const pk = new PublicKey(programId);
-  const base = PublicKey.findProgramAddressSync([], pk)[0];
-  const idlAddress = await PublicKey.createWithSeed(base, "anchor:idl", pk);
-  const acc = await fetchIdlAccount(idlAddress.toBase58()).catch(() => undefined);
+  const program = base58Decode(programId);
+  const idlAddress = base58Encode(createWithSeed(findProgramAddress([], program), "anchor:idl", program));
+  const acc = await fetchIdlAccount(idlAddress).catch(() => undefined);
   if (acc === undefined) return idlFinding(key, programId, "unknown");
   if (!acc) return idlFinding(key, programId, "unpublished");
   const len = acc.data.readUInt32LE(40);

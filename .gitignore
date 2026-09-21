@@ -18,5 +18,3 @@ txtx.yml
 crates/types/bindings/
 
 .idea
-
-.github/scripts/monitoring/node_modules/
