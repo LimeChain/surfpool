@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
@@ -260,8 +260,8 @@ function programsFindingsForProtocol(key, programIds, observations, snapshotDir,
   const current = {};
   const findings = programIds.map((pid) => {
     const obs = observations.get(pid) ?? null;
-    current[pid] = obs;
     const prev = previous[pid];
+    current[pid] = obs ?? prev ?? null;
     const status = !obs ? "missing" : !prev ? "first" : programChanged(obs, prev) ? "changed" : "unchanged";
     return { protocol: key, program_id: pid, status, current: obs, previous: prev ?? null };
   });
@@ -404,7 +404,13 @@ async function idlFindingForProtocol(key, idl, outDir) {
   if (!acc) return idlFinding(key, programId, "unpublished");
   const len = acc.data.readUInt32LE(40);
   if (len > MAX_IDL_LEN) return idlFinding(key, programId, "unknown", { errors: [`idl too large: ${len} bytes`] });
-  const publishedIdl = JSON.parse(zlib.inflateSync(acc.data.subarray(44, 44 + len)).toString("utf8"));
+  let inflated;
+  try {
+    inflated = zlib.inflateSync(acc.data.subarray(44, 44 + len), { maxOutputLength: MAX_IDL_LEN });
+  } catch {
+    return idlFinding(key, programId, "unknown", { errors: [`idl inflates beyond ${MAX_IDL_LEN} bytes`] });
+  }
+  const publishedIdl = JSON.parse(inflated.toString("utf8"));
   const publishedIsLegacy = isLegacyIdl(publishedIdl);
   const { errors, infos } = compareIdls(canonicalizeIdl(idl), canonicalizeIdl(publishedIdl), publishedIsLegacy);
   const drift = errors.length > 0 || infos.length > 0;
@@ -472,6 +478,7 @@ async function runCheck(argv) {
     console.log(`${key}: ${programIds.length} program${programIds.length === 1 ? "" : "s"}, ${idlLine}, ${marketAddresses.length} markets`);
   }
   const rpcOk = stats.total === 0 || stats.failed <= stats.total / 2;
+  if (!rpcOk) rmSync(path.join(args.out, "snapshot.next"), { recursive: true, force: true });
   writeJson(path.join(args.out, "findings.json"), { generated_at: new Date().toISOString(), rpc_ok: rpcOk, protocols: protocolKeys, programs: programFindings, idls: idlFindings, markets: marketFindings, not_covered: notCovered });
   console.log(`done: ${protocolKeys.length} protocols, ${programFindings.length} programs, ${idlFindings.length} idls, ${marketFindings.length} markets, rpc_ok=${rpcOk}`);
 }
@@ -503,6 +510,8 @@ function short(value) {
 const ENV_FAILURE_RES = [
   /kind:\s*Reqwest\([\s\S]*?127\.0\.0\.1[\s\S]*?TimedOut/,
   /error sending request for url/,
+  /datasource request to .* (timed out|failed)/,
+  /failed to connect to /,
 ];
 const isEnvFailure = (detail) => ENV_FAILURE_RES.some((re) => re.test(detail));
 
