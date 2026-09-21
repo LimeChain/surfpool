@@ -1,0 +1,104 @@
+protocol: Whirlpool
+version: v0.7.0
+account_type: Whirlpool
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - concentrated-liquidity
+  - defi
+
+templates:
+  - id: whirlpool-custom
+    name: Override Custom Whirlpool
+    description: Override any Whirlpool pool state with custom address
+    idl_account_name: Whirlpool
+    properties:
+      - path: sqrt_price
+        label: Sqrt price (Q64.64)
+        description: >-
+          sqrt(price) * 2^64, raw price (token B per token A, before decimal adjustment):
+          price_raw = (sqrt_price / 2^64)^2. Real price = price_raw * 10^(decimals_a - decimals_b).
+          Must stay consistent with tick_current_index - see the coupling rule in llm_context.
+      - path: liquidity
+        label: Active liquidity
+        description: >-
+          Raw u128 liquidity active at tick_current_index. A swap that must move the price needs
+          liquidity in every TickArray it crosses; zero here starves the pool of depth.
+      - path: tick_current_index
+        label: Current tick index
+        description: >-
+          i32 tick implied by sqrt_price: floor(log(price_raw) / log(1.0001)). The swap reads the
+          TickArray whose start_index brackets this tick; an inconsistent tick, or one with no
+          initialized TickArray, fails the swap rather than mispricing it.
+      - path: fee_rate
+        label: Swap fee rate
+        description: >-
+          Hundredths of a basis point. Divide by 1,000,000 for the fraction of every swap's input
+          the program charges: 3000 = 0.30%. Program maximum is 60000 (6%).
+      - path: protocol_fee_rate
+        label: Protocol's share of the fee
+        description: >-
+          Basis points OF THE COLLECTED FEE, not of the swap. Divide by 10,000: 1300 = 13% of the
+          fee (the live default). Program maximum is 2500 (25% of the fee).
+    address:
+      type: pubkey
+    llm_context: |
+      fetchBeforeUse: set to true so the live pool is forked before this override is applied;
+      set it to false only for a later override that builds on state an earlier override in the
+      same scenario already prepared.
+
+      UNITS
+      - fee_rate: hundredths of a basis point (divide by 1,000,000 for the fraction charged).
+      - protocol_fee_rate: basis points of the fee, not of the swap (divide by 10,000).
+      - liquidity, sqrt_price: raw u128, Q64.64 for sqrt_price.
+      - tick_current_index: raw i32.
+
+      COUPLING RULE - sqrt_price and tick_current_index describe the same state and must be set
+      together:
+        price_raw = (sqrt_price / 2^64)^2
+        price = price_raw * 10^(decimals_a - decimals_b)
+        tick_current_index = floor(log(price_raw) / log(1.0001))
+      The swap walks the TickArray covering tick_current_index (start_index =
+      floor(tick_current_index / (tick_spacing * 88)) * tick_spacing * 88, PDA
+      ["tick_array", whirlpool, start_index.to_string()]). A tick_current_index with no
+      initialized TickArray at that start_index, or one inconsistent with sqrt_price, fails the
+      swap.
+
+      VAULT BALANCES - a swap's output is paid from token_vault_a / token_vault_b (plain
+      spl-token accounts; override them separately with the spl-token templates). Raising
+      liquidity or moving sqrt_price without funding the vault the swap pays out from makes the
+      swap fail on the token transfer, not on this override.
+
+      EXAMPLE - halve the price of a pool where token_mint_a has 9 decimals and token_mint_b has
+      6 (e.g. SOL/USDC): compute new_sqrt_price = old_sqrt_price / sqrt(2), then
+      tick_current_index = floor(log((new_sqrt_price/2^64)^2) / log(1.0001)), and set both.
+
+  - id: whirlpools-config
+    name: Override Whirlpools Config
+    description: Override the Orca Whirlpools protocol-fee default new pools are created with
+    idl_account_name: WhirlpoolsConfig
+    properties:
+      - path: default_protocol_fee_rate
+        label: Default protocol fee rate for new pools
+        description: >-
+          Basis points of the swap fee (divide by 10,000) a newly initialized pool copies into its
+          own protocol_fee_rate; existing pools keep theirs. 1300 = 13% of the fee (the live
+          default). Program maximum is 2500 (25%).
+    address:
+      type: pubkey
+      value: 2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ
+    llm_context: |
+      fetchBeforeUse: set to true so the live config singleton is forked before this override is
+      applied; false only for a later override that builds on state an earlier override in the
+      same scenario already prepared.
+
+      default_protocol_fee_rate is read once, at pool creation (initialize_pool), to seed the new
+      pool's own Whirlpool.protocol_fee_rate. It has no effect on pools that already exist -
+      override protocol_fee_rate on whirlpool-custom for that. Units: basis points of the swap
+      fee, divide by 10,000 (1300 = 13%, the live default). Program maximum 2500 (25%).
+
+      This template's address is the one deployed WhirlpoolsConfig singleton,
+      2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ. Every Whirlpool pool was created under it and
+      reads/writes it as the field at offset 8 of its own Whirlpool account (verify with the live
+      field, not a re-derivation of the same constant - VERIFY-15).
