@@ -17,9 +17,19 @@ extra_programs=(
   solfi:SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF
 )
 
-# The committed IDLs keep only accounts and types, so only those are compared.
+# Committed IDLs are trimmed (most keep no instructions or errors), so only what a template can
+# depend on is compared. Older IDLs spell account flags isMut/isSigner; the published ones are
+# converted to writable/signer, so both sides are normalised the same way before comparing.
 idl_pick='del(.. | .docs?)
-  | {accounts: (.accounts // [] | sort_by(.name)), types: (.types // [] | sort_by(.name))}'
+  | walk(if type == "object"
+      then with_entries(.key |= ({isMut: "writable", isSigner: "signer"}[.] // .))
+      else . end)
+  | {accounts: (.accounts // [] | sort_by(.name)),
+     types: (.types // [] | sort_by(.name)),
+     instructions: (.instructions // [] | sort_by(.name))}'
+# Entries of one side that the other side does not publish identically, as "section/name".
+idl_only_in_first='to_entries[] | .key as $section | .value[]
+  | select(. as $entry | $other[0][$section] | index($entry) | not) | "\($section)/\(.name)"'
 
 mkdir -p "$out_dir/snapshot/programs" "$out_dir/idls"
 work=$(mktemp -d)
@@ -83,30 +93,36 @@ check_idl() {
       return
     fi
   fi
-  if ! jq -S "$idl_pick" "$committed" > "$work/$safe.ours" \
-      || ! jq -S "$idl_pick" "$fetched" > "$work/$safe.theirs"; then
+  local sections='["accounts", "types", "instructions"]'
+  if [ "$(jq '.instructions // [] | length' "$committed")" = 0 ]; then
+    sections='["accounts", "types"]'
+  fi
+  local keep="with_entries(select(.key as \$key | $sections | index(\$key)))"
+  local ours=$work/$safe.ours theirs=$work/$safe.theirs
+  if ! jq -S "$idl_pick | $keep" "$committed" > "$ours" \
+      || ! jq -S "$idl_pick | $keep" "$fetched" > "$theirs"; then
     echo "- $name: IDL is not valid JSON" >> "$idls"
     gaps=true
     return
   fi
   local diff_file=$out_dir/idls/$safe.diff
-  if diff "$work/$safe.ours" "$work/$safe.theirs" > "$diff_file"; then
+  if diff -d "$ours" "$theirs" > "$diff_file"; then
     rm "$diff_file"
     echo "- $name: match" >> "$idls"
     echo "$name: idl match"
     return
   fi
   cp "$fetched" "$out_dir/idls/$safe.json"
-  local removed added
-  removed=$(grep -c '^<' "$diff_file" || true)
-  added=$(grep -c '^>' "$diff_file" || true)
-  if [ "$removed" = 0 ]; then
-    echo "- $name: $added lines added upstream, nothing we ship is missing" \
+  local changed added
+  changed=$(jq -r --slurpfile other "$theirs" "$idl_only_in_first" "$ours" | paste -sd ' ' -)
+  added=$(jq -r --slurpfile other "$ours" "$idl_only_in_first" "$theirs" | grep -c '' || true)
+  if [ -z "$changed" ]; then
+    echo "- $name: $added entries added upstream, everything we ship is still published" \
       "([diff](idls/$safe.diff))" >> "$idls"
   else
     drift=true
-    echo "- $name: **$removed lines we ship are no longer published**, $added added" \
-      "([diff](idls/$safe.diff))" >> "$idls"
+    echo "- $name: **we ship entries the program no longer publishes as we have them:**" \
+      "$changed; $added added upstream ([diff](idls/$safe.diff))" >> "$idls"
   fi
   echo "$name: idl differs"
 }
