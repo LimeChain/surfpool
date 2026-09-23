@@ -35,6 +35,8 @@ use crate::{
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+const BISONFI_PROGRAM: &str = "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi";
+const BISONFI_OWNER: Pubkey = Pubkey::from_str_const(BISONFI_PROGRAM);
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
 async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
@@ -241,7 +243,7 @@ const BISONFI_POOL: &str = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo";
 async fn bisonfi_pool_round_trips_unchanged() {
     let data = fetch(&[BISONFI_POOL]).await.remove(0);
     assert_eq!(data.len(), 2048, "BisonFi pool accounts are 2048 bytes");
-    assert_eq!(&data[..8], b"POOLSTAT", "magic prefix");
+    assert_eq!(&data[..8], b"POOLSTAT", "account prefix");
 
     let registry = TemplateRegistry::new();
     let template = registry
@@ -253,7 +255,13 @@ async fn bisonfi_pool_round_trips_unchanged() {
         .expect("bisonfi templates carry a raw layout");
 
     let forged = raw_layout
-        .materialize(&data, &template.properties, &HashMap::new(), 0)
+        .materialize(
+            &BISONFI_OWNER,
+            &data,
+            &template.properties,
+            &HashMap::new(),
+            0,
+        )
         .expect("live BisonFi pool should round-trip through the byte layout");
 
     assert_eq!(forged.len(), data.len(), "size changed on round-trip");
@@ -285,6 +293,7 @@ async fn bisonfi_fair_value_override_writes_expected_bytes() {
     let target: u128 = 50u128 * (1u128 << 88);
     let forged = raw_layout
         .materialize(
+            &BISONFI_OWNER,
             &data,
             &template.properties,
             &HashMap::from([(
@@ -309,7 +318,8 @@ async fn bisonfi_fair_value_override_writes_expected_bytes() {
     );
 }
 
-/// The size, magic and version guard stands in for a discriminator, so every part has to bite.
+/// The owner, size, expected bytes and version guard stand in for a discriminator, so every part
+/// has to bite.
 #[tokio::test]
 async fn bisonfi_raw_layout_refuses_the_wrong_account() {
     let data = fetch(&[BISONFI_POOL]).await.remove(0);
@@ -317,23 +327,32 @@ async fn bisonfi_raw_layout_refuses_the_wrong_account() {
     let template = registry.get("bisonfi-fair-value").expect("template");
     let raw_layout = template.raw_layout.as_ref().expect("raw layout");
 
-    assert!(raw_layout.guard(&data).is_ok(), "the real pool must pass");
+    assert!(
+        raw_layout.guard(&BISONFI_OWNER, &data).is_ok(),
+        "the real pool must pass"
+    );
 
-    let mut wrong_magic = data.clone();
-    wrong_magic[0] = b'X';
+    let wrong_owner = Pubkey::new_unique();
     let err = raw_layout
-        .guard(&wrong_magic)
-        .expect_err("a changed magic must be refused");
-    assert!(err.contains("magic"), "unexpected error: {err}");
+        .guard(&wrong_owner, &data)
+        .expect_err("a different owner must be refused");
+    assert!(err.contains("does not match expected owner"), "{err}");
+
+    let mut wrong_expected_bytes = data.clone();
+    wrong_expected_bytes[0] = b'X';
+    let err = raw_layout
+        .guard(&BISONFI_OWNER, &wrong_expected_bytes)
+        .expect_err("changed expected bytes must be refused");
+    assert!(err.contains("expected_bytes"), "unexpected error: {err}");
 
     // The former live v2 fixture was closed on mainnet. Mutating a current v3 account exercises the
     // same guard deterministically without pinning this safety check to an account's lifetime.
     let mut wrong_version = data.clone();
     wrong_version[8..16].copy_from_slice(&2u64.to_le_bytes());
     let err = raw_layout
-        .guard(&wrong_version)
+        .guard(&BISONFI_OWNER, &wrong_version)
         .expect_err("a different layout version must be refused");
-    assert!(err.contains("magic"), "unexpected error: {err}");
+    assert!(err.contains("expected_bytes"), "unexpected error: {err}");
     for template in registry
         .all()
         .into_iter()
@@ -344,7 +363,7 @@ async fn bisonfi_raw_layout_refuses_the_wrong_account() {
                 .raw_layout
                 .as_ref()
                 .expect("BisonFi template must carry a raw layout")
-                .guard(&wrong_version)
+                .guard(&BISONFI_OWNER, &wrong_version)
                 .is_err(),
             "{} must reject a pool with another layout version",
             template.id
@@ -352,7 +371,7 @@ async fn bisonfi_raw_layout_refuses_the_wrong_account() {
     }
 
     let err = raw_layout
-        .guard(&data[..2047])
+        .guard(&BISONFI_OWNER, &data[..2047])
         .expect_err("a differently sized account must be refused");
     assert!(err.contains("bytes"), "unexpected error: {err}");
 }
@@ -403,6 +422,7 @@ async fn bisonfi_freshness_tracks_the_chain_slot() {
     let aged = last - 1000;
     let forged = raw_layout
         .materialize(
+            &BISONFI_OWNER,
             &data,
             &template.properties,
             &HashMap::from([("last_update_slot".to_string(), serde_json::json!(aged))]),
@@ -461,10 +481,16 @@ async fn bisonfi_every_pool_round_trips_unchanged() {
 
     for (pool, data) in BISONFI_ALL_POOLS.iter().zip(all.iter()) {
         assert_eq!(data.len(), 2048, "{pool} should be 2048 bytes");
-        assert_eq!(&data[..8], b"POOLSTAT", "{pool} magic prefix");
+        assert_eq!(&data[..8], b"POOLSTAT", "{pool} account prefix");
 
         let forged = raw_layout
-            .materialize(data, &template.properties, &HashMap::new(), 0)
+            .materialize(
+                &BISONFI_OWNER,
+                data,
+                &template.properties,
+                &HashMap::new(),
+                0,
+            )
             .unwrap_or_else(|e| panic!("{pool} failed to round-trip through the byte layout: {e}"));
         let diffs = diff_indices(&forged, data);
         assert!(
@@ -525,11 +551,12 @@ async fn bisonfi_every_property_writes_cleanly_on_every_pool() {
 
         for (pool, data) in BISONFI_ALL_POOLS.iter().zip(all.iter()) {
             raw_layout
-                .guard(data)
+                .guard(&BISONFI_OWNER, data)
                 .unwrap_or_else(|e| panic!("{id}: guard rejected {pool}: {e}"));
 
             let forged = raw_layout
                 .materialize(
+                    &BISONFI_OWNER,
                     data,
                     &template.properties,
                     &HashMap::from([(prop.to_string(), value.clone())]),
@@ -661,7 +688,7 @@ impl BisonfiRig {
         let target_slot = u64::from_le_bytes(data[72..80].try_into().expect("8 bytes"));
         bisonfi_replay(&self.elf, pool, data, tp, amount_in, direction, move |d| {
             let forged = layout
-                .materialize(d.as_slice(), &props, &map, target_slot)
+                .materialize(&BISONFI_OWNER, d.as_slice(), &props, &map, target_slot)
                 .unwrap_or_else(|e| panic!("materialize failed: {e}"));
             *d = forged;
         })
@@ -1093,7 +1120,7 @@ fn bisonfi_apply_template(
         .collect();
     move |d: &mut Vec<u8>| {
         *d = layout
-            .materialize(d.as_slice(), &props, &map, 0)
+            .materialize(&BISONFI_OWNER, d.as_slice(), &props, &map, 0)
             .unwrap_or_else(|e| panic!("{id}: materialize failed: {e}"));
     }
 }
@@ -1277,6 +1304,7 @@ async fn bisonfi_spread_template_writes_only_its_tick_fields() {
         for (pool, data) in BISONFI_ALL_POOLS.iter().zip(all.iter()) {
             let forged = raw_layout
                 .materialize(
+                    &BISONFI_OWNER,
                     data,
                     &template.properties,
                     &HashMap::from([(path.to_string(), serde_json::json!(-12_345i32))]),
@@ -1389,6 +1417,7 @@ async fn bisonfi_scenario_arbitrage_against_an_amm() {
     let layout = template.raw_layout.as_ref().expect("layout");
     let dislocated = layout
         .materialize(
+            &BISONFI_OWNER,
             data,
             &template.properties,
             &HashMap::from([(
@@ -1805,6 +1834,7 @@ async fn bisonfi_scenario_dislocated_price_behind_thin_depth() {
             .expect("layout");
         let priced = layout
             .materialize(
+                &BISONFI_OWNER,
                 data,
                 &registry.get("bisonfi-fair-value").unwrap().properties,
                 &HashMap::from([(
@@ -2023,8 +2053,6 @@ async fn bisonfi_spread_lever_moves_the_quote_on_every_pool() {
     );
 }
 
-const BISONFI_PROGRAM: &str = "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi";
-
 const BISONFI_PROGRAMDATA: &str = "42snJ7ip4zKKsip3EtaMoBo8wzoRsQJSzgUSFXAVJFfG";
 
 const BISONFI_NINTH: &str = "8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d";
@@ -2137,7 +2165,7 @@ async fn bisonfi_guard_accepts_every_v3_pool() {
         for template in &templates {
             let raw_layout = template.raw_layout.as_ref().unwrap();
             raw_layout
-                .guard(data)
+                .guard(&BISONFI_OWNER, data)
                 .unwrap_or_else(|e| panic!("{}: guard rejected v3 pool {pool}: {e}", template.id));
         }
     }
