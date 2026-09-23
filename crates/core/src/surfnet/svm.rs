@@ -3113,14 +3113,10 @@ impl SurfnetSvm {
                 // Programs with no usable IDL carry a byte layout instead, and this MUST come
                 // before the IDL lookup below: those programs have no registered IDL at all, so the
                 // lookup would `continue` and silently drop the override.
-                let raw_template =
-                    override_template.filter(|template| template.raw_layout.is_some());
+                let raw_template = override_template.filter(|template| template.raw_layout);
                 if let Some(template) = raw_template {
-                    let raw_layout = template.raw_layout.as_ref().expect("filtered above");
-                    match raw_layout.materialize(
-                        account.owner(),
+                    match template.materialize_raw_layout(
                         account.data(),
-                        &template.properties,
                         &account_values,
                         target_slot,
                     ) {

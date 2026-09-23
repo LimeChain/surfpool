@@ -56,10 +56,7 @@ Programs that publish no usable IDL can describe their account bytes directly in
 collection:
 
 ```yaml
-raw_layout:
-  owner: "11111111111111111111111111111111"
-  account_size: 128
-  expected_bytes: { offset: 0, bytes: [69, 88, 65, 77, 80, 76, 69] }
+raw_layout: true
 
 templates:
   - id: example-market-price
@@ -70,13 +67,14 @@ templates:
 ```
 
 Raw-layout overrides use the same scenario API as IDL-backed templates. Values are encoded as
-little-endian integers and can be written once or repeatedly at a fixed stride. Before writing,
-Surfpool verifies the account's owner program, its exact size and any `expected_bytes`, refusing an
-account that does not match. Large integers that exceed `u64` should be supplied as decimal strings
-so JSON parsing cannot lose precision.
+little-endian integers and can be written once or repeatedly at a fixed stride. Every write is
+bounds-checked against the account data available at runtime, while the selected account is the
+caller's responsibility. This permits compatible accounts with additional trailing data and layouts
+that remain valid across program upgrades. Large integers that exceed `u64` should be supplied as
+decimal strings so JSON parsing cannot lose precision.
 
-Each collection uses exactly one write model: an IDL-backed collection cannot also declare
-`raw_layout`, and an IDL-less collection must declare it. Raw-layout collections are currently
+Each collection uses exactly one write model: an IDL-backed collection cannot set
+`raw_layout: true`, and an IDL-less collection must set it. Raw-layout collections are currently
 compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
 endpoint.
 
