@@ -204,12 +204,28 @@ impl TemplateRegistry {
         overrides_content: &str,
         protocol_name: &str,
     ) {
-        let requires_raw_layout = idl.is_none();
         let collection =
             match serde_yaml::from_str::<YamlOverrideTemplateCollection>(overrides_content) {
                 Ok(c) => c,
                 Err(e) => panic!("unable to load {} overrides: {}", protocol_name, e),
             };
+
+        match (idl.is_some(), collection.raw_layout.is_some()) {
+            (true, true) => panic!(
+                "unable to load {protocol_name} overrides: a collection cannot contain both an IDL and raw_layout"
+            ),
+            (false, false) => panic!(
+                "unable to load {protocol_name} overrides: an IDL-less collection must define raw_layout"
+            ),
+            _ => {}
+        }
+        let requires_raw_layout = idl.is_none();
+
+        if let Some(layout) = &collection.raw_layout {
+            layout.validate_properties(&[]).unwrap_or_else(|e| {
+                panic!("unable to load {protocol_name} overrides: invalid raw_layout guard: {e}")
+            });
+        }
 
         // Convert all templates in the collection
         let templates = collection.to_override_templates(idl);
@@ -602,8 +618,9 @@ protocol: Example
 version: v1
 account_type: State
 raw_layout:
+  owner: "11111111111111111111111111111111"
   account_size: 16
-  magic:
+  expected_bytes:
     offset: 0
     bytes: [69, 88]
 templates:
@@ -627,8 +644,16 @@ templates:
         let template = registry.get("example-raw-value").expect("raw template");
         assert!(template.idl.is_none());
         let layout = template.raw_layout.as_ref().expect("raw layout");
+        assert_eq!(
+            layout
+                .expected_bytes
+                .as_ref()
+                .map(|guard| guard.bytes.as_slice()),
+            Some([69, 88].as_slice())
+        );
         let output = layout
             .materialize(
+                &Pubkey::default(),
                 &[69, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 &template.properties,
                 &HashMap::from([("value".to_string(), serde_json::json!(42))]),
@@ -636,6 +661,37 @@ templates:
             )
             .expect("materialize raw template");
         assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 42);
+
+        let error = layout
+            .materialize(
+                &Pubkey::default(),
+                &[0u8; 16],
+                &template.properties,
+                &HashMap::from([("value".to_string(), serde_json::json!(42))]),
+                0,
+            )
+            .expect_err("mismatched expected_bytes must reject the account");
+        assert!(error.contains("do not match expected_bytes"), "{error}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_an_unknown_guard_key() {
+        const OVERRIDES: &str = r#"
+protocol: Example
+version: v1
+account_type: State
+raw_layout:
+  owner: "11111111111111111111111111111111"
+  account_size: 16
+  expected_byte: { offset: 0, bytes: [69, 88] }
+templates: []
+"#;
+
+        let result = std::panic::catch_unwind(|| {
+            let mut registry = TemplateRegistry::default();
+            registry.load_raw_layout_overrides(OVERRIDES, "example");
+        });
+        assert!(result.is_err(), "an unknown guard key must not be ignored");
     }
 
     #[test]
@@ -668,7 +724,7 @@ templates:
     address: { type: pubkey, value: "11111111111111111111111111111111" }
     properties: []
 "#,
-            "has no raw_layout",
+            "must define raw_layout",
         );
 
         rejected(
@@ -676,6 +732,26 @@ templates:
 protocol: Broken
 version: v1
 raw_layout: { account_size: 16 }
+templates: []
+"#,
+            "missing field `owner`",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: { owner: "not-a-pubkey", account_size: 16 }
+templates: []
+"#,
+            "is not a valid pubkey",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: { owner: "11111111111111111111111111111111", account_size: 16 }
 templates:
   - id: no-offset
     name: No offset
@@ -691,7 +767,7 @@ templates:
             r#"
 protocol: Broken
 version: v1
-raw_layout: { account_size: 16 }
+raw_layout: { owner: "11111111111111111111111111111111", account_size: 16 }
 templates:
   - id: no-encoding
     name: No encoding
@@ -707,7 +783,7 @@ templates:
             r#"
 protocol: Broken
 version: v1
-raw_layout: { account_size: 16 }
+raw_layout: { owner: "11111111111111111111111111111111", account_size: 16 }
 templates:
   - id: out-of-bounds
     name: Out of bounds
@@ -725,7 +801,7 @@ templates:
                 r#"
 protocol: Broken
 version: v1
-raw_layout: { account_size: 16 }
+raw_layout: { owner: "11111111111111111111111111111111", account_size: 16 }
 templates:
   - id: valid-sibling
     name: Valid sibling
@@ -752,6 +828,31 @@ templates:
             0,
             "validation must finish before any sibling is registered"
         );
+    }
+
+    #[test]
+    fn collection_cannot_mix_an_idl_with_raw_layout() {
+        const HYBRID: &str = r#"
+protocol: Broken
+version: v1
+account_type: PriceUpdateV2
+raw_layout:
+  owner: "11111111111111111111111111111111"
+  account_size: 16
+templates: []
+"#;
+
+        let result = std::panic::catch_unwind(|| {
+            let mut registry = TemplateRegistry::default();
+            registry.load_protocol_overrides(PYTH_V2_IDL_CONTENT, HYBRID, "hybrid");
+        });
+        let panic = result.expect_err("a hybrid collection must be rejected");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic message");
+        assert!(message.contains("both an IDL and raw_layout"), "{message}");
     }
 
     #[test]

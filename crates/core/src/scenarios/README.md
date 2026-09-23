@@ -57,8 +57,9 @@ collection:
 
 ```yaml
 raw_layout:
+  owner: "11111111111111111111111111111111"
   account_size: 128
-  magic: { offset: 0, bytes: [69, 88, 65, 77, 80, 76, 69] }
+  expected_bytes: { offset: 0, bytes: [69, 88, 65, 77, 80, 76, 69] }
 
 templates:
   - id: example-market-price
@@ -69,9 +70,15 @@ templates:
 ```
 
 Raw-layout overrides use the same scenario API as IDL-backed templates. Values are encoded as
-little-endian integers and can be written once or repeatedly at a fixed stride. Account-size and
-magic guards ensure a template refuses the wrong account before changing any bytes. Large integers
-that exceed `u64` should be supplied as decimal strings so JSON parsing cannot lose precision.
+little-endian integers and can be written once or repeatedly at a fixed stride. Before writing,
+Surfpool verifies the account's owner program, its exact size and any `expected_bytes`, refusing an
+account that does not match. Large integers that exceed `u64` should be supplied as decimal strings
+so JSON parsing cannot lose precision.
+
+Each collection uses exactly one write model: an IDL-backed collection cannot also declare
+`raw_layout`, and an IDL-less collection must declare it. Raw-layout collections are currently
+compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
+endpoint.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
