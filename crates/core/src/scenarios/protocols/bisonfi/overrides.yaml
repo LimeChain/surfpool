@@ -1,21 +1,12 @@
 protocol: BisonFi
 # The pool-account version this layout describes, and the only one supported. BisonFi ships no
-# program semver; the guard below rejects accounts with a different layout version outright.
+# program semver, so these offsets were derived and tested against v3 accounts.
 version: v3
 account_type: PoolStat
 
-# BisonFi publishes no IDL and none is reconstructed here. Writes go through the byte layout below.
-raw_layout:
-  owner: BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi
-  account_size: 2048
-  expected_bytes:
-    offset: 0
-    # "POOLSTAT" followed by the u64 version, which must be 3.
-    #
-    # The version is part of the guard on purpose: owner, size and "POOLSTAT" alone admit an older
-    # account whose fields sit elsewhere, and a scenario naming it would write a price into an
-    # unrelated field.
-    bytes: [80, 79, 79, 76, 83, 84, 65, 84, 3, 0, 0, 0, 0, 0, 0, 0]
+# BisonFi publishes no IDL and none is reconstructed here. Properties are written using their byte
+# offsets and encodings; Studio limits account selection to the supported v3 pools.
+raw_layout: true
 
 tags:
   - pmm

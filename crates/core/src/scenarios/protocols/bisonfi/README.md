@@ -36,8 +36,8 @@ actions also repeat this requirement in their visible descriptions.
 The templates default to the live WSOL/USDC market `8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo`.
 Other markets are found by reading `base_mint` and `quote_mint` on the accounts the program owns.
 
-Only version-3 pool accounts are supported and the guard rejects accounts with another layout version
-rather than write a price into the wrong field.
+Only version-3 pool accounts are supported. Studio offers the supported accounts. Direct API callers
+are responsible for supplying an account that uses this layout.
 
 # Recipes
 
@@ -146,7 +146,6 @@ executable margin - both legs fit in one transaction. Two things to get right:
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
 | The quote becomes stale again later in the scenario | Schedule another freshness override in each slot where the quote must be usable |
-| The guard rejects the account | Only version-3 pools are supported |
 | `Custom(60)` | A Token-2022 mint whose token accounts need matching extension data. Two live markets quote such an asset |
 | A swap in a simulated slot returns 0 for no reason | The `LastRestartSlot` sysvar must be at least `246464040`, and the default 200k compute budget cannot finish a large trade - ask for ~1.4M |
 | A freshness override does not seem to age the pool | If your harness derives its clock from the pool's own `last_update_slot`, aging the account moves the clock with it. Apply the override after the clock is taken |
