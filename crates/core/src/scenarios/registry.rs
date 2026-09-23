@@ -23,6 +23,8 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -76,6 +78,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_bisonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -114,6 +117,10 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_bisonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(BISONFI_OVERRIDES_CONTENT, "bisonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -522,11 +529,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (4) = 66
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -597,6 +604,181 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+
+        assert!(registry.contains("bisonfi-fair-value"));
+        assert!(registry.contains("bisonfi-depth"));
+        assert!(registry.contains("bisonfi-spread"));
+        assert!(registry.contains("bisonfi-freshness"));
+    }
+
+    #[test]
+    fn raw_layout_collection_loads_without_an_idl() {
+        const OVERRIDES: &str = r#"
+protocol: Example
+version: v1
+account_type: State
+raw_layout: true
+templates:
+  - id: example-raw-value
+    name: Override Value
+    description: Override one integer in an example binary account
+    address:
+      type: pubkey
+      value: "11111111111111111111111111111111"
+    properties:
+      - path: value
+        offset: 8
+        encoding: u64
+        label: Value
+        description: Example unsigned integer
+"#;
+
+        let mut registry = TemplateRegistry::default();
+        registry.load_raw_layout_overrides(OVERRIDES, "example");
+
+        let template = registry.get("example-raw-value").expect("raw template");
+        assert!(template.idl.is_none());
+        assert!(template.raw_layout);
+        let output = template
+            .materialize_raw_layout(
+                &[0u8; 16],
+                &HashMap::from([("value".to_string(), serde_json::json!(42))]),
+                0,
+            )
+            .expect("materialize raw template");
+        assert_eq!(u64::from_le_bytes(output[8..16].try_into().unwrap()), 42);
+
+        let error = template
+            .materialize_raw_layout(
+                &[0u8; 15],
+                &HashMap::from([("value".to_string(), serde_json::json!(42))]),
+                0,
+            )
+            .expect_err("a write beyond the loaded account must be rejected");
+        assert!(error.contains("exceeds the 15 byte account"), "{error}");
+    }
+
+    #[test]
+    fn raw_layout_collection_rejects_invalid_write_definitions_at_load_time() {
+        fn rejected(yaml: &str, expected: &str) {
+            let result = std::panic::catch_unwind(|| {
+                let mut registry = TemplateRegistry::default();
+                registry.load_raw_layout_overrides(yaml, "broken");
+            });
+            let panic = result.expect_err("invalid raw-layout collection must be rejected");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .expect("panic message");
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in {message:?}"
+            );
+        }
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+templates:
+  - id: no-layout
+    name: No layout
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties: []
+"#,
+            "must set raw_layout: true",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: true
+templates:
+  - id: no-offset
+    name: No offset
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, encoding: u64 }
+"#,
+            "missing an offset",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: true
+templates:
+  - id: no-encoding
+    name: No encoding
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 8 }
+"#,
+            "missing an encoding",
+        );
+
+        let mut registry = TemplateRegistry::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.load_raw_layout_overrides(
+                r#"
+protocol: Broken
+version: v1
+raw_layout: true
+templates:
+  - id: valid-sibling
+    name: Valid sibling
+    description: Valid alone
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 8, encoding: u64 }
+  - id: invalid-sibling
+    name: Invalid sibling
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, encoding: u64 }
+"#,
+                "broken",
+            );
+        }));
+        assert!(
+            result.is_err(),
+            "invalid sibling must reject the collection"
+        );
+        assert_eq!(
+            registry.count(),
+            0,
+            "validation must finish before any sibling is registered"
+        );
+    }
+
+    #[test]
+    fn collection_cannot_mix_an_idl_with_raw_layout() {
+        const HYBRID: &str = r#"
+protocol: Broken
+version: v1
+account_type: PriceUpdateV2
+raw_layout: true
+templates: []
+"#;
+
+        let result = std::panic::catch_unwind(|| {
+            let mut registry = TemplateRegistry::default();
+            registry.load_protocol_overrides(PYTH_V2_IDL_CONTENT, HYBRID, "hybrid");
+        });
+        let panic = result.expect_err("a hybrid collection must be rejected");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic message");
+        assert!(message.contains("both an IDL and raw_layout"), "{message}");
     }
 
     #[test]
