@@ -414,10 +414,10 @@ pub struct OverrideTemplate {
     /// This helps LLMs understand how to correctly use the template
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_context: Option<String>,
-    /// Set for programs with no usable IDL. When present the override engine writes bytes at
-    /// each property's offset instead of decoding and re-encoding through the IDL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_layout: Option<RawLayout>,
+    /// Whether the override engine writes bytes at each property's offset instead of decoding and
+    /// re-encoding through an IDL.
+    #[serde(default)]
+    pub raw_layout: bool,
 }
 
 impl OverrideTemplate {
@@ -457,7 +457,7 @@ impl OverrideTemplate {
             constants: HashMap::new(),
             tags: Vec::new(),
             llm_context: None,
-            raw_layout: None,
+            raw_layout: false,
         }
     }
 
@@ -690,7 +690,7 @@ impl YamlOverrideTemplateFile {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-            raw_layout: None,
+            raw_layout: false,
         }
     }
 }
@@ -964,9 +964,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
-    /// Byte layout, for programs with no usable IDL. Shared by every template in the collection.
+    /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
-    pub raw_layout: Option<RawLayout>,
+    pub raw_layout: bool,
     /// The templates
     pub templates: Vec<YamlOverrideTemplateEntry>,
 }
@@ -1118,71 +1118,14 @@ impl RawEncoding {
     }
 }
 
-/// Additional bytes that must be present for an account to be the one a raw layout describes.
-/// This complements the required owner and size checks when a program has multiple account types.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
-pub struct ExpectedBytes {
-    pub offset: usize,
-    /// Exact byte values expected at `offset`.
-    pub bytes: Vec<u8>,
-}
-
-/// A byte-level description of an account, used instead of an IDL.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-// Deliberately no `ts(export)`: override templates are not part of the TS surface, so the three
-// raw-layout types have nothing referencing them there and exporting them produced no file.
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
-pub struct RawLayout {
-    /// Program that must own the account. Raw layouts have no IDL owner lookup, so this check is
-    /// mandatory before any byte-level write.
-    pub owner: String,
-    /// Exact account size. A mismatch means this is not the account the layout describes.
-    /// Serialized camelCase for the JSON API; the alias keeps the YAML snake_case like its peers.
-    #[serde(alias = "account_size")]
-    #[cfg_attr(feature = "ts-bindings", ts(type = "number"))]
-    pub account_size: usize,
-    /// Optional bytes that must already exist at the configured offset before any write occurs.
-    /// Serialized camelCase for the JSON API; the alias keeps the YAML snake_case like its peers.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "expected_bytes"
-    )]
-    pub expected_bytes: Option<ExpectedBytes>,
-}
-
-impl RawLayout {
-    /// Validates the layout guard and every byte range before a template enters the registry.
-    pub fn validate_properties(&self, properties: &[Property]) -> Result<(), String> {
-        Pubkey::from_str(&self.owner).map_err(|error| {
-            format!(
-                "raw_layout owner '{}' is not a valid pubkey: {error}",
-                self.owner
-            )
-        })?;
-        if self.account_size == 0 {
-            return Err("raw_layout account_size must be greater than zero".to_string());
+impl OverrideTemplate {
+    /// Validates every byte placement before a template enters the registry.
+    pub fn validate_raw_layout(&self) -> Result<(), String> {
+        if !self.raw_layout {
+            return Err(format!("template '{}' is not a raw layout", self.id));
         }
 
-        if let Some(expected) = &self.expected_bytes {
-            let end = expected
-                .offset
-                .checked_add(expected.bytes.len())
-                .ok_or_else(|| "raw_layout expected_bytes offset overflow".to_string())?;
-            if end > self.account_size {
-                return Err(format!(
-                    "raw_layout expected_bytes at offset {} + {} bytes exceeds the {} byte account",
-                    expected.offset,
-                    expected.bytes.len(),
-                    self.account_size
-                ));
-            }
-        }
-
-        for property in properties {
+        for property in &self.properties {
             // Constant references select PDA seeds or catalog values; they are not account writes.
             if property.is_constant_ref() {
                 continue;
@@ -1223,69 +1166,29 @@ impl RawLayout {
                         .ok_or_else(|| format!("stride overflow for '{}'", property.path))?,
                 )
                 .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
-            let end = final_offset
+            final_offset
                 .checked_add(encoding.width())
                 .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
-            if end > self.account_size {
-                return Err(format!(
-                    "writable raw-layout property '{}' ends at byte {}, beyond the {} byte account",
-                    property.path, end, self.account_size
-                ));
-            }
         }
 
-        Ok(())
-    }
-
-    /// Rejects an account that is not the shape this layout describes.
-    pub fn guard(&self, owner: &Pubkey, data: &[u8]) -> Result<(), String> {
-        let expected_owner = Pubkey::from_str(&self.owner).map_err(|error| {
-            format!(
-                "raw_layout owner '{}' is not a valid pubkey: {error}",
-                self.owner
-            )
-        })?;
-        if owner != &expected_owner {
-            return Err(format!(
-                "account owner {owner} does not match expected owner {}",
-                self.owner
-            ));
-        }
-        if data.len() != self.account_size {
-            return Err(format!(
-                "account is {} bytes, the layout describes {}",
-                data.len(),
-                self.account_size
-            ));
-        }
-        if let Some(expected) = &self.expected_bytes {
-            let end = expected
-                .offset
-                .checked_add(expected.bytes.len())
-                .ok_or_else(|| "expected_bytes offset overflow".to_string())?;
-            if end > data.len() || &data[expected.offset..end] != expected.bytes.as_slice() {
-                return Err(format!(
-                    "bytes at offset {} do not match expected_bytes; this is not the expected account",
-                    expected.offset
-                ));
-            }
-        }
         Ok(())
     }
 
     /// Writes `values` into a copy of `data` using each property's offset and encoding.
-    pub fn materialize(
+    pub fn materialize_raw_layout(
         &self,
-        owner: &Pubkey,
         data: &[u8],
-        properties: &[Property],
         values: &HashMap<String, serde_json::Value>,
         target_slot: Slot,
     ) -> Result<Vec<u8>, String> {
-        self.guard(owner, data)?;
+        if !self.raw_layout {
+            return Err(format!("template '{}' is not a raw layout", self.id));
+        }
+
         let mut out = data.to_vec();
         for (name, value) in values {
-            let property = properties
+            let property = self
+                .properties
                 .iter()
                 .find(|p| &p.path == name)
                 .ok_or_else(|| format!("'{name}' is not a property of this raw-layout template"))?;
@@ -1477,7 +1380,7 @@ impl YamlOverrideTemplateCollection {
                     constants: constants.clone(),
                     tags: self.tags.clone(),
                     llm_context: entry.llm_context,
-                    raw_layout: self.raw_layout.clone(),
+                    raw_layout: self.raw_layout,
                 }
             })
             .collect()
@@ -1526,7 +1429,7 @@ impl YamlOverrideTemplate {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-            raw_layout: None,
+            raw_layout: false,
         }
     }
 }
@@ -1622,9 +1525,25 @@ mod tests {
     use std::collections::HashMap;
 
     use serde_json::json;
-    use solana_pubkey::Pubkey;
 
-    use super::PdaSeed;
+    use super::{AccountAddress, OverrideTemplate, PdaSeed, Property};
+
+    fn raw_template(properties: Vec<Property>) -> OverrideTemplate {
+        OverrideTemplate {
+            id: "example-raw".to_string(),
+            name: "Example raw layout".to_string(),
+            description: "Test template".to_string(),
+            protocol: "Example".to_string(),
+            idl: None,
+            address: AccountAddress::Pubkey(String::new()),
+            account_type: String::new(),
+            properties,
+            constants: HashMap::new(),
+            tags: Vec::new(),
+            llm_context: None,
+            raw_layout: true,
+        }
+    }
 
     /// The encoding layer must never route a value through f64: a 2^88-scaled price is a 29-digit
     /// integer and f64 carries about 16 significant digits.
@@ -1701,80 +1620,43 @@ mod tests {
 
     #[test]
     fn raw_layout_rejects_writes_past_the_end_of_the_account() {
-        use super::{Property, RawEncoding, RawLayout};
+        use super::RawEncoding;
 
-        let layout = RawLayout {
-            owner: Pubkey::default().to_string(),
-            account_size: 16,
-            expected_bytes: None,
-        };
         let mut property = Property::field("tail".to_string());
         property.offset = Some(12);
         property.encoding = Some(RawEncoding::U64);
+        let template = raw_template(vec![property]);
 
-        let err = layout
-            .materialize(
-                &Pubkey::default(),
+        let err = template
+            .materialize_raw_layout(
                 &[0u8; 16],
-                &[property],
                 &HashMap::from([("tail".to_string(), json!(1))]),
                 0,
             )
             .expect_err("a field crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
-
-        let wrong_owner = Pubkey::new_unique();
-        let err = layout
-            .materialize(
-                &wrong_owner,
-                &[0u8; 16],
-                &[Property::field("unused".to_string())],
-                &HashMap::new(),
-                0,
-            )
-            .expect_err("a different owner program must be refused");
-        assert!(err.contains("does not match expected owner"), "{err}");
     }
 
     #[test]
-    fn raw_layout_serializes_the_expected_bytes_name() {
-        use super::{ExpectedBytes, RawLayout};
-
-        let json = serde_json::to_value(RawLayout {
-            owner: Pubkey::default().to_string(),
-            account_size: 16,
-            expected_bytes: Some(ExpectedBytes {
-                offset: 0,
-                bytes: vec![69, 88],
-            }),
-        })
-        .expect("serialize raw layout");
-
-        assert_eq!(json["owner"], Pubkey::default().to_string());
-        assert_eq!(json["expectedBytes"]["offset"], 0);
-        assert_eq!(json["expectedBytes"]["bytes"], json!([69, 88]));
+    fn raw_layout_serializes_as_a_boolean() {
+        let json = serde_json::to_value(raw_template(Vec::new())).expect("serialize raw template");
+        assert_eq!(json["rawLayout"], true);
     }
 
     #[test]
     fn i32_strided_writes_every_slot_and_nothing_between() {
-        use super::{Property, RawEncoding, RawLayout};
-        let layout = RawLayout {
-            owner: Pubkey::default().to_string(),
-            account_size: 64,
-            expected_bytes: None,
-        };
+        use super::RawEncoding;
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
         property.encoding = Some(RawEncoding::I32Strided {
             count: 3,
             stride: 16,
         });
+        let template = raw_template(vec![property]);
 
-        let out = layout
-            .materialize(
-                &Pubkey::default(),
+        let out = template
+            .materialize_raw_layout(
                 &[0u8; 64],
-                &[property],
                 &HashMap::from([("ticks".to_string(), json!(-25_600))]),
                 0,
             )
@@ -1802,23 +1684,17 @@ mod tests {
 
     #[test]
     fn i32_strided_rejects_a_run_that_leaves_the_account() {
-        use super::{Property, RawEncoding, RawLayout};
-        let layout = RawLayout {
-            owner: Pubkey::default().to_string(),
-            account_size: 32,
-            expected_bytes: None,
-        };
+        use super::RawEncoding;
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
         property.encoding = Some(RawEncoding::I32Strided {
             count: 3,
             stride: 16,
         });
-        let err = layout
-            .materialize(
-                &Pubkey::default(),
+        let template = raw_template(vec![property]);
+        let err = template
+            .materialize_raw_layout(
                 &[0u8; 32],
-                &[property],
                 &HashMap::from([("ticks".to_string(), json!(1))]),
                 0,
             )
@@ -1828,22 +1704,18 @@ mod tests {
 
     #[test]
     fn raw_layout_rejects_overlapping_strided_writes() {
-        use super::{Property, RawEncoding, RawLayout};
+        use super::RawEncoding;
 
-        let layout = RawLayout {
-            owner: Pubkey::default().to_string(),
-            account_size: 32,
-            expected_bytes: None,
-        };
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
         property.encoding = Some(RawEncoding::I32Strided {
             count: 2,
             stride: 2,
         });
+        let template = raw_template(vec![property]);
 
-        let err = layout
-            .validate_properties(&[property])
+        let err = template
+            .validate_raw_layout()
             .expect_err("a stride smaller than the encoded width must be rejected");
         assert!(err.contains("smaller than its 4 byte width"), "{err}");
     }
