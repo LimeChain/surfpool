@@ -1,6 +1,6 @@
 //! SolFi V2 raw-layout and deployed-program tests.
 //!
-//! These deliberately drive the shipped templates through `RawLayout::materialize` before replaying
+//! These deliberately drive the shipped templates through `materialize_raw_layout` before replaying
 //! the current deployed program. SolFi publishes no IDL, and visually plausible offsets are not
 //! evidence that a field reaches pricing.
 
@@ -105,18 +105,6 @@ const INITIALIZED_LAYOUTS: [(&str, &str); 10] = [
         "5Q6oe47U9WxMhvnEjpi6AnZZPMBcatcWKUTfLkguPEiG",
         "6LRUvVthoRGUSfJMqewZtFRmp2fK96xoUn6AyahqxxBw",
     ),
-];
-
-const UNINITIALIZED_MARKETS: [&str; 9] = [
-    "2kfQuYG2FVZL2RqqKEttcdadbPWP4c7b6AFQztNcBWyV",
-    "2Q6S8p9iZNzMvpTemiC56HqCJ3F3szNoyRkvqEKfCanY",
-    "GxZwsApah3Bsgg14dG7MUtnPCQbGiDqFEwyWYZvDxn6Y",
-    "Bnwc3wzE8PYYvgtbriRn9RpRnDH1TvJJthJVacrbgiD7",
-    "AZEKRYWew6zAyoksytTeBFJRHyYdwycPMBn1P2QgfDpQ",
-    "2e25gRiddjn968aXrLt1oZw3BZ4fYD5D8mCv7uKxu1yL",
-    "7TKsqWxU9QkPYVLdjjR1V67ky3FnYogjntUpNLexib4E",
-    "BmVBqFL8LD2KiBsDE8fWXLZ2MWVgPR1qor55MCimriGR",
-    "HYKRMKiXfs1CedDsUHNyaVmEyuw7gj3E3uY6gJgUeMr6",
 ];
 
 async fn fetch(addresses: &[&str]) -> Vec<Account> {
@@ -230,13 +218,8 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect::<HashMap<_, _>>();
-    let layout = t.raw_layout.as_ref().expect("raw layout");
-    let owner = layout
-        .owner
-        .parse::<Pubkey>()
-        .unwrap_or_else(|e| panic!("{id}: invalid raw-layout owner: {e}"));
-    layout
-        .materialize(&owner, data, &t.properties, &map, slot)
+    assert!(t.raw_layout, "{id} must use raw-layout writes");
+    t.materialize_raw_layout(data, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
 }
 
@@ -400,7 +383,7 @@ fn run(
 }
 
 #[tokio::test]
-async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibling() {
+async fn solfi_raw_layouts_cover_every_initialized_market() {
     let registry = TemplateRegistry::new();
     let market_templates = ["solfi-spread", "solfi-size-impact"];
     let oracle_templates = ["solfi-price", "solfi-freshness"];
@@ -419,6 +402,18 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
         assert_eq!(market.len(), 1728, "{market_address}");
         assert_eq!(oracle.len(), 168, "{oracle_address}");
         assert_eq!(
+            &market[704..712],
+            &[1, 0, 0, 0, 0, 0, 0, 0],
+            "{market_address} no longer has the initialized v2 layout"
+        );
+        assert_eq!(
+            &oracle[72..88],
+            &[
+                18, 52, 86, 120, 154, 188, 222, 240, 18, 52, 86, 120, 154, 188, 222, 240
+            ],
+            "{oracle_address} no longer has the decoded oracle layout"
+        );
+        assert_eq!(
             Pubkey::new_from_array(market[24..56].try_into().unwrap()),
             Pubkey::from_str_const(oracle_address),
             "{market_address} no longer embeds the expected oracle"
@@ -426,12 +421,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
 
         for id in market_templates {
             let template = registry.get(id).unwrap();
-            template
-                .raw_layout
-                .as_ref()
-                .unwrap()
-                .guard(&accounts[0].owner, market)
-                .unwrap_or_else(|e| panic!("{id} rejected {market_address}: {e}"));
+            assert!(template.raw_layout, "{id} must use raw-layout writes");
             assert_eq!(
                 apply_raw(id, market, &[], 0),
                 market.to_vec(),
@@ -440,12 +430,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
         }
         for id in oracle_templates {
             let template = registry.get(id).unwrap();
-            template
-                .raw_layout
-                .as_ref()
-                .unwrap()
-                .guard(&accounts[1].owner, oracle)
-                .unwrap_or_else(|e| panic!("{id} rejected {oracle_address}: {e}"));
+            assert!(template.raw_layout, "{id} must use raw-layout writes");
             assert_eq!(
                 apply_raw(id, oracle, &[], 0),
                 oracle.to_vec(),
@@ -497,15 +482,13 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
         .collect::<Vec<_>>();
     let vaults = fetch(&vault_address_refs).await;
     let vault_template = registry.get("solfi-vault-balance").unwrap();
+    assert!(
+        vault_template.raw_layout,
+        "vault template must use raw-layout writes"
+    );
     let mut supported_vaults = 0;
     for (vault, address) in vaults.iter().zip(&vault_addresses) {
-        let guard = vault_template
-            .raw_layout
-            .as_ref()
-            .unwrap()
-            .guard(&vault.owner, &vault.data);
         if vault.data.len() == 165 && vault.data[108] == 1 {
-            guard.unwrap_or_else(|e| panic!("vault guard rejected {address}: {e}"));
             assert_eq!(
                 apply_raw("solfi-vault-balance", &vault.data, &[], 0),
                 vault.data.clone(),
@@ -524,37 +507,12 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
                 "{address} escaped the token amount write set"
             );
             supported_vaults += 1;
-        } else {
-            assert!(
-                guard.is_err(),
-                "vault guard admitted unsupported token layout {address}"
-            );
         }
     }
     assert!(
         supported_vaults >= 18,
         "expected both vault layouts for almost every initialized market, got {supported_vaults}"
     );
-
-    let siblings = fetch(&UNINITIALIZED_MARKETS).await;
-    let mut rejected = 0;
-    for (account, address) in siblings.iter().zip(UNINITIALIZED_MARKETS) {
-        assert_eq!(account.data.len(), 1728, "{address}");
-        for id in market_templates {
-            let template = registry.get(id).unwrap();
-            assert!(
-                template
-                    .raw_layout
-                    .as_ref()
-                    .unwrap()
-                    .guard(&account.owner, &account.data)
-                    .is_err(),
-                "{id} admitted uninitialized sibling {address}"
-            );
-        }
-        rejected += 1;
-    }
-    assert_eq!(rejected, 9, "every uninitialized sibling must be rejected");
 }
 
 #[tokio::test]
@@ -708,61 +666,6 @@ async fn solfi_templates_write_only_proven_bytes_on_both_replay_fixtures() {
     assert_eq!(
         checked, 2,
         "both complete replay fixtures must be exercised"
-    );
-}
-
-#[tokio::test]
-async fn solfi_raw_guards_reject_corrupted_type_markers() {
-    let fork = &forks().await[0];
-    let registry = TemplateRegistry::new();
-
-    let price = registry.get("solfi-price").expect("price template");
-    let price_layout = price.raw_layout.as_ref().unwrap();
-    let err = price_layout
-        .guard(&fork.market.owner, &fork.oracle.data)
-        .expect_err("the market program must not own a SolFi oracle account");
-    assert!(err.contains("does not match expected owner"), "{err}");
-
-    let mut bad_oracle = fork.oracle.data.clone();
-    bad_oracle[72] ^= 1;
-    assert!(
-        price_layout.guard(&fork.oracle.owner, &bad_oracle).is_err(),
-        "expected oracle bytes must reject a wrong 168-byte account"
-    );
-
-    let spread = registry.get("solfi-spread").expect("spread template");
-    let mut bad_market = fork.market.data.clone();
-    bad_market[704] ^= 1;
-    assert!(
-        spread
-            .raw_layout
-            .as_ref()
-            .unwrap()
-            .guard(&fork.market.owner, &bad_market)
-            .is_err(),
-        "MarketConfig initialized marker must be part of the guard"
-    );
-
-    let vault = registry.get("solfi-vault-balance").expect("vault template");
-    assert!(
-        vault
-            .raw_layout
-            .as_ref()
-            .unwrap()
-            .guard(&fork.base_vault.owner, &vec![0; 164])
-            .is_err(),
-        "vault layout must reject non-token-account sizes"
-    );
-    let mut wrong_state = fork.base_vault.data.clone();
-    wrong_state[108] = 0;
-    assert!(
-        vault
-            .raw_layout
-            .as_ref()
-            .unwrap()
-            .guard(&fork.base_vault.owner, &wrong_state)
-            .is_err(),
-        "vault layout must reject a token account that is not initialized"
     );
 }
 

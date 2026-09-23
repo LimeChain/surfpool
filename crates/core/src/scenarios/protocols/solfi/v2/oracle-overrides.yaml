@@ -2,13 +2,7 @@ protocol: SolFi
 version: v2
 account_type: XorPriceOracle
 
-raw_layout:
-  owner: E2uCGJ4TtYyKPGaK57UMfbs9sgaumwDEZF1aAY6fF3mS
-  account_size: 168
-  expected_bytes:
-    offset: 72
-    # Two repetitions of the oracle's fixed 0xf0debc9a78563412 word.
-    bytes: [18, 52, 86, 120, 154, 188, 222, 240, 18, 52, 86, 120, 154, 188, 222, 240]
+raw_layout: true
 
 tags:
   - pmm

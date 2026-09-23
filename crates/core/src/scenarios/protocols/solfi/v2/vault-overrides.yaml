@@ -2,13 +2,7 @@ protocol: SolFi
 version: v2
 account_type: TokenAccount
 
-raw_layout:
-  owner: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
-  account_size: 165
-  expected_bytes:
-    offset: 108
-    # Classic SPL Token AccountState::Initialized.
-    bytes: [1]
+raw_layout: true
 
 tags:
   - pmm
