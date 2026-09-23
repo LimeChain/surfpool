@@ -1031,7 +1031,9 @@ pub enum RawEncoding {
     },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
-    /// The slot the override materializes at, plus `lead` (may be negative).
+    /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
+    /// when the caller explicitly supplies JSON `null`; omitting the property performs no write.
+    /// A negative offset before slot zero saturates at zero, while positive overflow is rejected.
     Slot {
         lead: i64,
     },
@@ -1174,52 +1176,65 @@ fn slot_with_lead(target_slot: Slot, lead: i64) -> Result<Slot, String> {
     }
 }
 
-/// Bytes that must be present for an account to be the one a raw layout describes. Without an
-/// IDL there is no discriminator to resolve the type, so this is the only thing standing between
-/// a raw write and silently corrupting an unrelated account.
+/// Additional bytes that must be present for an account to be the one a raw layout describes.
+/// This complements the required owner and size checks when a program has multiple account types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
-pub struct RawMagic {
+pub struct ExpectedBytes {
     pub offset: usize,
-    /// Expected bytes, as an ASCII string or a byte list.
+    /// Exact byte values expected at `offset`.
     pub bytes: Vec<u8>,
 }
 
 /// A byte-level description of an account, used instead of an IDL.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 // Deliberately no `ts(export)`: override templates are not part of the TS surface, so the three
 // raw-layout types have nothing referencing them there and exporting them produced no file.
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 pub struct RawLayout {
+    /// Program that must own the account. Raw layouts have no IDL owner lookup, so this check is
+    /// mandatory before any byte-level write.
+    pub owner: String,
     /// Exact account size. A mismatch means this is not the account the layout describes.
     /// Serialized camelCase for the JSON API; the alias keeps the YAML snake_case like its peers.
     #[serde(alias = "account_size")]
     #[cfg_attr(feature = "ts-bindings", ts(type = "number"))]
     pub account_size: usize,
-    /// Optional type tag. Omit for programs that have none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub magic: Option<RawMagic>,
+    /// Optional bytes that must already exist at the configured offset before any write occurs.
+    /// Serialized camelCase for the JSON API; the alias keeps the YAML snake_case like its peers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "expected_bytes"
+    )]
+    pub expected_bytes: Option<ExpectedBytes>,
 }
 
 impl RawLayout {
-    /// Validates every byte range a template can write before the template enters the registry.
+    /// Validates the layout guard and every byte range before a template enters the registry.
     pub fn validate_properties(&self, properties: &[Property]) -> Result<(), String> {
+        Pubkey::from_str(&self.owner).map_err(|error| {
+            format!(
+                "raw_layout owner '{}' is not a valid pubkey: {error}",
+                self.owner
+            )
+        })?;
         if self.account_size == 0 {
             return Err("raw_layout account_size must be greater than zero".to_string());
         }
 
-        if let Some(magic) = &self.magic {
-            let end = magic
+        if let Some(expected) = &self.expected_bytes {
+            let end = expected
                 .offset
-                .checked_add(magic.bytes.len())
-                .ok_or_else(|| "raw_layout magic offset overflow".to_string())?;
+                .checked_add(expected.bytes.len())
+                .ok_or_else(|| "raw_layout expected_bytes offset overflow".to_string())?;
             if end > self.account_size {
                 return Err(format!(
-                    "raw_layout magic at offset {} + {} bytes exceeds the {} byte account",
-                    magic.offset,
-                    magic.bytes.len(),
+                    "raw_layout expected_bytes at offset {} + {} bytes exceeds the {} byte account",
+                    expected.offset,
+                    expected.bytes.len(),
                     self.account_size
                 ));
             }
@@ -1250,6 +1265,14 @@ impl RawLayout {
                     property.path
                 ));
             }
+            if count > 1 && stride < encoding.width() {
+                return Err(format!(
+                    "writable raw-layout property '{}' has stride {}, smaller than its {} byte width",
+                    property.path,
+                    stride,
+                    encoding.width()
+                ));
+            }
 
             let final_offset = offset
                 .checked_add(
@@ -1273,7 +1296,19 @@ impl RawLayout {
     }
 
     /// Rejects an account that is not the shape this layout describes.
-    pub fn guard(&self, data: &[u8]) -> Result<(), String> {
+    pub fn guard(&self, owner: &Pubkey, data: &[u8]) -> Result<(), String> {
+        let expected_owner = Pubkey::from_str(&self.owner).map_err(|error| {
+            format!(
+                "raw_layout owner '{}' is not a valid pubkey: {error}",
+                self.owner
+            )
+        })?;
+        if owner != &expected_owner {
+            return Err(format!(
+                "account owner {owner} does not match expected owner {}",
+                self.owner
+            ));
+        }
         if data.len() != self.account_size {
             return Err(format!(
                 "account is {} bytes, the layout describes {}",
@@ -1281,15 +1316,15 @@ impl RawLayout {
                 self.account_size
             ));
         }
-        if let Some(magic) = &self.magic {
-            let end = magic
+        if let Some(expected) = &self.expected_bytes {
+            let end = expected
                 .offset
-                .checked_add(magic.bytes.len())
-                .ok_or_else(|| "magic offset overflow".to_string())?;
-            if end > data.len() || &data[magic.offset..end] != magic.bytes.as_slice() {
+                .checked_add(expected.bytes.len())
+                .ok_or_else(|| "expected_bytes offset overflow".to_string())?;
+            if end > data.len() || &data[expected.offset..end] != expected.bytes.as_slice() {
                 return Err(format!(
-                    "magic bytes at offset {} do not match; this is not the expected account",
-                    magic.offset
+                    "bytes at offset {} do not match expected_bytes; this is not the expected account",
+                    expected.offset
                 ));
             }
         }
@@ -1299,12 +1334,13 @@ impl RawLayout {
     /// Writes `values` into a copy of `data` using each property's offset and encoding.
     pub fn materialize(
         &self,
+        owner: &Pubkey,
         data: &[u8],
         properties: &[Property],
         values: &HashMap<String, serde_json::Value>,
         target_slot: Slot,
     ) -> Result<Vec<u8>, String> {
-        self.guard(data)?;
+        self.guard(owner, data)?;
         let mut out = data.to_vec();
         for (name, value) in values {
             let property = properties
@@ -1644,6 +1680,7 @@ mod tests {
     use std::collections::HashMap;
 
     use serde_json::json;
+    use solana_pubkey::Pubkey;
 
     use super::PdaSeed;
 
@@ -1791,8 +1828,9 @@ mod tests {
         use super::{Property, RawEncoding, RawLayout};
 
         let layout = RawLayout {
+            owner: Pubkey::default().to_string(),
             account_size: 16,
-            magic: None,
+            expected_bytes: None,
         };
         let mut property = Property::field("tail".to_string());
         property.offset = Some(12);
@@ -1800,6 +1838,7 @@ mod tests {
 
         let err = layout
             .materialize(
+                &Pubkey::default(),
                 &[0u8; 16],
                 &[property],
                 &HashMap::from([("tail".to_string(), json!(1))]),
@@ -1807,14 +1846,46 @@ mod tests {
             )
             .expect_err("a field crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+
+        let wrong_owner = Pubkey::new_unique();
+        let err = layout
+            .materialize(
+                &wrong_owner,
+                &[0u8; 16],
+                &[Property::field("unused".to_string())],
+                &HashMap::new(),
+                0,
+            )
+            .expect_err("a different owner program must be refused");
+        assert!(err.contains("does not match expected owner"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_serializes_the_expected_bytes_name() {
+        use super::{ExpectedBytes, RawLayout};
+
+        let json = serde_json::to_value(RawLayout {
+            owner: Pubkey::default().to_string(),
+            account_size: 16,
+            expected_bytes: Some(ExpectedBytes {
+                offset: 0,
+                bytes: vec![69, 88],
+            }),
+        })
+        .expect("serialize raw layout");
+
+        assert_eq!(json["owner"], Pubkey::default().to_string());
+        assert_eq!(json["expectedBytes"]["offset"], 0);
+        assert_eq!(json["expectedBytes"]["bytes"], json!([69, 88]));
     }
 
     #[test]
     fn i32_strided_writes_every_slot_and_nothing_between() {
         use super::{Property, RawEncoding, RawLayout};
         let layout = RawLayout {
+            owner: Pubkey::default().to_string(),
             account_size: 64,
-            magic: None,
+            expected_bytes: None,
         };
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
@@ -1825,6 +1896,7 @@ mod tests {
 
         let out = layout
             .materialize(
+                &Pubkey::default(),
                 &[0u8; 64],
                 &[property],
                 &HashMap::from([("ticks".to_string(), json!(-25_600))]),
@@ -1897,8 +1969,9 @@ mod tests {
     fn i32_strided_rejects_a_run_that_leaves_the_account() {
         use super::{Property, RawEncoding, RawLayout};
         let layout = RawLayout {
+            owner: Pubkey::default().to_string(),
             account_size: 32,
-            magic: None,
+            expected_bytes: None,
         };
         let mut property = Property::field("ticks".to_string());
         property.offset = Some(4);
@@ -1908,6 +1981,7 @@ mod tests {
         });
         let err = layout
             .materialize(
+                &Pubkey::default(),
                 &[0u8; 32],
                 &[property],
                 &HashMap::from([("ticks".to_string(), json!(1))]),
@@ -1915,6 +1989,28 @@ mod tests {
             )
             .expect_err("a run crossing the end must be refused");
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_overlapping_strided_writes() {
+        use super::{Property, RawEncoding, RawLayout};
+
+        let layout = RawLayout {
+            owner: Pubkey::default().to_string(),
+            account_size: 32,
+            expected_bytes: None,
+        };
+        let mut property = Property::field("ticks".to_string());
+        property.offset = Some(4);
+        property.encoding = Some(RawEncoding::I32Strided {
+            count: 2,
+            stride: 2,
+        });
+
+        let err = layout
+            .validate_properties(&[property])
+            .expect_err("a stride smaller than the encoded width must be rejected");
+        assert!(err.contains("smaller than its 4 byte width"), "{err}");
     }
 
     #[test]

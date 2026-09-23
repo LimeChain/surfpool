@@ -230,10 +230,13 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect::<HashMap<_, _>>();
-    t.raw_layout
-        .as_ref()
-        .expect("raw layout")
-        .materialize(data, &t.properties, &map, slot)
+    let layout = t.raw_layout.as_ref().expect("raw layout");
+    let owner = layout
+        .owner
+        .parse::<Pubkey>()
+        .unwrap_or_else(|e| panic!("{id}: invalid raw-layout owner: {e}"));
+    layout
+        .materialize(&owner, data, &t.properties, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
 }
 
@@ -427,7 +430,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
                 .raw_layout
                 .as_ref()
                 .unwrap()
-                .guard(market)
+                .guard(&accounts[0].owner, market)
                 .unwrap_or_else(|e| panic!("{id} rejected {market_address}: {e}"));
             assert_eq!(
                 apply_raw(id, market, &[], 0),
@@ -441,7 +444,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
                 .raw_layout
                 .as_ref()
                 .unwrap()
-                .guard(oracle)
+                .guard(&accounts[1].owner, oracle)
                 .unwrap_or_else(|e| panic!("{id} rejected {oracle_address}: {e}"));
             assert_eq!(
                 apply_raw(id, oracle, &[], 0),
@@ -500,7 +503,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
             .raw_layout
             .as_ref()
             .unwrap()
-            .guard(&vault.data);
+            .guard(&vault.owner, &vault.data);
         if vault.data.len() == 165 && vault.data[108] == 1 {
             guard.unwrap_or_else(|e| panic!("vault guard rejected {address}: {e}"));
             assert_eq!(
@@ -544,7 +547,7 @@ async fn solfi_raw_layouts_cover_every_initialized_market_and_reject_every_sibli
                     .raw_layout
                     .as_ref()
                     .unwrap()
-                    .guard(&account.data)
+                    .guard(&account.owner, &account.data)
                     .is_err(),
                 "{id} admitted uninitialized sibling {address}"
             );
@@ -714,16 +717,17 @@ async fn solfi_raw_guards_reject_corrupted_type_markers() {
     let registry = TemplateRegistry::new();
 
     let price = registry.get("solfi-price").expect("price template");
+    let price_layout = price.raw_layout.as_ref().unwrap();
+    let err = price_layout
+        .guard(&fork.market.owner, &fork.oracle.data)
+        .expect_err("the market program must not own a SolFi oracle account");
+    assert!(err.contains("does not match expected owner"), "{err}");
+
     let mut bad_oracle = fork.oracle.data.clone();
     bad_oracle[72] ^= 1;
     assert!(
-        price
-            .raw_layout
-            .as_ref()
-            .unwrap()
-            .guard(&bad_oracle)
-            .is_err(),
-        "oracle magic is the protection against a wrong 168-byte account"
+        price_layout.guard(&fork.oracle.owner, &bad_oracle).is_err(),
+        "expected oracle bytes must reject a wrong 168-byte account"
     );
 
     let spread = registry.get("solfi-spread").expect("spread template");
@@ -734,7 +738,7 @@ async fn solfi_raw_guards_reject_corrupted_type_markers() {
             .raw_layout
             .as_ref()
             .unwrap()
-            .guard(&bad_market)
+            .guard(&fork.market.owner, &bad_market)
             .is_err(),
         "MarketConfig initialized marker must be part of the guard"
     );
@@ -745,7 +749,7 @@ async fn solfi_raw_guards_reject_corrupted_type_markers() {
             .raw_layout
             .as_ref()
             .unwrap()
-            .guard(&vec![0; 164])
+            .guard(&fork.base_vault.owner, &vec![0; 164])
             .is_err(),
         "vault layout must reject non-token-account sizes"
     );
@@ -756,7 +760,7 @@ async fn solfi_raw_guards_reject_corrupted_type_markers() {
             .raw_layout
             .as_ref()
             .unwrap()
-            .guard(&wrong_state)
+            .guard(&fork.base_vault.owner, &wrong_state)
             .is_err(),
         "vault layout must reject a token account that is not initialized"
     );

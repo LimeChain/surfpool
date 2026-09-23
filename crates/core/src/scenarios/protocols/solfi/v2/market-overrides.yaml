@@ -3,8 +3,9 @@ version: v2
 account_type: Market
 
 raw_layout:
+  owner: SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF
   account_size: 1728
-  magic:
+  expected_bytes:
     offset: 704
     # The initialized marker at the start of the serialized MarketConfig.
     bytes: [1, 0, 0, 0, 0, 0, 0, 0]

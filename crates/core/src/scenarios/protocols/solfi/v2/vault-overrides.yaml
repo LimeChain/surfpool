@@ -3,8 +3,9 @@ version: v2
 account_type: TokenAccount
 
 raw_layout:
+  owner: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
   account_size: 165
-  magic:
+  expected_bytes:
     offset: 108
     # Classic SPL Token AccountState::Initialized.
     bytes: [1]
