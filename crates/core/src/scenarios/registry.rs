@@ -480,13 +480,13 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (1)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 61
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            61,
+            "Registry should load 61 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -500,8 +500,7 @@ mod tests {
         assert!(registry.contains("raydium-amm-swap-stats"));
         assert!(registry.contains("raydium-amm-custom"));
 
-        assert!(registry.contains("meteora-dlmm-sol-usdc"));
-        assert!(registry.contains("meteora-dlmm-usdt-sol"));
+        assert!(registry.contains("meteora-dlmm-pool-state"));
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
@@ -596,6 +595,13 @@ mod tests {
             raydium_templates.len(),
             5,
             "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
+        );
+
+        let meteora_templates = registry.by_protocol("Meteora");
+        assert_eq!(
+            meteora_templates.len(),
+            1,
+            "Should have 1 Meteora DLMM template"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
@@ -737,7 +743,7 @@ mod tests {
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
-        assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
+        assert!(ids.contains(&"meteora-dlmm-pool-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
         assert!(ids.contains(&"kamino-obligation-health".to_string()));
@@ -1395,5 +1401,38 @@ mod tests {
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn meteora_templates_expose_the_economic_levers() {
+        let registry = TemplateRegistry::new();
+
+        let template = registry
+            .get("meteora-dlmm-pool-state")
+            .expect("meteora-dlmm-pool-state should exist");
+        assert_eq!(template.account_type, "LbPair");
+        assert!(
+            !template.properties.iter().any(|p| p.path == "bin_step"),
+            "bin_step must not be exposed as a property"
+        );
+
+        for property in &template.properties {
+            assert!(
+                property
+                    .label
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} has no label",
+                property.path
+            );
+            assert!(
+                property
+                    .description
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} has no description",
+                property.path
+            );
+        }
     }
 }

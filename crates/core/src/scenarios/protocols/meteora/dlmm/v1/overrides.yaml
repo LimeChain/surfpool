@@ -10,20 +10,57 @@ tags:
   - defi
 
 templates:
-  - id: meteora-dlmm-sol-usdc
-    name: Override SOL/USDC DLMM Pool
-    description: Override Meteora DLMM SOL/USDC pool state with simulated values
+  - id: meteora-dlmm-pool-state
+    name: Override DLMM Pool State (By Address)
+    description: >-
+      Override any Meteora DLMM pool by passing its LbPair address: its price bin, its status
+      and its fees.
     idl_account_name: LbPair
-    properties: ["active_id", "status", "bin_step"]
-    address:
-      type: pubkey
-      value: BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y
+    properties:
+      - path: active_id
+        label: Active Bin ID
+        description: Bin the pool trades in, a raw signed i32 bin index (often negative).
+      - path: status
+        label: Pool Status
+        description: PairStatus, raw u8 - 0 enabled, 1 disabled (swaps rejected).
+      - path: parameters.base_factor
+        label: Base Fee Factor
+        description: Base swap fee factor, raw u16 (10000 at bin step 10 is a 0.1% fee).
+      - path: v_parameters.volatility_accumulator
+        label: Volatility Accumulator
+        description: Variable-fee driver, raw u32, 10000 per bin crossed; recomputed on every swap.
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
+      All values are raw on-chain units; nothing is scaled.
 
-  - id: meteora-dlmm-usdt-sol
-    name: Override USDT/SOL DLMM Pool
-    description: Override Meteora DLMM USDT/SOL pool state with simulated values
-    idl_account_name: LbPair
-    properties: ["active_id", "status", "bin_step"]
+      PICKING A POOL: pass the LbPair address as the account. Find one at
+      https://dlmm.datapi.meteora.ag/pools (filter by mint or bin step). The account must be
+      owned by LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo, 904 bytes, discriminator
+      21 0b 31 62 b5 65 b1 0d. Example: SOL/USDC at BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y
+      (bin step 10).
+
+      PRICE: price = (1 + bin_step / 10000) ^ active_id * 10 ^ (decimals_x - decimals_y), in
+      token Y per token X, where bin_step is the pool's own (the u16 at offset 80). Read the
+      live active_id first: it is signed and often negative. To move the price by a factor f,
+      add round(ln(f) / ln(1 + bin_step / 10000)) to the live value.
+
+      MOVING active_id IS NOT ENOUGH ON ITS OWN. A swap walks BinArray accounts, so the array
+      covering the new active bin must already exist and hold liquidity, otherwise the swap
+      fails or returns nothing. That array is the PDA ["bin_array", lb_pair,
+      floor(active_id / 70) as i64 LE] under LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo
+      (10136 bytes, floored division: active_id -2222 is index -32, not -31). Small moves that
+      stay inside the current array are the safe ones.
+
+      FEES: total fee = base fee + variable fee. The base fee fraction is
+      base_factor * bin_step * 1e-8 while parameters.base_fee_power_factor is 0. The variable
+      fee grows with v_parameters.volatility_accumulator, which the program recomputes on every
+      swap from the distance to v_parameters.index_reference (one bin = 10000), so an override
+      of it only holds until the next swap. base_factor is the durable fee lever.
+
+      STATUS: 0 enabled, 1 disabled. Set 1 to prove a router reacts to a dead pool.
+
+      bin_step is not exposed: it is the base of the bin math and a seed of the pool address.
+      To test a different bin step, pick a different pool.
     address:
       type: pubkey
-      value: HToiT8XK8GHgAT4N3oGXadc7opdApPwsbCL9tFRYa3Rg
