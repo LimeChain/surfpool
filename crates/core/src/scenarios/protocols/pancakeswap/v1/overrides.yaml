@@ -1,0 +1,423 @@
+protocol: PancakeSwap
+version: v1
+account_type: PoolState
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - concentrated-liquidity
+  - defi
+
+# Protocol-specific constants that can be referenced by templates
+constants:
+  # PancakeSwap CLMM AMM Config index (for dynamic derivation)
+  # The AMM config PDA is derived as: ["amm_config", index.to_be_bytes()]
+  # Captured 2026-09-21 from all 22 live AmmConfig accounts on mainnet
+  # (getProgramAccounts, dataSize 117, AmmConfig discriminator memcmp).
+  amm_config_index:
+    label: Fee Tier (by index)
+    description: |
+      AMM config index for dynamic PDA derivation, captured live 2026-09-21 from all
+      22 AmmConfig accounts owned by the PancakeSwap program.
+      The config address is derived from ["amm_config", index.to_be_bytes()].
+    options:
+      - id: index_0
+        label: "Fee tier 0.01% (tick spacing 10)"
+        description: AMM config index 0, trade fee 100 / 1,000,000
+        value: "0"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 1
+          derived_address: HZzqEWHEvSiqYt6PxxLs7zXETmqGuryqfmvggjAkqisp
+      - id: index_1
+        label: "Fee tier 0.25% (tick spacing 60)"
+        description: AMM config index 1, trade fee 2500 / 1,000,000
+        value: "1"
+        metadata:
+          tick_spacing: 60
+          fee_rate_bps: 25
+          derived_address: He4brjK7TRKiqJ8szpRmhuueDwC4837BFRRBmWfmjo14
+      - id: index_2
+        label: "Fee tier 0.05% (tick spacing 10)"
+        description: AMM config index 2, trade fee 500 / 1,000,000
+        value: "2"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 5
+          derived_address: GUNzSDNbhcWpS6Ymj7kgyYmhgHimwfzpRdhJnbKDAi9K
+      - id: index_3
+        label: "Fee tier 1% (tick spacing 120)"
+        description: AMM config index 3, trade fee 10000 / 1,000,000
+        value: "3"
+        metadata:
+          tick_spacing: 120
+          fee_rate_bps: 100
+          derived_address: EtgcyD5Yk6Kuqf1fahAjTrsRCDgoUmgeZ7xJDS3giaE
+      - id: index_4
+        label: "Fee tier 0.01% (tick spacing 1)"
+        description: AMM config index 4, trade fee 100 / 1,000,000
+        value: "4"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 1
+          derived_address: EvKEMSRSdxJUcpVTaB2isqMyF5G4yETvMbQxbfwSuwZa
+      - id: index_5
+        label: "Fee tier 0.05% (tick spacing 1)"
+        description: AMM config index 5, trade fee 500 / 1,000,000
+        value: "5"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 5
+          derived_address: 2cc6jRdZgmN7uG3PxbuVEkYwQNPS7qQinKYYCwG53cpr
+      - id: index_6
+        label: "Fee tier 0.02% (tick spacing 1)"
+        description: AMM config index 6, trade fee 200 / 1,000,000
+        value: "6"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 2
+          derived_address: GcJVsj5MxokA4eRMUkB4cJHuZ6o9Y8MooXBViN5F1mYW
+      - id: index_7
+        label: "Fee tier 0.03% (tick spacing 1)"
+        description: AMM config index 7, trade fee 300 / 1,000,000
+        value: "7"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 3
+          derived_address: 2zmg7259ahZkrSn6M3PEM7eFvEfBU8obgfVHT3AL9Qwu
+      - id: index_8
+        label: "Fee tier 0.04% (tick spacing 1)"
+        description: AMM config index 8, trade fee 400 / 1,000,000
+        value: "8"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 4
+          derived_address: 5kosJrgZ6rHyqqweWGpp11nNqdwPTHbyXVczvzPM9h7M
+      - id: index_9
+        label: "Fee tier 2% (tick spacing 120)"
+        description: AMM config index 9, trade fee 20000 / 1,000,000
+        value: "9"
+        metadata:
+          tick_spacing: 120
+          fee_rate_bps: 200
+          derived_address: 2W1ToXSAUDwRQtZdgCjgXmFfiSvPmGDPx3CijKpVKArw
+      - id: index_10
+        label: "Fee tier 0.1% (tick spacing 10)"
+        description: AMM config index 10, trade fee 1000 / 1,000,000
+        value: "10"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 10
+          derived_address: 5szFcjKA7UU93nhgb3fE1o1cfcurwpFQEzywZyb2qAYF
+      - id: index_11
+        label: "Fee tier 0.15% (tick spacing 10)"
+        description: AMM config index 11, trade fee 1500 / 1,000,000
+        value: "11"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 15
+          derived_address: J1SzfvdJ3p4ixWdyhoHmVpnixfjUBcEZiJ3M66JHGTKz
+      - id: index_12
+        label: "Fee tier 0.16% (tick spacing 10)"
+        description: AMM config index 12, trade fee 1600 / 1,000,000
+        value: "12"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 16
+          derived_address: 5B9wMiyqe7maHxAKACrTiGYwTeSX3ZmpmxRgALUMTcdZ
+      - id: index_13
+        label: "Fee tier 0.18% (tick spacing 10)"
+        description: AMM config index 13, trade fee 1800 / 1,000,000
+        value: "13"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 18
+          derived_address: 5tbvQTWV2btAgX5NwzCbd8aFwTfDWeCZANRQUcWuKRan
+      - id: index_14
+        label: "Fee tier 0.2% (tick spacing 10)"
+        description: AMM config index 14, trade fee 2000 / 1,000,000
+        value: "14"
+        metadata:
+          tick_spacing: 10
+          fee_rate_bps: 20
+          derived_address: G3BrCQzNu93v1acayMA23CmCMH8tf6iAFb3PYUHUHtcg
+      - id: index_15
+        label: "Fee tier 0.4% (tick spacing 60)"
+        description: AMM config index 15, trade fee 4000 / 1,000,000
+        value: "15"
+        metadata:
+          tick_spacing: 60
+          fee_rate_bps: 40
+          derived_address: 2G7HZiydoxtDqQU5SPsyc66nCGRUaP6H85FRKunKpmPs
+      - id: index_16
+        label: "Fee tier 0.6% (tick spacing 60)"
+        description: AMM config index 16, trade fee 6000 / 1,000,000
+        value: "16"
+        metadata:
+          tick_spacing: 60
+          fee_rate_bps: 60
+          derived_address: A3qKMAUV2JsBUeRssKeLm2xJr9w9PKFNWGxPfSV6E7vu
+      - id: index_17
+        label: "Fee tier 0.8% (tick spacing 60)"
+        description: AMM config index 17, trade fee 8000 / 1,000,000
+        value: "17"
+        metadata:
+          tick_spacing: 60
+          fee_rate_bps: 80
+          derived_address: GaWZjVasTQLCNmag5n34eyhhD4T56TN39ckNcuUmu7x4
+      - id: index_18
+        label: "Fee tier 3% (tick spacing 120)"
+        description: AMM config index 18, trade fee 30000 / 1,000,000
+        value: "18"
+        metadata:
+          tick_spacing: 120
+          fee_rate_bps: 300
+          derived_address: 3EKNN4mNKSzBnfB5gC9q4eeL7WMWBrnuaoagMQVCL2vq
+      - id: index_19
+        label: "Fee tier 4% (tick spacing 120)"
+        description: AMM config index 19, trade fee 40000 / 1,000,000
+        value: "19"
+        metadata:
+          tick_spacing: 120
+          fee_rate_bps: 400
+          derived_address: GeNe8uDSMpCip17DmToci8XNhTgwJJ4QdXP3HNrZbA21
+      - id: index_20
+        label: "Fee tier 0.3% (tick spacing 60)"
+        description: AMM config index 20, trade fee 3000 / 1,000,000
+        value: "20"
+        metadata:
+          tick_spacing: 60
+          fee_rate_bps: 30
+          derived_address: 4LTiLQbjodjCy8dFWqgUx6fzQ93Pq37c5jWGX9jRsRtC
+      - id: index_21
+        label: "Fee tier 0.08% (tick spacing 1)"
+        description: AMM config index 21, trade fee 800 / 1,000,000
+        value: "21"
+        metadata:
+          tick_spacing: 1
+          fee_rate_bps: 8
+          derived_address: 9rrh2c8w15HExZnLFzcEgkvHg846TBBFEPUuFG7RMGmm
+
+  # Token mints loaded from verified tokens registry
+  token_mint:
+    label: Token
+    description: Select a token mint address from verified tokens
+    source: verified_tokens
+
+templates:
+  - id: pancakeswap-clmm-custom
+    name: Override Any CLMM Pool (Custom)
+    description: |
+      Override any PancakeSwap CLMM pool by specifying the fee tier index and token
+      mints. Both the AMM config address AND the pool address are dynamically derived:
+      - AMM Config: PDA from ["amm_config", config_index.to_be_bytes()]
+      - Pool: PDA from ["pool", amm_config, token_mint_0, token_mint_1]
+    idl_account_name: PoolState
+    properties:
+      - path: liquidity
+        label: Liquidity
+        description: Total liquidity in the current tick range (raw u128, no decimals)
+      - path: sqrt_price_x64
+        label: Square Root Price (Q64.64)
+        description: sqrt(token_1/token_0) in Q64.64 fixed point (raw u128); must agree with tick_current
+      - path: tick_current
+        label: Current Tick
+        description: Tick index of the current price (i32); must agree with sqrt_price_x64
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
+      - path: config_index
+        type: constant_ref
+        label: Fee Tier
+        constant: amm_config_index
+        description: Fee tier of the pool. Together with the two mints it selects the pool address.
+      - path: token_mint_0
+        type: constant_ref
+        label: Token 0 Mint
+        constant: token_mint
+        description: First mint of the pair as the program stores it, the lower of the two by raw bytes.
+      - path: token_mint_1
+        type: constant_ref
+        label: Token 1 Mint
+        constant: token_mint
+        description: Second mint of the pair as the program stores it, the higher of the two by raw bytes.
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override keeps its live value; set it to false only for a later override
+      that builds on state an earlier override in the same scenario already prepared.
+
+      CRITICAL: token_mint_0 and token_mint_1 must be SPL TOKEN MINT addresses, NOT
+      program IDs!
+
+      CORRECT examples of token mints:
+      - SOL (wrapped): So11111111111111111111111111111111111111112
+      - USDC: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+
+      WRONG - these are PROGRAM IDs, not token mints:
+      - HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq (PancakeSwap CLMM)
+      - CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK (Raydium CLMM)
+
+      Always use get_token_address tool to look up token mints by symbol (e.g., "SOL",
+      "USDC").
+
+      MINT ORDER: token_mint_0 must be the mint whose raw 32-byte pubkey is numerically
+      smaller than token_mint_1's (compare the decoded bytes, not the base58 string).
+      The pool PDA is ["pool", amm_config, token_mint_0, token_mint_1] in that exact
+      order, so swapping the two mints derives a different, almost certainly empty,
+      address. token_mint_0/token_mint_1 are plain property_ref seeds here and the
+      caller is responsible for the ordering.
+
+      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
+      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
+        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
+        human-readable price
+      - tick_current = floor(log(raw price) / log(1.0001))
+      - a swap walks TickArrayState accounts starting from tick_current; if
+        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
+        never initialized, the swap fails. Overriding one of the pair without
+        recomputing the other from the formula above leaves the pool in a state no
+        real swap can trade against.
+
+      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
+      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
+      price is still bounded by what the vaults actually hold, so fund the vaults (or
+      accept that only small trades succeed) when the override should support a real
+      swap at depth.
+
+      FINDING A POOL: the PancakeSwap CLMM program is
+      HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq. A live PoolState account is 1544
+      bytes and starts with the 8-byte discriminator [247, 237, 227, 245, 215, 195,
+      222, 70]. The deepest SOL/USDC pool is DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ
+      (fee tier index 0, tick spacing 10). Browse pools at
+      https://solana.pancakeswap.finance/liquidity-pools/.
+    address:
+      type: pda
+      program_id: HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
+      seeds:
+        - type: string
+          value: pool
+        # Dynamically derive the AMM config PDA from the index
+        - type: derived_pda
+          program_id: HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
+          seeds:
+            - type: string
+              value: amm_config
+            - type: u16_be_ref
+              value: config_index
+        - type: property_ref
+          value: token_mint_0
+        - type: property_ref
+          value: token_mint_1
+
+  - id: pancakeswap-clmm-pool-state
+    name: Override CLMM Pool State (By Address)
+    description: |
+      Override any PancakeSwap CLMM pool by its own address, for a pubkey the caller
+      already has (no mint/config lookup).
+    idl_account_name: PoolState
+    properties:
+      - path: liquidity
+        label: Liquidity
+        description: Total liquidity in the current tick range (raw u128, no decimals)
+      - path: sqrt_price_x64
+        label: Square Root Price (Q64.64)
+        description: sqrt(token_1/token_0) in Q64.64 fixed point (raw u128); must agree with tick_current
+      - path: tick_current
+        label: Current Tick
+        description: Tick index of the current price (i32); must agree with sqrt_price_x64
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override keeps its live value; set it to false only for a later override
+      that builds on state an earlier override in the same scenario already prepared.
+
+      This template takes the pool's own address directly (no PDA derivation): supply a
+      pubkey you already have. If you only have the fee tier index and the two mints,
+      use pancakeswap-clmm-custom instead, which derives the address for you.
+
+      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
+      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
+        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
+        human-readable price
+      - tick_current = floor(log(raw price) / log(1.0001))
+      - a swap walks TickArrayState accounts starting from tick_current; if
+        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
+        never initialized, the swap fails. Overriding one of the pair without
+        recomputing the other from the formula above leaves the pool in a state no
+        real swap can trade against.
+
+      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
+      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
+      price is still bounded by what the vaults actually hold, so fund the vaults (or
+      accept that only small trades succeed) when the override should support a real
+      swap at depth.
+
+      FINDING A POOL: the PancakeSwap CLMM program is
+      HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq. A live PoolState account is 1544
+      bytes and starts with the 8-byte discriminator [247, 237, 227, 245, 215, 195,
+      222, 70]. Three known pools: 1Piz3kL4v9fcS8GRkArpskfDG9BeSVc5eHMRjnvSfoX,
+      DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ (SOL/USDC, the deepest),
+      14qfdHrPWhduozgCkwosL9AC3DnKY12GySXP9bz3BJ6F. Browse pools at
+      https://solana.pancakeswap.finance/liquidity-pools/.
+    address:
+      type: pubkey
+
+  - id: pancakeswap-clmm-amm-config
+    name: Override CLMM Fee Tier (AmmConfig)
+    description: |
+      Override an AmmConfig fee tier for PancakeSwap CLMM. The address is a PDA derived
+      from ["amm_config", index.to_be_bytes()]. Every pool created with this config
+      index shares these fee rates.
+    idl_account_name: AmmConfig
+    properties:
+      - path: trade_fee_rate
+        label: Trade Fee Rate
+        description: Fee on the input amount, parts per million (2500 = 0.25%); below 1,000,000
+      - path: protocol_fee_rate
+        label: Protocol Fee Rate
+        description: Protocol treasury's share of the collected trade fee, parts per million
+      - path: fund_fee_rate
+        label: Fund Fee Rate
+        description: Fund owner's share of the collected trade fee, parts per million
+      - path: config_index
+        type: constant_ref
+        label: Fee Tier Index
+        constant: amm_config_index
+        description: Fee tier whose AmmConfig account is overridden. The address derives from this index.
+    llm_context: |
+      Set fetchBeforeUse: true so the live account is forked first and every field you
+      don't override (owner, fund_owner, tick_spacing, bump) keeps its live value; set
+      it to false only for a later override that builds on state an earlier override in
+      the same scenario already prepared.
+
+      BLAST RADIUS: this AmmConfig is shared by every pool created with the same index
+      - overriding it changes fees for all of them at once, not one pool. To change a
+      single pool's price instead, use pancakeswap-clmm-pool-state or
+      pancakeswap-clmm-custom.
+
+      UNITS AND DENOMINATOR (all three fields use FEE_RATE_DENOMINATOR_VALUE = 1,000,000):
+      - trade_fee_rate is a fraction of TRADE VOLUME: fee = amount_in * trade_fee_rate
+        / 1,000,000. E.g. 2500 = 0.25% (25 bps). The program requires trade_fee_rate to
+        stay strictly below 1,000,000.
+      - protocol_fee_rate and fund_fee_rate are fractions of the FEE trade_fee_rate
+        ALREADY COLLECTED, not of trade volume: protocol_cut = trade_fee *
+        protocol_fee_rate / 1,000,000 (and likewise for fund_fee_rate). E.g. 160000
+        means 16% of the trade fee goes to the protocol treasury, not 16% of the trade.
+        The program requires protocol_fee_rate + fund_fee_rate to stay at or below
+        1,000,000.
+
+      This template has no sqrt_price_x64/tick_current or mint fields of its own; for
+      an actual price or tick override on a specific pool use
+      pancakeswap-clmm-pool-state or pancakeswap-clmm-custom, and keep this config's
+      fee-rate change and that pool's price change in the same scenario when both need
+      to move together.
+    address:
+      type: pda
+      program_id: HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
+      seeds:
+        - type: string
+          value: amm_config
+        - type: u16_be_ref
+          value: config_index

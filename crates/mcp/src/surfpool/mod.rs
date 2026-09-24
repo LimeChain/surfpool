@@ -20,11 +20,13 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
+            pancakeswap::v1::PANCAKESWAP,
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
             },
             raydium::v3::price_shock_builder::{
-                RAYDIUM, build_price_shock_scenario, plan_price_shock, validate_price_factor,
+                ClmmProgram, RAYDIUM, build_price_shock_scenario, plan_price_shock,
+                validate_price_factor,
             },
         },
     },
@@ -152,6 +154,23 @@ pub struct CreatePumpGraduationScenarioParams {
 pub struct CreateRaydiumClmmPriceShockScenarioParams {
     #[schemars(
         description = "Base58 address of the Raydium CLMM (amm_v3) pool account, the PoolState owned by CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK."
+    )]
+    pub pool: String,
+    #[schemars(
+        description = "Multiplier applied to the pool's current price: 0.5 halves it, 4 quadruples it. Sent as a decimal string, like the other scenario tools. Must be finite, greater than zero, and not 1."
+    )]
+    pub price_factor: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePancakeswapPriceShockScenarioParams {
+    #[schemars(
+        description = "Base58 address of the PancakeSwap CLMM pool account, the PoolState owned by HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq."
     )]
     pub pool: String,
     #[schemars(
@@ -509,6 +528,65 @@ impl Surfpool {
         let response = RegisterScenarioResponse::success(url);
         let json = serde_json::to_string(&response).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    async fn stage_clmm_price_shock(
+        &self,
+        program: &ClmmProgram,
+        label: &str,
+        pool: &str,
+        price_factor: &str,
+        surfnet_port: Option<u16>,
+    ) -> Result<CallToolResult, McpError> {
+        let pool = match Pubkey::from_str(pool.trim()) {
+            Ok(pool) => pool,
+            Err(error) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid pool address: {error}"
+                )));
+            }
+        };
+        let price_factor = match price_factor.trim().parse::<f64>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid price factor {price_factor:?}: expected a decimal number such as 0.5"
+                )));
+            }
+        };
+        if let Err(error) = validate_price_factor(price_factor) {
+            return Ok(scenario_tool_error(error.to_string()));
+        }
+
+        let pool_account = match self.fetch_surfnet_accounts(surfnet_port, &[pool]).await {
+            Ok(accounts) => match accounts.into_iter().next().flatten() {
+                Some(account) => account,
+                None => {
+                    return Ok(scenario_tool_error(format!(
+                        "{label} pool {pool} was not found"
+                    )));
+                }
+            },
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let plan = match plan_price_shock(*program, pool, &pool_account, price_factor) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        // The tick array's address falls out of the shocked tick, so it can only be read after the pool.
+        let tick_array = match self
+            .fetch_surfnet_accounts(surfnet_port, &[plan.tick_array])
+            .await
+        {
+            Ok(accounts) => accounts.into_iter().next().flatten(),
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let scenario = match build_price_shock_scenario(plan, tick_array.as_ref()) {
+            Ok(scenario) => scenario,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        self.stage_scenario(scenario).await
     }
 }
 
@@ -1052,59 +1130,31 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<CreateRaydiumClmmPriceShockScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
-        let pool = match Pubkey::from_str(params.pool.trim()) {
-            Ok(pool) => pool,
-            Err(error) => {
-                return Ok(scenario_tool_error(format!(
-                    "Invalid pool address: {error}"
-                )));
-            }
-        };
-        let price_factor = match params.price_factor.trim().parse::<f64>() {
-            Ok(price_factor) => price_factor,
-            Err(_) => {
-                return Ok(scenario_tool_error(format!(
-                    "Invalid price factor {:?}: expected a decimal number such as 0.5",
-                    params.price_factor
-                )));
-            }
-        };
-        if let Err(error) = validate_price_factor(price_factor) {
-            return Ok(scenario_tool_error(error.to_string()));
-        }
+        self.stage_clmm_price_shock(
+            &RAYDIUM,
+            "Raydium CLMM",
+            &params.pool,
+            &params.price_factor,
+            params.surfnet_port,
+        )
+        .await
+    }
 
-        let pool_account = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[pool])
-            .await
-        {
-            Ok(accounts) => match accounts.into_iter().next().flatten() {
-                Some(account) => account,
-                None => {
-                    return Ok(scenario_tool_error(format!(
-                        "Raydium CLMM pool {pool} was not found"
-                    )));
-                }
-            },
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let plan = match plan_price_shock(RAYDIUM, pool, &pool_account, price_factor) {
-            Ok(plan) => plan,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-
-        // The tick array's address falls out of the shocked tick, so it can only be read after the pool.
-        let tick_array = match self
-            .fetch_surfnet_accounts(params.surfnet_port, &[plan.tick_array])
-            .await
-        {
-            Ok(accounts) => accounts.into_iter().next().flatten(),
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-        let scenario = match build_price_shock_scenario(plan, tick_array.as_ref()) {
-            Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error.to_string())),
-        };
-        self.stage_scenario(scenario).await
+    #[tool(
+        description = "Creates an editable PancakeSwap CLMM price shock scenario: moves the pool's sqrt_price_x64 by priceFactor and recomputes the matching tick_current. If validation fails, report that error and do not retry. The backend validates the factor, the pool's owner, size and discriminator, and that the tick array covering the new tick already exists."
+    )]
+    async fn create_pancakeswap_price_shock_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePancakeswapPriceShockScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stage_clmm_price_shock(
+            &PANCAKESWAP,
+            "PancakeSwap CLMM",
+            &params.pool,
+            &params.price_factor,
+            params.surfnet_port,
+        )
+        .await
     }
 
     #[tool(
@@ -1466,6 +1516,54 @@ mod tests {
             let result = surfpool
                 .create_raydium_clmm_price_shock_scenario(Parameters(
                     CreateRaydiumClmmPriceShockScenarioParams {
+                        pool: pool.to_string(),
+                        price_factor: price_factor.to_string(),
+                        surfnet_port: None,
+                    },
+                ))
+                .await
+                .expect("tool result");
+            let error = json_of(&result)["error"]
+                .as_str()
+                .expect("error")
+                .to_string();
+            assert!(error.contains(expected), "{pool} x{price_factor}: {error}");
+        }
+    }
+
+    #[test]
+    fn pancakeswap_price_shock_params_are_camel_case_on_the_wire() {
+        let schema = serde_json::to_value(schemars::schema_for!(
+            CreatePancakeswapPriceShockScenarioParams
+        ))
+        .expect("schema");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(properties.contains_key("priceFactor"), "{properties:?}");
+        assert!(properties.contains_key("surfnetPort"), "{properties:?}");
+        assert!(!properties.contains_key("price_factor"), "{properties:?}");
+        let required = schema["required"].as_array().expect("required list");
+        assert!(
+            !required.contains(&serde_json::json!("surfnetPort")),
+            "{required:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pancakeswap_price_shock_rejects_invalid_inputs_before_rpc() {
+        let surfpool = Surfpool::new();
+        for (pool, price_factor, expected) in [
+            (
+                "DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ",
+                "half",
+                "expected a decimal number",
+            ),
+            ("not-a-pool", "0.5", "Invalid pool address"),
+        ] {
+            let result = surfpool
+                .create_pancakeswap_price_shock_scenario(Parameters(
+                    CreatePancakeswapPriceShockScenarioParams {
                         pool: pool.to_string(),
                         price_factor: price_factor.to_string(),
                         surfnet_port: None,
