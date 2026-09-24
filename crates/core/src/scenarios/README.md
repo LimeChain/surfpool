@@ -21,6 +21,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 - **Raydium AMM v4 / CLMM** - Classic constant-product pools and concentrated-liquidity pools, with pool state, fees, and swap stats override templates. See [protocols/raydium/v4/README.md](./protocols/raydium/v4/README.md) and [protocols/raydium/v3/README.md](./protocols/raydium/v3/README.md)
+- **PancakeSwap CLMM (Solana)** - Concentrated liquidity AMM, a fork of Raydium CLMM with identical account layouts. See [protocols/pancakeswap/README.md](./protocols/pancakeswap/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 

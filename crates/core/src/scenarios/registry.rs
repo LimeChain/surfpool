@@ -60,6 +60,10 @@ pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/
 pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pump-amm/v1/overrides.yaml");
 
+pub const PANCAKESWAP_V1_IDL_CONTENT: &str = include_str!("./protocols/pancakeswap/v1/idl.json");
+pub const PANCAKESWAP_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pancakeswap/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -80,6 +84,7 @@ impl TemplateRegistry {
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
         default.load_pump_overrides();
+        default.load_pancakeswap_overrides();
         default
     }
 
@@ -176,6 +181,14 @@ impl TemplateRegistry {
             PUMP_AMM_V1_IDL_CONTENT,
             PUMP_AMM_V1_OVERRIDES_CONTENT,
             "pump-amm",
+        );
+    }
+
+    pub fn load_pancakeswap_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PANCAKESWAP_V1_IDL_CONTENT,
+            PANCAKESWAP_V1_OVERRIDES_CONTENT,
+            "pancakeswap",
         );
     }
 
@@ -407,6 +420,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pancakeswap_amm_config_options_derive_their_documented_address() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("pancakeswap-clmm-amm-config")
+            .expect("template");
+        let custom = registry.get("pancakeswap-clmm-custom").expect("template");
+
+        let options = &custom
+            .constants
+            .get("amm_config_index")
+            .expect("amm_config_index constant")
+            .options;
+        assert_eq!(options.len(), 22, "22 live AmmConfig accounts");
+
+        for option in options {
+            let expected = option
+                .metadata
+                .get("derived_address")
+                .and_then(|address| address.as_str())
+                .map(|address| Pubkey::from_str(address).expect("a valid address"))
+                .unwrap_or_else(|| panic!("option {} documents no derived_address", option.id));
+
+            let values = HashMap::from([(
+                "config_index".to_string(),
+                serde_json::Value::String(option.value.clone()),
+            )]);
+
+            assert_eq!(
+                template
+                    .address
+                    .resolve(Some(&values))
+                    .unwrap_or_else(|| panic!("option {} did not resolve", option.id)),
+                expected,
+                "option {}",
+                option.id
+            );
+        }
+    }
+
+    #[test]
+    fn pancakeswap_template_derives_a_live_pool() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("pancakeswap-clmm-custom").expect("template");
+
+        let values = HashMap::from([
+            (
+                "config_index".to_string(),
+                serde_json::Value::String("0".to_string()),
+            ),
+            (
+                "token_mint_0".to_string(),
+                serde_json::Value::String(
+                    "CGiwPp7bzmpYkUChduemtXKMZsUB54hB82tuFR7euJ8R".to_string(),
+                ),
+            ),
+            (
+                "token_mint_1".to_string(),
+                serde_json::Value::String(
+                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            template.address.resolve(Some(&values)).expect("resolves"),
+            Pubkey::from_str("1Piz3kL4v9fcS8GRkArpskfDG9BeSVc5eHMRjnvSfoX").expect("address"),
+        );
+    }
+
     /// Both singleton addresses are documented in pump-public-docs: the Pump Global
     /// account at 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf and the PumpSwap
     /// GlobalConfig at ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw.
@@ -493,11 +576,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (3) + Raydium AMM v4 (3) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 63
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + PancakeSwap CLMM (3) = 66
         assert_eq!(
             registry.count(),
-            63,
-            "Registry should load 63 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -569,6 +652,10 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+
+        assert!(registry.contains("pancakeswap-clmm-custom"));
+        assert!(registry.contains("pancakeswap-clmm-pool-state"));
+        assert!(registry.contains("pancakeswap-clmm-amm-config"));
     }
 
     #[test]
@@ -690,6 +777,13 @@ mod tests {
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        let pancakeswap_templates = registry.by_protocol("PancakeSwap");
+        assert_eq!(
+            pancakeswap_templates.len(),
+            3,
+            "Should have 3 PancakeSwap templates"
         );
     }
 
