@@ -19,8 +19,13 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
-        protocols::pump::v1::graduation_builder::{
-            build_pump_graduation_scenario, pump_graduation_addresses,
+        protocols::{
+            pump::v1::graduation_builder::{
+                build_pump_graduation_scenario, pump_graduation_addresses,
+            },
+            whirlpool::v1::price_shock_builder::{
+                build_price_shock_scenario, plan_price_shock, validate_price_factor,
+            },
         },
     },
     solana_account::Account,
@@ -136,6 +141,23 @@ pub struct CreatePumpGraduationScenarioParams {
         description = "Live Token-2022 Pump mint. If validation fails, report the error and do not retry without tokenMint."
     )]
     pub token_mint: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWhirlpoolPriceShockScenarioParams {
+    #[schemars(
+        description = "Base58 address of the Whirlpool pool account, owned by whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc."
+    )]
+    pub pool: String,
+    #[schemars(
+        description = "Multiplier applied to the pool's current price: 0.5 halves it, 4 quadruples it. Sent as a decimal string, like the other scenario tools. Must be finite, greater than zero, and not 1."
+    )]
+    pub price_factor: String,
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
@@ -1024,6 +1046,68 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Creates an editable Whirlpool price shock scenario: moves the pool's sqrt_price by priceFactor and recomputes the matching tick_current_index. If validation fails, report that error and do not retry. The backend validates the factor, the pool's owner, size and discriminator, and that the tick array covering the new tick already exists."
+    )]
+    async fn create_whirlpool_price_shock_scenario(
+        &self,
+        Parameters(params): Parameters<CreateWhirlpoolPriceShockScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let pool = match Pubkey::from_str(params.pool.trim()) {
+            Ok(pool) => pool,
+            Err(error) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid pool address: {error}"
+                )));
+            }
+        };
+        let price_factor = match params.price_factor.trim().parse::<f64>() {
+            Ok(price_factor) => price_factor,
+            Err(_) => {
+                return Ok(scenario_tool_error(format!(
+                    "Invalid price factor {:?}: expected a decimal number such as 0.5",
+                    params.price_factor
+                )));
+            }
+        };
+        if let Err(error) = validate_price_factor(price_factor) {
+            return Ok(scenario_tool_error(error.to_string()));
+        }
+
+        let pool_account = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[pool])
+            .await
+        {
+            Ok(accounts) => match accounts.into_iter().next().flatten() {
+                Some(account) => account,
+                None => {
+                    return Ok(scenario_tool_error(format!(
+                        "Whirlpool pool {pool} was not found"
+                    )));
+                }
+            },
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let plan = match plan_price_shock(pool, &pool_account, price_factor) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+
+        // The tick array's address falls out of the shocked tick, so it can only be read after the pool.
+        let tick_array = match self
+            .fetch_surfnet_accounts(params.surfnet_port, &[plan.tick_array])
+            .await
+        {
+            Ok(accounts) => accounts.into_iter().next().flatten(),
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+        let scenario = match build_price_shock_scenario(plan, tick_array.as_ref()) {
+            Ok(scenario) => scenario,
+            Err(error) => return Ok(scenario_tool_error(error.to_string())),
+        };
+        self.stage_scenario(scenario).await
+    }
+
+    #[tool(
         description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
@@ -1347,6 +1431,56 @@ mod tests {
                 .expect("error")
                 .contains("Invalid token mint")
         );
+    }
+
+    #[test]
+    fn whirlpool_price_shock_params_are_camel_case_on_the_wire() {
+        let listed = Surfpool::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "create_whirlpool_price_shock_scenario")
+            .expect("the tool is advertised by tools/list");
+        let schema = serde_json::to_value(&listed.input_schema).expect("input schema");
+        let properties = schema["properties"]
+            .as_object()
+            .expect("input schema has properties");
+        assert!(properties.contains_key("priceFactor"), "{properties:?}");
+        assert!(properties.contains_key("surfnetPort"), "{properties:?}");
+        assert!(!properties.contains_key("price_factor"), "{properties:?}");
+        let required = schema["required"].as_array().expect("required list");
+        assert!(
+            !required.contains(&serde_json::json!("surfnetPort")),
+            "{required:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn whirlpool_price_shock_rejects_invalid_inputs_before_rpc() {
+        let surfpool = Surfpool::new();
+        for (pool, price_factor, expected) in [
+            ("not-a-pool", "0.5", "Invalid pool address"),
+            (
+                "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+                "half",
+                "expected a decimal number",
+            ),
+        ] {
+            let result = surfpool
+                .create_whirlpool_price_shock_scenario(Parameters(
+                    CreateWhirlpoolPriceShockScenarioParams {
+                        pool: pool.to_string(),
+                        price_factor: price_factor.to_string(),
+                        surfnet_port: None,
+                    },
+                ))
+                .await
+                .expect("tool result");
+            let error = json_of(&result)["error"]
+                .as_str()
+                .expect("error")
+                .to_string();
+            assert!(error.contains(expected), "{pool} x {price_factor}: {error}");
+        }
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {

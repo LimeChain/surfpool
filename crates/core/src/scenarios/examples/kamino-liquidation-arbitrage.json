@@ -35,9 +35,9 @@
       }
     },
     {
-      "id": "whirlpool-popcat-sol-depth",
-      "templateId": "whirlpool-popcat-sol",
-      "label": "Deepen POPCAT/SOL so the exit does not slip",
+      "id": "whirlpool-sol-usdc-ts4-depth",
+      "templateId": "whirlpool-pool-state",
+      "label": "Deepen the SOL/USDC (tick spacing 4) pool so the exit does not slip",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
@@ -49,8 +49,8 @@
       }
     },
     {
-      "id": "whirlpool-sol-usdc-depth",
-      "templateId": "whirlpool-sol-usdc",
+      "id": "whirlpool-sol-usdc-ts64-depth",
+      "templateId": "whirlpool-pool-state",
       "label": "Deepen SOL/USDC to close the route back to USDC",
       "scenarioRelativeSlot": 0,
       "enabled": true,
