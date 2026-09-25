@@ -1,0 +1,77 @@
+protocol: GoonFi
+version: v2
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+constants:
+  market:
+    label: GoonFi market vault
+    description: Choose a GoonFi market that has traded within the last day and the vault that pays out.
+    source:
+      program_accounts:
+        program: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
+        size: 2048
+        filters:
+          - offset: 0
+            bytes: [48, 188, 47, 53, 52, 88, 50, 154]
+        fields:
+          base_mint: { offset: 80, encoding: pubkey }
+          quote_mint: { offset: 112, encoding: pubkey }
+          base_vault: { offset: 144, encoding: pubkey }
+          quote_vault: { offset: 176, encoding: pubkey }
+          oracle: { offset: 208, encoding: pubkey }
+          activity_slot: { offset: 40, encoding: u64 }
+        pair: { base: base_mint, quote: quote_mint }
+        expand:
+          - value: base_vault
+            suffix: " base vault"
+            metadata: { side: base }
+          - value: quote_vault
+            suffix: " quote vault"
+            metadata: { side: quote }
+        default:
+          base: So11111111111111111111111111111111111111112
+          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        fresh: { field: activity_slot, within_slots: 216000 }
+
+templates:
+  - id: goonfi-vault-balance
+    name: Override Vault Balance
+    description: Change one GoonFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      PRECONDITION - SELECT A VAULT FROM THE MARKET. The base vault is stored at market bytes
+      144..176 and the quote vault at 176..208. Do not apply this to the market or oracle account.
+
+      Apply this to the actual base or quote SPL-token vault referenced by the GoonFi market. The
+      base vault pays buys (quote in, base out); the quote vault pays sells (base in, quote out).
+      Lowering a payout vault below the requested output makes GoonFi reject with custom error 0x1.
+      The opposite direction keeps filling.
+
+      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. The option's
+      metadata.side names the vault; use metadata.base_decimals or metadata.quote_decimals to match.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
+
+      LOWER FOR STRESS TESTS. Raising a wrapped-SOL vault amount without matching lamports can create
+      an impossible token account, so lowering is the safe default.

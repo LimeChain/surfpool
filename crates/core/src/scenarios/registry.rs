@@ -25,6 +25,12 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const GOONFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/oracle-overrides.yaml");
+pub const GOONFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/market-overrides.yaml");
+pub const GOONFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/vault-overrides.yaml");
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -78,6 +84,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_goonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -118,6 +125,11 @@ impl TemplateRegistry {
         );
     }
 
+    pub fn load_goonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(GOONFI_ORACLE_OVERRIDES_CONTENT, "goonfi-oracle");
+        self.load_raw_layout_overrides(GOONFI_MARKET_OVERRIDES_CONTENT, "goonfi-market");
+        self.load_raw_layout_overrides(GOONFI_VAULT_OVERRIDES_CONTENT, "goonfi-vault");
+    }
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
 
@@ -537,11 +549,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) = 66
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -612,6 +624,10 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("goonfi-price"));
+        assert!(registry.contains("goonfi-freshness"));
+        assert!(registry.contains("goonfi-reference-band"));
+        assert!(registry.contains("goonfi-vault-balance"));
     }
 
     #[test]
@@ -904,6 +920,12 @@ templates: []
             "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
         );
 
+        assert_eq!(
+            registry.by_protocol("GoonFi").len(),
+            4,
+            "Should have 4 GoonFi templates (price, freshness, band, vault)"
+        );
+
         let kamino_templates = registry.by_protocol("kamino");
         assert_eq!(
             kamino_templates.len(),
@@ -994,8 +1016,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            6,
+            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 2 GoonFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1713,5 +1735,60 @@ templates: []
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn test_every_goonfi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "goonfi-price",
+            "goonfi-freshness",
+            "goonfi-reference-band",
+            "goonfi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing GoonFi template {id}"));
+            assert!(template.raw_layout, "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6
+                        && context.contains("fetchBeforeUse")),
+                "{id} needs substantive LLM guidance"
+            );
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{id} takes its default from the first live option"
+            );
+            let market = template.constants.get("market").expect("GoonFi market");
+            assert!(
+                market.options.is_empty(),
+                "{id} must not list markets offline"
+            );
+            let Some(surfpool_types::LiveConstantSource::ProgramAccounts(source)) = &market.source
+            else {
+                panic!("{id} must read its markets from the program");
+            };
+            assert_eq!(
+                source.program, "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
+                "{id}"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 6, "every shipped GoonFi property must be checked");
     }
 }

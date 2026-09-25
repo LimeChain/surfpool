@@ -112,14 +112,31 @@ pub async fn fetch_program_account_options(
         commitment: Some(CommitmentConfig::confirmed()),
         ..Default::default()
     };
-    let accounts: Vec<(Pubkey, Vec<u8>)> = client
+    let matched: Vec<Pubkey> = client
         .get_program_accounts(&program, config, Some(filters))
         .await
         .and_then(|result| result.into_result())
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter_map(|(pubkey, account)| Some((pubkey, account.data.decode()?)))
+        .map(|(pubkey, _)| pubkey)
         .collect();
+    // The surfnet merges remote program accounts with local ones, so an account overridden
+    // locally can come back in its remote form; re-read each one local-first and re-apply
+    // the filters to the bytes a scenario would actually see.
+    let mut accounts: Vec<(Pubkey, Vec<u8>)> = Vec::with_capacity(matched.len());
+    for chunk in matched.chunks(MAX_MULTIPLE_ACCOUNTS) {
+        let results = client
+            .get_multiple_accounts(chunk, CommitmentConfig::confirmed())
+            .await
+            .map_err(|e| e.to_string())?;
+        for (pubkey, result) in chunk.iter().zip(results) {
+            if let Ok(account) = result.map_account()
+                && matches_source(source, &account.data)
+            {
+                accounts.push((*pubkey, account.data));
+            }
+        }
+    }
 
     let mut mints: Vec<Pubkey> = accounts
         .iter()
@@ -172,6 +189,7 @@ pub fn program_account_options(
 ) -> Vec<ConstantOption> {
     let mut options: Vec<ConstantOption> = accounts
         .iter()
+        .filter(|(_, data)| matches_source(source, data))
         .filter_map(|(address, data)| account_options(source, address, data, mints, current_slot))
         .flatten()
         .collect();
@@ -262,6 +280,15 @@ fn account_options(
             })
         })
         .collect()
+}
+
+/// Whether `data` still has the source's size and tag bytes.
+pub fn matches_source(source: &ProgramAccountsSource, data: &[u8]) -> bool {
+    data.len() == source.size
+        && source.filters.iter().all(|filter| {
+            data.get(filter.offset..filter.offset + filter.bytes.len())
+                == Some(filter.bytes.as_slice())
+        })
 }
 
 fn symbol(mint: &Pubkey) -> String {
@@ -517,5 +544,33 @@ pair: { base: base_mint, quote: quote_mint }
             [900, 1_000, 1_050],
             "100 slots behind is still fresh, ahead is fresh"
         );
+    }
+
+    #[test]
+    fn accounts_that_no_longer_match_the_filters_are_dropped() {
+        let (wsol, usdc) = (Pubkey::from_str_const(WSOL), Pubkey::from_str_const(USDC));
+        let tag = wsol.to_bytes()[0];
+        let source = source(&format!(
+            "{TWO_FIELD_SOURCE}filters: [{{ offset: 0, bytes: [{tag}] }}]\n"
+        ));
+        let good = market(&wsol, &usdc, 1_000);
+        let mut wrong_tag = good.clone();
+        wrong_tag[0] ^= 0xff;
+        let short = good[..good.len() - 1].to_vec();
+        let accounts = vec![
+            (Pubkey::new_from_array([1; 32]), good),
+            (Pubkey::new_from_array([2; 32]), wrong_tag),
+            (Pubkey::new_from_array([3; 32]), short),
+        ];
+        let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6))]);
+
+        let kept = program_account_options(&source, &accounts, &mints, 1_000);
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "only the account that still matches the size and tag"
+        );
+        assert_eq!(kept[0].value, Pubkey::new_from_array([1; 32]).to_string());
     }
 }
