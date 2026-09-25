@@ -25,7 +25,7 @@ use rmcp_actix_web::transport::StreamableHttpService;
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use surfpool_core::scenarios::TemplateRegistry;
+use surfpool_core::scenarios::{TemplateRegistry, resolve_live_constants};
 use surfpool_mcp::Surfpool;
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
@@ -147,12 +147,24 @@ async fn get_config(
 #[actix_web::get("/v1/scenarios/templates")]
 async fn get_scenario_templates(
     template_registry: Data<RwLock<TemplateRegistry>>,
+    config: Data<RwLock<SanitizedConfig>>,
 ) -> Result<HttpResponse, Error> {
-    let registry = template_registry.read().map_err(|_| {
-        actix_web::error::ErrorInternalServerError("Failed to read template registry")
-    })?;
+    let templates: Vec<OverrideTemplate> = template_registry
+        .read()
+        .map_err(|_| {
+            actix_web::error::ErrorInternalServerError("Failed to read template registry")
+        })?
+        .all()
+        .into_iter()
+        .cloned()
+        .collect();
+    let rpc_url = config
+        .read()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to read context"))?
+        .rpc_url
+        .clone();
 
-    let templates: Vec<&OverrideTemplate> = registry.all();
+    let templates = resolve_live_constants(&rpc_url, templates).await;
     let response = serde_json::to_string(&templates)
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to serialize templates"))?;
 

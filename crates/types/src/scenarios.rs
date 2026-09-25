@@ -1,4 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use solana_clock::Slot;
@@ -42,6 +45,9 @@ pub struct ConstantDefinition {
     pub description: Option<String>,
     /// The available options to choose from
     pub options: Vec<ConstantOption>,
+    /// Where `options` are read from when the template is served; empty until then.
+    #[serde(skip)]
+    pub source: Option<LiveConstantSource>,
 }
 
 impl ConstantDefinition {
@@ -744,6 +750,179 @@ pub enum YamlConstantSource {
         #[serde(default)]
         address_suffix: Option<String>,
     },
+    /// Options read from the network when the template is served, never at registry load.
+    Live { source: LiveConstantSource },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveConstantSource {
+    ProgramAccounts(ProgramAccountsSource),
+}
+
+/// One option per account of `program` that has `size` bytes and matches every filter.
+///
+/// The option's label is the pair's token symbols, its value the account address (or the pubkey
+/// field named by `value`), and its metadata every decoded field plus both mint decimals. Each
+/// `expand` entry replaces that single option with one option per entry. `fresh` drops accounts
+/// whose slot field lags the current slot, and `default` moves one pair to the front.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramAccountsSource {
+    pub program: String,
+    pub size: usize,
+    #[serde(default)]
+    pub filters: Vec<AccountBytesFilter>,
+    pub fields: BTreeMap<String, AccountField>,
+    pub pair: PairFields,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub expand: Vec<OptionExpansion>,
+    #[serde(default)]
+    pub default: Option<PairFields>,
+    #[serde(default)]
+    pub fresh: Option<FreshWithin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshWithin {
+    pub field: String,
+    pub within_slots: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountBytesFilter {
+    pub offset: usize,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountField {
+    pub offset: usize,
+    pub encoding: AccountFieldEncoding,
+    /// One XOR key per little-endian 8-byte word of the field.
+    #[serde(default)]
+    pub mask: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountFieldEncoding {
+    Pubkey,
+    U64,
+}
+
+impl AccountFieldEncoding {
+    pub fn width(self) -> usize {
+        match self {
+            AccountFieldEncoding::Pubkey => 32,
+            AccountFieldEncoding::U64 => 8,
+        }
+    }
+}
+
+/// As `pair`, the base and quote mint field names; as `default`, the two mint pubkeys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairFields {
+    pub base: String,
+    pub quote: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionExpansion {
+    pub value: String,
+    pub suffix: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Metadata keys the resolver adds to every option, so a field may not reuse them.
+pub const PROGRAM_ACCOUNTS_METADATA_KEYS: [&str; 4] =
+    ["account", "pair", "base_decimals", "quote_decimals"];
+
+/// Lowercase ASCII words joined by `-`, used for option ids.
+pub fn option_slug(text: &str) -> String {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+impl ProgramAccountsSource {
+    pub fn validate(&self) -> Result<(), String> {
+        Pubkey::from_str(&self.program)
+            .map_err(|e| format!("program '{}' is not a pubkey: {e}", self.program))?;
+        for filter in &self.filters {
+            if filter.bytes.is_empty() || filter.offset + filter.bytes.len() > self.size {
+                return Err(format!(
+                    "filter at offset {} must match 1 to {} bytes inside the account",
+                    filter.offset, self.size
+                ));
+            }
+        }
+        for (name, field) in &self.fields {
+            if PROGRAM_ACCOUNTS_METADATA_KEYS.contains(&name.as_str()) {
+                return Err(format!("field '{name}' reuses a reserved metadata key"));
+            }
+            let width = field.encoding.width();
+            if field.offset + width > self.size {
+                return Err(format!(
+                    "field '{name}' ends past the {}-byte account",
+                    self.size
+                ));
+            }
+            if !field.mask.is_empty() && field.mask.len() != width / 8 {
+                return Err(format!(
+                    "field '{name}' needs one mask word per 8 bytes ({}), got {}",
+                    width / 8,
+                    field.mask.len()
+                ));
+            }
+        }
+        let pubkey_field = |name: &str| match self.fields.get(name) {
+            Some(field) if field.encoding == AccountFieldEncoding::Pubkey => Ok(()),
+            _ => Err(format!("'{name}' is not a pubkey field")),
+        };
+        pubkey_field(&self.pair.base)?;
+        pubkey_field(&self.pair.quote)?;
+        if let Some(value) = &self.value {
+            if !self.expand.is_empty() {
+                return Err("set either value or expand, not both".to_string());
+            }
+            pubkey_field(value)?;
+        }
+        let mut slugs = HashSet::new();
+        for expansion in &self.expand {
+            pubkey_field(&expansion.value)?;
+            let slug = option_slug(&expansion.suffix);
+            if slug.is_empty() || !slugs.insert(slug) {
+                return Err(format!(
+                    "expand suffix '{}' must be non-empty and distinct",
+                    expansion.suffix
+                ));
+            }
+        }
+        if let Some(default) = &self.default {
+            for mint in [&default.base, &default.quote] {
+                Pubkey::from_str(mint)
+                    .map_err(|e| format!("default mint '{mint}' is not a pubkey: {e}"))?;
+            }
+        }
+        if let Some(fresh) = &self.fresh {
+            match self.fields.get(&fresh.field) {
+                Some(field) if field.encoding == AccountFieldEncoding::U64 => {}
+                _ => return Err(format!("fresh field '{}' is not a u64 field", fresh.field)),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// YAML representation of a constant definition
@@ -762,6 +941,7 @@ pub struct YamlConstantDefinition {
 impl YamlConstantDefinition {
     /// Convert to runtime ConstantDefinition, resolving verified tokens references
     pub fn to_constant_definition(self) -> ConstantDefinition {
+        let mut live = None;
         let options = match self.source {
             YamlConstantSource::Inline { options } => options.into_iter().map(Into::into).collect(),
             YamlConstantSource::TokensRef {
@@ -832,12 +1012,17 @@ impl YamlConstantDefinition {
                     Vec::new()
                 }
             }
+            YamlConstantSource::Live { source } => {
+                live = Some(source);
+                Vec::new()
+            }
         };
 
         ConstantDefinition {
             label: self.label,
             description: self.description,
             options,
+            source: live,
         }
     }
 }
