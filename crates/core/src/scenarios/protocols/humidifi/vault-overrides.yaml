@@ -1,0 +1,84 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these vaults belong to schema-8 market accounts.
+version: v8
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+constants:
+  market:
+    label: HumidiFi market vault
+    description: Choose the market and the token inventory that HumidiFi should have available, read from the program's own accounts.
+    source:
+      program_accounts:
+        program: 9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp
+        size: 1728
+        filters:
+          - offset: 8
+            bytes: [44, 90, 19, 124, 56, 111, 47, 150]
+          - offset: 1720
+            bytes: [8, 0, 0, 0, 0, 0, 0, 0]
+        fields:
+          quote_mint:
+            offset: 384
+            encoding: pubkey
+            mask: &pubkey_mask [18112607414984653880, 333855179453154247, 333573717361279942, 333292238089536453]
+          base_mint: { offset: 416, encoding: pubkey, mask: *pubkey_mask }
+          quote_vault: { offset: 448, encoding: pubkey, mask: *pubkey_mask }
+          base_vault: { offset: 480, encoding: pubkey, mask: *pubkey_mask }
+          max_staleness_slots: { offset: 608, encoding: u64, mask: [7970776174128919018] }
+          last_update_slot: { offset: 616, encoding: u64, mask: [7970776174128919018] }
+        pair: { base: base_mint, quote: quote_mint }
+        expand:
+          - { value: base_vault, suffix: " base vault", metadata: { side: base } }
+          - { value: quote_vault, suffix: " quote vault", metadata: { side: quote } }
+        default:
+          base: So11111111111111111111111111111111111111112
+          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        fresh: { field: last_update_slot, within_slots: 5000 }
+
+templates:
+  - id: humidifi-vault-balance
+    name: Override Vault Balance
+    description: Change one HumidiFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+    llm_context: |
+      The target account is chosen through account.pubkey (a vault option's value); never put a market key in values.
+      PRECONDITION - SELECT A VAULT FROM THE OPTIONS. HumidiFi stores its vault addresses inside the
+      market as XOR-masked words, so they cannot be read off the market by eye; the options list
+      both vaults of every recently quoting market, with the market in metadata.account, plus pair,
+      side (base or quote), both mints and base_decimals/quote_decimals.
+
+      Apply this to the actual base or quote SPL-token vault, never to the 1728-byte market. The
+      base vault pays quote-to-base swaps; the quote vault pays base-to-quote swaps. The input-side
+      vault only receives tokens, so lowering it leaves that direction's output unchanged.
+
+      HumidiFi prices against its payout inventory: a thin payout vault that can still settle cuts
+      the quoted output, drastically on the SOL/USDC market. An empty payout vault rejects the swap.
+      The error is market-specific: the SOL/USDC market refuses with HumidiFi custom
+      error 49 (0x31), while other markets can leave it to the token transfer, which fails with the
+      token program's InsufficientFunds (custom error 1).
+      This does not set the mid-price; use humidifi-price for that.
+
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
+
+      LOWER FOR STRESS TESTS. Raising a wrapped-native vault amount without matching lamports can
+      create an impossible token account, so lowering is the safe default.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.

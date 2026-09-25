@@ -1,4 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use solana_clock::Slot;
@@ -42,6 +45,9 @@ pub struct ConstantDefinition {
     pub description: Option<String>,
     /// The available options to choose from
     pub options: Vec<ConstantOption>,
+    /// Where `options` are read from when the template is served; empty until then.
+    #[serde(skip)]
+    pub source: Option<LiveConstantSource>,
 }
 
 impl ConstantDefinition {
@@ -744,6 +750,179 @@ pub enum YamlConstantSource {
         #[serde(default)]
         address_suffix: Option<String>,
     },
+    /// Options read from the network when the template is served, never at registry load.
+    Live { source: LiveConstantSource },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveConstantSource {
+    ProgramAccounts(ProgramAccountsSource),
+}
+
+/// One option per account of `program` that has `size` bytes and matches every filter.
+///
+/// The option's label is the pair's token symbols, its value the account address (or the pubkey
+/// field named by `value`), and its metadata every decoded field plus both mint decimals. Each
+/// `expand` entry replaces that single option with one option per entry. `fresh` drops accounts
+/// whose slot field lags the current slot, and `default` moves one pair to the front.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramAccountsSource {
+    pub program: String,
+    pub size: usize,
+    #[serde(default)]
+    pub filters: Vec<AccountBytesFilter>,
+    pub fields: BTreeMap<String, AccountField>,
+    pub pair: PairFields,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub expand: Vec<OptionExpansion>,
+    #[serde(default)]
+    pub default: Option<PairFields>,
+    #[serde(default)]
+    pub fresh: Option<FreshWithin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshWithin {
+    pub field: String,
+    pub within_slots: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountBytesFilter {
+    pub offset: usize,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountField {
+    pub offset: usize,
+    pub encoding: AccountFieldEncoding,
+    /// One XOR key per little-endian 8-byte word of the field.
+    #[serde(default)]
+    pub mask: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountFieldEncoding {
+    Pubkey,
+    U64,
+}
+
+impl AccountFieldEncoding {
+    pub fn width(self) -> usize {
+        match self {
+            AccountFieldEncoding::Pubkey => 32,
+            AccountFieldEncoding::U64 => 8,
+        }
+    }
+}
+
+/// As `pair`, the base and quote mint field names; as `default`, the two mint pubkeys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairFields {
+    pub base: String,
+    pub quote: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionExpansion {
+    pub value: String,
+    pub suffix: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Metadata keys the resolver adds to every option, so a field may not reuse them.
+pub const PROGRAM_ACCOUNTS_METADATA_KEYS: [&str; 4] =
+    ["account", "pair", "base_decimals", "quote_decimals"];
+
+/// Lowercase ASCII words joined by `-`, used for option ids.
+pub fn option_slug(text: &str) -> String {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+impl ProgramAccountsSource {
+    pub fn validate(&self) -> Result<(), String> {
+        Pubkey::from_str(&self.program)
+            .map_err(|e| format!("program '{}' is not a pubkey: {e}", self.program))?;
+        for filter in &self.filters {
+            if filter.bytes.is_empty() || filter.offset + filter.bytes.len() > self.size {
+                return Err(format!(
+                    "filter at offset {} must match 1 to {} bytes inside the account",
+                    filter.offset, self.size
+                ));
+            }
+        }
+        for (name, field) in &self.fields {
+            if PROGRAM_ACCOUNTS_METADATA_KEYS.contains(&name.as_str()) {
+                return Err(format!("field '{name}' reuses a reserved metadata key"));
+            }
+            let width = field.encoding.width();
+            if field.offset + width > self.size {
+                return Err(format!(
+                    "field '{name}' ends past the {}-byte account",
+                    self.size
+                ));
+            }
+            if !field.mask.is_empty() && field.mask.len() != width / 8 {
+                return Err(format!(
+                    "field '{name}' needs one mask word per 8 bytes ({}), got {}",
+                    width / 8,
+                    field.mask.len()
+                ));
+            }
+        }
+        let pubkey_field = |name: &str| match self.fields.get(name) {
+            Some(field) if field.encoding == AccountFieldEncoding::Pubkey => Ok(()),
+            _ => Err(format!("'{name}' is not a pubkey field")),
+        };
+        pubkey_field(&self.pair.base)?;
+        pubkey_field(&self.pair.quote)?;
+        if let Some(value) = &self.value {
+            if !self.expand.is_empty() {
+                return Err("set either value or expand, not both".to_string());
+            }
+            pubkey_field(value)?;
+        }
+        let mut slugs = HashSet::new();
+        for expansion in &self.expand {
+            pubkey_field(&expansion.value)?;
+            let slug = option_slug(&expansion.suffix);
+            if slug.is_empty() || !slugs.insert(slug) {
+                return Err(format!(
+                    "expand suffix '{}' must be non-empty and distinct",
+                    expansion.suffix
+                ));
+            }
+        }
+        if let Some(default) = &self.default {
+            for mint in [&default.base, &default.quote] {
+                Pubkey::from_str(mint)
+                    .map_err(|e| format!("default mint '{mint}' is not a pubkey: {e}"))?;
+            }
+        }
+        if let Some(fresh) = &self.fresh {
+            match self.fields.get(&fresh.field) {
+                Some(field) if field.encoding == AccountFieldEncoding::U64 => {}
+                _ => return Err(format!("fresh field '{}' is not a u64 field", fresh.field)),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// YAML representation of a constant definition
@@ -762,6 +941,7 @@ pub struct YamlConstantDefinition {
 impl YamlConstantDefinition {
     /// Convert to runtime ConstantDefinition, resolving verified tokens references
     pub fn to_constant_definition(self) -> ConstantDefinition {
+        let mut live = None;
         let options = match self.source {
             YamlConstantSource::Inline { options } => options.into_iter().map(Into::into).collect(),
             YamlConstantSource::TokensRef {
@@ -832,12 +1012,17 @@ impl YamlConstantDefinition {
                     Vec::new()
                 }
             }
+            YamlConstantSource::Live { source } => {
+                live = Some(source);
+                Vec::new()
+            }
         };
 
         ConstantDefinition {
             label: self.label,
             description: self.description,
             options,
+            source: live,
         }
     }
 }
@@ -1016,6 +1201,24 @@ pub enum RawEncoding {
         count: usize,
         stride: usize,
     },
+    /// An unsigned 8-bit value written to `count` slots, `stride` bytes apart.
+    U8Strided {
+        count: usize,
+        stride: usize,
+    },
+    /// An unsigned 64-bit value written to `count` slots, `stride` bytes apart.
+    U64Strided {
+        count: usize,
+        stride: usize,
+    },
+    /// A logical unsigned 64-bit value XORed with `mask` before being written.
+    U64Xor {
+        mask: u64,
+    },
+    /// A logical signed 64-bit value XORed with `mask` before being written.
+    I64Xor {
+        mask: u64,
+    },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
@@ -1024,16 +1227,27 @@ pub enum RawEncoding {
     Slot {
         lead: i64,
     },
+    /// A relative slot XORed with `mask` before being written.
+    SlotXor {
+        lead: i64,
+        mask: u64,
+    },
 }
 
 impl RawEncoding {
     /// Byte width of this encoding.
     pub fn width(&self) -> usize {
         match self {
-            RawEncoding::U8 => 1,
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
-            RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
+            RawEncoding::U64
+            | RawEncoding::U64Strided { .. }
+            | RawEncoding::U64Xor { .. }
+            | RawEncoding::I64
+            | RawEncoding::I64Xor { .. }
+            | RawEncoding::Slot { .. }
+            | RawEncoding::SlotXor { .. } => 8,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
         }
@@ -1045,7 +1259,9 @@ impl RawEncoding {
     /// encodings with the same loop instead of special-casing one of them.
     pub fn placements(&self) -> (usize, usize) {
         match self {
-            RawEncoding::I32Strided { count, stride } => (*count, *stride),
+            RawEncoding::I32Strided { count, stride }
+            | RawEncoding::U8Strided { count, stride }
+            | RawEncoding::U64Strided { count, stride } => (*count, *stride),
             other => (1, other.width()),
         }
     }
@@ -1079,13 +1295,29 @@ impl RawEncoding {
             }};
         }
         Ok(match self {
-            RawEncoding::U8 => int!(u8, "u8"),
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => int!(u8, "u8"),
             RawEncoding::U16 => int!(u16, "u16"),
             RawEncoding::U32 => int!(u32, "u32"),
-            RawEncoding::U64 => int!(u64, "u64"),
+            RawEncoding::U64 | RawEncoding::U64Strided { .. } => int!(u64, "u64"),
+            RawEncoding::U64Xor { mask } => {
+                let d = digits("u64")?;
+                (d.parse::<u64>()
+                    .map_err(|e| format!("invalid u64: '{d}': {e}"))?
+                    ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
             RawEncoding::U128 => int!(u128, "u128"),
             RawEncoding::I32 | RawEncoding::I32Strided { .. } => int!(i32, "i32"),
             RawEncoding::I64 => int!(i64, "i64"),
+            RawEncoding::I64Xor { mask } => {
+                let d = digits("i64")?;
+                ((d.parse::<i64>()
+                    .map_err(|e| format!("invalid i64: '{d}': {e}"))? as u64)
+                    ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
             RawEncoding::I128 => int!(i128, "i128"),
             RawEncoding::Bytes32 => {
                 let text = value
@@ -1105,16 +1337,33 @@ impl RawEncoding {
                             .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
                     }
                 };
-                let slot = if lead >= 0 {
-                    target_slot.checked_add(lead as u64).ok_or_else(|| {
-                        format!("slot {target_slot} plus lead {lead} exceeds u64::MAX")
-                    })?
-                } else {
-                    target_slot.checked_sub(lead.unsigned_abs()).unwrap_or(0)
-                };
+                let slot = slot_with_lead(target_slot, lead)?;
                 slot.to_le_bytes().to_vec()
             }
+            RawEncoding::SlotXor { lead, mask } => {
+                let lead = match value {
+                    serde_json::Value::Null => *lead,
+                    _ => {
+                        let d = digits("slot lead")?;
+                        d.parse::<i64>()
+                            .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
+                    }
+                };
+                (slot_with_lead(target_slot, lead)? ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
         })
+    }
+}
+
+fn slot_with_lead(target_slot: Slot, lead: i64) -> Result<Slot, String> {
+    if lead >= 0 {
+        target_slot
+            .checked_add(lead as u64)
+            .ok_or_else(|| format!("slot {target_slot} plus lead {lead} exceeds u64::MAX"))
+    } else {
+        Ok(target_slot.checked_sub(lead.unsigned_abs()).unwrap_or(0))
     }
 }
 
@@ -1619,6 +1868,72 @@ mod tests {
     }
 
     #[test]
+    fn raw_encoding_handles_xored_u64_and_slot_fields() {
+        use super::RawEncoding;
+
+        let mask = 0x44dd_2288_77ee_1166;
+        let logical = 9_997_556_206u64;
+        let bytes = RawEncoding::U64Xor { mask }
+            .encode(&json!(logical), 0)
+            .expect("XOR-obfuscated u64");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()),
+            logical ^ mask
+        );
+
+        let exponent_mask = 0x990f_f033_cc55_aaff;
+        let bytes = RawEncoding::I64Xor {
+            mask: exponent_mask,
+        }
+        .encode(&json!(-10), 0)
+        .expect("XOR-obfuscated i64");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ exponent_mask,
+            (-10i64) as u64
+        );
+
+        let slot_mask = 0x9966_33cc_00ff_aa55;
+        let bytes = RawEncoding::SlotXor {
+            lead: 200,
+            mask: slot_mask,
+        }
+        .encode(&json!(null), 443_367_679)
+        .expect("XOR-obfuscated relative slot");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask,
+            443_367_879
+        );
+
+        let bytes = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(-500), 10)
+        .expect("negative lead clamps before XOR");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask, 0);
+
+        let large_slot = i64::MAX as u64 + 42;
+        let bytes = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(0), large_slot)
+        .expect("large u64 slot must not truncate");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask,
+            large_slot
+        );
+
+        let err = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(1), u64::MAX)
+        .expect_err("an XOR slot must not wrap past u64::MAX");
+        assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn raw_layout_rejects_writes_past_the_end_of_the_account() {
         use super::RawEncoding;
 
@@ -1678,6 +1993,72 @@ mod tests {
                     *b, 0,
                     "byte {i} lies between strided slots and must not change"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn u8_strided_writes_every_slot_and_nothing_between() {
+        use super::RawEncoding;
+        let mut property = Property::field("flags".to_string());
+        property.offset = Some(16);
+        property.encoding = Some(RawEncoding::U8Strided {
+            count: 3,
+            stride: 24,
+        });
+        let template = raw_template(vec![property]);
+
+        let original = vec![0xa5; 72];
+        let out = template
+            .materialize_raw_layout(
+                &original,
+                &HashMap::from([("flags".to_string(), json!(0))]),
+                0,
+            )
+            .expect("strided write");
+
+        for (i, byte) in out.iter().enumerate() {
+            if i >= 16 && (i - 16) % 24 == 0 {
+                assert_eq!(*byte, 0, "slot at byte {i} should carry the value");
+            } else {
+                assert_eq!(*byte, original[i], "unexpected write at byte {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn u64_strided_writes_every_slot_and_nothing_between() {
+        use super::{Property, RawEncoding};
+        let mut property = Property::field("values".to_string());
+        property.offset = Some(8);
+        property.encoding = Some(RawEncoding::U64Strided {
+            count: 4,
+            stride: 16,
+        });
+        let template = raw_template(vec![property]);
+
+        let original = vec![0xa5; 80];
+        let out = template
+            .materialize_raw_layout(
+                &original,
+                &HashMap::from([("values".to_string(), json!(50_000))]),
+                0,
+            )
+            .expect("strided write");
+
+        let expected_bytes = 50_000u64.to_le_bytes();
+        let expected_indices: std::collections::BTreeSet<_> = (0..4)
+            .flat_map(|i| {
+                let at = 8 + i * 16;
+                at..at + 8
+            })
+            .collect();
+        for i in 0..out.len() {
+            if expected_indices.contains(&i) {
+                let at = 8 + ((i - 8) / 16) * 16;
+                assert_eq!(out[i], expected_bytes[i - at]);
+            } else {
+                assert_eq!(out[i], original[i], "unexpected write at byte {i}");
             }
         }
     }

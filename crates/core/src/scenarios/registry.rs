@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use surfpool_types::{OverrideTemplate, YamlOverrideTemplateCollection};
+use surfpool_types::{
+    LiveConstantSource, OverrideTemplate, YamlConstantSource, YamlOverrideTemplateCollection,
+};
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
@@ -22,6 +24,11 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
+
+pub const HUMIDIFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/market-overrides.yaml");
+pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/vault-overrides.yaml");
 
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
@@ -76,6 +83,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_humidifi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -114,6 +122,11 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_humidifi_overrides(&mut self) {
+        self.load_raw_layout_overrides(HUMIDIFI_MARKET_OVERRIDES_CONTENT, "humidifi-market");
+        self.load_raw_layout_overrides(HUMIDIFI_VAULT_OVERRIDES_CONTENT, "humidifi-vault");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -220,6 +233,19 @@ impl TemplateRegistry {
             _ => {}
         }
         let requires_raw_layout = idl.is_none();
+
+        for (name, constant) in &collection.constants {
+            if let YamlConstantSource::Live {
+                source: LiveConstantSource::ProgramAccounts(source),
+            } = &constant.source
+            {
+                source.validate().unwrap_or_else(|e| {
+                    panic!(
+                        "unable to load {protocol_name} overrides: invalid constant '{name}': {e}"
+                    )
+                });
+            }
+        }
 
         // Convert all templates in the collection
         let templates = collection.to_override_templates(idl);
@@ -522,11 +548,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + HumidiFi (3) = 65
         assert_eq!(
             registry.count(),
-            62,
-            "Registry should load 62 templates total"
+            65,
+            "Registry should load 65 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -597,6 +623,9 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("humidifi-price"));
+        assert!(registry.contains("humidifi-freshness"));
+        assert!(registry.contains("humidifi-vault-balance"));
     }
 
     #[test]
@@ -747,6 +776,87 @@ templates:
     }
 
     #[test]
+    fn program_accounts_constants_are_validated_at_load_time() {
+        fn load(source: &str) -> Result<(), String> {
+            let yaml = format!(
+                r#"
+protocol: Example
+version: v1
+raw_layout: true
+constants:
+  market:
+    label: Market
+    source:
+      program_accounts:
+{source}
+templates: []
+"#
+            );
+            std::panic::catch_unwind(|| {
+                let mut registry = TemplateRegistry::default();
+                registry.load_raw_layout_overrides(&yaml, "example");
+            })
+            .map_err(|panic| {
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| panic.downcast_ref::<&str>().unwrap().to_string())
+            })
+        }
+        const VALID: &str = r#"        program: "11111111111111111111111111111111"
+        size: 64
+        filters: [{ offset: 0, bytes: [1] }]
+        fields:
+          base_mint: { offset: 0, encoding: pubkey }
+          quote_mint: { offset: 32, encoding: pubkey, mask: [1, 2, 3, 4] }"#;
+
+        load(&format!(
+            "{VALID}\n        pair: {{ base: base_mint, quote: quote_mint }}"
+        ))
+        .expect("a valid source loads offline");
+        for (extra, expected) in [
+            (
+                "pair: { base: base_mint, quote: nope }",
+                "'nope' is not a pubkey field",
+            ),
+            (
+                "pair: { base: base_mint, quote: quote_mint }\n        value: base_mint\n        expand: [{ value: quote_mint, suffix: x }]",
+                "either value or expand",
+            ),
+            (
+                "pair: { base: base_mint, quote: quote_mint }\n        typo: 1",
+                "did not match",
+            ),
+            (
+                "pair: { base: base_mint, quote: quote_mint }\n        default: { base: sol, quote: usdc }",
+                "default mint 'sol' is not a pubkey",
+            ),
+            (
+                "pair: { base: base_mint, quote: quote_mint }\n        fresh: { field: base_mint, within_slots: 5 }",
+                "fresh field 'base_mint' is not a u64 field",
+            ),
+        ] {
+            let error = load(&format!("{VALID}\n        {extra}")).expect_err(extra);
+            assert!(error.contains(expected), "{expected:?} not in {error:?}");
+        }
+        let out_of_bounds = VALID.replace(
+            "offset: 32, encoding: pubkey",
+            "offset: 40, encoding: pubkey",
+        );
+        let error = load(&format!(
+            "{out_of_bounds}\n        pair: {{ base: base_mint, quote: quote_mint }}"
+        ))
+        .expect_err("field past the end");
+        assert!(error.contains("ends past the 64-byte account"), "{error}");
+        let short_mask = VALID.replace("mask: [1, 2, 3, 4]", "mask: [1]");
+        let error = load(&format!(
+            "{short_mask}\n        pair: {{ base: base_mint, quote: quote_mint }}"
+        ))
+        .expect_err("mask per word");
+        assert!(error.contains("one mask word per 8 bytes"), "{error}");
+    }
+
+    #[test]
     fn collection_cannot_mix_an_idl_with_raw_layout() {
         const HYBRID: &str = r#"
 protocol: Broken
@@ -888,6 +998,12 @@ templates: []
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        assert_eq!(
+            registry.by_protocol("HumidiFi").len(),
+            3,
+            "Should have 3 HumidiFi templates"
         );
     }
 
@@ -1616,6 +1732,98 @@ templates: []
             missing.len(),
             described,
             missing.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn test_every_humidifi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "humidifi-price",
+            "humidifi-freshness",
+            "humidifi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing HumidiFi template {id}"));
+            assert!(template.raw_layout, "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6
+                        && context.contains("fetchBeforeUse: true")),
+                "{id} needs substantive LLM guidance"
+            );
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{id} takes its default market from the first live option"
+            );
+            let market = template.constants.get("market").expect("HumidiFi market");
+            assert!(
+                market.options.is_empty(),
+                "{id} must not list markets offline"
+            );
+            assert!(
+                matches!(market.source, Some(LiveConstantSource::ProgramAccounts(_))),
+                "{id} must read its markets from the program"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 4,
+            "every shipped HumidiFi property must be checked"
+        );
+    }
+
+    #[test]
+    fn humidifi_vault_source_lists_both_vaults_of_the_market_source() {
+        let registry = TemplateRegistry::new();
+        let source = |id: &str| match &registry.get(id).unwrap().constants["market"].source {
+            Some(LiveConstantSource::ProgramAccounts(source)) => source.clone(),
+            None => panic!("{id} must read its markets from the program"),
+        };
+        let market = source("humidifi-price");
+        assert_eq!(source("humidifi-freshness"), market);
+        let mut vault = source("humidifi-vault-balance");
+        let expand = std::mem::take(&mut vault.expand);
+        assert_eq!(
+            vault, market,
+            "the vault options come from the same markets"
+        );
+        assert_eq!(
+            expand
+                .iter()
+                .map(|e| (e.value.as_str(), e.metadata["side"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [("base_vault", "base"), ("quote_vault", "quote")]
+        );
+        assert_eq!(
+            market.fields.keys().collect::<Vec<_>>(),
+            [
+                "base_mint",
+                "base_vault",
+                "last_update_slot",
+                "max_staleness_slots",
+                "quote_mint",
+                "quote_vault"
+            ]
+        );
+        assert!(
+            market.fields.values().all(|field| !field.mask.is_empty()),
+            "every HumidiFi word read here is XOR-masked"
         );
     }
 }
