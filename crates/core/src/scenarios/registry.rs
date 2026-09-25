@@ -1757,33 +1757,28 @@ templates: []
             );
             assert_eq!(
                 template.address,
-                surfpool_types::AccountAddress::Pubkey(
-                    "FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n".to_string()
-                ),
-                "{id} should default to the first catalog entry"
+                surfpool_types::AccountAddress::Pubkey(String::new()),
+                "{id} takes its default market from the first live option"
             );
-            let options = &template
-                .constants
-                .get("market")
-                .expect("Tessera market catalog")
-                .options;
-            assert_eq!(options.len(), 10, "{id}");
-            for option in options {
-                for key in [
-                    "pair",
+            let market = template.constants.get("market").expect("Tessera market");
+            assert!(
+                market.options.is_empty(),
+                "{id} must not list markets offline"
+            );
+            let Some(surfpool_types::LiveConstantSource::ProgramAccounts(source)) = &market.source
+            else {
+                panic!("{id} must read its markets from the program");
+            };
+            assert_eq!(
+                source.fields.keys().collect::<Vec<_>>(),
+                [
                     "base_mint",
-                    "quote_mint",
-                    "base_decimals",
-                    "quote_decimals",
                     "freshness_limit_slots",
-                ] {
-                    assert!(
-                        option.metadata.contains_key(key),
-                        "{id}:{} lacks {key}",
-                        option.id
-                    );
-                }
-            }
+                    "last_update_slot",
+                    "quote_mint"
+                ],
+                "{id}"
+            );
             for property in &template.properties {
                 assert!(
                     property

@@ -19,8 +19,9 @@ use solana_signer::Signer;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, resolve_live_constants},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -419,14 +420,6 @@ fn values<const N: usize>(
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b)
-        .enumerate()
-        .filter_map(|(i, (a, b))| (a != b).then_some(i))
-        .collect()
-}
-
 fn first_level_output(market: &[u8], amount_in: u64, direction: u8) -> u64 {
     let (price_offset, factor_offset) = if direction == 1 {
         (128, 168)
@@ -512,16 +505,39 @@ fn price_values(quote_per_base: u64) -> Vec<(String, serde_json::Value)> {
 }
 
 #[tokio::test]
-async fn tessera_catalog_matches_every_live_market() {
+async fn tessera_resolver_returns_every_live_market() {
     let registry = TemplateRegistry::new();
-    let catalog = registry
-        .get("tessera-price")
-        .unwrap()
-        .constants
-        .get("market")
-        .expect("market catalog")
-        .options
-        .clone();
+    let all_templates = registry.by_protocol("Tessera");
+    assert_eq!(all_templates.len(), 5);
+    let rpc_url = std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+    let served = resolve_live_constants(
+        &rpc_url,
+        all_templates.iter().map(|t| (*t).clone()).collect(),
+    )
+    .await;
+    let catalog = served[0].constants["market"].options.clone();
+    assert!(
+        !catalog.is_empty(),
+        "no live markets resolved; a 429 or timeout from {rpc_url} is unverified, not a failure"
+    );
+    assert_eq!(
+        catalog[0].value,
+        SOL_USDC.address.to_string(),
+        "SOL / USDC is the default market"
+    );
+    for template in &served {
+        assert_eq!(
+            template.constants["market"].options, catalog,
+            "{}",
+            template.id
+        );
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey(catalog[0].value.clone()),
+            "{} defaults to the first market",
+            template.id
+        );
+    }
     let addresses = catalog
         .iter()
         .map(|option| pubkey(&option.value))
@@ -540,12 +556,11 @@ async fn tessera_catalog_matches_every_live_market() {
     let mint_accounts: HashMap<Pubkey, Account> =
         mints.iter().copied().zip(fetch(&mints).await).collect();
 
-    let all_templates = registry.by_protocol("Tessera");
-    assert_eq!(all_templates.len(), 5);
     let mut checked = 0;
     for (option, account) in catalog.iter().zip(&markets) {
         let data = &account.data;
         let id = &option.id;
+        assert_eq!(meta(option, "account"), option.value.as_str(), "{id}");
         assert_eq!(account.owner, PROGRAM, "{id}");
         assert_eq!(data.len(), MARKET_SIZE, "{id}");
         assert_eq!(
@@ -606,7 +621,11 @@ async fn tessera_catalog_matches_every_live_market() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 10, "every catalog market must be exercised");
+    assert_eq!(
+        checked,
+        catalog.len(),
+        "every live market must be exercised"
+    );
 }
 
 #[tokio::test]
@@ -740,11 +759,7 @@ async fn tessera_freshness_boundary_follows_each_market_limit() {
     set_quote_start(&mut fork.sol.market.data, 0);
     pin_ladder(&mut fork.sol.market.data, SOL_SELL_UNIT, SOL_BUY_UNIT);
     let sol = &fork.sol;
-    let registry = TemplateRegistry::new();
-    let live_limit = registry.get("tessera-freshness").unwrap().constants["market"].options[0]
-        .metadata["freshness_limit_slots"]
-        .as_u64()
-        .unwrap();
+    let live_limit = read_u64(&sol.market.data, 88);
     let slot = clock_slot(sol);
     let aged = |data: &[u8], lead: i64| {
         apply_raw(
@@ -873,10 +888,23 @@ async fn tessera_curve_scales_output_and_rejects_unordered_factors() {
     );
     let err = run(unordered).expect_err("a rising factor must reject");
     assert!(err.contains("Custom(8)"), "{err}");
+
+    let with_second_factor = |factor: u64| {
+        apply_raw(
+            "tessera-curve",
+            &live,
+            &values([("sell_level_1_factor", serde_json::json!(factor.to_string()))]),
+            0,
+        )
+    };
+    let first_factor = read_u64(&live, 168);
+    let err = run(with_second_factor(first_factor)).expect_err("an equal factor must reject");
+    assert!(err.contains("Custom(8)"), "{err}");
+    assert_eq!(run(with_second_factor(first_factor - 1)).unwrap(), baseline);
 }
 
 #[tokio::test]
-async fn tessera_halt_rejects_both_directions() {
+async fn tessera_halt_rejects_only_halted_directions() {
     let mut fork = fork().await;
     for skipped_levels in [None, Some(1)] {
         set_quote_start(&mut fork.cbb.market.data, skipped_levels.unwrap_or(0));
@@ -916,5 +944,21 @@ async fn tessera_halt_rejects_both_directions() {
             let err = run(halted.clone()).expect_err("a halted market must reject");
             assert!(err.contains(STALE), "direction {direction}: {err}");
         }
+        let sell_halted = apply_raw(
+            "tessera-halt",
+            &live,
+            &values([("sell_levels_enabled", serde_json::json!(0))]),
+            0,
+        );
+        let run_side = |direction, amount, data: Vec<u8>| {
+            swap(&fork, cbb, amount, direction, Route::Jupiter, data)
+        };
+        let err =
+            run_side(1, CBB_SELL, sell_halted.clone()).expect_err("a halted sell side must reject");
+        assert!(err.contains(STALE), "{err}");
+        assert_eq!(
+            run_side(0, CBB_BUY, sell_halted).expect("the buy side must still fill"),
+            run_side(0, CBB_BUY, live.clone()).unwrap()
+        );
     }
 }

@@ -9,7 +9,7 @@ which output factor. It publishes no IDL, so every template writes the market ac
 raw byte layout.
 
 Deployment: program `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`, last deployed at slot
-446053401; market catalog captured at slot 450249094 (2026-09-25).
+446053401; verified 2026-09-25.
 
 ## Template index
 
@@ -25,9 +25,9 @@ Deployment: program `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`, last deployed
 
 | You'll see                          | It means                                          | Example                                          |
 | ----------------------------------- | ------------------------------------------------- | ------------------------------------------------ |
-| `quote_atoms_per_base_atom_x1e15`   | quote atoms per base atom × 10^15, prices sells   | WSOL/USDC $100 → `100000000000000`               |
-| `base_atoms_per_quote_atom_x1e15`   | floor(10^30 / the value above), prices buys       | WSOL/USDC $100 → `10000000000000000`             |
-| `*_level_N_amount`                  | capacity in atoms of the swap's input token       | sell side of WSOL/USDC: `1000000000` = 1 SOL     |
+| `quote_atoms_per_base_atom_x1e15`   | quote atoms per base atom × 10^15, prices sells   | SOL/USDC $100 → `100000000000000`               |
+| `base_atoms_per_quote_atom_x1e15`   | floor(10^30 / the value above), prices buys       | SOL/USDC $100 → `10000000000000000`             |
+| `*_level_N_amount`                  | capacity in atoms of the swap's input token       | sell side of SOL/USDC: `1000000000` = 1 SOL     |
 | `*_level_N_factor`                  | output factor, `1000000` is neutral               | `990000` pays 1% less                            |
 | `*_levels_enabled`                  | enabled flag of all twenty levels on one side     | `0` halts that side                              |
 | `last_update_slot`                  | offset from the materialization slot              | `0` = updated now, `-20` = twenty slots old      |
@@ -71,20 +71,22 @@ quote skip leading levels, and two consumed-depth words at 0 and 8 are not expos
 
 ## Picking a market
 
-Every template starts with a market picker listing the ten markets Tessera's maker was quoting when
-the catalog was captured:
+Every template starts with a market picker. Its options are read from the program when Studio or
+MCP loads the templates: every 1264-byte account with market tag `5` at offset 96 whose quote was
+updated within the last 5000 slots, through the surfnet (local state first, then mainnet) and cached
+for 60 seconds. Markets the maker stopped quoting drop out. On 2026-09-25 that included:
 
 | Choice                         | Best suited for                                       |
 | ------------------------------ | ----------------------------------------------------- |
-| WSOL / USDC, WSOL / USDT       | SOL price shocks and stablecoin-quote comparisons     |
+| SOL / USDC, SOL / USDT         | SOL price shocks and stablecoin-quote comparisons     |
 | cbBTC / USDC, ETH / USDC       | majors with 8-decimal base tokens                     |
-| JLP / WSOL                     | a quote token that is not a stablecoin                |
+| JLP / SOL                      | a quote token that is not a stablecoin                |
 | JTO, HYPE, RAY, PUMP, USELESS  | long-tail tokens quoted in USDC; PUMP is Token-2022   |
 
-The picker supplies the market account to the template. Each option's metadata carries the pair,
-both mints, both decimals and the market's `freshness_limit_slots` (20 or 25), which the price and
-freshness formulas need. BONK / USDC is quoted live but not listed: its base-per-quote price exceeds
-the u64 field, so the price formula cannot express it.
+The picker supplies the market account to the template. SOL / USDC is listed first and is the
+default when no market is chosen. Each option's metadata carries the pair, both mints, both decimals and the
+market's `freshness_limit_slots`, which the price and freshness formulas need. A BONK / USDC market
+cannot be priced through `tessera-price`: its base-per-quote price exceeds the u64 field.
 
 Use `fetchBeforeUse: true` so the selected market is forked before its bytes are changed.
 
@@ -106,7 +108,7 @@ every enabled level on the side you stress by one ratio, and keep factors descen
 
 Use this to test whether a router or strategy reacts when Tessera's SOL price moves.
 
-1. Choose **WSOL / USDC** in `tessera-price`.
+1. Choose **SOL / USDC** in `tessera-price`.
 2. Set both price fields from the formula. $100 per SOL is `100000000000000` and
    `10000000000000000`.
 3. Add `tessera-freshness` with `last_update_slot: 0`.
@@ -136,7 +138,7 @@ Use this to test fallback routing when Tessera stops updating.
 
 1. Choose the market in `tessera-freshness`.
 2. Set `last_update_slot` to minus the market's `freshness_limit_slots`, for example `-20` on
-   WSOL / USDC.
+   SOL / USDC.
 3. Confirm both directions fail with custom error 65535 and that one slot younger still fills.
 
 ### Maker pulls all liquidity
@@ -150,7 +152,7 @@ Use this to test fallback routing when Tessera stops updating.
 
 ```text
 template: tessera-price
-quote_atoms_per_base_atom_x1e15: "100000000000000"     # WSOL/USDC at $100, 9/6 decimals
+quote_atoms_per_base_atom_x1e15: "100000000000000"     # SOL/USDC at $100, 9/6 decimals
 base_atoms_per_quote_atom_x1e15: "10000000000000000"
 ```
 
@@ -171,7 +173,7 @@ where a quote is needed.
 
 ```text
 template: tessera-freshness
-last_update_slot: -20      # WSOL/USDC freshness_limit_slots is 20
+last_update_slot: -20      # SOL/USDC freshness_limit_slots is 20
 ```
 
 The boundary is exclusive: `-19` still fills, `-20` rejects. Do not schedule a fresh override after it.
@@ -192,8 +194,8 @@ template: tessera-curve
 sell_level_N_factor: floor(live sell_level_N_factor × 5000 / 10000)   # all twenty sell levels
 ```
 
-Scaling every factor by one ratio keeps them descending. A factor larger than the level before it
-rejects with custom error 8.
+Scaling every factor by one ratio keeps them descending unless two close neighbours round to the same value, so check the result stays strictly descending. A factor equal to or larger than the level
+before it rejects with custom error 8.
 
 ## Halt the market
 
@@ -212,10 +214,10 @@ level.
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `Custom(65535)` after a price, depth or curve change  | The quote is stale. Add `tessera-freshness` with `last_update_slot: 0` in that slot   |
 | `Custom(65535)` on a market you did not halt          | The maker pulled that side live; every level on it is disabled                        |
-| `Custom(8)`                                           | A curve factor is larger than the level before it; scale all factors by one ratio     |
+| `Custom(8)`                                           | A curve factor is not lower than the level before it; scale all factors by one ratio  |
 | Only one direction repriced                           | Set both price fields; 128 prices sells and 144 prices buys                           |
 | A depth change has no visible effect                  | The fill was smaller than the first level; use a larger swap                          |
-| A price change lands on the wrong account          | No owner or size check exists on raw writes; pick the market from the catalog, the picker in Studio only offers those |
+| A price change lands on the wrong account          | No owner or size check exists on raw writes; pick the market from the picker, which only offers Tessera market accounts |
 | `buy_levels_enabled: 1` re-enabled maker-disabled levels | Only 0 is supported; 1 makes the program quote levels the maker had pulled                                   |
 | Price field rejected as out of range                  | The reciprocal exceeds u64; the price is too small for that market's decimals         |
 | A stale override stops rejecting                      | A later `tessera-freshness` with a non-negative offset refreshed it; remove it        |
