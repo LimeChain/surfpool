@@ -1,0 +1,386 @@
+protocol: Tessera
+version: v1
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+constants:
+  market:
+    label: Tessera market
+    description: Choose one of the Tessera markets that its maker currently quotes.
+    options:
+      - id: wsol-usdc
+        label: WSOL / USDC
+        description: The most active Tessera market, wrapped SOL priced in USDC.
+        value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+        metadata:
+          pair: WSOL/USDC
+          base_mint: So11111111111111111111111111111111111111112
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: wsol-usdt
+        label: WSOL / USDT
+        description: Wrapped SOL priced in USDT.
+        value: 7sJf1SmKDDAFtBmMtg253rTbjG7zVFm3zTNounSgSNc9
+        metadata:
+          pair: WSOL/USDT
+          base_mint: So11111111111111111111111111111111111111112
+          quote_mint: Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: cbbtc-usdc
+        label: cbBTC / USDC
+        description: Coinbase Wrapped BTC priced in USDC.
+        value: 9NkuAWB4LgCVFV77omEkJEjXqgV5PGupwMTu3B3pBRhc
+        metadata:
+          pair: cbBTC/USDC
+          base_mint: cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: eth-usdc
+        label: ETH / USDC
+        description: Wormhole Portal ETH priced in USDC.
+        value: Ce8WKGKeNPrtk85inFtkpskekaNibZiogSZBrcP7yhTN
+        metadata:
+          pair: ETH/USDC
+          base_mint: 7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 8
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: jlp-wsol
+        label: JLP / WSOL
+        description: Jupiter Perps LP priced in wrapped SOL; the only market whose quote is not a stablecoin.
+        value: H3chk8rgniKXnToGTdPUFieuHGLQQfBMXVbGp6bR1uMD
+        metadata:
+          pair: JLP/WSOL
+          base_mint: 27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4
+          quote_mint: So11111111111111111111111111111111111111112
+          base_decimals: 6
+          quote_decimals: 9
+          freshness_limit_slots: 25
+      - id: jto-usdc
+        label: JTO / USDC
+        description: JITO priced in USDC.
+        value: DoKKUBzWcv6TYg3vr6kvVzvadnibieYctse6oD6d7Hxs
+        metadata:
+          pair: JTO/USDC
+          base_mint: jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: hype-usdc
+        label: HYPE / USDC
+        description: HYPE priced in USDC.
+        value: FvQds9kfSi7opoW7Lf3KcsgcuKfJZB2HdrVNkdLSLQbi
+        metadata:
+          pair: HYPE/USDC
+          base_mint: 98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 9
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: ray-usdc
+        label: RAY / USDC
+        description: Raydium priced in USDC.
+        value: FWyD88TgTj3XrpiEAfdTZTbHwLwXCGjBFK5FGdjSecrt
+        metadata:
+          pair: RAY/USDC
+          base_mint: 4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 25
+      - id: pump-usdc
+        label: PUMP / USDC
+        description: Pump (a Token-2022 mint) priced in USDC.
+        value: DNhfyh75AApg1L1Yig3fErvERKutYRqfWLGb496iViSZ
+        metadata:
+          pair: PUMP/USDC
+          base_mint: pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+      - id: useless-usdc
+        label: USELESS / USDC
+        description: USELESS COIN priced in USDC.
+        value: BDqQBspbipXxnTX2kw4FPM9pzfcf9kwieGCy4yUZ9tCC
+        metadata:
+          pair: USELESS/USDC
+          base_mint: Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk
+          quote_mint: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          base_decimals: 6
+          quote_decimals: 6
+          freshness_limit_slots: 20
+
+templates:
+  - id: tessera-price
+    name: Override Price
+    description: Move a Tessera market's reference price in both swap directions
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: quote_atoms_per_base_atom_x1e15
+        offset: 128
+        encoding: u64
+        label: Quote per base
+        description: >-
+          Quote atoms paid per base atom, times 10^15. Prices base-to-quote sells; set it together
+          with base_atoms_per_quote_atom_x1e15.
+      - path: base_atoms_per_quote_atom_x1e15
+        offset: 144
+        encoding: u64
+        label: Base per quote
+        description: >-
+          Base atoms paid per quote atom, times 10^15. Prices quote-to-base buys; the integer floor
+          of 10^30 divided by quote_atoms_per_base_atom_x1e15.
+    llm_context: |
+      The target account is chosen through account.pubkey (a catalog option's value); never put a market key in values.
+      PRECONDITION - THE QUOTE MUST BE FRESH. Tessera rejects a quote whose last update is at least
+      the market's freshness_limit_slots old with custom error 65535 (0xffff), so a correct price can
+      appear to do nothing. Also apply tessera-freshness with last_update_slot 0 in the same slot.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Tessera stores one price per direction in raw atoms. Offset 128 alone moves base-to-quote
+      sells, offset 144 alone moves quote-to-base buys, so set both as one invariant. Read
+      base_decimals and quote_decimals from the selected market's metadata:
+        quote_atoms_per_base_atom_x1e15 = price * 10^(quote_decimals - base_decimals) * 10^15
+        base_atoms_per_quote_atom_x1e15 = floor(10^30 / quote_atoms_per_base_atom_x1e15)
+      Pass both as decimal integer strings.
+
+      For a fill that starts and ends in the first ladder level:
+        sell output = floor(base_in * quote_atoms_per_base_atom_x1e15 * sell_level_0_factor / 10^21)
+        buy output  = floor(quote_in * base_atoms_per_quote_atom_x1e15 * buy_level_0_factor / 10^21)
+      A factor of 1000000 is neutral.
+
+      EXAMPLE - "SOL is worth $100" on WSOL / USDC (9/6 decimals):
+        quote_atoms_per_base_atom_x1e15: "100000000000000"
+        base_atoms_per_quote_atom_x1e15: "10000000000000000"
+
+      EXAMPLE - "BTC is worth $100000" on cbBTC / USDC (8/6 decimals):
+        quote_atoms_per_base_atom_x1e15: "1000000000000000000"
+        base_atoms_per_quote_atom_x1e15: "1000000000000"
+
+  - id: tessera-freshness
+    name: Override Quote Freshness
+    description: Keep a Tessera quote current or age it past the market's freshness limit
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding:
+          slot:
+            lead: 0
+        label: Last-update offset
+        description: >-
+          Relative to the slot where the override materializes; 0 means updated now, a negative
+          value ages the quote by that many slots.
+    llm_context: |
+      The target account is chosen through account.pubkey (a catalog option's value); never put a market key in values.
+      This one template covers both a fresh and a stale quote. The stored word is an absolute slot;
+      the value is an offset from the slot where the override materializes, clamped at zero.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Tessera rejects a quote whose age is at least the market's own limit, read from the selected
+      market's freshness_limit_slots metadata (20 or 25 slots). The boundary is exclusive:
+      last_update_slot -(freshness_limit_slots - 1) still fills, -freshness_limit_slots rejects
+      both swap directions with custom error 65535 (0xffff).
+
+      HOW TO USE:
+      1. For a fresh quote set last_update_slot to 0
+      2. For a stale quote set it to minus the market's freshness_limit_slots, e.g. -20 on WSOL / USDC
+      3. A fresh quote lasts freshness_limit_slots; schedule this template again in each later slot
+         where a quote is needed, and never after a stale override you want to keep stale
+
+  - id: tessera-depth
+    name: Override Depth
+    description: Change how much Tessera fills at each level of its sell and buy ladders
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - { path: sell_level_0_amount, offset: 160, encoding: u64, label: "Sell level 1 capacity", description: "Base atoms the first sell level fills before the quote moves to level 2." }
+      - { path: sell_level_1_amount, offset: 184, encoding: u64, label: "Sell level 2 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_2_amount, offset: 208, encoding: u64, label: "Sell level 3 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_3_amount, offset: 232, encoding: u64, label: "Sell level 4 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_4_amount, offset: 256, encoding: u64, label: "Sell level 5 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_5_amount, offset: 280, encoding: u64, label: "Sell level 6 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_6_amount, offset: 304, encoding: u64, label: "Sell level 7 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_7_amount, offset: 328, encoding: u64, label: "Sell level 8 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_8_amount, offset: 352, encoding: u64, label: "Sell level 9 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_9_amount, offset: 376, encoding: u64, label: "Sell level 10 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_10_amount, offset: 400, encoding: u64, label: "Sell level 11 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_11_amount, offset: 424, encoding: u64, label: "Sell level 12 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_12_amount, offset: 448, encoding: u64, label: "Sell level 13 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_13_amount, offset: 472, encoding: u64, label: "Sell level 14 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_14_amount, offset: 496, encoding: u64, label: "Sell level 15 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_15_amount, offset: 520, encoding: u64, label: "Sell level 16 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_16_amount, offset: 544, encoding: u64, label: "Sell level 17 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_17_amount, offset: 568, encoding: u64, label: "Sell level 18 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_18_amount, offset: 592, encoding: u64, label: "Sell level 19 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: sell_level_19_amount, offset: 616, encoding: u64, label: "Sell level 20 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_0_amount, offset: 640, encoding: u64, label: "Buy level 1 capacity", description: "Quote atoms the first buy level fills before the quote moves to level 2." }
+      - { path: buy_level_1_amount, offset: 664, encoding: u64, label: "Buy level 2 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_2_amount, offset: 688, encoding: u64, label: "Buy level 3 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_3_amount, offset: 712, encoding: u64, label: "Buy level 4 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_4_amount, offset: 736, encoding: u64, label: "Buy level 5 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_5_amount, offset: 760, encoding: u64, label: "Buy level 6 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_6_amount, offset: 784, encoding: u64, label: "Buy level 7 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_7_amount, offset: 808, encoding: u64, label: "Buy level 8 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_8_amount, offset: 832, encoding: u64, label: "Buy level 9 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_9_amount, offset: 856, encoding: u64, label: "Buy level 10 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_10_amount, offset: 880, encoding: u64, label: "Buy level 11 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_11_amount, offset: 904, encoding: u64, label: "Buy level 12 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_12_amount, offset: 928, encoding: u64, label: "Buy level 13 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_13_amount, offset: 952, encoding: u64, label: "Buy level 14 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_14_amount, offset: 976, encoding: u64, label: "Buy level 15 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_15_amount, offset: 1000, encoding: u64, label: "Buy level 16 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_16_amount, offset: 1024, encoding: u64, label: "Buy level 17 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_17_amount, offset: 1048, encoding: u64, label: "Buy level 18 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_18_amount, offset: 1072, encoding: u64, label: "Buy level 19 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+      - { path: buy_level_19_amount, offset: 1096, encoding: u64, label: "Buy level 20 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
+    llm_context: |
+      The target account is chosen through account.pubkey (a catalog option's value); never put a market key in values.
+      PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
+      otherwise the swap rejects with custom error 65535 and the new depth is never used.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Each side is a ladder of twenty 24-byte levels: a u64 capacity at +0, a u64 output factor at
+      +8 and a u8 enabled flag at +16. The sell ladder starts at 160 and fills base-to-quote sells
+      (capacity in base atoms); the buy ladder starts at 640 and fills quote-to-base buys (capacity
+      in quote atoms). Capacities are directional quoting limits, not vault balances.
+
+      Only enabled levels quote, and how many are enabled differs per market, so read the live
+      account first. For a percentage cut, multiply every enabled level's capacity on the chosen
+      side by one ratio; leave disabled levels alone and never round a live nonzero capacity to zero.
+      A fill smaller than the first level is unchanged, so only a large swap shows the change.
+
+      EXAMPLE - keep 10% of sell depth: sell_level_N_amount = floor(live sell_level_N_amount * 1000 / 10000)
+      for every enabled sell level; leave the buy side unset.
+
+  - id: tessera-curve
+    name: Override Curve
+    description: Scale the output factor Tessera applies at each ladder level
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - { path: sell_level_0_factor, offset: 168, encoding: u64, label: "Sell level 1 output factor", description: "Output factor of the first sell level; 1000000 is neutral, lower pays less quote." }
+      - { path: sell_level_1_factor, offset: 192, encoding: u64, label: "Sell level 2 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_2_factor, offset: 216, encoding: u64, label: "Sell level 3 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_3_factor, offset: 240, encoding: u64, label: "Sell level 4 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_4_factor, offset: 264, encoding: u64, label: "Sell level 5 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_5_factor, offset: 288, encoding: u64, label: "Sell level 6 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_6_factor, offset: 312, encoding: u64, label: "Sell level 7 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_7_factor, offset: 336, encoding: u64, label: "Sell level 8 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_8_factor, offset: 360, encoding: u64, label: "Sell level 9 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_9_factor, offset: 384, encoding: u64, label: "Sell level 10 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_10_factor, offset: 408, encoding: u64, label: "Sell level 11 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_11_factor, offset: 432, encoding: u64, label: "Sell level 12 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_12_factor, offset: 456, encoding: u64, label: "Sell level 13 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_13_factor, offset: 480, encoding: u64, label: "Sell level 14 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_14_factor, offset: 504, encoding: u64, label: "Sell level 15 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_15_factor, offset: 528, encoding: u64, label: "Sell level 16 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_16_factor, offset: 552, encoding: u64, label: "Sell level 17 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_17_factor, offset: 576, encoding: u64, label: "Sell level 18 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_18_factor, offset: 600, encoding: u64, label: "Sell level 19 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: sell_level_19_factor, offset: 624, encoding: u64, label: "Sell level 20 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_0_factor, offset: 648, encoding: u64, label: "Buy level 1 output factor", description: "Output factor of the first buy level; 1000000 is neutral, lower pays less base." }
+      - { path: buy_level_1_factor, offset: 672, encoding: u64, label: "Buy level 2 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_2_factor, offset: 696, encoding: u64, label: "Buy level 3 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_3_factor, offset: 720, encoding: u64, label: "Buy level 4 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_4_factor, offset: 744, encoding: u64, label: "Buy level 5 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_5_factor, offset: 768, encoding: u64, label: "Buy level 6 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_6_factor, offset: 792, encoding: u64, label: "Buy level 7 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_7_factor, offset: 816, encoding: u64, label: "Buy level 8 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_8_factor, offset: 840, encoding: u64, label: "Buy level 9 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_9_factor, offset: 864, encoding: u64, label: "Buy level 10 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_10_factor, offset: 888, encoding: u64, label: "Buy level 11 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_11_factor, offset: 912, encoding: u64, label: "Buy level 12 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_12_factor, offset: 936, encoding: u64, label: "Buy level 13 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_13_factor, offset: 960, encoding: u64, label: "Buy level 14 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_14_factor, offset: 984, encoding: u64, label: "Buy level 15 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_15_factor, offset: 1008, encoding: u64, label: "Buy level 16 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_16_factor, offset: 1032, encoding: u64, label: "Buy level 17 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_17_factor, offset: 1056, encoding: u64, label: "Buy level 18 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_18_factor, offset: 1080, encoding: u64, label: "Buy level 19 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+      - { path: buy_level_19_factor, offset: 1104, encoding: u64, label: "Buy level 20 output factor", description: "Output factor of this level, 1000000 neutral; must not exceed the previous level's factor." }
+    llm_context: |
+      The target account is chosen through account.pubkey (a catalog option's value); never put a market key in values.
+      PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
+      otherwise the swap rejects with custom error 65535 and the new curve is never used.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      The factor multiplies the directional price: output = input * price * factor / 10^21, so a
+      factor of 1000000 is neutral and 990000 pays 1% less. The sell factors price base-to-quote
+      sells, the buy factors quote-to-base buys; the other side is untouched.
+
+      Factors must keep descending across a ladder. A level whose factor is larger than the one
+      before it makes the program reject with custom error 8. To widen a side, read all twenty live
+      factors and multiply every nonzero one by the same ratio, which preserves the ordering. A
+      ratio that rounds a nonzero factor to zero disables that level.
+
+      EXAMPLE - make selling base 50% worse: sell_level_N_factor = floor(live * 5000 / 10000) for
+      all twenty sell levels.
+
+  - id: tessera-halt
+    name: Halt Liquidity
+    description: Disable every level of a Tessera ladder; each field is one swap direction
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+      value: FLckHLGMJy5gEoXWwcE68Nprde1D4araK4TGLw4pQq2n
+    properties:
+      - path: sell_levels_enabled
+        offset: 176
+        encoding:
+          u8_strided:
+            count: 20
+            stride: 24
+        label: Sell liquidity enabled
+        description: Enabled flag of all twenty sell levels; only 0 is supported.
+      - path: buy_levels_enabled
+        offset: 656
+        encoding:
+          u8_strided:
+            count: 20
+            stride: 24
+        label: Buy liquidity enabled
+        description: Enabled flag of all twenty buy levels; only 0 is supported.
+    llm_context: |
+      The target account is chosen through account.pubkey (a catalog option's value); never put a market key in values.
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Set both fields to 0 together. Each writes the enabled flag of all twenty levels on its side,
+      after which the program rejects either swap direction with custom error 65535 (0xffff), the
+      same code as a stale quote. Clearing only the first level does not halt a quote that the
+      market starts at a later level. Writing 1 would enable levels whose capacity and factor were
+      never configured, so only 0 is supported.
