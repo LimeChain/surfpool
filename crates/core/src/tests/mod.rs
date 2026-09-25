@@ -1,3 +1,5 @@
+#[cfg(feature = "integration-tests")]
+pub mod goonfi;
 pub mod helpers;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
