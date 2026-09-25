@@ -49,7 +49,7 @@ use crate::{
         GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
     },
     tests::{
-        helpers::get_free_port,
+        helpers::{diff_indices, get_free_port},
         integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
     },
 };
@@ -126,15 +126,6 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
 }
 
 /// Byte indices at which two buffers differ.
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b.iter())
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// A failure here means a bundled IDL disagrees with the live on-chain layout.
 #[tokio::test]
 async fn real_mainnet_accounts_round_trip_unchanged() {
