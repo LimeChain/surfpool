@@ -19,10 +19,10 @@ templates:
         description: Exact signed quote-lot collateral encoded as a decimal string
     llm_context: |
       This prepares collateral stress state. It does not guarantee liquidation and does not execute liquidation.
-      Hot traders read collateral from GlobalTraderIndex. Play resolves the reachable entry by trader key and updates both records through the IDL, preserving unrelated bytes. Cold traders use their own account.
+      Hot traders read collateral from GlobalTraderIndex; cold traders use their own account.
       Hot traders currently require a valid single-arena GlobalTraderIndex; unsupported layouts are rejected before collateral writes.
       For a liquidation cascade, pair it with phoenix-direct-mark-risk-shock at the next slot. Keep override labels short.
-      Pass traderState.quoteLotCollateral as a decimal string. Builder-created scenarios leave fetchBeforeUse off; the value applies to the local fork state.
+      Pass traderState.quoteLotCollateral as a decimal string.
     address:
       type: pubkey
 
@@ -46,8 +46,6 @@ templates:
       Pass target_ticks as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
-    # The singleton named by GlobalConfig's perp_asset_map field, which only moves if the
-    # protocol migrates the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC

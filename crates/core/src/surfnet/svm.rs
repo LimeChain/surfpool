@@ -95,10 +95,7 @@ use crate::{
     scenarios::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::{
-            collateral::{
-                parse_quote_lot_collateral, trader_header, validate_collateral_fields,
-                validate_hot_trader_fields,
-            },
+            collateral::{parse_quote_lot_collateral, trader_header, validate_hot_trader_fields},
             state_builder::{
                 PHOENIX_ETERNAL_PROGRAM_ID, forge_phoenix_override,
                 is_phoenix_perp_asset_map_account, is_phoenix_trader_account,
@@ -3097,7 +3094,6 @@ impl SurfnetSvm {
                     && is_phoenix_trader_account(account.data());
                 if is_phoenix_trader {
                     let checked = trader_header(&account_pubkey, &account).and_then(|header| {
-                        validate_collateral_fields(&account_values)?;
                         if header.trader_state.is_hot() {
                             validate_hot_trader_fields(&account_values)?;
                         }
@@ -3265,12 +3261,9 @@ impl SurfnetSvm {
                     rent_epoch: account.rent_epoch(),
                 };
 
-                if let Some((index_key, before, after)) = index_update {
-                    self.inner.set_account(index_key, after)?;
-                    if let Err(error) = self.inner.set_account(account_pubkey, modified_account) {
-                        self.inner.set_account(index_key, before)?;
-                        return Err(error);
-                    }
+                if let Some((index_key, index_account)) = index_update {
+                    self.inner.set_account(index_key, index_account)?;
+                    self.inner.set_account(account_pubkey, modified_account)?;
                     settled_this_slot.extend([index_key, account_pubkey]);
                     continue;
                 }
@@ -3333,7 +3326,7 @@ impl SurfnetSvm {
         idl: &Idl,
         values: &HashMap<String, serde_json::Value>,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    ) -> SurfpoolResult<Option<(Pubkey, Account, Account)>> {
+    ) -> SurfpoolResult<Option<(Pubkey, Account)>> {
         use crate::scenarios::protocols::phoenix_eternal::v1::{
             collateral::{index_trader_state_range, trader_header},
             state_builder::{PHOENIX_GLOBAL_CONFIG, phoenix_global_trader_index_address},
@@ -3346,10 +3339,10 @@ impl SurfnetSvm {
             .phoenix_dependency(&PHOENIX_GLOBAL_CONFIG, remote_ctx)
             .await?;
         let index_key = phoenix_global_trader_index_address(&global)?;
-        let before = self.phoenix_dependency(&index_key, remote_ctx).await?;
-        let range = index_trader_state_range(&before, &header.key)?;
+        let mut index = self.phoenix_dependency(&index_key, remote_ctx).await?;
+        let range = index_trader_state_range(&index, &header.key)?;
         let encoded = Self::get_forged_idl_type_data(
-            &before.data[range.clone()],
+            &index.data[range.clone()],
             idl,
             "TraderState",
             &HashMap::from([(
@@ -3357,14 +3350,8 @@ impl SurfnetSvm {
                 values["traderState.quoteLotCollateral"].clone(),
             )]),
         )?;
-        if encoded.len() != range.len() || encoded[8..] != before.data[range.start + 8..range.end] {
-            return Err(SurfpoolError::internal(
-                "Phoenix TraderState IDL must preserve the index record layout",
-            ));
-        }
-        let mut after = before.clone();
-        after.data[range].copy_from_slice(&encoded);
-        Ok(Some((index_key, before, after)))
+        index.data[range].copy_from_slice(&encoded);
+        Ok(Some((index_key, index)))
     }
 
     /// Forges account data by applying overrides to existing account data

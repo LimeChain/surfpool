@@ -1,22 +1,3 @@
-//! Phoenix Eternal integration tests.
-//!
-//! These fetch the real accounts from mainnet rather than embedding captured copies, so they
-//! need a network connection and are compiled only behind a feature:
-//!
-//! ```text
-//! cargo test -p surfpool-core --features integration-tests phoenix
-//! ```
-//!
-//! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
-//!
-//! What these cover that unit tests cannot: Phoenix is zero-copy, so decoding a synthetic
-//! account and decoding the bytes it was built from can never disagree. Only live accounts
-//! carry the real header values, populated market entries and the dynamic tail, so a program
-//! upgrade that moves a field shows up here as a failed invariant or a stray byte diff.
-//!
-//! Nothing here hunts for a market that happens to sit in an interesting state: the live
-//! accounts are the raw material, and the production builders prepare the scene.
-
 use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
@@ -534,8 +515,6 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         .with_svm_reader(|svm| svm.get_account(&graph.global_trader_index))
         .unwrap()
         .unwrap();
-    // The cascade is the two templates across slots: the collateral tool's scenario at slot 0
-    // and the mark shock at slot 1, which is what a user composes in the editor.
     let mut cascade = build_phoenix_collateral_scenario(
         graph.trader,
         &trader_account,
@@ -611,21 +590,13 @@ async fn reference_prices_change_hawkeye_index_on_live_markets() {
             .await
             .unwrap();
         let after = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
-        println!(
-            "{symbol}: mark {} -> {}, index {} -> {} (target spot 80000, perp 79000)",
-            before.mark_price_ticks,
-            after.mark_price_ticks,
-            before.index_price_ticks,
-            after.index_price_ticks
-        );
         assert_eq!(after.mark_price_ticks, before.mark_price_ticks, "{symbol}");
         assert_eq!(after.index_price_ticks, 80000, "{symbol}");
     }
 }
 
 /// A surfnet holding the live Phoenix account graph and a discovered live trader, with the
-/// two SBF programs loaded. Nothing here looks for a market or trader in an interesting
-/// state: the collateral stress below produces the risk condition the assertions check.
+/// two SBF programs loaded.
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA, "eternal").await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA, "hawkeye").await;
@@ -698,10 +669,6 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     let clock: Clock = bincode::deserialize(&fresh.pop().unwrap().data).unwrap();
     assert!(clock.slot > 0);
     let accounts = addresses.into_iter().zip(fresh).collect();
-    println!(
-        "Phoenix live fork: slot={}, unix_timestamp={}",
-        clock.slot, clock.unix_timestamp
-    );
 
     let graph = PhoenixLiveGraph {
         clock,
