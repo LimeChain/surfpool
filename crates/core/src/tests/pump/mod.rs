@@ -45,15 +45,17 @@ use crate::{
         },
     },
     storage::tests::TestType,
-    surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
+    surfnet::{
+        GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
+    },
     tests::{
-        helpers::{
-            diff_indices, get_free_port,
-            remote::{client, fetch, url},
-        },
+        helpers::get_free_port,
         integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
     },
 };
+
+const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
+const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const PUMP: Pubkey = Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const PAMM: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
@@ -100,6 +102,38 @@ const AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET: usize = 57;
 const POOL_LP_SUPPLY_OFFSET: usize = 203;
 const POOL_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 245;
 const POOL_COIN_CREATOR_OFFSET: usize = 211;
+
+/// Fetches the accounts in one request, so every account returned is from the same slot.
+async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
+    let client = SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+    );
+
+    client
+        .get_multiple_accounts(addresses, CommitmentConfig::confirmed())
+        .await
+        .unwrap_or_else(|e| panic!("failed to fetch {addresses:?} from mainnet: {e}"))
+        .into_iter()
+        .zip(addresses)
+        .map(|(result, address)| match result {
+            GetAccountResult::FoundAccount(_, account, _)
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account,
+            GetAccountResult::None(_) => {
+                panic!("{address} no longer exists on mainnet; the test needs a new address")
+            }
+        })
+        .collect()
+}
+
+/// Byte indices at which two buffers differ.
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
+}
 
 /// A failure here means a bundled IDL disagrees with the live on-chain layout.
 #[tokio::test]
@@ -452,7 +486,9 @@ fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     let ws_port = get_free_port().unwrap();
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
-            remote_rpc_url: Some(url()),
+            remote_rpc_url: Some(
+                std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+            ),
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -489,7 +525,8 @@ fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
 async fn find_live_graduation_candidate(
     surfnet: &RpcClient,
 ) -> (Pubkey, PumpGraduationPreparation) {
-    let mainnet = client().client;
+    let mainnet =
+        RpcClient::new(std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()));
     let signatures: serde_json::Value = mainnet
         .send(
             RpcRequest::GetSignaturesForAddress,

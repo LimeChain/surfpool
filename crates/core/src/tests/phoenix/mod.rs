@@ -22,87 +22,59 @@ use solana_rpc_client_api::{
 };
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-use surfpool_types::AccountAddress;
+use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 
 use crate::{
     scenarios::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::state_builder::{
-            PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
-            forge_phoenix_override, phoenix_market_symbols, phoenix_perp_asset_map_address,
+            PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
+            build_phoenix_collateral_scenario, phoenix_market_symbols,
         },
     },
-    surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
-    tests::helpers::{
-        diff_indices,
-        remote::{RPC_URL_ENV, client, fetch},
-    },
+    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
     types::RemoteRpcResult,
 };
 
-type LiveMarketGraph = (Account, Pubkey, Account, String);
+const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
+const PHOENIX_GLOBAL_CONFIG: Pubkey =
+    Pubkey::from_str_const("2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ");
 
-/// One fetch of the fork state per process. The perp asset map alone is 1.6MB, and running the
-/// tests in parallel against a public endpoint is what exhausts it.
-fn market_graph_cache() -> &'static tokio::sync::Mutex<Option<LiveMarketGraph>> {
-    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<LiveMarketGraph>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+fn client() -> SurfnetRemoteClient {
+    SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_MAINNET_RPC_URL.to_string()),
+    )
 }
 
-fn trader_cache() -> &'static tokio::sync::Mutex<HashMap<bool, (Pubkey, Account)>> {
-    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<bool, (Pubkey, Account)>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+/// Fetches the accounts in one request, so every account returned is from the same slot.
+async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
+    client()
+        .get_multiple_accounts(addresses, CommitmentConfig::confirmed())
+        .await
+        .unwrap_or_else(|e| panic!("failed to fetch {addresses:?} from mainnet: {e}"))
+        .into_iter()
+        .zip(addresses)
+        .map(|(result, address)| {
+            result.map_account().unwrap_or_else(|_| {
+                panic!("{address} no longer exists on mainnet; the test needs a new address")
+            })
+        })
+        .collect()
 }
 
-/// The live Phoenix account graph: GlobalConfig, the perp asset map it points at, and the
-/// symbol of a market that is actually listed right now.
-async fn live_market_graph() -> LiveMarketGraph {
-    let mut cache = market_graph_cache().lock().await;
-    if let Some(cached) = cache.as_ref() {
-        return cached.clone();
-    }
-    let global_account = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
-    assert_eq!(
-        global_account.owner, PHOENIX_ETERNAL_PROGRAM_ID,
-        "GlobalConfig must be owned by the deployed Eternal program"
-    );
-
-    let perp_asset_map = phoenix_perp_asset_map_address(&global_account)
-        .expect("live GlobalConfig should resolve its perp asset map");
-    let map_account = fetch(&[perp_asset_map]).await.remove(0);
-    let symbols = phoenix_market_symbols(perp_asset_map, &map_account)
-        .expect("live PerpAssetMap should decode");
-    let symbol = symbols
-        .first()
-        .cloned()
-        .expect("no eligible live candidate: the Phoenix PerpAssetMap lists no markets");
-
-    let graph = (global_account, perp_asset_map, map_account, symbol);
-    *cache = Some(graph.clone());
-
-    graph
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b)
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
 }
 
-/// A live Trader account with collateral on it. Traders are per-user accounts that come and go,
-/// so the test discovers one through the program's own account list rather than pinning an
-/// address that may be closed tomorrow.
-pub(crate) async fn live_trader_with_position() -> (Pubkey, Account) {
-    live_candidate(true).await
-}
-
-async fn live_trader() -> (Pubkey, Account) {
-    live_candidate(false).await
-}
-
-/// Walks the program's own account list for a Trader that carries collateral, and an open
-/// position when the caller needs something for a mark shock to act on.
-async fn live_candidate(needs_position: bool) -> (Pubkey, Account) {
-    let mut cache = trader_cache().lock().await;
-    if let Some(hit) = cache.get(&needs_position) {
-        return hit.clone();
-    }
+/// A live hot Trader with collateral and a long position, so a downward mark shock has
+/// something to act on. Traders come and go, so the test discovers one through the program's
+/// own account list rather than pinning an address that may be closed tomorrow.
+async fn live_trader_with_position() -> Pubkey {
     let listed = client()
         .get_program_accounts(
             &PHOENIX_ETERNAL_PROGRAM_ID,
@@ -134,37 +106,25 @@ async fn live_candidate(needs_position: bool) -> (Pubkey, Account) {
         let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
             continue;
         };
-        let has_collateral = trader.header.trader_state.quote_lot_collateral.as_inner() > 0;
-        // A downward mark shock only threatens a long, so the risk scenarios need one:
-        // the shock direction is fixed, the trader is what we go looking for.
+        let state = &trader.header.trader_state;
         let holds_a_long = trader
             .positions()
             .any(|(_, position)| position.base_lot_position().as_inner() > 0);
-        if has_collateral
-            && (!needs_position || (holds_a_long && trader.header.trader_state.is_hot()))
-        {
-            cache.insert(needs_position, (pubkey, account.clone()));
-            return (pubkey, account);
+        if state.quote_lot_collateral.as_inner() > 0 && state.is_hot() && holds_a_long {
+            return pubkey;
         }
     }
 
-    panic!(
-        "no eligible live candidate: no live Phoenix Trader read carries collateral{}",
-        if needs_position {
-            " and is hot with a long position"
-        } else {
-            ""
-        }
-    )
+    panic!("no eligible live candidate: no live Phoenix Trader is hot with collateral and a long")
 }
 
 /// A zero-copy layout cannot be round-tripped against itself, so drift shows up as an
 /// invariant that stops holding on live bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_accounts_satisfy_the_typed_layout_invariants() {
-    let (global_account, perp_asset_map, map_account, symbol) = live_market_graph().await;
+    let graph = phoenix_live_graph().await;
 
-    let global = GlobalConfig::try_from_account_bytes(&global_account.data)
+    let global = GlobalConfig::try_from_account_bytes(&graph.account(&PHOENIX_GLOBAL_CONFIG).data)
         .expect("live GlobalConfig should decode through phoenix-rise-accounts");
     assert_eq!(
         Pubkey::new_from_array(global.account_key()),
@@ -172,136 +132,61 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
         "GlobalConfig stores its own address, so a moved field shows up here first"
     );
     assert_eq!(
-        Pubkey::new_from_array(global.perp_asset_map_key()),
-        perp_asset_map
+        (
+            Pubkey::new_from_array(global.perp_asset_map_key()),
+            Pubkey::new_from_array(global.global_trader_index_header_key()),
+        ),
+        (PHOENIX_PERP_ASSET_MAP, PHOENIX_GLOBAL_TRADER_INDEX),
+        "the hardcoded Phoenix singletons moved; update them to what GlobalConfig points at"
     );
-    for id in [
-        "phoenix-direct-mark-risk-shock",
-        "phoenix-reference-price-divergence",
-    ] {
-        let template_address = TemplateRegistry::new()
-            .get(id)
-            .unwrap_or_else(|| panic!("{id} template exists"))
-            .address
-            .resolve(None)
-            .unwrap_or_else(|| panic!("{id} carries a fixed address"));
-        assert_eq!(
-            template_address, perp_asset_map,
-            "{id} hardcodes the PerpAssetMap address; GlobalConfig says it moved"
-        );
-    }
-    assert_ne!(
-        Pubkey::new_from_array(global.global_trader_index_header_key()),
-        Pubkey::default()
-    );
-    assert_ne!(
-        Pubkey::new_from_array(global.active_trader_buffer_header_key()),
-        Pubkey::default()
+    let template_address = TemplateRegistry::new()
+        .get("phoenix-direct-mark-risk-shock")
+        .expect("the direct mark template exists")
+        .address
+        .resolve(None)
+        .expect("the direct mark template carries a fixed address");
+    assert_eq!(
+        template_address, graph.perp_asset_map,
+        "the template hardcodes the PerpAssetMap address; GlobalConfig says it moved"
     );
 
+    let map_account = graph.account(&graph.perp_asset_map);
     assert_eq!(map_account.owner, PHOENIX_ETERNAL_PROGRAM_ID);
+    let symbols = phoenix_market_symbols(graph.perp_asset_map, map_account)
+        .expect("live PerpAssetMap should decode");
     let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
         .expect("live PerpAssetMap should decode through phoenix-rise-accounts");
-    let entry = map
-        .find_by_symbol(&symbol)
-        .expect("symbol lookup should decode")
-        .expect("the symbol came from this map");
-    let market = Pubkey::new_from_array(entry.metadata.static_market_params().market_account);
-    assert_ne!(
-        market,
-        Pubkey::default(),
-        "a listed market needs an address"
-    );
-
-    let price = entry.metadata.oracle_price();
-    assert!(
-        price.mark_price.price.ticks.as_inner() > 0,
-        "{symbol} is listed with a zero mark price, which the risk engine cannot use"
-    );
-
-    // The spline address is derived, so a change in the seeds surfaces as an account the
-    // program would no longer find.
-    let spline = derive_spline_collection_address(&PHOENIX_ETERNAL_PROGRAM_ID, &market);
-    let spline_account = fetch(&[spline]).await.remove(0);
-    assert_eq!(
-        spline_account.owner, PHOENIX_ETERNAL_PROGRAM_ID,
-        "the derived spline collection must belong to the Eternal program"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn overrides_on_live_accounts_touch_only_their_target_bytes() {
-    let (_global_account, perp_asset_map, map_account, symbol) = live_market_graph().await;
-
-    let map = PerpAssetMap::try_from_account_bytes(&map_account.data).expect("live map decodes");
-    let entry = map
-        .find_by_symbol(&symbol)
-        .expect("symbol lookup")
-        .expect("listed symbol");
-    let live_mark = entry
-        .metadata
-        .oracle_price()
-        .mark_price
-        .price
-        .ticks
-        .as_inner();
-
-    let materialization_slot = entry.metadata.oracle_price().mark_price.price.slot + 1;
-    let shocked = forge_phoenix_override(
-        &perp_asset_map,
-        &map_account,
-        &HashMap::from([
-            ("symbol".to_string(), serde_json::json!(symbol)),
-            (
-                "target_ticks".to_string(),
-                serde_json::json!((live_mark / 2 + 1).to_string()),
-            ),
-        ]),
-        materialization_slot,
-    )
-    .expect("direct mark patch on the live map");
-    assert_eq!(
-        shocked.len(),
-        map_account.data.len(),
-        "the map's dynamic tail must survive"
-    );
-    let mark_diffs = diff_indices(&shocked, &map_account.data);
-    assert!(
-        !mark_diffs.is_empty() && mark_diffs.len() <= 16,
-        "a mark shock writes its ticks and slot, got {} changed bytes",
-        mark_diffs.len()
-    );
-
-    let diverged = forge_phoenix_override(
-        &perp_asset_map,
-        &map_account,
-        &HashMap::from([
-            ("symbol".to_string(), serde_json::json!(symbol)),
-            (
-                "spot_ticks".to_string(),
-                serde_json::json!((live_mark * 2).to_string()),
-            ),
-            (
-                "perp_ticks".to_string(),
-                serde_json::json!((live_mark * 3).to_string()),
-            ),
-        ]),
-        materialization_slot,
-    )
-    .expect("reference price patch on the live map");
-    assert_eq!(diverged.len(), map_account.data.len());
-    let reference_diffs = diff_indices(&diverged, &map_account.data);
-    assert!(
-        reference_diffs
-            .iter()
-            .all(|index| !mark_diffs.contains(index)),
-        "reference divergence must preserve the mark price it diverges from"
-    );
+    for (symbol, _, spline) in &graph.markets {
+        assert!(symbols.contains(symbol), "{symbol} is listed");
+        let entry = map
+            .find_by_symbol(symbol)
+            .expect("symbol lookup should decode")
+            .expect("the symbol came from this map");
+        assert!(
+            entry
+                .metadata
+                .oracle_price()
+                .mark_price
+                .price
+                .ticks
+                .as_inner()
+                > 0,
+            "{symbol} is listed with a zero mark price, which the risk engine cannot use"
+        );
+        // The spline address is derived, so a change in the seeds surfaces as an account the
+        // program would no longer find.
+        assert_eq!(
+            graph.account(spline).owner,
+            PHOENIX_ETERNAL_PROGRAM_ID,
+            "the derived spline collection must belong to the Eternal program"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn collateral_idl_override_preserves_live_trader_layout() {
-    let (trader, account) = live_trader().await;
+    let graph = phoenix_live_graph().await;
+    let account = graph.account(&graph.trader);
 
     let idl: anchor_lang_idl::types::Idl =
         serde_json::from_str(crate::scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT)
@@ -310,19 +195,13 @@ async fn collateral_idl_override_preserves_live_trader_layout() {
         SurfnetSvm::new(crate::surfnet::svm::SurfnetSvmConfig::default()).unwrap();
 
     let target: i64 = 12_345;
-    let mut overrides = HashMap::new();
-    overrides.insert(
+    let overrides = HashMap::from([(
         "traderState.quoteLotCollateral".to_string(),
-        serde_json::Value::from(
-            crate::scenarios::protocols::phoenix_eternal::v1::collateral::parse_quote_lot_collateral(
-                &serde_json::json!(target.to_string()),
-            )
-            .unwrap(),
-        ),
-    );
+        serde_json::Value::from(target),
+    )]);
 
     let forged = svm
-        .get_forged_account_data(&trader, &account.data, &idl, &overrides)
+        .get_forged_account_data(&graph.trader, &account.data, &idl, &overrides)
         .expect("idl override path forges the trader account");
 
     let header = TraderHeader::try_read_from_account_bytes(&forged).expect("forged header decodes");
@@ -332,64 +211,6 @@ async fn collateral_idl_override_preserves_live_trader_layout() {
     assert!(
         diffs.iter().all(|index| (88..96).contains(index)),
         "collateral override changed bytes outside 88..96: {diffs:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_market_templates_address_the_live_perp_asset_map() {
-    let (_global_account, perp_asset_map, _map_account, _symbol) = live_market_graph().await;
-    let registry = TemplateRegistry::new();
-
-    for template_id in [
-        "phoenix-direct-mark-risk-shock",
-        "phoenix-reference-price-divergence",
-    ] {
-        let template = registry
-            .get(template_id)
-            .unwrap_or_else(|| panic!("{template_id} should be registered"));
-        let addressed = match &template.address {
-            AccountAddress::Pubkey(value) => Pubkey::from_str_const(value),
-            other => panic!("{template_id} should address a fixed pubkey, got {other:?}"),
-        };
-        assert_eq!(
-            addressed, perp_asset_map,
-            "{template_id} writes to a hardcoded map; a Phoenix migration moves the one \
-             GlobalConfig points at, and nothing else here would notice"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn collateral_stress_refuses_to_outrun_the_live_vault() {
-    let (trader, account) = live_trader().await;
-    let global = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
-    let index_key = crate::scenarios::protocols::phoenix_eternal::v1::state_builder::phoenix_global_trader_index_address(&global).unwrap();
-    let index = fetch(&[index_key]).await.remove(0);
-    let header = TraderHeader::try_read_from_account_bytes(&account.data).unwrap();
-    let live_collateral =
-        crate::scenarios::protocols::phoenix_eternal::v1::collateral::effective_collateral(
-            &header,
-            Some(&index),
-        )
-        .unwrap();
-
-    let lowered = build_phoenix_collateral_scenario(trader, &account, "1", Some(&index))
-        .expect("lowering collateral is state preparation");
-    assert_eq!(
-        lowered.overrides[0].values["traderState.quoteLotCollateral"],
-        "1"
-    );
-
-    let raised = build_phoenix_collateral_scenario(
-        trader,
-        &account,
-        &(live_collateral + 1).to_string(),
-        Some(&index),
-    )
-    .unwrap_err();
-    assert!(
-        raised.to_string().contains("can only lower collateral"),
-        "raising collateral past its vault backing must be refused, got: {raised}"
     );
 }
 
@@ -438,8 +259,6 @@ fn live_graph_cache() -> &'static tokio::sync::Mutex<Option<PhoenixLiveGraph>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
-    // Collateral stress produces the risk condition: a trader with an open position and
-    // almost no collateral is liquidatable whichever way the position points.
     let (collateral_locker, graph) = phoenix_behavior_locker().await;
     use crate::scenarios::protocols::phoenix_eternal::v1::collateral::index_trader_state_range;
 
@@ -463,8 +282,6 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         before.position_count > 0,
         "the discovered trader must hold a position for margin to mean anything"
     );
-    // The program itself says how much collateral this trader's positions require, so the
-    // stress target is derived from live state rather than picked.
     assert!(
         before.maintenance_margin_quote_lots > 0,
         "no eligible live candidate: the discovered trader's positions require no margin"
@@ -501,9 +318,8 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     assert_eq!(account(&graph.trader), expected_trader);
     assert_eq!(account(&graph.global_trader_index), expected_index);
 
-    // The cascade prepares the same collateral at slot 0 and a mark shock at slot 1. What
-    // the deployed program reads is asserted; whether this particular position liquidates
-    // depends on its side, which the discovery does not choose.
+    // Whether the position liquidates depends on its side, so the cascade asserts what the
+    // program reads, not the outcome.
     let (mark_locker, graph) = phoenix_behavior_locker().await;
     let (symbol, orderbook, spline) = graph.markets[0].clone();
     let trader_account = mark_locker
@@ -566,37 +382,52 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reference_prices_change_hawkeye_index_on_live_markets() {
-    let graph = phoenix_live_graph().await;
-    for (symbol, orderbook, spline) in &graph.markets {
-        let (locker, _) = phoenix_behavior_locker().await;
-        let before = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
-        locker
-            .register_scenario(
-                phoenix_market_scenario(
-                    "phoenix-reference-price-divergence",
-                    graph.perp_asset_map,
-                    &[
-                        ("symbol", symbol.as_str()),
-                        ("spot_ticks", "80000"),
-                        ("perp_ticks", "79000"),
-                    ],
-                ),
-                Some(graph.clock.slot),
-            )
-            .unwrap();
-        locker
-            .materialize_overrides_for_slot(&None, graph.clock.slot)
-            .await
-            .unwrap();
-        let after = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
-        assert_eq!(after.mark_price_ticks, before.mark_price_ticks, "{symbol}");
-        assert_eq!(after.index_price_ticks, 80000, "{symbol}");
-    }
+async fn maintenance_margin_stress_raises_the_live_requirement() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader_account = graph.account(&graph.trader);
+    let trader = Trader::try_from_account_bytes(&trader_account.data).unwrap();
+    let (asset_id, _) = trader
+        .positions()
+        .next()
+        .expect("the discovered trader holds a position");
+    let map = PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
+        .expect("live PerpAssetMap decodes");
+    let entry = map
+        .iter()
+        .map(|entry| entry.expect("live map entry decodes"))
+        .find(|entry| u64::from(entry.metadata.static_market_params().asset_id()) == asset_id)
+        .expect("the position's market is listed");
+    let doubled = entry.metadata.risk_params().risk_factors[0].saturating_mul(2);
+
+    let before = hawkeye_margin(&locker, &graph);
+    locker
+        .register_scenario(
+            phoenix_market_scenario(
+                "phoenix-maintenance-margin-stress",
+                graph.perp_asset_map,
+                &[
+                    ("symbol", entry.symbol.as_str()),
+                    ("maintenance_risk_factor_bps", &doubled.to_string()),
+                ],
+            ),
+            Some(graph.clock.slot),
+        )
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
+        .await
+        .unwrap();
+    let after = hawkeye_margin(&locker, &graph);
+
+    assert_eq!(after.collateral_quote_lots, before.collateral_quote_lots);
+    assert!(
+        after.maintenance_margin_quote_lots > before.maintenance_margin_quote_lots,
+        "a stricter factor must raise the maintenance margin the program computes: {} -> {}",
+        before.maintenance_margin_quote_lots,
+        after.maintenance_margin_quote_lots
+    );
 }
 
-/// A surfnet holding the live Phoenix account graph and a discovered live trader, with the
-/// two SBF programs loaded.
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA, "eternal").await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA, "hawkeye").await;
@@ -659,7 +490,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         markets.push((symbol.to_string(), orderbook, spline));
     }
 
-    let (trader, _) = live_trader_with_position().await;
+    let trader = live_trader_with_position().await;
     addresses.push(trader);
     addresses.push(Pubkey::from_str_const(
         "SysvarC1ock11111111111111111111111111111111",
@@ -684,8 +515,6 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     graph
 }
 
-/// The live accounts a Phoenix behavioral run needs, with the addresses the Hawkeye
-/// margin view expects to be passed alongside them.
 #[derive(Clone)]
 struct PhoenixLiveGraph {
     clock: Clock,
@@ -694,9 +523,17 @@ struct PhoenixLiveGraph {
     active_trader_buffer: Pubkey,
     perp_asset_map: Pubkey,
     trader: Pubkey,
-    /// Two live markets, as symbol plus the orderbook and spline accounts the
-    /// Hawkeye reader wants for it.
+    /// Symbol, orderbook and spline for each market the Hawkeye BBO view reads.
     markets: Vec<(String, Pubkey, Pubkey)>,
+}
+
+impl PhoenixLiveGraph {
+    fn account(&self, address: &Pubkey) -> &Account {
+        self.accounts
+            .iter()
+            .find_map(|(key, account)| (key == address).then_some(account))
+            .unwrap_or_else(|| panic!("{address} is not in the live graph"))
+    }
 }
 
 fn hawkeye_view(

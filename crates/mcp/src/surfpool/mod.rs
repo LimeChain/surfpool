@@ -21,11 +21,10 @@ use surfpool_core::{
         TemplateRegistry,
         protocols::{
             phoenix_eternal::v1::{
-                collateral::{trader_header, validate_hot_trader_fields},
+                collateral::trader_header,
                 state_builder::{
-                    PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
-                    phoenix_global_trader_index_address, phoenix_market_symbols,
-                    phoenix_perp_asset_map_address,
+                    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
+                    build_phoenix_collateral_scenario, phoenix_market_symbols,
                 },
             },
             pump::v1::graduation_builder::{
@@ -461,33 +460,17 @@ impl Surfpool {
         let trader = Pubkey::from_str(params.trader.trim())
             .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
         let accounts = self
-            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_CONFIG])
+            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_TRADER_INDEX])
             .await?;
         let trader_account = accounts[0]
             .as_ref()
             .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
         let header = trader_header(&trader, trader_account).map_err(|error| error.to_string())?;
-        let index = if header.trader_state.is_hot() {
-            let global = accounts[1]
-                .as_ref()
-                .ok_or("Phoenix GlobalConfig was not found")?;
-            let index_address =
-                phoenix_global_trader_index_address(global).map_err(|error| error.to_string())?;
-            self.fetch_surfnet_accounts(params.surfnet_port, &[index_address])
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
-        } else {
-            None
-        };
-        build_phoenix_collateral_scenario(
-            trader,
-            trader_account,
-            &params.target_quote_lots,
-            index.as_ref(),
-        )
-        .map_err(|error| error.to_string())
+        let index = accounts[1]
+            .as_ref()
+            .filter(|_| header.trader_state.is_hot());
+        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots, index)
+            .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -885,12 +868,6 @@ impl Surfpool {
 
                 // Get the template for validation and normalization
                 if let Some(template) = registry.get(&override_instance.template_id) {
-                    if template.id == "phoenix-trader-collateral-stress"
-                        && let Err(error) = validate_hot_trader_fields(&override_instance.values)
-                    {
-                        validation_errors.push(error.to_string());
-                        continue;
-                    }
                     // Normalize: Extract values from malformed PDA seeds
                     // LLMs sometimes put values directly in seeds instead of in values map
                     if let surfpool_types::AccountAddress::Pda { seeds, .. } =
@@ -1118,7 +1095,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. Validates effective collateral in the Trader or its GlobalTraderIndex entry. Hot traders require a supported single-arena index. This prepares risk state; it does not guarantee or execute liquidation."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. Only lowers collateral: a target above the trader's effective collateral is refused, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
     )]
     async fn create_phoenix_collateral_scenario(
         &self,
@@ -1139,14 +1116,7 @@ impl Surfpool {
         &self,
         surfnet_port: Option<u16>,
     ) -> Result<serde_json::Value, String> {
-        let globals = self
-            .fetch_surfnet_accounts(surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
-            .await?;
-        let global_account = globals[0]
-            .as_ref()
-            .ok_or("Phoenix GlobalConfig account was not found on the surfnet")?;
-        let perp_asset_map =
-            phoenix_perp_asset_map_address(global_account).map_err(|error| error.to_string())?;
+        let perp_asset_map = PHOENIX_PERP_ASSET_MAP;
         let maps = self
             .fetch_surfnet_accounts(surfnet_port, &[perp_asset_map])
             .await?;
@@ -1163,7 +1133,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's GlobalConfig and the map it points at, so the catalog reflects live state rather than a hardcoded snapshot. Use it to discover valid market symbols before preparing a Phoenix scenario."
+        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Use it to discover valid market symbols before preparing a Phoenix scenario."
     )]
     async fn list_phoenix_markets(
         &self,
@@ -1504,28 +1474,6 @@ mod tests {
                 .expect("error")
                 .contains("Invalid token mint")
         );
-    }
-
-    #[tokio::test]
-    async fn create_scenario_rejects_unsupported_phoenix_collateral_fields_before_staging() {
-        let mut scenario = Scenario::new("unsupported".to_string(), "unsupported".to_string());
-        scenario.add_override(
-            surfpool_types::OverrideInstance::new(
-                "phoenix-trader-collateral-stress".to_string(),
-                0,
-                surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
-            )
-            .with_values(HashMap::from([(
-                "traderState.flags".to_string(),
-                serde_json::json!("1"),
-            )])),
-        );
-        let result = Surfpool::new()
-            .create_scenario(Parameters(scenario))
-            .await
-            .unwrap();
-        assert!(json_of(&result)["url"].is_null());
-        assert!(json_of(&result).to_string().contains("traderState.flags"));
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {

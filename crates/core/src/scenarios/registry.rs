@@ -1184,8 +1184,8 @@ mod tests {
         let mut errors = Vec::new();
 
         for template in registry.all() {
-            // Phoenix market templates feed the typed PerpAssetMap price codec in svm.rs, so
-            // their inputs (market symbol, ticks) are codec arguments, not IDL fields.
+            // Phoenix market templates feed the typed PerpAssetMap codec, so their inputs
+            // (market symbol, ticks, risk factor) are codec arguments, not IDL fields.
             if template.protocol == "Phoenix Eternal" && template.account_type == "PerpAssetMap" {
                 continue;
             }

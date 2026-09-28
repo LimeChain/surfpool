@@ -273,24 +273,9 @@ mod tests {
         }
     }
 
-    fn global_account(index: &Pubkey) -> Account {
-        use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
-
-        let mut data = vec![0; 2_560];
-        data[..8].copy_from_slice(&PhoenixAccount::GlobalConfiguration.discriminant());
-        data[8..40].copy_from_slice(PHOENIX_GLOBAL_CONFIG.as_ref());
-        data[392..424].copy_from_slice(index.as_ref());
-        Account {
-            lamports: 1,
-            data,
-            owner: PHOENIX_ETERNAL_PROGRAM_ID,
-            ..Account::default()
-        }
-    }
-
     #[tokio::test]
     async fn materialization_patches_selected_hot_trader_and_index_record_only() {
-        use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
+        use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
         for (key, other_key, collateral_offset, target) in [
@@ -299,14 +284,13 @@ mod tests {
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
-            let index_key = Pubkey::new_unique();
+            let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
             let mut before_trader = trader_account(key, 9_999, true);
             before_trader.lamports = 1;
             let mut before_other = trader_account(other_key, 8_888, true);
             before_other.lamports = 1;
             let mut before_index = index_account();
             before_index.lamports = 1;
-            let global = global_account(&index_key);
             let scenario = build_phoenix_collateral_scenario(
                 trader,
                 &before_trader,
@@ -319,8 +303,6 @@ mod tests {
             svm.set_account(&other_trader, before_other.clone())
                 .unwrap();
             svm.set_account(&index_key, before_index.clone()).unwrap();
-            svm.set_account(&PHOENIX_GLOBAL_CONFIG, global.clone())
-                .unwrap();
             svm.register_scenario(scenario, Some(100)).unwrap();
 
             assert_eq!(svm.get_account(&trader).unwrap().unwrap(), before_trader);
@@ -343,16 +325,12 @@ mod tests {
                 svm.get_account(&other_trader).unwrap().unwrap(),
                 before_other
             );
-            assert_eq!(
-                svm.get_account(&PHOENIX_GLOBAL_CONFIG).unwrap().unwrap(),
-                global
-            );
         }
     }
 
     #[tokio::test]
     async fn materialization_skips_invalid_or_missing_index_without_partial_trader_write() {
-        use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
+        use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
         for failure in [
@@ -363,7 +341,7 @@ mod tests {
             "unsupported field",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
-            let index_key = Pubkey::new_unique();
+            let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
             let mut before_trader = trader_account(FIRST_KEY, 9_999, true);
             before_trader.lamports = 1;
             let mut before_index = index_account();
@@ -384,8 +362,6 @@ mod tests {
             }
             let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
             svm.set_account(&trader, before_trader.clone()).unwrap();
-            svm.set_account(&PHOENIX_GLOBAL_CONFIG, global_account(&index_key))
-                .unwrap();
             if failure != "missing account" {
                 svm.set_account(&index_key, before_index.clone()).unwrap();
             }

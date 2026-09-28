@@ -9,7 +9,7 @@ for submitting trades, arbitrage, and liquidation transactions.
 | --- | --- | --- |
 | Collateral stress | `phoenix-trader-collateral-stress` | Exact signed quote-lot collateral on one validated Trader account |
 | Direct mark shock | `phoenix-direct-mark-risk-shock` | Mark-price ticks for one market in the current PerpAssetMap |
-| Spot/perp divergence | `phoenix-reference-price-divergence` | Cached spot and external-perp reference ticks while preserving the mark price |
+| Maintenance margin stress | `phoenix-maintenance-margin-stress` | Maintenance margin risk factor for one market in the current PerpAssetMap |
 | Liquidation cascade | Two validated overrides in one scenario | Trader collateral at slot 0, then a direct market mark shock at slot 1 |
 
 Tick inputs are Phoenix protocol ticks, not human-readable USD prices. Pass tick and collateral
@@ -18,19 +18,20 @@ values as decimal strings so values outside JavaScript's safe integer range rema
 Market templates identify the real `PerpAssetMap` account. Their `symbol` and tick properties
 carry `value_type: string` so Studio can render scenario inputs without synthetic IDL accounts.
 
+`idl.json` is the on-chain IDL of the program, with instructions, events and errors removed like
+the Kamino IDLs. One edit: `maxPositions` is split into `maxPositions: u32` and
+`traderPreferenceBits: u32` to match the Rise SDK; the on-chain IDL shows them as one `u64`.
+
 ## Use from Studio
 
 1. Start an online Surfpool fork and open Studio.
 2. Open **Scenario presets**, choose **Phoenix state**, then select the state goal.
-3. For price scenarios, select a market from the live dropdown. For collateral stress, enter a
+3. For market scenarios, select a market from the live dropdown. For collateral stress, enter a
    Phoenix Eternal Trader account.
 4. Enter the target values and create the scenario.
 5. Inspect the generated override, then press **Play** to activate it.
 6. Send the bot, trade, arbitrage, or liquidation transaction you want to evaluate to the local
    Surfnet RPC, normally `http://127.0.0.1:8899`.
-
-Play prepares account state; it does not submit a Phoenix transaction. The Transaction Inspector
-remains empty until a client sends a transaction against the prepared state.
 
 ## Use through MCP
 
@@ -48,12 +49,11 @@ above the trader’s effective collateral.
 
 | Error or observation | Meaning |
 | --- | --- |
-| `Phoenix GlobalConfig ... was not found` or `Phoenix PerpAssetMap ... was not found` | Neither the local fork nor its datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment. |
+| `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local fork nor its datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment. |
 | `Phoenix market ... was not found` | The symbol is not in the live PerpAssetMap. Symbols are exact, such as `BTC`. |
 | `Phoenix collateral stress can only lower collateral` | The target exceeds what the global vault backs. Send a real deposit to raise collateral. |
 | `Expected a valid Phoenix Eternal Trader account` | The supplied account is not a decodable Phoenix Eternal Trader owned by the deployed program. |
-| Scenario is green but the Transaction Inspector is empty | The state is active, but no client transaction has been sent yet. |
-| A transaction does not produce the expected economic result | Confirm its accounts and instruction path consume the field changed by the selected preparation. |
+| `Cannot get mark price, staleness or validity check failed` | The fork's PerpAssetMap aged since it was loaded. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart the fork. |
 
 ## Verification against mainnet
 
