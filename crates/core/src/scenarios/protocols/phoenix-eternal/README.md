@@ -61,7 +61,6 @@ above the trader’s effective collateral.
 cargo test -p surfpool-core --features integration-tests tests::phoenix
 ```
 
-Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. The deployed
-Phoenix Eternal and Hawkeye bytecode is cached under the system temp directory as
-`surfpool-phoenix-$USER/eternal.so` and `surfpool-phoenix-$USER/hawkeye.so`; delete them to pick
-up a program upgrade.
+Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. Each run
+reads the deployed Phoenix Eternal and Hawkeye bytecode once, so a program upgrade is picked up
+on the next run.

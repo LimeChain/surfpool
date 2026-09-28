@@ -6,10 +6,10 @@ use phoenix_rise_accounts::{
     global_config::GlobalConfig,
     pda::derive_spline_collection_address,
     perp_asset_map::PerpAssetMap,
-    trader::{Trader, TraderHeader},
+    trader::{TRADER_CAPABILITY_HOT, Trader, TraderHeader},
 };
 use solana_account::Account;
-use solana_account_decoder::UiAccountEncoding;
+use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -75,12 +75,18 @@ fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
 /// something to act on. Traders come and go, so the test discovers one through the program's
 /// own account list rather than pinning an address that may be closed tomorrow.
 async fn live_trader_with_position() -> Pubkey {
+    // The list carries only collateral (offset 88) and the capability flags (96) of every
+    // Trader; the full accounts, mostly 5 KB each, are read for the hot ones with collateral.
     let listed = client()
         .get_program_accounts(
             &PHOENIX_ETERNAL_PROGRAM_ID,
             RpcAccountInfoConfig {
                 encoding: Some(UiAccountEncoding::Base64),
                 commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: Some(UiDataSliceConfig {
+                    offset: 88,
+                    length: 12,
+                }),
                 ..RpcAccountInfoConfig::default()
             },
             Some(vec![RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
@@ -89,7 +95,7 @@ async fn live_trader_with_position() -> Pubkey {
             ))]),
         )
         .await;
-    let candidates = match listed {
+    let listed = match listed {
         Ok(RemoteRpcResult::Ok(accounts)) => accounts,
         // The protocol keeps its own trader index, but 0.3.4 exposes only the arena
         // metadata, so the program's account list is the reader we have.
@@ -100,18 +106,36 @@ async fn live_trader_with_position() -> Pubkey {
         ),
         Err(error) => panic!("failed to list live Phoenix traders: {error}"),
     };
+    let candidates: Vec<Pubkey> = listed
+        .into_iter()
+        .filter_map(|(pubkey, account)| {
+            let data = account.to_account()?.data;
+            let collateral = i64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+            let flags = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?);
+            (collateral > 0 && flags & TRADER_CAPABILITY_HOT != 0).then_some(pubkey)
+        })
+        .collect();
 
-    for (pubkey, account) in candidates {
-        let account = account.to_account().expect("live Trader account decodes");
-        let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
-            continue;
-        };
-        let state = &trader.header.trader_state;
-        let holds_a_long = trader
-            .positions()
-            .any(|(_, position)| position.base_lot_position().as_inner() > 0);
-        if state.quote_lot_collateral.as_inner() > 0 && state.is_hot() && holds_a_long {
-            return pubkey;
+    for chunk in candidates.chunks(100) {
+        let accounts = client()
+            .get_multiple_accounts(chunk, CommitmentConfig::confirmed())
+            .await
+            .unwrap_or_else(|e| panic!("failed to read live Phoenix traders: {e}"));
+        for (pubkey, account) in chunk.iter().zip(accounts) {
+            // A trader closed since the list was read is skipped, not an error.
+            let Ok(account) = account.map_account() else {
+                continue;
+            };
+            let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
+                continue;
+            };
+            let state = &trader.header.trader_state;
+            let holds_a_long = trader
+                .positions()
+                .any(|(_, position)| position.base_lot_position().as_inner() > 0);
+            if state.quote_lot_collateral.as_inner() > 0 && state.is_hot() && holds_a_long {
+                return *pubkey;
+            }
         }
     }
 
@@ -221,32 +245,18 @@ const ETERNAL_PROGRAMDATA: Pubkey =
 const HAWKEYE_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("Gv1WgG864CQqF5vedJVbpnhpRpRbTW1A7SyARzSw9B4Y");
 
-/// The deployed bytecode, read from the upgradeable loader's ProgramData account. The ELF
-/// starts 45 bytes in, past the loader's own header.
-async fn deployed_program(programdata: Pubkey, name: &str) -> Vec<u8> {
-    // The cache lives in a directory only this user can read or write, and a symlink in its
-    // place is ignored, so another account on a shared host cannot feed the tests bytecode.
-    let dir = std::env::temp_dir().join(format!(
-        "surfpool-phoenix-{}",
-        std::env::var("USER").unwrap_or_else(|_| "user".to_string())
-    ));
-    let cache = dir.join(format!("{name}.so"));
-    let is_regular_file = std::fs::symlink_metadata(&cache).is_ok_and(|m| m.file_type().is_file());
-    match std::fs::read(&cache) {
-        Ok(bytes) if is_regular_file && bytes.len() > 200_000 => bytes,
-        _ => {
-            let bytes = fetch(&[programdata]).await.remove(0).data[45..].to_vec();
-            if std::fs::create_dir_all(&dir).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-                }
-                let _ = std::fs::write(&cache, &bytes);
-            }
-            bytes
-        }
+/// The deployed bytecode, read from the upgradeable loader's ProgramData account once per test
+/// process. The ELF starts 45 bytes in, past the loader's own header.
+async fn deployed_program(programdata: Pubkey) -> Vec<u8> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<HashMap<Pubkey, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().await;
+    if let Some(bytes) = cache.get(&programdata) {
+        return bytes.clone();
     }
+    let bytes = fetch(&[programdata]).await.remove(0).data[45..].to_vec();
+    cache.insert(programdata, bytes.clone());
+    bytes
 }
 
 /// Refetching the graph per test is what exhausts a public endpoint: the perp asset map alone
@@ -429,8 +439,8 @@ async fn maintenance_margin_stress_raises_the_live_requirement() {
 }
 
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
-    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA, "eternal").await;
-    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA, "hawkeye").await;
+    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
+    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
     let graph = phoenix_live_graph().await;
 
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
