@@ -19,6 +19,7 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
+        live_constants::resolve_live_constants,
         protocols::pump::v1::graduation_builder::{
             build_pump_graduation_scenario, pump_graduation_addresses,
         },
@@ -128,6 +129,10 @@ pub struct SearchConstantOptionsParams {
         description = "Case-insensitive text matched against option id, label, description and value (e.g., \"SOL/USD\"). An empty string returns the first options."
     )]
     pub query: String,
+    #[schemars(
+        description = "Port of the running surfnet that live constant options (e.g. Tessera markets) are read from. Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -150,6 +155,10 @@ pub struct GetTemplateParams {
         description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
     )]
     pub template_id: String,
+    #[schemars(
+        description = "Port of the running surfnet that live constant options (e.g. Tessera markets) are read from. Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -401,6 +410,39 @@ impl TokenAddressResponse {
 }
 
 impl Surfpool {
+    /// The template with its live constants read from the surfnet on `surfnet_port`, or the
+    /// tool result naming the valid ids.
+    async fn served_template(
+        &self,
+        template_id: &str,
+        surfnet_port: Option<u16>,
+    ) -> Result<surfpool_types::OverrideTemplate, Result<CallToolResult, McpError>> {
+        let template = {
+            let registry = self.template_registry.read().map_err(|_| {
+                use std::borrow::Cow;
+                Err(McpError {
+                    code: ErrorCode(-32603),
+                    message: Cow::from("Failed to read template registry"),
+                    data: None,
+                })
+            })?;
+            let Some(template) = registry.get(template_id).cloned() else {
+                let valid_ids: Vec<&String> = registry.all().into_iter().map(|t| &t.id).collect();
+                return Err(Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Unknown templateId {template_id:?}. Valid IDs are: {valid_ids:?}"
+                ))])));
+            };
+            template
+        };
+        let rpc_url = format!(
+            "http://127.0.0.1:{}",
+            surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+        );
+        Ok(resolve_live_constants(&rpc_url, vec![template])
+            .await
+            .remove(0))
+    }
+
     /// Reads through the surfnet's own RPC: local state wins, only missing
     /// accounts fall back to its remote source.
     async fn fetch_surfnet_accounts(
@@ -1054,23 +1096,14 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<GetTemplateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let registry = self.template_registry.read().map_err(|_| {
-            use std::borrow::Cow;
-            McpError {
-                code: ErrorCode(-32603),
-                message: Cow::from("Failed to read template registry"),
-                data: None,
-            }
-        })?;
-
-        let all_templates = registry.all();
-        let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
-            let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Unknown templateId {:?}. Valid IDs are: {:?}",
-                params.template_id, valid_ids
-            ))]));
+        let template = match self
+            .served_template(&params.template_id, params.surfnet_port)
+            .await
+        {
+            Ok(template) => template,
+            Err(unknown) => return unknown,
         };
+        let template = &template;
 
         let json_str = serde_json::to_string(&compact_template_json(template)).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
@@ -1083,23 +1116,14 @@ impl Surfpool {
         &self,
         Parameters(params): Parameters<SearchConstantOptionsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let registry = self.template_registry.read().map_err(|_| {
-            use std::borrow::Cow;
-            McpError {
-                code: ErrorCode(-32603),
-                message: Cow::from("Failed to read template registry"),
-                data: None,
-            }
-        })?;
-
-        let all_templates = registry.all();
-        let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
-            let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Unknown templateId {:?}. Valid IDs are: {:?}",
-                params.template_id, valid_ids
-            ))]));
+        let template = match self
+            .served_template(&params.template_id, params.surfnet_port)
+            .await
+        {
+            Ok(template) => template,
+            Err(unknown) => return unknown,
         };
+        let template = &template;
 
         if let Some(ref wanted) = params.constant {
             if !template.constants.contains_key(wanted) {
@@ -1364,12 +1388,14 @@ mod tests {
             template_id: template_id.to_string(),
             constant: constant.map(str::to_string),
             query: query.to_string(),
+            surfnet_port: None,
         })
     }
 
     fn template_id(id: &str) -> Parameters<GetTemplateParams> {
         Parameters(GetTemplateParams {
             template_id: id.to_string(),
+            surfnet_port: None,
         })
     }
 

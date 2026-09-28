@@ -1,0 +1,79 @@
+protocol: GoonFi
+version: v2
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+constants:
+  market:
+    label: GoonFi market
+    description: Choose a GoonFi market that has traded within the last day.
+    source:
+      program_accounts:
+        program: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
+        size: 2048
+        filters:
+          - offset: 0
+            bytes: [48, 188, 47, 53, 52, 88, 50, 154]
+        fields:
+          base_mint: { offset: 80, encoding: pubkey }
+          quote_mint: { offset: 112, encoding: pubkey }
+          base_vault: { offset: 144, encoding: pubkey }
+          quote_vault: { offset: 176, encoding: pubkey }
+          oracle: { offset: 208, encoding: pubkey }
+          activity_slot: { offset: 40, encoding: u64 }
+        pair: { base: base_mint, quote: quote_mint }
+        default:
+          base: So11111111111111111111111111111111111111112
+          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        fresh: { field: activity_slot, within_slots: 216000 }
+
+templates:
+  - id: goonfi-reference-band
+    name: Override Reference Band
+    description: Move the market's reference prices that bound the oracle quote
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: reference_price_a_x1e6
+        offset: 1712
+        encoding: u64
+        label: Reference price A
+        description: First reference anchor, quote per base times 10^6, independent of mint decimals.
+      - path: reference_price_b_x1e6
+        offset: 1720
+        encoding: u64
+        label: Reference price B
+        description: Second reference anchor, quote per base times 10^6; their order is not fixed.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      PRECONDITION - MOVE THE BAND WITH THE PRICE. GoonFi checks the oracle quote against these two
+      reference prices before it fills. A sell whose oracle bid sits above the band, or a buy whose
+      oracle ask sits below it, rejects with custom error 0x24 (36). Every goonfi-price move needs
+      this template on the same market, scaled by the same factor, in the same scenario.
+
+      UNIT: quote per base times 10^6, the same scale as the oracle and independent of mint
+      decimals. SOL at 99.74 USDC is 99740000.
+
+      CONVERSION:
+        reference_price_x1e6 = human_price * 10^6
+
+      Set both anchors. Their order on the live market is not fixed, so set both to the target price
+      or scale both by the same factor as the oracle.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared. The market's oracle is
+      at market bytes 208..240; its vaults are at 144..176 (base) and 176..208 (quote).
+
+      ONE-SIDED BLOCK: leaving the band untouched while raising only the bid blocks sells, and
+      lowering only the ask blocks buys. The other direction keeps filling.
+
+      EXAMPLE - "SOL is worth $150" on the selected SOL/USDC market, paired with goonfi-price:
+        reference_price_a_x1e6: 150000000
+        reference_price_b_x1e6: 150000000
