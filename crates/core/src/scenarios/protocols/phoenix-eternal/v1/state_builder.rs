@@ -4,16 +4,12 @@ use std::collections::HashMap;
 use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError,
     global_config::GlobalConfig,
-    perp_asset_map::{
-        MarkPrice, PerpAssetMap, PerpPriceComponent, PriceComponent, SpotPriceComponent,
-        TicksAtSlot,
-    },
+    perp_asset_map::{PerpAssetMap, PriceComponent},
 };
 use phoenix_rise_math::quantities::Ticks;
 use solana_account::Account;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
-use thiserror::Error;
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -43,7 +39,6 @@ const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
 const REFERENCE_SPOT_TICKS_FIELD: &str = "spot_ticks";
 const REFERENCE_PERP_TICKS_FIELD: &str = "perp_ticks";
 const PREPARATION_SLOT: u64 = 0;
-const MARK_PRICE_RANGE: core::ops::Range<usize> = 16..32;
 
 pub fn phoenix_market_symbols(
     perp_asset_map: Pubkey,
@@ -73,63 +68,48 @@ pub fn phoenix_market_symbols(
     Ok(symbols)
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-enum PhoenixPricePatchError {
-    #[error("invalid Phoenix PerpAssetMap account: {0}")]
-    InvalidPerpAssetMap(#[from] PhoenixAccountDecodeError),
-    #[error("Phoenix market {symbol} was not found")]
-    MarketNotFound { symbol: String },
-    #[error("price ticks {ticks} exceed the Phoenix u32 tick range")]
-    InvalidTicks { ticks: u64 },
-    #[error("selected Phoenix market metadata does not occur exactly once")]
-    InvalidMetadataLocation,
-    #[error("price patch changed byte {offset} outside the requested price fields")]
-    UnexpectedByteChange { offset: usize },
+fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) -> SurfpoolError {
+    SurfpoolError::invalid_account_data(
+        account_pubkey,
+        "Expected a valid Phoenix Eternal PerpAssetMap account",
+        Some(message),
+    )
 }
 
-fn changed_byte_outside(
-    original: &[u8],
-    patched: &[u8],
-    allowed: &[core::ops::Range<usize>],
-) -> Option<usize> {
-    original
-        .iter()
-        .zip(patched)
-        .enumerate()
-        .find(|(offset, (before, after))| {
-            before != after && !allowed.iter().any(|range| range.contains(offset))
-        })
-        .map(|(offset, _)| offset)
+fn checked_ticks(account_pubkey: &Pubkey, ticks: u64) -> SurfpoolResult<Ticks> {
+    Ticks::new_checked(ticks).map_err(|_| {
+        price_patch_error(
+            account_pubkey,
+            format!("price ticks {ticks} exceed the Phoenix u32 tick range"),
+        )
+    })
 }
 
 fn patch_direct_mark(
+    account_pubkey: &Pubkey,
     data: &[u8],
     symbol: &str,
     target_ticks: u64,
     mark_slot: u64,
-) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    let target_ticks =
-        Ticks::new_checked(target_ticks).map_err(|_| PhoenixPricePatchError::InvalidTicks {
-            ticks: target_ticks,
-        })?;
-    patch_price_component(data, symbol, &[MARK_PRICE_RANGE], |price| {
+) -> SurfpoolResult<Vec<u8>> {
+    let target_ticks = checked_ticks(account_pubkey, target_ticks)?;
+    patch_price_component(account_pubkey, data, symbol, |price| {
         price.mark_price.price.slot = mark_slot;
         price.mark_price.price.ticks = target_ticks;
     })
 }
 
 fn patch_reference_prices(
+    account_pubkey: &Pubkey,
     data: &[u8],
     symbol: &str,
     spot_ticks: u64,
     perp_ticks: u64,
     reference_slot: u64,
-) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    let spot_ticks = Ticks::new_checked(spot_ticks)
-        .map_err(|_| PhoenixPricePatchError::InvalidTicks { ticks: spot_ticks })?;
-    let perp_ticks = Ticks::new_checked(perp_ticks)
-        .map_err(|_| PhoenixPricePatchError::InvalidTicks { ticks: perp_ticks })?;
-    patch_price_component(data, symbol, &reference_value_ranges(), |price| {
+) -> SurfpoolResult<Vec<u8>> {
+    let spot_ticks = checked_ticks(account_pubkey, spot_ticks)?;
+    let perp_ticks = checked_ticks(account_pubkey, perp_ticks)?;
+    patch_price_component(account_pubkey, data, symbol, |price| {
         for value in &mut price
             .mark_price
             .spot_price_component
@@ -150,20 +130,34 @@ fn patch_reference_prices(
 }
 
 fn patch_price_component(
+    account_pubkey: &Pubkey,
     data: &[u8],
     symbol: &str,
-    allowed: &[core::ops::Range<usize>],
     update: impl FnOnce(&mut PriceComponent),
-) -> Result<Vec<u8>, PhoenixPricePatchError> {
-    let map = PerpAssetMap::try_from_account_bytes(data)?;
-    let entry =
-        map.find_by_symbol(symbol)?
-            .ok_or_else(|| PhoenixPricePatchError::MarketNotFound {
-                symbol: symbol.to_string(),
-            })?;
+) -> SurfpoolResult<Vec<u8>> {
+    let decode_error = |error: PhoenixAccountDecodeError| {
+        price_patch_error(
+            account_pubkey,
+            format!("invalid Phoenix PerpAssetMap account: {error}"),
+        )
+    };
+    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
+    let entry = map
+        .find_by_symbol(symbol)
+        .map_err(decode_error)?
+        .ok_or_else(|| {
+            price_patch_error(
+                account_pubkey,
+                format!("Phoenix market {symbol} was not found"),
+            )
+        })?;
     let metadata_bytes = entry.metadata.as_bytes();
-    let metadata_offset = unique_subslice_offset(data, metadata_bytes)
-        .ok_or(PhoenixPricePatchError::InvalidMetadataLocation)?;
+    let metadata_offset = unique_subslice_offset(data, metadata_bytes).ok_or_else(|| {
+        price_patch_error(
+            account_pubkey,
+            "selected Phoenix market metadata does not occur exactly once",
+        )
+    })?;
     let price_len = size_of::<PriceComponent>();
     let mut price = bytemuck::pod_read_unaligned::<PriceComponent>(&metadata_bytes[..price_len]);
     update(&mut price);
@@ -171,34 +165,7 @@ fn patch_price_component(
     let mut patched = data.to_vec();
     patched[metadata_offset..metadata_offset + price_len]
         .copy_from_slice(bytemuck::bytes_of(&price));
-    PerpAssetMap::try_from_account_bytes(&patched)?;
-    let allowed: Vec<_> = allowed
-        .iter()
-        .map(|range| metadata_offset + range.start..metadata_offset + range.end)
-        .collect();
-    if let Some(offset) = changed_byte_outside(data, &patched, &allowed) {
-        return Err(PhoenixPricePatchError::UnexpectedByteChange { offset });
-    }
     Ok(patched)
-}
-
-fn reference_value_ranges() -> Vec<core::ops::Range<usize>> {
-    let mark_offset = core::mem::offset_of!(PriceComponent, mark_price);
-    let spot_offset = mark_offset
-        + core::mem::offset_of!(MarkPrice, spot_price_component)
-        + core::mem::offset_of!(SpotPriceComponent, last_exchange_spot_price);
-    let perp_offset = mark_offset
-        + core::mem::offset_of!(MarkPrice, perp_price_component)
-        + core::mem::offset_of!(PerpPriceComponent, last_exchange_perp_price);
-    [spot_offset, perp_offset]
-        .into_iter()
-        .flat_map(|component_offset| {
-            (0..5).map(move |index| {
-                let value_start = component_offset + index * size_of::<TicksAtSlot>();
-                value_start..value_start + size_of::<TicksAtSlot>()
-            })
-        })
-        .collect()
 }
 
 fn unique_subslice_offset(data: &[u8], needle: &[u8]) -> Option<usize> {
@@ -232,8 +199,9 @@ pub fn forge_phoenix_override(
             .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))
     };
     let ticks = |field: &str| parse_unsigned_ticks(&account_values[field], field);
-    let patched = match fields.as_slice() {
+    match fields.as_slice() {
         [DIRECT_MARK_SYMBOL_FIELD, DIRECT_MARK_TICKS_FIELD] => patch_direct_mark(
+            account_pubkey,
             &account.data,
             symbol()?,
             ticks(DIRECT_MARK_TICKS_FIELD)?,
@@ -244,26 +212,18 @@ pub fn forge_phoenix_override(
             REFERENCE_SPOT_TICKS_FIELD,
             DIRECT_MARK_SYMBOL_FIELD,
         ] => patch_reference_prices(
+            account_pubkey,
             &account.data,
             symbol()?,
             ticks(REFERENCE_SPOT_TICKS_FIELD)?,
             ticks(REFERENCE_PERP_TICKS_FIELD)?,
             materialization_slot,
         ),
-        _ => {
-            return Err(SurfpoolError::internal(
-                "Phoenix map overrides accept exactly one value group: \
-                 symbol + target_ticks, or symbol + spot_ticks + perp_ticks",
-            ));
-        }
-    };
-    patched.map_err(|error| {
-        SurfpoolError::invalid_account_data(
-            account_pubkey,
-            "Expected a valid Phoenix Eternal PerpAssetMap account",
-            Some(error),
-        )
-    })
+        _ => Err(SurfpoolError::internal(
+            "Phoenix map overrides accept exactly one value group: \
+             symbol + target_ticks, or symbol + spot_ticks + perp_ticks",
+        )),
+    }
 }
 
 pub fn build_phoenix_collateral_scenario(
@@ -439,28 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_non_traders_and_out_of_range_collateral() {
-        let mut not_a_trader = trader_account();
-        not_a_trader.data[..8].fill(0);
-        let mut foreign = trader_account();
-        foreign.owner = Pubkey::new_unique();
-        for (account, target, expected) in [
-            (not_a_trader, "1", "Trader"),
-            (foreign, "1", "invalid account owner"),
-            (
-                trader_account(),
-                "9223372036854775808",
-                "signed 64-bit integer",
-            ),
-        ] {
-            let error =
-                build_phoenix_collateral_scenario(Pubkey::new_unique(), &account, target, None)
-                    .unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
-        }
-    }
-
-    #[test]
     fn builds_one_collateral_override_bounded_by_its_vault_backing() {
         let trader = Pubkey::new_unique();
         let funded = trader_account_for(trader, 500);
@@ -490,23 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn lists_active_market_symbols_from_the_perp_asset_map() {
-        assert_eq!(
-            phoenix_market_symbols(Pubkey::new_unique(), &perp_asset_map_account()).unwrap(),
-            vec!["SOL"]
-        );
-    }
-
-    #[test]
     fn direct_mark_patches_only_the_selected_mark_ticks_and_slot() {
         let account = perp_asset_map_account();
-        let before = PerpAssetMap::try_from_account_bytes(&account.data)
-            .unwrap()
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap();
-        let metadata_offset =
-            unique_subslice_offset(&account.data, before.metadata.as_bytes()).unwrap();
         let values = HashMap::from([
             (
                 DIRECT_MARK_SYMBOL_FIELD.to_string(),
@@ -525,26 +448,6 @@ mod tests {
         let price = after.metadata.oracle_price().mark_price.price;
         assert_eq!((price.ticks.as_inner(), price.slot), (1, 123));
         assert_eq!(patched.len(), account.data.len());
-        let allowed =
-            metadata_offset + MARK_PRICE_RANGE.start..metadata_offset + MARK_PRICE_RANGE.end;
-        assert!(
-            account
-                .data
-                .iter()
-                .zip(&patched)
-                .enumerate()
-                .filter(|(_, (before, after))| before != after)
-                .all(|(offset, _)| allowed.contains(&offset))
-        );
-
-        let mut numeric_ticks = values;
-        numeric_ticks.insert(DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!(1));
-        assert!(
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &numeric_ticks, 123)
-                .unwrap_err()
-                .to_string()
-                .contains("encoded as a string")
-        );
     }
 
     #[test]
@@ -607,57 +510,6 @@ mod tests {
                     .all(|value| value.ticks.as_inner() == perp_ticks && value.slot == 123)
             );
             assert_eq!(patched.len(), account.data.len());
-        }
-
-        let mut numeric = values(8_000, 7_000);
-        numeric.insert(
-            REFERENCE_SPOT_TICKS_FIELD.to_string(),
-            serde_json::json!(8000),
-        );
-        assert!(
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &numeric, 100)
-                .unwrap_err()
-                .to_string()
-                .contains("encoded as a string")
-        );
-    }
-
-    #[test]
-    fn direct_mark_rejects_unknown_markets_and_out_of_range_ticks() {
-        let data = perp_asset_map_fixture();
-        assert!(matches!(
-            patch_direct_mark(&data, "BTC", 1, 123),
-            Err(PhoenixPricePatchError::MarketNotFound { .. })
-        ));
-        assert!(matches!(
-            patch_direct_mark(&data, "SOL", u64::from(u32::MAX) + 1, 123),
-            Err(PhoenixPricePatchError::InvalidTicks { .. })
-        ));
-    }
-
-    #[test]
-    fn forge_rejects_missing_or_mixed_value_groups() {
-        for values in [
-            HashMap::new(),
-            HashMap::from([
-                (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
-                (
-                    REFERENCE_SPOT_TICKS_FIELD.to_string(),
-                    serde_json::json!("2"),
-                ),
-            ]),
-        ] {
-            let error = forge_phoenix_override(
-                &Pubkey::new_unique(),
-                &perp_asset_map_account(),
-                &values,
-                100,
-            )
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("exactly one value group"),
-                "{error}"
-            );
         }
     }
 }

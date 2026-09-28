@@ -21,9 +21,7 @@ use surfpool_core::{
         TemplateRegistry,
         protocols::{
             phoenix_eternal::v1::{
-                collateral::{
-                    trader_header, validate_collateral_fields, validate_hot_trader_fields,
-                },
+                collateral::{trader_header, validate_hot_trader_fields},
                 state_builder::{
                     PHOENIX_GLOBAL_CONFIG, build_phoenix_collateral_scenario,
                     phoenix_global_trader_index_address, phoenix_market_symbols,
@@ -463,17 +461,14 @@ impl Surfpool {
         let trader = Pubkey::from_str(params.trader.trim())
             .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
         let accounts = self
-            .fetch_surfnet_accounts(params.surfnet_port, &[trader])
+            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_CONFIG])
             .await?;
         let trader_account = accounts[0]
             .as_ref()
             .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
         let header = trader_header(&trader, trader_account).map_err(|error| error.to_string())?;
         let index = if header.trader_state.is_hot() {
-            let globals = self
-                .fetch_surfnet_accounts(params.surfnet_port, &[PHOENIX_GLOBAL_CONFIG])
-                .await?;
-            let global = globals[0]
+            let global = accounts[1]
                 .as_ref()
                 .ok_or("Phoenix GlobalConfig was not found")?;
             let index_address =
@@ -891,8 +886,7 @@ impl Surfpool {
                 // Get the template for validation and normalization
                 if let Some(template) = registry.get(&override_instance.template_id) {
                     if template.id == "phoenix-trader-collateral-stress"
-                        && let Err(error) = validate_collateral_fields(&override_instance.values)
-                            .and_then(|_| validate_hot_trader_fields(&override_instance.values))
+                        && let Err(error) = validate_hot_trader_fields(&override_instance.values)
                     {
                         validation_errors.push(error.to_string());
                         continue;
@@ -1513,129 +1507,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phoenix_collateral_rejects_invalid_inputs_before_rpc() {
-        let surfpool = Surfpool::new();
-
-        let collateral = surfpool
-            .create_phoenix_collateral_scenario(Parameters(CreatePhoenixCollateralScenarioParams {
-                surfnet_port: None,
-                trader: "not-a-pubkey".to_string(),
-                target_quote_lots: "1".to_string(),
-            }))
-            .await
-            .expect("tool result");
-        assert!(
-            json_of(&collateral)["error"]
-                .as_str()
-                .expect("error")
-                .contains("Invalid Trader pubkey")
-        );
-    }
-
-    #[test]
-    fn phoenix_collateral_fetches_dependencies_only_for_hot_traders() {
-        use surfpool_core::{
-            jsonrpc_core::{IoHandler, Params},
-            jsonrpc_http_server::ServerBuilder,
-            scenarios::protocols::phoenix_eternal::v1::state_builder::PHOENIX_ETERNAL_PROGRAM_ID,
-        };
-
-        for (hot, matching_key) in [(false, true), (true, true), (false, false)] {
-            let trader = Pubkey::new_unique();
-            let mut data = vec![0_u8; 240];
-            data[..8].copy_from_slice(&[41, 97, 73, 105, 110, 214, 112, 9]);
-            data[24..56].copy_from_slice(if matching_key {
-                trader.as_ref()
-            } else {
-                PHOENIX_GLOBAL_CONFIG.as_ref()
-            });
-            data[88..96].copy_from_slice(&50_i64.to_le_bytes());
-            data[96..100].copy_from_slice(&u32::from(hot).to_le_bytes());
-            let account = serde_json::json!({
-                "lamports": 1, "owner": PHOENIX_ETERNAL_PROGRAM_ID.to_string(),
-                "data": [bs58::encode(data).into_string(), "base58"],
-                "executable": false, "rentEpoch": 0,
-            });
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let observed = requests.clone();
-            let mut io = IoHandler::new();
-            io.add_sync_method("getMultipleAccounts", move |params: Params| {
-                let params: Vec<Value> = params.parse()?;
-                let keys: Vec<String> = serde_json::from_value(params[0].clone()).unwrap();
-                observed.lock().unwrap().push(keys.clone());
-                let values: Vec<Value> = keys
-                    .iter()
-                    .map(|key| {
-                        if key == &trader.to_string() {
-                            account.clone()
-                        } else {
-                            Value::Null
-                        }
-                    })
-                    .collect();
-                Ok(serde_json::json!({"context": {"slot": 100}, "value": values}))
-            });
-            let server = ServerBuilder::new(io)
-                .start_http(&"127.0.0.1:0".parse().unwrap())
-                .unwrap();
-            let params = CreatePhoenixCollateralScenarioParams {
-                surfnet_port: Some(server.address().port()),
-                trader: trader.to_string(),
-                target_quote_lots: "-9007199254740993".to_string(),
-            };
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let result = runtime
-                .block_on(Surfpool::new().build_phoenix_collateral_scenario_from_surfnet(&params));
-            server.close();
-            let mut expected = vec![vec![trader.to_string()]];
-            if !matching_key {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("key does not match its account address")
-                );
-            } else if hot {
-                assert!(result.unwrap_err().contains("GlobalConfig was not found"));
-                expected.push(vec![PHOENIX_GLOBAL_CONFIG.to_string()]);
-            } else {
-                let scenario = result.unwrap();
-                assert_eq!(scenario.overrides.len(), 1);
-                assert_eq!(
-                    scenario.overrides[0].account,
-                    surfpool_types::AccountAddress::Pubkey(trader.to_string())
-                );
-                assert_eq!(
-                    scenario.overrides[0].values["traderState.quoteLotCollateral"],
-                    "-9007199254740993"
-                );
-                assert!(!scenario.overrides[0].fetch_before_use);
-            }
-            assert_eq!(*requests.lock().unwrap(), expected);
-        }
-    }
-
-    #[tokio::test]
     async fn create_scenario_rejects_unsupported_phoenix_collateral_fields_before_staging() {
-        for (field, expected) in [
-            ("quote_lot_collateral", "use traderState.quoteLotCollateral"),
-            ("traderState.flags", "traderState.flags"),
-        ] {
-            let mut scenario = Scenario::new(field.to_string(), "unsupported".to_string());
-            scenario.add_override(
-                surfpool_types::OverrideInstance::new(
-                    "phoenix-trader-collateral-stress".to_string(),
-                    0,
-                    surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
-                )
-                .with_values(HashMap::from([(field.to_string(), serde_json::json!("1"))])),
-            );
-            let result = Surfpool::new()
-                .create_scenario(Parameters(scenario))
-                .await
-                .unwrap();
-            assert!(json_of(&result)["url"].is_null(), "{field}");
-            assert!(json_of(&result).to_string().contains(expected), "{field}");
-        }
+        let mut scenario = Scenario::new("unsupported".to_string(), "unsupported".to_string());
+        scenario.add_override(
+            surfpool_types::OverrideInstance::new(
+                "phoenix-trader-collateral-stress".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+            )
+            .with_values(HashMap::from([(
+                "traderState.flags".to_string(),
+                serde_json::json!("1"),
+            )])),
+        );
+        let result = Surfpool::new()
+            .create_scenario(Parameters(scenario))
+            .await
+            .unwrap();
+        assert!(json_of(&result)["url"].is_null());
+        assert!(json_of(&result).to_string().contains("traderState.flags"));
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {

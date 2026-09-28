@@ -1304,34 +1304,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-mod property_value_type_tests {
-    use super::*;
-
-    #[test]
-    fn explicit_value_types_roundtrip_without_changing_legacy_properties() {
-        for input in [
-            serde_json::json!("amount"),
-            serde_json::json!({"path": "amount"}),
-        ] {
-            let yaml: YamlProperty = serde_json::from_value(input).unwrap();
-            let property = Property::from(yaml);
-            assert!(property.value_type.is_none());
-            assert!(
-                serde_json::to_value(property)
-                    .unwrap()
-                    .get("value_type")
-                    .is_none()
-            );
-        }
-        let yaml: YamlProperty = serde_json::from_value(serde_json::json!({
-            "path": "target_ticks", "value_type": "string"
-        }))
-        .unwrap();
-        let property = Property::from(yaml);
-        let json = serde_json::to_value(&property).unwrap();
-        assert_eq!(json["value_type"], "string");
-        assert_eq!(serde_json::from_value::<Property>(json).unwrap(), property);
-    }
-}

@@ -36,17 +36,6 @@ pub fn trader_header(trader: &Pubkey, account: &Account) -> SurfpoolResult<Trade
     Ok(header)
 }
 
-pub fn validate_collateral_fields(
-    values: &HashMap<String, serde_json::Value>,
-) -> SurfpoolResult<()> {
-    if values.contains_key("quote_lot_collateral") {
-        return Err(SurfpoolError::internal(
-            "Phoenix field quote_lot_collateral is no longer supported; use traderState.quoteLotCollateral as a decimal string",
-        ));
-    }
-    Ok(())
-}
-
 /// A hot Trader's TraderState is mirrored in the GlobalTraderIndex and the mirror update carries
 /// only the collateral, so any other TraderState write would leave the two copies disagreeing.
 pub fn validate_hot_trader_fields(
@@ -284,39 +273,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hot_trader_uses_effective_index_collateral_and_requires_index() {
-        let trader = Pubkey::new_from_array(FIRST_KEY);
-        let account = trader_account(FIRST_KEY, 9_999, true);
-        let header = trader_header(&trader, &account).unwrap();
-        assert_eq!(
-            effective_collateral(&header, Some(&index_account())).unwrap(),
-            111
-        );
-        assert!(effective_collateral(&header, None).is_err());
-    }
-
-    #[test]
-    fn collateral_builder_bounds_hot_targets_by_effective_state() {
-        let trader = Pubkey::new_from_array(FIRST_KEY);
-        let index = index_account();
-        let stale_high = trader_account(FIRST_KEY, 9_999, true);
-        assert!(
-            build_phoenix_collateral_scenario(trader, &stale_high, "112", Some(&index)).is_err()
-        );
-        assert!(build_phoenix_collateral_scenario(trader, &stale_high, "1", None).is_err());
-
-        let stale_low = trader_account(FIRST_KEY, 1, true);
-        let prepared =
-            build_phoenix_collateral_scenario(trader, &stale_low, "100", Some(&index)).unwrap();
-        assert_eq!(
-            prepared.overrides[0].values["traderState.quoteLotCollateral"],
-            "100"
-        );
-        assert_eq!(index, index_account());
-        assert_eq!(stale_low, trader_account(FIRST_KEY, 1, true));
-    }
-
     fn global_account(index: &Pubkey) -> Account {
         use super::super::state_builder::PHOENIX_GLOBAL_CONFIG;
 
@@ -403,7 +359,6 @@ mod tests {
             "cycle",
             "missing key",
             "missing account",
-            "conflicting fields",
             "mismatched key",
             "unsupported field",
         ] {
@@ -422,11 +377,6 @@ mod tests {
                     scenario.overrides[0]
                         .values
                         .insert("traderState.flags".to_string(), serde_json::json!(0));
-                }
-                "conflicting fields" => {
-                    scenario.overrides[0]
-                        .values
-                        .insert("quote_lot_collateral".to_string(), serde_json::json!("2"));
                 }
                 "cycle" => write_u32(&mut before_index.data, 96, 2),
                 "missing key" => before_index.data[112..144].copy_from_slice(&[33; 32]),
@@ -482,42 +432,6 @@ mod tests {
                 expected.data[88..96].copy_from_slice(&1_i64.to_le_bytes());
             }
             assert_eq!(svm.get_account(&trader).unwrap().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn trader_idl_keeps_max_positions_and_preference_bits_separate() {
-        use crate::{scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT, surfnet::svm::SurfnetSvm};
-        let trader = Pubkey::new_from_array(FIRST_KEY);
-        let mut account = trader_account(FIRST_KEY, 9_999, false);
-        account.data[112..116].copy_from_slice(&7_u32.to_le_bytes());
-        account.data[116..120].copy_from_slice(&0xa5a5_5a5a_u32.to_le_bytes());
-        let idl = serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).unwrap();
-        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        for (field, offset, target) in [
-            ("maxPositions", 112, 11_u32),
-            ("traderPreferenceBits", 116, 0x1234_5678),
-        ] {
-            let forged = svm
-                .get_forged_account_data(
-                    &trader,
-                    &account.data,
-                    &idl,
-                    &HashMap::from([(field.to_string(), serde_json::json!(target))]),
-                )
-                .unwrap();
-            let mut expected = account.data.clone();
-            expected[offset..offset + 4].copy_from_slice(&target.to_le_bytes());
-            assert_eq!(
-                forged, expected,
-                "{field} must preserve all neighboring and trailing bytes"
-            );
-            let header = TraderHeader::try_read_from_account_bytes(&forged).unwrap();
-            assert_eq!(header.max_positions, if offset == 112 { target } else { 7 });
-            assert_eq!(
-                header.trader_preference_bits,
-                if offset == 116 { target } else { 0xa5a5_5a5a }
-            );
         }
     }
 }

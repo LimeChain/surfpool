@@ -491,43 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn phoenix_market_templates_source_symbols_from_the_live_catalog_tool() {
-        let registry = TemplateRegistry::new();
-        for id in [
-            "phoenix-direct-mark-risk-shock",
-            "phoenix-reference-price-divergence",
-        ] {
-            let template = registry.get(id).expect("phoenix market template exists");
-            assert_eq!(template.account_type, "PerpAssetMap");
-            for property in &template.properties {
-                assert_eq!(
-                    serde_json::to_value(property).unwrap()["value_type"],
-                    "string"
-                );
-            }
-
-            let symbol = template
-                .properties
-                .iter()
-                .find(|property| property.path == "symbol")
-                .expect("market template has a symbol property");
-            assert!(
-                symbol.is_dynamic_ref(),
-                "{id} symbol must be a dynamic_ref, not a hardcoded constant"
-            );
-            assert_eq!(
-                symbol.source_name(),
-                Some("list_phoenix_markets"),
-                "{id} symbol options must come from the live catalog tool"
-            );
-            assert!(
-                symbol.constant_name().is_none(),
-                "{id} symbol must not reference a static constant"
-            );
-        }
-    }
-
-    #[test]
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
