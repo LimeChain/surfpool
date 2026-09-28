@@ -22,6 +22,7 @@ use solana_pubkey::Pubkey;
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -69,15 +70,6 @@ async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
 }
 
 /// Byte indices at which two buffers differ.
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b.iter())
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// A failure here means a bundled IDL disagrees with the live on-chain layout.
 #[tokio::test]
 async fn real_mainnet_accounts_round_trip_unchanged() {
