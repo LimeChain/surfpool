@@ -1,0 +1,130 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these offsets describe schema-8 market accounts.
+version: v8
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+constants:
+  market:
+    label: HumidiFi market
+    description: Choose one of the schema-8 HumidiFi markets that quoted recently, read from the program's own accounts.
+    source:
+      program_accounts:
+        program: 9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp
+        size: 1728
+        filters:
+          - offset: 8
+            bytes: [44, 90, 19, 124, 56, 111, 47, 150]
+          - offset: 1720
+            bytes: [8, 0, 0, 0, 0, 0, 0, 0]
+        fields:
+          quote_mint:
+            offset: 384
+            encoding: pubkey
+            mask: &pubkey_mask [18112607414984653880, 333855179453154247, 333573717361279942, 333292238089536453]
+          base_mint: { offset: 416, encoding: pubkey, mask: *pubkey_mask }
+          quote_vault: { offset: 448, encoding: pubkey, mask: *pubkey_mask }
+          base_vault: { offset: 480, encoding: pubkey, mask: *pubkey_mask }
+          max_staleness_slots: { offset: 608, encoding: u64, mask: [7970776174128919018] }
+          last_update_slot: { offset: 616, encoding: u64, mask: [7970776174128919018] }
+        pair: { base: base_mint, quote: quote_mint }
+        default:
+          base: So11111111111111111111111111111111111111112
+          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        fresh: { field: last_update_slot, within_slots: 5000 }
+
+templates:
+  - id: humidifi-price
+    name: Override Price
+    description: Move the fair value a HumidiFi market quotes around
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: fair_value
+        offset: 576
+        encoding:
+          u64_xor:
+            mask: 13355403898140455974
+        label: Fair value
+        description: >-
+          Quote atoms per base atom times 2^48, before HumidiFi's fixed XOR encoding. Pass it as a
+          decimal string.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote older than the market's
+      max_staleness_slots (market metadata, usually 2 to 15 slots) before pricing, and nothing on a
+      fork republishes it. Apply humidifi-freshness in the same slot as this override, and schedule
+      it again in each later slot where a swap must fill.
+
+      fair_value is a raw ratio, not a human price:
+        fair_value = floor(price * 2^48 / 10^(base_decimals - quote_decimals))
+      where price is quote tokens per base token and both decimals come from the selected market's
+      metadata. Pass the result as a decimal STRING; it can exceed what a JSON number holds
+      exactly.
+
+      EXAMPLE - SOL/USDC (9/6 decimals) at 208 USDC per SOL:
+        fair_value: "58546795155816"
+      which is floor(208 * 2^48 / 10^3).
+
+      DIRECTION: raising fair_value makes the base token more expensive, so a quote-to-base swap
+      returns proportionally less base. Halving it doubles that output, subject to the market's own
+      spread and inventory.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+  - id: humidifi-freshness
+    name: Override Quote Freshness
+    description: Keep a HumidiFi quote current or make the market reject it as stale
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 616
+        encoding:
+          slot_xor:
+            lead: 0
+            mask: 7970776174128919018
+        label: Quote-slot offset
+        description: Relative to the slot where the override materializes; 0 means quoted now.
+      - path: max_staleness_slots
+        offset: 608
+        encoding:
+          u64_xor:
+            mask: 7970776174128919018
+        label: Staleness limit
+        description: Oldest quote age in slots that HumidiFi still fills; leave unset to keep the live limit.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      HumidiFi fills only while clock_slot - last_update_slot <= max_staleness_slots. Both words are
+      stored XORed with the same fixed key; the values you pass stay plaintext.
+
+      last_update_slot is a relative slot offset even though the stored word is an absolute slot.
+      Set it to 0 so the market quotes the price it already holds, or the price humidifi-price just
+      wrote, from the materialization slot. One application covers max_staleness_slots slots; for a
+      longer scenario, schedule this template again in each later slot where a swap must fill.
+
+      STALE QUOTE: set last_update_slot to -(max_staleness_slots + 1), taking the limit from the
+      selected market's metadata, and every swap on that market reverts with custom error
+      0xfaded (1027565). One slot younger it still fills: the boundary is inclusive. Do not apply a
+      fresh override afterwards.
+
+      max_staleness_slots is the operator's live limit. Leave it unset for ordinary scenarios. Set it
+      only to model a more tolerant or stricter venue, and set last_update_slot relative to the new
+      limit in the same override.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      HOW TO USE:
+      1. Set last_update_slot to 0
+      2. Leave max_staleness_slots unset
+      3. If a swap happens after the limit, schedule this template again in that later slot
