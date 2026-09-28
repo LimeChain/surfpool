@@ -3152,7 +3152,13 @@ impl SurfnetSvm {
                 {
                     Ok(Some(writes)) => {
                         for (pubkey, written) in writes {
-                            self.inner.set_account(pubkey, written)?;
+                            if let Err(e) = self.inner.set_account(pubkey, written) {
+                                warn!(
+                                    "Failed to set {} for override {}: {}",
+                                    pubkey, override_instance.id, e
+                                );
+                                break;
+                            }
                             settled_this_slot.insert(pubkey);
                         }
                         continue;
