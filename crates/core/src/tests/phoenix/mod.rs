@@ -422,12 +422,26 @@ const HAWKEYE_PROGRAMDATA: Pubkey =
 /// The deployed bytecode, read from the upgradeable loader's ProgramData account. The ELF
 /// starts 45 bytes in, past the loader's own header.
 async fn deployed_program(programdata: Pubkey, name: &str) -> Vec<u8> {
-    let cache = std::env::temp_dir().join(format!("surfpool-phoenix-{name}.so"));
+    // The cache lives in a directory only this user can read or write, and a symlink in its
+    // place is ignored, so another account on a shared host cannot feed the tests bytecode.
+    let dir = std::env::temp_dir().join(format!(
+        "surfpool-phoenix-{}",
+        std::env::var("USER").unwrap_or_else(|_| "user".to_string())
+    ));
+    let cache = dir.join(format!("{name}.so"));
+    let is_regular_file = std::fs::symlink_metadata(&cache).is_ok_and(|m| m.file_type().is_file());
     match std::fs::read(&cache) {
-        Ok(bytes) if bytes.len() > 200_000 => bytes,
+        Ok(bytes) if is_regular_file && bytes.len() > 200_000 => bytes,
         _ => {
             let bytes = fetch(&[programdata]).await.remove(0).data[45..].to_vec();
-            let _ = std::fs::write(&cache, &bytes);
+            if std::fs::create_dir_all(&dir).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                }
+                let _ = std::fs::write(&cache, &bytes);
+            }
             bytes
         }
     }
