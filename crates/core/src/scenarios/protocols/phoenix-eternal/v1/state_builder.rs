@@ -545,4 +545,38 @@ mod tests {
             assert!(forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err());
         }
     }
+
+    // These templates' fields are codec inputs, not IDL paths, so the registry's IDL check
+    // cannot cover them; this ties the YAML field names to what the codec accepts.
+    #[test]
+    fn the_codec_accepts_every_market_template_field_set() {
+        let registry = TemplateRegistry::new();
+        let market_templates: Vec<_> = registry
+            .by_protocol("Phoenix Eternal")
+            .into_iter()
+            .filter(|template| template.account_type == "PerpAssetMap")
+            .collect();
+        assert_eq!(
+            market_templates.len(),
+            2,
+            "direct mark and maintenance margin"
+        );
+
+        for template in market_templates {
+            let values = template
+                .properties
+                .iter()
+                .map(|property| {
+                    let value = if property.path == MARKET_SYMBOL_FIELD {
+                        "SOL"
+                    } else {
+                        "1"
+                    };
+                    (property.path.clone(), serde_json::json!(value))
+                })
+                .collect();
+            forge_phoenix_override(&Pubkey::new_unique(), &perp_asset_map_account(), &values, 1)
+                .unwrap_or_else(|error| panic!("{}: {error}", template.id));
+        }
+    }
 }
