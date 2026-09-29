@@ -17,7 +17,7 @@ fees.
 | You'll see | It means | Example |
 |---|---|---|
 | `active_id` | the bin the pair trades in, signed | `-2127` = 119.32 USDC per SOL at bin step 10 |
-| `parameters.base_factor` | base fee, `base_factor x bin_step x 1e-8` | `10000` = 0.1% at bin step 10, `50000` = 0.5% |
+| `parameters.base_factor` | base fee, `base_factor x bin_step x 1e-8` while `parameters.base_fee_power_factor` is 0, as on SOL/USDC | `10000` = 0.1% at bin step 10, `50000` = 0.5% |
 | `status` | `0` enabled, `1` disabled | |
 
 Price is `(1 + bin_step / 10000) ^ active_id` token Y per token X, times
