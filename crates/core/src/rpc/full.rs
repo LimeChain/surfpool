@@ -33,7 +33,9 @@ use solana_transaction_status::{
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
     UiTransactionEncoding,
 };
-use surfpool_types::{SimnetCommand, TransactionStatusEvent};
+use surfpool_types::{
+    SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
+};
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
@@ -1720,15 +1722,36 @@ impl Full for SurfpoolFullRpc {
             return Err(SurfpoolError::missing_context().into());
         };
         let svm_locker = ctx.svm_locker;
-        let res = svm_locker
-            .airdrop(&pubkey, lamports)
-            .map_err(Error::from)?
-            .map_err(|err| Error::invalid_params(format!("failed to send transaction: {err:?}")))?;
-        let _ = ctx
-            .simnet_commands_tx
-            .try_send(SimnetCommand::AirdropProcessed);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let task = SerialVmMutationTask::new(move || {
+            Box::pin(async move {
+                let result = svm_locker
+                    .airdrop(&pubkey, lamports)
+                    .map_err(Error::from)
+                    .and_then(|result| {
+                        result.map_err(|err| {
+                            Error::invalid_params(format!("failed to send transaction: {err:?}"))
+                        })
+                    })
+                    .map(|result| result.signature.to_string());
+                let should_produce_block = result.is_ok();
+                let _ = reply_tx.send(result);
+                if should_produce_block {
+                    SerialVmMutationResult::ProduceBlock
+                } else {
+                    SerialVmMutationResult::NoBlock
+                }
+            })
+        });
+        ctx.simnet_commands_tx
+            .send(SimnetCommand::ProcessSerialVmMutation(task))
+            .map_err(|_| RpcCustomError::NodeUnhealthy {
+                num_slots_behind: None,
+            })?;
 
-        Ok(res.signature.to_string())
+        reply_rx.recv().map_err(|_| RpcCustomError::NodeUnhealthy {
+            num_slots_behind: None,
+        })?
     }
 
     fn send_transaction(
@@ -1753,6 +1776,40 @@ impl Full for SurfpoolFullRpc {
             }
             .into());
         };
+
+        if !config.base.skip_preflight {
+            let preflight_commitment = CommitmentConfig {
+                commitment: config.base.preflight_commitment.unwrap_or_default(),
+            };
+            let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
+                    .is_blockhash_visible_at(tx_message.recent_blockhash(), &preflight_commitment)
+            });
+            if !blockhash_visible {
+                let error = TransactionError::BlockhashNotFound;
+                return Err(Error {
+                    data: Some(
+                        serde_json::to_value(get_simulate_transaction_result(
+                            TransactionMetadata::default(),
+                            None,
+                            Some(error.clone()),
+                            None,
+                            false,
+                            &tx_message,
+                            None,
+                            None,
+                        ))
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "Failed to serialize simulation result: {e}"
+                            ))
+                        })?,
+                    ),
+                    message: format!("Transaction simulation failed: {error}"),
+                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                });
+            }
+        }
 
         let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
         ctx.svm_locker.mark_transaction_pending(signature);
@@ -2458,12 +2515,20 @@ impl Full for SurfpoolFullRpc {
             }
         }
 
-        let blockhash = svm_locker
-            .get_latest_blockhash(&commitment)
-            .unwrap_or_else(|| svm_locker.latest_absolute_blockhash());
-
-        let current_block_height = svm_locker.get_epoch_info().block_height;
-        let last_valid_block_height = current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
+            let blockhash = svm_reader
+                .blockhash_for_commitment(&commitment)
+                .unwrap_or_else(|| svm_reader.latest_blockhash());
+            let age = svm_reader.blockhash_age(&blockhash).unwrap_or(0);
+            let minted_at_block_height = svm_reader
+                .latest_epoch_info
+                .block_height
+                .saturating_sub(age);
+            (
+                blockhash,
+                minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+            )
+        });
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: RpcBlockhash {
@@ -2749,7 +2814,7 @@ mod tests {
 
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
-    use crossbeam_channel::Receiver;
+    use crossbeam_channel::{Receiver, Sender};
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
     use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
     use solana_commitment_config::CommitmentConfig;
@@ -2778,16 +2843,78 @@ mod tests {
         UiRawMessage, UiTransaction, UiTransactionEncoding,
     };
     use solana_transaction_status_client_types::UiTransactionConfig;
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
+    use surfpool_types::{
+        BlockProductionMode, ClockCommand, ClockEvent, SimnetCommand, SimnetConfig,
+        TransactionConfirmationStatus,
+    };
     use test_case::test_case;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
+        runloops::start_block_production_runloop,
         surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
+
+    fn new_airdrop_runloop(
+        block_production_mode: BlockProductionMode,
+    ) -> (
+        TestSetup<SurfpoolFullRpc>,
+        Sender<ClockEvent>,
+        JoinHandle<std::result::Result<(), String>>,
+    ) {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, commands_tx.clone());
+        let svm_locker = setup.context.svm_locker.clone();
+        let (clock_events_tx, clock_events_rx) = crossbeam_channel::unbounded();
+        let (clock_commands_tx, _clock_commands_rx) =
+            crossbeam_channel::unbounded::<ClockCommand>();
+        let simnet_config = SimnetConfig::default();
+        let runloop = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("airdrop runloop test runtime should start")
+                .block_on(async {
+                    start_block_production_runloop(
+                        clock_events_rx,
+                        clock_commands_tx,
+                        commands_rx,
+                        commands_tx,
+                        svm_locker,
+                        block_production_mode,
+                        &None,
+                        None,
+                        &simnet_config,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+        });
+
+        (setup, clock_events_tx, runloop)
+    }
+
+    fn stop_airdrop_runloop(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        clock_events_tx: Sender<ClockEvent>,
+        runloop: JoinHandle<std::result::Result<(), String>>,
+    ) {
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::Terminate(None))
+            .expect("runloop should accept termination");
+        drop(clock_events_tx);
+        runloop
+            .join()
+            .expect("runloop thread should not panic")
+            .expect("runloop should stop cleanly");
+    }
 
     fn build_v1_transaction(
         payer: &Pubkey,
@@ -3446,7 +3573,7 @@ mod tests {
     fn test_request_airdrop() {
         let pk = Pubkey::new_unique();
         let lamports = 1_000_000;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let res = setup
             .rpc
             .request_airdrop(Some(setup.context.clone()), pk.to_string(), lamports, None)
@@ -3474,6 +3601,107 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "transaction is not found in the history"
+        );
+    }
+
+    #[test]
+    fn request_airdrop_produces_blocks_only_in_transaction_mode() {
+        let (transaction_setup, transaction_clock_tx, transaction_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Transaction);
+        let transaction_start_slot = transaction_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        transaction_setup
+            .rpc
+            .request_airdrop(
+                Some(transaction_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .expect("successful requestAirdrop should succeed");
+        stop_airdrop_runloop(
+            &transaction_setup,
+            transaction_clock_tx,
+            transaction_runloop,
+        );
+        assert_eq!(
+            transaction_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            transaction_start_slot + 1,
+            "a successful airdrop should confirm a block in transaction mode"
+        );
+
+        let (rejected_setup, rejected_clock_tx, rejected_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Transaction);
+        let rejected_start_slot = rejected_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        let rejected = rejected_setup
+            .rpc
+            .request_airdrop(
+                Some(rejected_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                0,
+                None,
+            )
+            .expect_err("rejected requestAirdrop should return an RPC error");
+        assert_eq!(rejected.code, jsonrpc_core::ErrorCode::InvalidParams);
+        stop_airdrop_runloop(&rejected_setup, rejected_clock_tx, rejected_runloop);
+        assert_eq!(
+            rejected_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            rejected_start_slot,
+            "a rejected airdrop should not confirm a block"
+        );
+
+        let (manual_setup, manual_clock_tx, manual_runloop) =
+            new_airdrop_runloop(BlockProductionMode::Manual);
+        let manual_start_slot = manual_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .latest_epoch_info
+            .absolute_slot;
+        manual_setup
+            .rpc
+            .request_airdrop(
+                Some(manual_setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .expect("successful manual-mode requestAirdrop should succeed");
+        stop_airdrop_runloop(&manual_setup, manual_clock_tx, manual_runloop);
+        assert_eq!(
+            manual_setup
+                .context
+                .svm_locker
+                .0
+                .blocking_read()
+                .latest_epoch_info
+                .absolute_slot,
+            manual_start_slot,
+            "a successful airdrop should not confirm a block in manual mode"
         );
     }
 
@@ -3549,7 +3777,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3657,7 +3885,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         setup
             .context
             .svm_locker
@@ -3727,7 +3955,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3790,7 +4018,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3968,7 +4196,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -4156,7 +4384,7 @@ mod tests {
     fn test_get_latest_blockhash() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(&setup, 100..=150);
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
 
         // processed commitment
         {
@@ -4245,9 +4473,11 @@ mod tests {
                 .get_latest_blockhash(&commitment)
                 .unwrap();
 
+            // The finalized blockhash is 30 blocks old, so it expires 30 blocks sooner.
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            let expected_last_valid_block_height = current_block_height
+                - (FINALIZATION_SLOT_THRESHOLD - 1)
+                + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -4261,10 +4491,129 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_get_latest_blockhash_finalized_trails_the_tip_across_empty_slots() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let latest_blockhash = |commitment: CommitmentConfig| {
+            setup
+                .rpc
+                .get_latest_blockhash(
+                    Some(setup.context.clone()),
+                    Some(RpcContextConfig {
+                        commitment: Some(commitment),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap()
+                .value
+                .blockhash
+        };
+
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        let tip = latest_blockhash(CommitmentConfig::confirmed());
+
+        // No transaction lands, so none of these slots is stored as a block.
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert_ne!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        confirm_blocks(&setup, 1);
+        assert_eq!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        assert_ne!(latest_blockhash(CommitmentConfig::confirmed()), tip);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_recent_prioritization_fees() {
+    async fn test_send_transaction_preflights_blockhash_at_preflight_commitment() {
+        let payer = Keypair::new();
         let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
         let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+
+        let confirmed_blockhash = setup
+            .rpc
+            .get_latest_blockhash(
+                Some(setup.context.clone()),
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap()
+            .value
+            .blockhash
+            .parse::<Hash>()
+            .unwrap();
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_unique(),
+                LAMPORTS_PER_SOL,
+            )],
+            &confirmed_blockhash,
+        );
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+
+        // An unset preflightCommitment is finalized, which cannot see a confirmed blockhash yet.
+        let (setup_clone, encoded_clone) = (setup.clone(), encoded.clone());
+        let rejected = hiro_system_kit::thread_named("send_tx_default_preflight")
+            .spawn(move || {
+                setup_clone
+                    .rpc
+                    .send_transaction(Some(setup_clone.context), encoded_clone, None)
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !rejected.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sendTransaction should fail preflight instead of waiting on the mempool"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let err = rejected.join().unwrap().unwrap_err();
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32002));
+        assert_eq!(
+            err.message,
+            "Transaction simulation failed: Blockhash not found"
+        );
+        assert!(
+            mempool_rx.try_recv().is_err(),
+            "a rejected transaction must not be enqueued"
+        );
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                preflight_commitment: Some(CommitmentLevel::Confirmed),
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let setup_clone = setup.clone();
+        let handle = hiro_system_kit::thread_named("send_tx_confirmed_preflight")
+            .spawn(move || {
+                setup_clone
+                    .rpc
+                    .send_transaction(Some(setup_clone.context), encoded, Some(config))
+            })
+            .unwrap();
+        let Ok(SimnetCommand::ProcessTransaction(_, _, status_tx, _, _)) = mempool_rx.recv() else {
+            panic!("the transaction should be enqueued");
+        };
+        status_tx
+            .send(TransactionStatusEvent::Success(
+                TransactionConfirmationStatus::Processed,
+            ))
+            .unwrap();
+        assert_eq!(
+            handle.join().unwrap().unwrap(),
+            tx.signatures[0].to_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_recent_prioritization_fees() {
+        let (setup, mempool_rx) =
+            TestSetup::new_with_serial_vm_executor_and_mempool(SurfpoolFullRpc);
 
         let recent_blockhash = setup
             .context
@@ -4733,6 +5082,14 @@ mod tests {
     }
 
     // helper to insert blocks into the SVM at specific slots
+    fn confirm_blocks(setup: &TestSetup<SurfpoolFullRpc>, count: u64) {
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for _ in 0..count {
+                svm_writer.confirm_current_block().unwrap();
+            }
+        });
+    }
+
     fn insert_test_blocks<I>(setup: &TestSetup<SurfpoolFullRpc>, slots: I)
     where
         I: IntoIterator<Item = u64>,
@@ -5571,7 +5928,7 @@ mod tests {
             let payer = Keypair::new();
             let recipient = Pubkey::new_unique();
             let lamports = LAMPORTS_PER_SOL;
-            let setup = TestSetup::new(SurfpoolFullRpc);
+            let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
 
             let _ = setup
                 .rpc
@@ -5623,7 +5980,7 @@ mod tests {
             let payer = Keypair::new();
             let recipient = Pubkey::new_unique();
             let lamports = LAMPORTS_PER_SOL;
-            let setup = TestSetup::new(SurfpoolFullRpc);
+            let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
 
             setup
                 .context
