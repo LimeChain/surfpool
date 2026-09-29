@@ -98,6 +98,52 @@ where
         setup
     }
 
+    /// Runs serialized VM mutations as the production runloop would and
+    /// deliberately discards every other command.
+    pub fn new_with_serial_vm_executor(rpc: T) -> Self {
+        Self::new_with_serial_vm_executor_and_handler(rpc, |_| true)
+    }
+
+    pub fn new_with_serial_vm_executor_and_mempool(rpc: T) -> (Self, Receiver<SimnetCommand>) {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = Self::new_with_serial_vm_executor_and_handler(rpc, move |command| {
+            mempool_tx.send(command).is_ok()
+        });
+
+        (setup, mempool_rx)
+    }
+
+    fn new_with_serial_vm_executor_and_handler(
+        rpc: T,
+        mut handle_non_mutation: impl FnMut(SimnetCommand) -> bool + Send + 'static,
+    ) -> Self {
+        let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
+        let setup = Self::new_with_mempool(rpc, simnet_commands_tx);
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("serial VM mutation test runtime should start");
+
+            while let Ok(command) = simnet_commands_rx.recv() {
+                match command {
+                    SimnetCommand::ProcessSerialVmMutation(task) => {
+                        runtime.block_on(task.run());
+                    }
+                    command => {
+                        if !handle_non_mutation(command) {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        setup
+    }
+
     pub async fn without_blockhash(self) -> Self {
         let mut state_writer = self.context.svm_locker.0.write().await;
         state_writer.skip_blockhash_check = true;
@@ -118,5 +164,44 @@ where
                 .await
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use surfpool_types::{BlockProductionMode, SerialVmMutationResult, SerialVmMutationTask};
+
+    use super::*;
+
+    #[test]
+    fn serial_vm_executor_discards_non_mutation_commands_without_stopping() {
+        let setup = TestSetup::new_with_serial_vm_executor(());
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::UpdateBlockProductionMode(
+                BlockProductionMode::Manual,
+            ))
+            .expect("discarded command should be accepted");
+
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::ProcessSerialVmMutation(
+                SerialVmMutationTask::new(move || {
+                    Box::pin(async move {
+                        completed_tx
+                            .send(())
+                            .expect("test mutation completion receiver should remain available");
+                        SerialVmMutationResult::NoBlock
+                    })
+                }),
+            ))
+            .expect("serial mutation should be accepted after a discarded command");
+
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("serial mutation executor should remain alive");
     }
 }

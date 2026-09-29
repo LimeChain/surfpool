@@ -1,4 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use solana_clock::Slot;
@@ -1172,7 +1175,7 @@ fn slot_with_lead(target_slot: Slot, lead: i64) -> Result<Slot, String> {
             .checked_add(lead as u64)
             .ok_or_else(|| format!("slot {target_slot} plus lead {lead} exceeds u64::MAX"))
     } else {
-        Ok(target_slot.checked_sub(lead.unsigned_abs()).unwrap_or(0))
+        Ok(target_slot.saturating_sub(lead.unsigned_abs()))
     }
 }
 
@@ -1183,10 +1186,46 @@ impl OverrideTemplate {
             return Err(format!("template '{}' is not a raw layout", self.id));
         }
 
+        let mut paths = HashSet::new();
+        let mut occupied = Vec::<(usize, usize, &str)>::new();
         for property in &self.properties {
+            if property.path.trim().is_empty() {
+                return Err("raw-layout property path must not be empty".to_string());
+            }
+            if !paths.insert(property.path.as_str()) {
+                return Err(format!(
+                    "raw-layout property path '{}' is defined more than once",
+                    property.path
+                ));
+            }
+
             // Constant references select PDA seeds or catalog values; they are not account writes.
             if property.is_constant_ref() {
+                if property.offset.is_some() || property.encoding.is_some() {
+                    return Err(format!(
+                        "raw-layout selector '{}' must not define an offset or encoding",
+                        property.path
+                    ));
+                }
+                let constant = property.constant.as_deref().ok_or_else(|| {
+                    format!(
+                        "raw-layout selector '{}' is missing a constant name",
+                        property.path
+                    )
+                })?;
+                if !self.constants.contains_key(constant) {
+                    return Err(format!(
+                        "raw-layout selector '{}' references unknown constant '{}'",
+                        property.path, constant
+                    ));
+                }
                 continue;
+            }
+            if property.constant.is_some() {
+                return Err(format!(
+                    "writable raw-layout property '{}' must not define a selector constant",
+                    property.path
+                ));
             }
 
             let offset = property.offset.ok_or_else(|| {
@@ -1217,16 +1256,34 @@ impl OverrideTemplate {
                 ));
             }
 
-            let final_offset = offset
-                .checked_add(
-                    (count - 1)
-                        .checked_mul(stride)
-                        .ok_or_else(|| format!("stride overflow for '{}'", property.path))?,
-                )
-                .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
-            final_offset
-                .checked_add(encoding.width())
-                .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+            for index in 0..count {
+                let start = offset
+                    .checked_add(
+                        index
+                            .checked_mul(stride)
+                            .ok_or_else(|| format!("stride overflow for '{}'", property.path))?,
+                    )
+                    .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+                let end = start
+                    .checked_add(encoding.width())
+                    .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+
+                occupied.push((start, end, property.path.as_str()));
+            }
+        }
+
+        // Sorting once avoids comparing every placement with every earlier placement. After the
+        // sort, any overlap must involve two neighboring ranges because each range is half-open.
+        occupied.sort_unstable_by_key(|(start, _, _)| *start);
+        for ranges in occupied.windows(2) {
+            let (start, end, path) = ranges[0];
+            let (other_start, other_end, other_path) = ranges[1];
+            if other_start < end {
+                return Err(format!(
+                    "raw-layout properties '{path}' at bytes {start}..{end} and '{other_path}' at \
+                     bytes {other_start}..{other_end} overlap"
+                ));
+            }
         }
 
         Ok(())
@@ -1239,9 +1296,7 @@ impl OverrideTemplate {
         values: &HashMap<String, serde_json::Value>,
         target_slot: Slot,
     ) -> Result<Vec<u8>, String> {
-        if !self.raw_layout {
-            return Err(format!("template '{}' is not a raw layout", self.id));
-        }
+        self.validate_raw_layout()?;
 
         let mut out = data.to_vec();
         for (name, value) in values {
@@ -1864,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_layout_rejects_overlapping_strided_writes() {
+    fn raw_layout_rejects_self_overlapping_strided_writes() {
         use super::RawEncoding;
 
         let mut property = Property::field("ticks".to_string());
@@ -1879,6 +1934,121 @@ mod tests {
             .validate_raw_layout()
             .expect_err("a stride smaller than the encoded width must be rejected");
         assert!(err.contains("smaller than its 4 byte width"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_overlaps_between_properties() {
+        use super::RawEncoding;
+
+        let mut amount = Property::field("amount".to_string());
+        amount.offset = Some(16);
+        amount.encoding = Some(RawEncoding::U64);
+
+        let mut ticks = Property::field("ticks".to_string());
+        ticks.offset = Some(4);
+        ticks.encoding = Some(RawEncoding::I32Strided {
+            count: 3,
+            stride: 8,
+        });
+
+        let template = raw_template(vec![amount, ticks]);
+        let err = template
+            .validate_raw_layout()
+            .expect_err("different properties must not target the same bytes");
+        assert!(err.contains("'ticks'"), "{err}");
+        assert!(err.contains("'amount'"), "{err}");
+        assert!(err.contains("overlap"), "{err}");
+
+        let err = template
+            .materialize_raw_layout(
+                &[0u8; 32],
+                &HashMap::from([
+                    ("amount".to_string(), json!(1)),
+                    ("ticks".to_string(), json!(2)),
+                ]),
+                0,
+            )
+            .expect_err("materialization must reject an unvalidated overlapping template");
+        assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_allows_adjacent_properties() {
+        use super::RawEncoding;
+
+        let mut first = Property::field("first".to_string());
+        first.offset = Some(0);
+        first.encoding = Some(RawEncoding::U64);
+
+        let mut second = Property::field("second".to_string());
+        second.offset = Some(8);
+        second.encoding = Some(RawEncoding::U64);
+
+        raw_template(vec![first, second])
+            .validate_raw_layout()
+            .expect("adjacent half-open byte ranges do not overlap");
+    }
+
+    #[test]
+    fn raw_layout_rejects_duplicate_and_empty_property_paths() {
+        use super::RawEncoding;
+
+        let property = |path: &str, offset| {
+            let mut property = Property::field(path.to_string());
+            property.offset = Some(offset);
+            property.encoding = Some(RawEncoding::U64);
+            property
+        };
+
+        let duplicate = raw_template(vec![property("value", 0), property("value", 8)]);
+        let err = duplicate
+            .validate_raw_layout()
+            .expect_err("duplicate paths make one property unreachable");
+        assert!(err.contains("defined more than once"), "{err}");
+
+        let empty = raw_template(vec![property(" ", 0)]);
+        let err = empty
+            .validate_raw_layout()
+            .expect_err("blank property paths must be rejected");
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_validates_selector_properties() {
+        use super::{ConstantDefinition, RawEncoding};
+
+        let selector = Property::constant_ref("market".to_string(), "markets".to_string());
+        let mut valid = raw_template(vec![selector.clone()]);
+        valid.constants.insert(
+            "markets".to_string(),
+            ConstantDefinition {
+                label: "Market".to_string(),
+                description: None,
+                options: Vec::new(),
+            },
+        );
+        valid
+            .validate_raw_layout()
+            .expect("a selector referencing a declared constant is valid");
+
+        let unknown = raw_template(vec![selector]);
+        let err = unknown
+            .validate_raw_layout()
+            .expect_err("a selector must reference a declared constant");
+        assert!(err.contains("unknown constant 'markets'"), "{err}");
+
+        let mut writable_selector = Property::constant_ref("market", "markets");
+        writable_selector.offset = Some(0);
+        writable_selector.encoding = Some(RawEncoding::Bytes32);
+        let mut invalid = raw_template(vec![writable_selector]);
+        invalid.constants = valid.constants;
+        let err = invalid
+            .validate_raw_layout()
+            .expect_err("a selector must not also write account bytes");
+        assert!(
+            err.contains("must not define an offset or encoding"),
+            "{err}"
+        );
     }
 
     #[test]

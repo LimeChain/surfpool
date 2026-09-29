@@ -1211,7 +1211,7 @@ where
     };
 
     let payer = Keypair::new();
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     setup
         .rpc
         .request_airdrop(
@@ -4584,6 +4584,8 @@ fn boot_simnet(
         simnets: vec![SimnetConfig {
             slot_time: slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS),
             block_production_mode,
+            offline_mode: true,
+            remote_rpc_url: None,
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -11885,7 +11887,7 @@ async fn test_request_airdrop_rejects_zero_amount() {
         tests::helpers::TestSetup,
     };
 
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     let recipient = Pubkey::new_unique();
     let err = setup
         .rpc
@@ -11902,7 +11904,7 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
         tests::helpers::TestSetup,
     };
 
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     let recipient = Pubkey::new_unique();
     let err = setup
         .rpc
