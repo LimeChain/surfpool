@@ -1210,17 +1210,21 @@ impl OverrideTemplate {
                     .checked_add(encoding.width())
                     .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
 
-                if let Some((other_start, other_end, other_path)) = occupied
-                    .iter()
-                    .find(|(other_start, other_end, _)| start < *other_end && *other_start < end)
-                {
-                    return Err(format!(
-                        "raw-layout properties '{}' at bytes {start}..{end} and '{}' at bytes \
-                         {other_start}..{other_end} overlap",
-                        property.path, other_path
-                    ));
-                }
                 occupied.push((start, end, property.path.as_str()));
+            }
+        }
+
+        // Sorting once avoids comparing every placement with every earlier placement. After the
+        // sort, any overlap must involve two neighboring ranges because each range is half-open.
+        occupied.sort_unstable_by_key(|(start, _, _)| *start);
+        for ranges in occupied.windows(2) {
+            let (start, end, path) = ranges[0];
+            let (other_start, other_end, other_path) = ranges[1];
+            if other_start < end {
+                return Err(format!(
+                    "raw-layout properties '{path}' at bytes {start}..{end} and '{other_path}' at \
+                     bytes {other_start}..{other_end} overlap"
+                ));
             }
         }
 
