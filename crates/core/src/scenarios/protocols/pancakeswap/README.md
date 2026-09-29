@@ -77,15 +77,21 @@ only. The pool's price moves between reads, so recompute both fields from its cu
 Multiplying the price by `f` means `sqrt_price_x64' = round(sqrt_price_x64 * sqrt(f))`,
 bounded to `[4295048016, 79226673521066979257578248091)`, and
 `tick_current' = floor(2 * ln(sqrt_price_x64' / 2^64) / ln(1.0001))`, bounded to
-`[-443636, 443636]`. Set both fields in one `pancakeswap-clmm-pool-state` override with
-`fetchBeforeUse: true`.
+`[-443636, 443636]`. The active liquidity must follow the price:
+`liquidity' = liquidity + sum(liquidity_net of initialized ticks crossed)` when it rises,
+`liquidity - sum(...)` when it falls. Set all three fields in one
+`pancakeswap-clmm-pool-state` override with `fetchBeforeUse: true`.
+
+A tick `t` is crossed when `old < t <= new` going up and `new < t <= old` going down. Without
+the liquidity step the pool keeps the old range's depth at the new price, so swaps succeed with
+wrong amounts: on the SOL/USDC pool a +10% move left the pool about 2.5x deeper than a real swap to the
+same price.
 
 A swap resumes from the tick array covering `tick_current'`: PDA
 `["tick_array", pool, start_index as i32 big-endian]` under the program, 60 ticks per
-array, `start_index = floor(tick / (tick_spacing * 60)) * tick_spacing * 60`. A move that
-stays inside the pool's current array is always safe; a larger one needs the destination
-array to exist (a null `getAccountInfo` on its PDA means the swap will fail). The Studio
-card computes this for you.
+array, `start_index = floor(tick / (tick_spacing * 60)) * tick_spacing * 60`. The destination
+array must exist (a null `getAccountInfo` on its PDA means the swap will fail). The Studio
+card computes all of this for you.
 
 ## Verification
 
