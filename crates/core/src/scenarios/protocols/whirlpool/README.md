@@ -104,16 +104,21 @@ pool, start from its live `sqrt_price`, and check that the `TickArray` for the n
 
 ## Price shock
 
-To multiply a pool's price by `factor`, set both coupled fields from the live pool:
+To multiply a pool's price by `factor`, set the coupled fields from the live pool:
 
 ```
 new_sqrt_price     = round(sqrt_price * sqrt(factor))
 tick_current_index = floor(2 * log(new_sqrt_price / 2^64) / log(1.0001))
+liquidity          = liquidity + sum(liquidity_net of initialized ticks crossed)   # price up
+liquidity          = liquidity - sum(liquidity_net of initialized ticks crossed)   # price down
 ```
 
-A new tick inside the `TickArray` covering the current tick (`start_index` as above, 88 ticks of
-`tick_spacing`) is always safe. A larger move needs the destination array to exist: read its PDA
-first, a missing account means the swap fails. The Studio Whirlpool card computes this for you.
+A tick `t` is crossed when `old < t <= new` going up and `new < t <= old` going down. Without
+the liquidity step the pool keeps the old range's depth at the new price, so swaps succeed with
+wrong amounts: on the SOL/USDC 64 pool a +10% move left the pool about 4.4x deeper than a real
+swap to the same price. The destination `TickArray` (`start_index` as above, 88 ticks of
+`tick_spacing`) must exist, otherwise the swap fails. The Studio Whirlpool card computes all of
+this for you.
 
 ## Verification
 
