@@ -103,19 +103,25 @@ so the pair satisfies the coupling rule.
 
 ## Price shock
 
-To multiply the pool's price by `f`, override both coupled fields in one
+To multiply the pool's price by `f`, override the coupled fields in one
 `raydium-clmm-pool-state` override:
 
 - `sqrt_price_x64' = round(sqrt_price_x64 * sqrt(f))`, inside
   `[4295048016, 79226673521066979257578248091)`
 - `tick_current' = floor(2 * ln(sqrt_price_x64' / 2^64) / ln(1.0001))`, inside `[-443636, 443636]`
+- `liquidity' = liquidity + sum(liquidity_net of initialized ticks crossed)` when the price
+  rises, `liquidity - sum(...)` when it falls
+
+A tick `t` is crossed when `old < t <= new` going up and `new < t <= old` going down. Without
+the liquidity step the pool keeps the old range's depth at the new price, so swaps succeed with
+wrong amounts: on the SOL/USDC 1 pool a +2% move left the pool about 1.4x deeper than a real swap to the
+same price.
 
 A swap resumes from the `TickArrayState` covering the new tick: PDA
 `["tick_array", pool, start_index as i32 big-endian]` under the CLMM program, 60 ticks per
-array, `start_index = floor(tick / (tick_spacing * 60)) * tick_spacing * 60`. A move that
-stays inside the array covering the current tick is always safe; a larger move needs the
-destination array to exist (`getAccountInfo` on the PDA returns null when it does not, and
-the swap would fail). The Studio Raydium card computes this for you.
+array, `start_index = floor(tick / (tick_spacing * 60)) * tick_spacing * 60`. The destination
+array must exist (`getAccountInfo` on the PDA returns null when it does not, and the swap
+would fail). The Studio Raydium card computes all of this for you.
 
 ## Verification
 
