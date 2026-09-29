@@ -24,6 +24,7 @@ const SOL_USDC_POOL: Pubkey =
     Pubkey::from_str_const("DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ");
 
 const LIQUIDITY_RANGE: std::ops::Range<usize> = 237..253;
+const SQRT_PRICE_X64_RANGE: std::ops::Range<usize> = 253..269;
 const TICK_CURRENT_RANGE: std::ops::Range<usize> = 269..273;
 const STATUS_OFFSET: usize = 389;
 
@@ -175,6 +176,8 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         0
     };
     let new_liquidity = u128::from_le_bytes(before.data[LIQUIDITY_RANGE].try_into().unwrap()) ^ 1;
+    let new_sqrt_price_x64 =
+        u128::from_le_bytes(before.data[SQRT_PRICE_X64_RANGE].try_into().unwrap()) + (1u128 << 64);
     let new_tick = i32::from_le_bytes(before.data[TICK_CURRENT_RANGE].try_into().unwrap()) - 1000;
 
     let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
@@ -199,13 +202,17 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
             "liquidity".to_string(),
             serde_json::json!(new_liquidity.to_string()),
         ),
+        (
+            "sqrt_price_x64".to_string(),
+            serde_json::json!(new_sqrt_price_x64.to_string()),
+        ),
         ("tick_current".to_string(), serde_json::json!(new_tick)),
     ]))
     .with_label("PancakeSwap CLMM pool override".to_string());
 
     let mut scenario = Scenario::new(
         "PancakeSwap CLMM Pool Override".to_string(),
-        "Change a live PoolState's status, liquidity and tick through the materializer."
+        "Change a live PoolState's status, liquidity, price and tick through the materializer."
             .to_string(),
     );
     scenario.add_override(pool_override);
@@ -228,7 +235,10 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     let outside: Vec<usize> = diff_indices(&before.data, &after.data)
         .into_iter()
         .filter(|i| {
-            *i != STATUS_OFFSET && !LIQUIDITY_RANGE.contains(i) && !TICK_CURRENT_RANGE.contains(i)
+            *i != STATUS_OFFSET
+                && !LIQUIDITY_RANGE.contains(i)
+                && !SQRT_PRICE_X64_RANGE.contains(i)
+                && !TICK_CURRENT_RANGE.contains(i)
         })
         .collect();
     assert!(
@@ -239,6 +249,10 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     assert_eq!(
         u128::from_le_bytes(after.data[LIQUIDITY_RANGE].try_into().unwrap()),
         new_liquidity
+    );
+    assert_eq!(
+        u128::from_le_bytes(after.data[SQRT_PRICE_X64_RANGE].try_into().unwrap()),
+        new_sqrt_price_x64
     );
     assert_eq!(
         i32::from_le_bytes(after.data[TICK_CURRENT_RANGE].try_into().unwrap()),
