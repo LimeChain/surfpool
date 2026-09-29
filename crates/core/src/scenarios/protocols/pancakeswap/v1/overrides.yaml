@@ -351,10 +351,16 @@ templates:
       TICK ARRAYS: the array covering a tick is the PDA ["tick_array", pool,
       start_index as i32 big-endian] under HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq,
       60 ticks per array, start_index = floor(tick / (tick_spacing * 60)) *
-      tick_spacing * 60. A move whose new tick stays inside the array covering the
-      current tick is always safe. A larger move needs the destination array to exist:
-      check it with getAccountInfo on the derived PDA; a null result means the swap
-      will fail.
+      tick_spacing * 60. The destination array must exist: check it with getAccountInfo
+      on the derived PDA; a null result means the swap will fail.
+
+      LIQUIDITY RULE: a price move must also set liquidity to the active liquidity at the
+      new tick. Start from the live liquidity and, for every initialized tick t the move
+      crosses, add its liquidity_net when the price rises (old < t <= new) and subtract it
+      when it falls (new < t <= old). Leaving liquidity unchanged keeps the old range's depth
+      at the new price, so swaps return wrong amounts without failing. The Studio price
+      shock computes this; without the tick arrays, keep the move between the initialized
+      ticks around the current one.
 
       VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
       not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
