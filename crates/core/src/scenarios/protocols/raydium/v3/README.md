@@ -1,136 +1,91 @@
-# Raydium CLMM (v3)
+# Raydium CLMM
 
-Declarative state-preparation templates for Raydium's concentrated liquidity AMM
-(`amm_v3`, the program most people mean by "Raydium CLMM"). The program publishes an
-Anchor IDL, so the templates use the standard IDL override path. For how scenarios work
-in general see the [scenarios README](../../../README.md).
+Raydium's concentrated-liquidity AMM (`amm_v3`). Three templates: a pool found by its mints, a pool
+found by its address, and a fee tier. For how scenarios work in general see the
+[scenarios README](../../../README.md).
 
-## Program identity (verified 2026-09-20)
+# Template index
 
-|                     |                                                                                 |
-| ------------------- | ------------------------------------------------------------------------------- |
-| Program ID          | `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`                                  |
-| ProgramData         | `HzD2cCXXT3UQNjMMY6kDv9w6gZ9qquSdfoGXrLL3LXx`                                   |
-| Last deployed slot  | 439846317                                                                       |
-| Source              | [raydium-io/raydium-clmm](https://github.com/raydium-io/raydium-clmm), `amm_v3` |
-| Bundled IDL         | `idl.json`, `amm_v3` spec/version `0.1.0`                                       |
+**Raydium CLMM** &middot; `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`
 
-A later deployment slot than the one above means the program was upgraded and this
-integration must be revisited (layouts, formulas, fee wiring).
+| Template | Overrides |
+|---|---|
+| `raydium-clmm-custom` | a pool's price, active liquidity and status, selected by fee tier and mints |
+| `raydium-clmm-pool-state` | the same fields, selected by the pool address |
+| `raydium-clmm-amm-config` | a fee tier, shared by every pool created on it |
 
-## Templates
+## Number formats
 
-| Template                  | Account     | Address                                                                   | Use for                                                 |
-| ------------------------- | ----------- | ------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `raydium-clmm-custom`     | `PoolState` | PDA `["pool", PDA(["amm_config", index_be]), token_mint_0, token_mint_1]` | any pool, selected by fee tier index and the two mints  |
-| `raydium-clmm-pool-state` | `PoolState` | caller-provided pubkey                                                    | any pool by raw address                                 |
-| `raydium-clmm-amm-config` | `AmmConfig` | PDA `["amm_config", index_be]`                                            | a fee tier shared by every pool created with that index |
+| You'll see | It means | Example |
+|---|---|---|
+| `sqrt_price_x64` | `sqrt(price_raw) x 2^64`, as a decimal **string** | |
+| `liquidity` | raw `u128`, as a decimal **string** | |
+| `status` | bitmask of disabled instructions | `16` = swaps off, `0` = everything on |
+| `trade_fee_rate` | parts per million of the input, below `1000000` | `2500` = 0.25% |
+| `protocol_fee_rate`, `fund_fee_rate` | parts per million of the collected fee, together at most `1000000` | `120000` = 12% of the fee |
 
-`token_mint_0` must be the mint whose raw 32-byte pubkey is numerically smaller (compare
-decoded bytes, not base58). Nothing checks the order: a reversed pair derives an empty
-address. SOL (`So1111...`) sorts before USDC (`EPjFWdd...`).
+`price_raw` is token_1 per token_0 in raw units; multiply by `10^(decimals_0 - decimals_1)` for the
+human price. `status` bits: 0 open or increase liquidity, 1 decrease liquidity, 2 collect fees,
+3 collect rewards, 4 swap.
 
-## Finding a pool
+## Picking a pool
 
-- Raydium's public API lists CLMM pools by liquidity:
-  `https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=liquidity`.
-- A pool account is owned by `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`, is 1544
-  bytes, and starts with `PoolState`'s discriminator from `idl.json`.
-- Example: the SOL/USDC pool (fee tier index 8, tick spacing 1) at
-  `3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv`.
+Raydium's API lists pools by liquidity:
+`https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=liquidity`. SOL/USDC
+on fee tier 8: `3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv`.
 
-## Field reference
+**Order the mints for `raydium-clmm-custom`.** `token_mint_0` is the mint whose raw 32 bytes are
+numerically smaller, not the smaller base58 string. A reversed pair derives an empty address and
+nothing checks it. SOL sorts before USDC.
 
-### `PoolState`
+Set `fetchBeforeUse: true` so the live pool is forked first.
 
-| Field            | Meaning                                                                                                   |
-| ---------------- | --------------------------------------------------------------------------------------------------------- |
-| `liquidity`      | In-range liquidity (raw `u128`, no decimals)                                                              |
-| `sqrt_price_x64` | `sqrt(token_1/token_0)` in Q64.64 fixed point (raw `u128`); must move with `tick_current`                 |
-| `tick_current`   | Tick index of the current price (`i32`)                                                                   |
-| `status`         | Disable bitmask (`u8`): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; `0` = all enabled |
+# Recipes
 
-Price and tick must agree, or no swap can trade against the pool:
+## Shock the price
 
-- raw price = `(sqrt_price_x64 / 2^64)^2` (token_1 per token_0, raw units; multiply by
-  `10^(mint_decimals_0 - mint_decimals_1)` for a human price)
-- `tick_current = floor(log(raw price) / log(1.0001))`
-- a swap loads the `TickArrayState` covering `tick_current`; it must already exist.
+Use **Scenario presets → Raydium state → CLMM price shock** in Studio. It reads the pool and the
+tick arrays the move crosses, and writes all three coupled fields:
 
-The price fields do not move the vault balances, so a swap at depth still needs funded
-vaults.
-
-### `AmmConfig`
-
-All three rates are parts per million (`FEE_RATE_DENOMINATOR_VALUE = 1,000,000`).
-
-| Field               | Meaning                                                                                      |
-| ------------------- | -------------------------------------------------------------------------------------------- |
-| `trade_fee_rate`    | `fee = amount_in * trade_fee_rate / 1_000_000`; must stay `< 1_000_000` (`2500` = 0.25%)     |
-| `protocol_fee_rate` | Share of the collected trade fee, not of volume, routed to the protocol treasury             |
-| `fund_fee_rate`     | Share of the collected trade fee routed to the fund owner; `protocol + fund <= 1_000_000`    |
-
-Every pool created with the same index shares this account, so an override changes all
-of them at once.
-
-## Worked example: move the SOL/USDC pool's price and cut its protocol fee
-
-```json
-{
-  "templateId": "raydium-clmm-pool-state",
-  "address": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
-  "values": {
-    "sqrt_price_x64": "6200000000000000000",
-    "tick_current": -21808
-  },
-  "fetchBeforeUse": true
-}
+```
+template: raydium-clmm-pool-state
+sqrt_price_x64: "<round(sqrt_price_x64 x sqrt(factor))>"
+tick_current:   <floor(2 x ln(new_sqrt_price_x64 / 2^64) / ln(1.0001))>
+liquidity:      "<live liquidity +/- liquidity_net of every initialized tick crossed>"
 ```
 
-`(6200000000000000000 / 2^64)^2 = 0.11297` and `floor(log(0.11297) / log(1.0001)) = -21808`,
-so the pair satisfies the coupling rule.
+**Never move the price without `liquidity`.** The pool keeps the old range's depth at the new
+price, and swaps succeed with wrong amounts: a +2% move on the SOL/USDC pool left it about 1.4x too
+deep. Going up, a tick `t` is crossed when `old < t <= new` and its `liquidity_net` is added; going
+down, when `new < t <= old` and it is subtracted.
 
-```json
-{
-  "templateId": "raydium-clmm-amm-config",
-  "values": {
-    "config_index": "8",
-    "protocol_fee_rate": 60000
-  },
-  "fetchBeforeUse": true
-}
+**The destination tick array must exist.** A swap resumes from the array covering the new tick,
+PDA `["tick_array", pool, start_index as i32 big-endian]` with 60 ticks of `tick_spacing` each.
+Studio refuses a move onto a missing array and names the largest (or smallest) factor that stays on
+the pool's current one.
+
+## Freeze swaps
+
+```
+template: raydium-clmm-pool-state
+status: 16      # bit 4: swaps off, liquidity still moves
 ```
 
-## Price shock
+## Change a fee tier
 
-To multiply the pool's price by `f`, override the coupled fields in one
-`raydium-clmm-pool-state` override:
+```
+template: raydium-clmm-amm-config
+config_index:   8          # the SOL/USDC pool's tier
+trade_fee_rate: 10000      # 1%
+```
 
-- `sqrt_price_x64' = round(sqrt_price_x64 * sqrt(f))`, inside
-  `[4295048016, 79226673521066979257578248091)`
-- `tick_current' = floor(2 * ln(sqrt_price_x64' / 2^64) / ln(1.0001))`, inside `[-443636, 443636]`
-- `liquidity' = liquidity + sum(liquidity_net of initialized ticks crossed)` when the price
-  rises, `liquidity - sum(...)` when it falls
+Every pool created with that index shares the account, so the change reaches all of them.
 
-A tick `t` is crossed when `old < t <= new` going up and `new < t <= old` going down. Without
-the liquidity step the pool keeps the old range's depth at the new price, so swaps succeed with
-wrong amounts: on the SOL/USDC 1 pool a +2% move left the pool about 1.4x deeper than a real swap to the
-same price.
+# Troubleshooting
 
-A swap resumes from the `TickArrayState` covering the new tick: PDA
-`["tick_array", pool, start_index as i32 big-endian]` under the CLMM program, 60 ticks per
-array, `start_index = floor(tick / (tick_spacing * 60)) * tick_spacing * 60`. The destination
-array must exist (`getAccountInfo` on the PDA returns null when it does not, and the swap
-would fail). The Studio Raydium card computes all of this for you.
-
-## Verification
-
-- Unit: `cargo test -p surfpool-core --lib raydium` covers PDA derivation for the pool
-  and every `amm_config_index` option, and template properties against the bundled IDL.
-- Live fork (`cargo test -p surfpool-core --features integration-tests raydium_clmm --
-  --test-threads=1`, needs network; `SURFPOOL_TEST_RPC_URL` overrides the endpoint):
-  round-trips the live SOL/USDC `PoolState` byte-for-byte, checks every
-  `amm_config_index` option's live size, discriminator, `tick_spacing` and
-  `trade_fee_rate`, runs `status`, `liquidity` and `tick_current` through the
-  materializer and asserts only their bytes changed.
-- Not verified: a swap simulation comparing baseline and shocked prices.
+| Symptom | Fix |
+|---|---|
+| The swap succeeds but the amounts look wrong after a price change | `liquidity` was not moved with the price. Use the Studio price shock |
+| The swap fails right after a price change | The new tick has no tick array, or `sqrt_price_x64` and `tick_current` disagree |
+| `raydium-clmm-custom` changed nothing | The mints are in the wrong order, so the derived address is empty |
+| The swap fails on the token transfer | The paying vault holds less than the output. Fund it with `spl-token-account-balance` |
