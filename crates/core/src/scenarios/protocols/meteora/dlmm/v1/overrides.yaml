@@ -25,7 +25,7 @@ templates:
         description: PairStatus, raw u8 - 0 enabled, 1 disabled (swaps rejected).
       - path: parameters.base_factor
         label: Base Fee Factor
-        description: Base swap fee factor, raw u16 (10000 at bin step 10 is a 0.1% fee).
+        description: Base swap fee factor, raw u16 (10000 at bin step 10 is a 0.1% fee while base_fee_power_factor is 0).
       - path: v_parameters.volatility_accumulator
         label: Volatility Accumulator
         description: Variable-fee driver, raw u32, 10000 per bin crossed; recomputed on every swap.
