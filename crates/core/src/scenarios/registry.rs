@@ -236,6 +236,18 @@ impl TemplateRegistry {
                             template.id
                         )
                     });
+                for property in &template.properties {
+                    if property
+                        .description
+                        .as_deref()
+                        .is_none_or(|description| description.trim().is_empty())
+                    {
+                        panic!(
+                            "unable to load {protocol_name} overrides: raw-layout property '{}:{}' must define a description",
+                            template.id, property.path
+                        );
+                    }
+                }
             }
         }
 
@@ -709,6 +721,39 @@ templates:
       - { path: value, offset: 8 }
 "#,
             "missing an encoding",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: true
+templates:
+  - id: overlapping
+    name: Overlapping
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: first, offset: 8, encoding: u64 }
+      - { path: second, offset: 12, encoding: u64 }
+"#,
+            "overlap",
+        );
+
+        rejected(
+            r#"
+protocol: Broken
+version: v1
+raw_layout: true
+templates:
+  - id: undocumented
+    name: Undocumented
+    description: Invalid
+    address: { type: pubkey, value: "11111111111111111111111111111111" }
+    properties:
+      - { path: value, offset: 8, encoding: u64 }
+"#,
+            "must define a description",
         );
 
         let mut registry = TemplateRegistry::default();
