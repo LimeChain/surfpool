@@ -49,9 +49,14 @@ templates:
       covering the new active bin must exist and hold liquidity. That array is the PDA ["bin_array", lb_pair,
       index as i64 little-endian] under LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo, 70 bins
       per array, index = floor(active_id / 70) (floored: active_id -2222 is index -32, not
-      -31). A move whose new bin keeps the index of the live active_id is always safe. A
-      larger move needs the destination array: check it with getAccountInfo on the derived
+      -31). The destination array must exist: check it with getAccountInfo on the derived
       PDA; a null result means the swap will fail.
+
+      ONE SIDE ONLY: bins above the active bin hold token X and bins below hold token Y, and
+      this override moves active_id without moving those balances. After a rise, buys of X
+      fill at the new price, but the new bin and every skipped bin hold no Y, so sells skip
+      them and fill back at the old price. After a drop it is the reverse. Pick the direction
+      that matches the side the test trades.
 
       FEES: total fee = base fee + variable fee. The base fee fraction is
       base_factor * bin_step * 1e-8 while parameters.base_fee_power_factor is 0. The variable

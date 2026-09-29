@@ -92,11 +92,16 @@ To make the pair expensive to trade instead, raise `parameters.base_factor` from
 
 A price shock by a factor `f` is one `active_id` override:
 `new_active_id = active_id + round(ln(f) / ln(1 + bin_step / 10000))`, on the pool's own
-`bin_step`. The destination bin array is `floor(new_active_id / 70)`. If that is the index
-of the array covering the live `active_id`, the move is always safe. A larger move needs the
-destination array to exist: read the derived PDA with `getAccountInfo`, and a null result
-means a swap will fail. The Studio Meteora card computes this for you and rejects a move
-onto a missing array, naming the largest (or smallest) factor that stays on the current one.
+`bin_step`. The destination bin array is `floor(new_active_id / 70)` and must exist: read the
+derived PDA with `getAccountInfo`, and a null result means a swap will fail. The Studio Meteora
+card computes this for you and rejects a move onto a missing array, naming the largest (or
+smallest) factor that stays on the current one.
+
+The shock only reaches one side of the market. Bins above the active bin hold token X and bins
+below hold token Y, and the override does not move those balances. After a rise, buys of X fill
+at the new price while sells skip the X-only bins and fill at the old one; after a drop it is
+the reverse. On SOL/USDC a +10% shock (94 bins) filled a buy at 131.47 USDC per SOL but a sell
+at 118.75, the pre-shock price.
 
 ## Verification
 
