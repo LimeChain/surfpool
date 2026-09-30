@@ -40,7 +40,7 @@ use solana_inflation::Inflation;
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_message::{
     Message, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader, VersionedMessage,
-    inline_nonce::is_advance_nonce_instruction_data, v0::LoadedAddresses,
+    v0::LoadedAddresses,
 };
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
@@ -85,9 +85,9 @@ use uuid::Uuid;
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
     FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, LocalSignatureStatus, LocalSignatureStatusOrSubscription,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    GeyserEvent, GeyserSlotStatus, GeyserTransactionEvent, LocalSignatureStatus,
+    LocalSignatureStatusOrSubscription, ProgramSubscriptionData, SignatureSubscriptionData,
+    SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -529,6 +529,10 @@ pub struct SurfnetSvm {
     /// For example, when an account is updated in the same slot multiple times,
     /// the update with higher write_version should supersede the one with lower write_version.
     pub write_version: u64,
+    /// Monotonic counter bumped by `SurfnetSvmLocker` on every exclusive write access.
+    /// Bundle sandboxes record it at clone time so a commit can detect live-state
+    /// mutations (cheatcodes, account writes) that happened during sandbox execution.
+    pub state_revision: u64,
     pub registered_idls: Box<dyn Storage<String, Vec<VersionedIdl>>>,
     pub feature_set: FeatureSet,
     pub instruction_profiling_enabled: bool,
@@ -567,6 +571,27 @@ pub struct SurfnetSvm {
     /// surfnet's database connections; kept so shutdown has one place to
     /// flush and so the connections live exactly as long as the surfnet.
     storage_backend: StorageBackend,
+}
+
+/// The mint inputs `token_amount_to_ui_amount_v3` needs, with the rate-based
+/// extensions evaluated at `unix_timestamp` (Agave passes the current `Clock`).
+pub fn spl_token_additional_data(
+    mint_data: &[u8],
+    unix_timestamp: i64,
+) -> Option<SplTokenAdditionalDataV2> {
+    let mint =
+        StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(mint_data).ok()?;
+    Some(SplTokenAdditionalDataV2 {
+        decimals: mint.base.decimals,
+        interest_bearing_config: mint
+            .get_extension::<InterestBearingConfig>()
+            .map(|x| (*x, unix_timestamp))
+            .ok(),
+        scaled_ui_amount_config: mint
+            .get_extension::<ScaledUiAmountConfig>()
+            .map(|x| (*x, unix_timestamp))
+            .ok(),
+    })
 }
 
 /// Add `pubkey_str` to the pubkey-list at `key`, creating the entry when absent
@@ -617,6 +642,9 @@ pub struct BundleSandbox {
     pub svm: SurfnetSvm,
     pub geyser_rx: Receiver<GeyserEvent>,
     pub simnet_rx: Receiver<SimnetEvent>,
+    pub confirmation_queue_base_len: usize,
+    /// Live `state_revision` at the moment the sandbox was cloned.
+    pub base_state_revision: u64,
 }
 
 /// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
@@ -821,6 +849,7 @@ impl SurfnetSvm {
             cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
+            state_revision: self.state_revision,
             feature_set: self.feature_set.clone(),
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
@@ -847,10 +876,12 @@ impl SurfnetSvm {
     }
 
     pub(crate) fn default_epoch_info(epoch_schedule: &EpochSchedule) -> EpochInfo {
+        let (epoch, slot_index) =
+            epoch_schedule.get_epoch_and_slot_index(FINALIZATION_SLOT_THRESHOLD);
         EpochInfo {
-            epoch: 0,
-            slot_index: 0,
-            slots_in_epoch: epoch_schedule.slots_per_epoch,
+            epoch,
+            slot_index,
+            slots_in_epoch: epoch_schedule.get_slots_in_epoch(epoch),
             absolute_slot: FINALIZATION_SLOT_THRESHOLD,
             block_height: FINALIZATION_SLOT_THRESHOLD,
             transaction_count: None,
@@ -880,6 +911,7 @@ impl SurfnetSvm {
     /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
     /// VM is left byte-identical to its pre-bundle state.
     pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+        let confirmation_queue_base_len = self.transactions_queued_for_confirmation.len();
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
@@ -889,15 +921,27 @@ impl SurfnetSvm {
             svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
+            base_state_revision: self.state_revision,
         }
+    }
+
+    /// Records an exclusive write access. Called by `SurfnetSvmLocker` for every writer.
+    pub(crate) fn bump_state_revision(&mut self) {
+        self.state_revision = self.state_revision.wrapping_add(1);
+    }
+
+    /// Whether live state has been mutated since `sandbox` was cloned from `self`.
+    pub fn is_stale_bundle_sandbox(&self, sandbox: &BundleSandbox) -> bool {
+        self.state_revision != sandbox.base_state_revision
     }
 
     /// Atomically commit the outcome of a fully-successful bundle sandbox onto `self`.
     ///
     /// This is the second half of the atomic Jito bundle pipeline. It must be invoked only
     /// after every transaction in the bundle succeeded inside the sandbox. The caller must
-    /// hold an exclusive writer guard on `self`'s `SurfnetSvmLocker` so that no other RPC
-    /// path can observe a half-committed state.
+    /// hold an exclusive writer guard on `self`'s `SurfnetSvmLocker` while committing so no
+    /// other RPC path can observe a half-committed state.
     ///
     /// Order of operations is **state mutations first, side-effects second**:
     ///   1. Drain every overlay-wrapped storage field from the sandbox onto `self`'s
@@ -908,9 +952,10 @@ impl SurfnetSvm {
     ///   3. Drain the sandbox's account-DB overlay (`inner.db`) onto `self.inner.db` so any
     ///      SQLite-backed account persistence reflects the bundle's mutations.
     ///   4. Pull forward counters (`write_version`, `transactions_processed`), per-account
-    ///      update slots, pending confirmation/finalization queues, perf samples, and the
-    ///      recent-blockhash deque from the sandbox.
-    ///   5. Drain the sandbox's buffered geyser events; replay each onto `self.geyser_events_tx`.
+    ///      update slots, perf samples, and the recent-blockhash deque from the sandbox; append
+    ///      only confirmation entries created in the sandbox.
+    ///   5. Drain the sandbox's buffered geyser events, rebase bundle transaction indices to
+    ///      the live confirmation queue, and replay each onto `self.geyser_events_tx`.
     ///      For each `UpdateAccount` event, also fire `notify_account_subscribers` /
     ///      `notify_program_subscribers` on `self` (the sandbox's registries were emptied,
     ///      so those notifications could not have been delivered during sandbox execution).
@@ -928,10 +973,19 @@ impl SurfnetSvm {
         sandbox: BundleSandbox,
         bundle_status_tx: Sender<TransactionStatusEvent>,
     ) -> SurfpoolResult<Vec<Signature>> {
+        if self.is_stale_bundle_sandbox(&sandbox) {
+            return Err(SurfpoolError::bundle_sandbox_stale(
+                sandbox.base_state_revision,
+                self.state_revision,
+            ));
+        }
+
         let BundleSandbox {
             mut svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
+            base_state_revision: _,
         } = sandbox;
 
         // 1. Drain all overlay storages onto self's real storages.
@@ -1001,11 +1055,14 @@ impl SurfnetSvm {
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
 
-        // Push sandbox's queued txs onto self's queues, rewriting the per-tx status channel
-        // to the bundle's status channel so the runloop's Confirmed/Finalized promotions
-        // flow through a single channel (the caller drops the receiver).
+        // Append only confirmation entries created in the sandbox. The prefix was cloned from
+        // the live queue and is already present on `self`.
+        let live_confirmation_queue_len = self.transactions_queued_for_confirmation.len();
         let mut signatures = Vec::new();
-        for (tx, _sandbox_status_tx, err) in svm.transactions_queued_for_confirmation.drain(..) {
+        for (tx, _sandbox_status_tx, err) in svm
+            .transactions_queued_for_confirmation
+            .drain(confirmation_queue_base_len..)
+        {
             signatures.push(tx.signatures[0]);
             self.transactions_queued_for_confirmation.push_back((
                 tx,
@@ -1013,20 +1070,15 @@ impl SurfnetSvm {
                 err,
             ));
         }
-        for (slot, tx, _sandbox_status_tx, err) in
-            svm.transactions_queued_for_finalization.drain(..)
-        {
-            self.transactions_queued_for_finalization.push_back((
-                slot,
-                tx,
-                bundle_status_tx.clone(),
-                err,
-            ));
-        }
-
         // 5. Drain buffered geyser events; replay onto self's real channel; for each
         //    UpdateAccount, also fire account/program subscribers on self's registries.
-        while let Ok(event) = geyser_rx.try_recv() {
+        while let Ok(mut event) = geyser_rx.try_recv() {
+            if let GeyserEvent::NotifyTransaction(transaction) = &mut event {
+                let sandbox_offset = transaction
+                    .index
+                    .saturating_sub(confirmation_queue_base_len);
+                transaction.index = live_confirmation_queue_len + sandbox_offset;
+            }
             if let GeyserEvent::UpdateAccount(update) = &event {
                 self.notify_account_subscribers(&update.pubkey, &update.account);
                 self.notify_program_subscribers(&update.pubkey, &update.account);
@@ -1090,27 +1142,11 @@ impl SurfnetSvm {
             .get_account(&spl_token_interface::native_mint::ID)?
             .unwrap();
 
-        let native_mint_associated_data = {
-            let mint = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(
+        let native_mint_associated_data = AccountAdditionalDataV3 {
+            spl_token_additional_data: spl_token_additional_data(
                 &native_mint_account.data,
-            )
-            .unwrap();
-            let unix_timestamp = inner.get_sysvar::<Clock>().unix_timestamp;
-            let interest_bearing_config = mint
-                .get_extension::<InterestBearingConfig>()
-                .map(|x| (*x, unix_timestamp))
-                .ok();
-            let scaled_ui_amount_config = mint
-                .get_extension::<ScaledUiAmountConfig>()
-                .map(|x| (*x, unix_timestamp))
-                .ok();
-            AccountAdditionalDataV3 {
-                spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
-                    decimals: mint.base.decimals,
-                    interest_bearing_config,
-                    scaled_ui_amount_config,
-                }),
-            }
+                inner.get_sysvar::<Clock>().unix_timestamp,
+            ),
         };
         let parsed_mint_account = MintAccount::unpack(&native_mint_account.data).unwrap();
 
@@ -1284,6 +1320,7 @@ impl SurfnetSvm {
             cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
+            state_revision: 0,
             registered_idls: registered_idls_db,
             feature_set,
             instruction_profiling_enabled: config.instruction_profiling_enabled,
@@ -1413,39 +1450,49 @@ impl SurfnetSvm {
                 )),
             };
 
+            let transaction_with_status_meta = TransactionWithStatusMeta {
+                slot,
+                transaction: tx.clone(),
+                meta: TransactionStatusMeta {
+                    status: Ok(()),
+                    fee: 5000,
+                    pre_balances: vec![
+                        airdrop_account_before.lamports,
+                        recipient_account_before.lamports,
+                        system_account_before.lamports,
+                    ],
+                    post_balances: vec![
+                        airdrop_account_after.lamports,
+                        recipient_account_after.lamports,
+                        system_account_after.lamports,
+                    ],
+                    inner_instructions: Some(vec![]),
+                    log_messages: Some(tx_result.logs.clone()),
+                    pre_token_balances: Some(vec![]),
+                    post_token_balances: Some(vec![]),
+                    rewards: Some(vec![]),
+                    loaded_addresses: LoadedAddresses::default(),
+                    return_data: Some(tx_result.return_data.clone()),
+                    compute_units_consumed: Some(tx_result.compute_units_consumed),
+                    cost_units: None,
+                },
+            };
+
             self.transactions.store(
                 tx.get_signature().to_string(),
                 SurfnetTransactionStatus::processed(
-                    TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx.clone(),
-                        meta: TransactionStatusMeta {
-                            status: Ok(()),
-                            fee: 5000,
-                            pre_balances: vec![
-                                airdrop_account_before.lamports,
-                                recipient_account_before.lamports,
-                                system_account_before.lamports,
-                            ],
-                            post_balances: vec![
-                                airdrop_account_after.lamports,
-                                recipient_account_after.lamports,
-                                system_account_after.lamports,
-                            ],
-                            inner_instructions: Some(vec![]),
-                            log_messages: Some(tx_result.logs.clone()),
-                            pre_token_balances: Some(vec![]),
-                            post_token_balances: Some(vec![]),
-                            rewards: Some(vec![]),
-                            loaded_addresses: LoadedAddresses::default(),
-                            return_data: Some(tx_result.return_data.clone()),
-                            compute_units_consumed: Some(tx_result.compute_units_consumed),
-                            cost_units: None,
-                        },
-                    },
+                    transaction_with_status_meta.clone(),
                     HashSet::from([*pubkey]),
                 ),
             )?;
+            let transaction_index = self.transactions_queued_for_confirmation.len();
+            let _ = self.geyser_events_tx.send(GeyserEvent::NotifyTransaction(
+                GeyserTransactionEvent {
+                    transaction_with_status_meta,
+                    versioned_transaction: Some(tx.clone()),
+                    index: transaction_index,
+                },
+            ));
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::processed(),
                 tx.get_signature(),
@@ -1837,9 +1884,8 @@ impl SurfnetSvm {
         self.inner.svm.get_fee_structure().lamports_per_signature
     }
 
-    /// Validates the blockhash of a transaction, considering nonce accounts if present.
-    /// If the transaction uses a nonce account, the blockhash is validated against the nonce account's stored blockhash.
-    /// Otherwise, it is validated against the RecentBlockhashes sysvar.
+    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a recent blockhash,
+    /// or else a durable nonce.
     ///
     /// # Arguments
     /// * `tx` - The transaction to validate.
@@ -1847,75 +1893,44 @@ impl SurfnetSvm {
     /// # Returns
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
-        if self.skip_blockhash_check {
-            return true;
-        }
+        self.skip_blockhash_check
+            || self.check_blockhash_is_recent(tx.message.recent_blockhash())
+            || self.check_durable_nonce(&tx.message)
+    }
 
-        let recent_blockhash = tx.message.recent_blockhash();
-
-        let some_nonce_account_index = tx
-            .message
-            .instructions()
-            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
-            .filter(|instruction| {
-                matches!(
-                    tx.message.static_account_keys().get(instruction.program_id_index as usize),
-                    Some(program_id) if system_program::check_id(program_id)
-                ) && is_advance_nonce_instruction_data(&instruction.data)
+    /// Agave's strict `check_nonce_account`: the nonce account is a system-owned, current-version
+    /// nonce holding the message's blockhash, and its authority signed the advance instruction.
+    ///
+    /// V0 lookup tables are left unresolved, so a nonce account loaded from one is not found.
+    fn check_durable_nonce(&self, message: &VersionedMessage) -> bool {
+        let Some(message) = SanitizedVersionedMessage::try_from(message.clone())
+            .ok()
+            .and_then(|message| {
+                SanitizedMessage::try_new(
+                    message,
+                    SimpleAddressLoader::Enabled(LoadedAddresses::default()),
+                    &agave_reserved_account_keys::ReservedAccountKeys::new_all_activated().active,
+                )
+                .ok()
             })
-            .map(|instruction| {
-                // nonce account is the first account in the instruction
-                instruction.accounts.get(0)
-            });
-
-        debug!(
-            "Validating tx blockhash: {}; is nonce tx?: {}",
-            recent_blockhash,
-            some_nonce_account_index.is_some()
-        );
-
-        if let Some(nonce_account_index) = some_nonce_account_index {
-            trace!(
-                "Nonce tx detected. Nonce account index: {:?}",
-                nonce_account_index
-            );
-            let Some(nonce_account_index) = nonce_account_index else {
-                return false;
-            };
-
-            let Some(nonce_account_pubkey) = tx
-                .message
-                .static_account_keys()
-                .get(*nonce_account_index as usize)
-            else {
-                return false;
-            };
-
-            trace!("Nonce account pubkey: {:?}", nonce_account_pubkey,);
-
-            // Here we're swallowing errors in the storage - if we fail to fetch the account because of a storage error,
-            // we're just considering the blockhash to be invalid.
-            let Ok(Some(nonce_account)) = self.get_account(nonce_account_pubkey) else {
-                return false;
-            };
-            trace!("Nonce account: {:?}", nonce_account);
-
-            let Some(nonce_data) =
-                bincode::deserialize::<solana_nonce::versions::Versions>(&nonce_account.data).ok()
-            else {
-                return false;
-            };
-            trace!("Nonce account data: {:?}", nonce_data);
-
-            let nonce_state = nonce_data.state();
-            let initialized_state = match nonce_state {
-                solana_nonce::state::State::Uninitialized => return false,
-                solana_nonce::state::State::Initialized(data) => data,
-            };
-            return initialized_state.blockhash() == *recent_blockhash;
-        } else {
-            self.check_blockhash_is_recent(recent_blockhash)
-        }
+        else {
+            return false;
+        };
+        message
+            .get_durable_nonce()
+            .and_then(|address| self.get_account(address).ok().flatten())
+            .filter(|account| account.data.len() == solana_nonce::state::State::size())
+            .and_then(|account| {
+                solana_nonce_account::verify_nonce_account(
+                    &account.into(),
+                    message.recent_blockhash(),
+                )
+            })
+            .is_some_and(|nonce| {
+                message
+                    .get_ix_signers(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
+                    .any(|signer| signer == &nonce.authority)
+            })
     }
 
     /// Verifies the signature of a transaction and validates that it hasn't already been processed.
@@ -2080,36 +2095,25 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// If `account.data` decodes as a Token-2022 mint with extensions,
-    /// snapshot the decimals and rate-limited extension state
-    /// (`InterestBearingConfig`, `ScaledUiAmountConfig`) into
-    /// `account_associated_data` so the RPC layer can serve UI-amount
-    /// conversions without re-parsing the raw account on every request.
+    /// If `account.data` decodes as a mint, cache its decimals and
+    /// UI-amount extension configs (`InterestBearingConfig`,
+    /// `ScaledUiAmountConfig`) in `account_associated_data` so the RPC layer
+    /// can serve UI amounts without re-parsing the mint on every request.
+    /// Readers go through [`Self::mint_additional_data`], which evaluates the
+    /// configs at the current clock.
     fn index_token_2022_mint_extensions(
         &mut self,
         pubkey: &Pubkey,
         account: &Account,
     ) -> SurfpoolResult<()> {
-        let Ok(mint) =
-            StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(&account.data)
-        else {
+        let Some(data) = spl_token_additional_data(
+            &account.data,
+            self.inner.get_sysvar::<Clock>().unix_timestamp,
+        ) else {
             return Ok(());
         };
-        let unix_timestamp = self.inner.get_sysvar::<Clock>().unix_timestamp;
-        let interest_bearing_config = mint
-            .get_extension::<InterestBearingConfig>()
-            .map(|x| (*x, unix_timestamp))
-            .ok();
-        let scaled_ui_amount_config = mint
-            .get_extension::<ScaledUiAmountConfig>()
-            .map(|x| (*x, unix_timestamp))
-            .ok();
         let additional_data: SerializableAccountAdditionalData = AccountAdditionalDataV3 {
-            spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
-                decimals: mint.base.decimals,
-                interest_bearing_config,
-                scaled_ui_amount_config,
-            }),
+            spl_token_additional_data: Some(data),
         }
         .into();
         self.account_associated_data
@@ -2165,27 +2169,11 @@ impl SurfnetSvm {
             .get_account(&spl_token_interface::native_mint::ID)?
             .unwrap();
 
-        let native_mint_associated_data = {
-            let mint = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(
+        let native_mint_associated_data = AccountAdditionalDataV3 {
+            spl_token_additional_data: spl_token_additional_data(
                 &native_mint_account.data,
-            )
-            .unwrap();
-            let unix_timestamp = self.inner.get_sysvar::<Clock>().unix_timestamp;
-            let interest_bearing_config = mint
-                .get_extension::<InterestBearingConfig>()
-                .map(|x| (*x, unix_timestamp))
-                .ok();
-            let scaled_ui_amount_config = mint
-                .get_extension::<ScaledUiAmountConfig>()
-                .map(|x| (*x, unix_timestamp))
-                .ok();
-            AccountAdditionalDataV3 {
-                spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
-                    decimals: mint.base.decimals,
-                    interest_bearing_config,
-                    scaled_ui_amount_config,
-                }),
-            }
+                self.inner.get_sysvar::<Clock>().unix_timestamp,
+            ),
         };
 
         let parsed_mint_account = MintAccount::unpack(&native_mint_account.data).unwrap();
@@ -2758,6 +2746,17 @@ impl SurfnetSvm {
         )
     }
 
+    /// Moves the chain to `absolute_slot`, at the epoch, slot index and epoch length the epoch
+    /// schedule gives it.
+    pub(crate) fn set_latest_absolute_slot(&mut self, absolute_slot: Slot) {
+        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(absolute_slot);
+        self.latest_epoch_info.absolute_slot = absolute_slot;
+        self.latest_epoch_info.epoch = epoch;
+        self.latest_epoch_info.slot_index = slot_index;
+        self.latest_epoch_info.slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+    }
+
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
         let slot = self.get_latest_absolute_slot();
         // `slotsUpdatesSubscribe` clients expect millisecond-precision Unix
@@ -2813,13 +2812,8 @@ impl SurfnetSvm {
             num_non_vote_transactions: Some(num_transactions),
         });
 
-        self.latest_epoch_info.slot_index += 1;
         self.latest_epoch_info.block_height = self.chain_tip.index;
-        self.latest_epoch_info.absolute_slot += 1;
-        if self.latest_epoch_info.slot_index > self.latest_epoch_info.slots_in_epoch {
-            self.latest_epoch_info.slot_index = 0;
-            self.latest_epoch_info.epoch += 1;
-        }
+        self.set_latest_absolute_slot(self.latest_epoch_info.absolute_slot + 1);
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
@@ -3609,20 +3603,12 @@ impl SurfnetSvm {
         if let Some(subscriptions) = self.program_subscriptions.remove(&program_id) {
             for (encoding, filters, tx) in subscriptions {
                 // Apply filters if present
-                if let Some(ref active_filters) = filters {
-                    match super::locker::apply_rpc_filters(&account.data, active_filters) {
-                        Ok(true) => {} // Account matches all filters
-                        Ok(false) => {
-                            // Filtered out - keep subscription active but don't notify
-                            remaining.push((encoding, filters, tx));
-                            continue;
-                        }
-                        Err(_) => {
-                            // Error applying filter - keep subscription, skip notification
-                            remaining.push((encoding, filters, tx));
-                            continue;
-                        }
-                    }
+                if let Some(ref active_filters) = filters
+                    && !super::locker::apply_rpc_filters(&account.data, active_filters)
+                {
+                    // Filtered out - keep subscription active but don't notify
+                    remaining.push((encoding, filters, tx));
+                    continue;
                 }
 
                 let config = RpcAccountInfoConfig {
@@ -3774,13 +3760,33 @@ impl SurfnetSvm {
                 .map(|ta| ta.mint())
         };
 
-        token_mint.and_then(|mint| {
-            self.account_associated_data
-                .get(&mint.to_string())
-                .ok()
-                .flatten()
-                .and_then(|data| data.try_into().ok())
-        })
+        token_mint
+            .and_then(|mint| self.mint_additional_data(&mint))
+            .map(|data| AccountAdditionalDataV3 {
+                spl_token_additional_data: Some(data),
+            })
+    }
+
+    /// The cached UI-amount inputs of `mint`, with the rate-based extensions
+    /// evaluated at the current clock like Agave's `get_additional_mint_data`
+    /// (the cache holds the clock of the slot the mint was last written).
+    pub fn mint_additional_data(&self, mint: &Pubkey) -> Option<SplTokenAdditionalDataV2> {
+        let cached: AccountAdditionalDataV3 = self
+            .account_associated_data
+            .get(&mint.to_string())
+            .ok()
+            .flatten()?
+            .try_into()
+            .ok()?;
+        let mut data = cached.spl_token_additional_data?;
+        let now = self.inner.get_sysvar::<Clock>().unix_timestamp;
+        if let Some((_, ts)) = data.interest_bearing_config.as_mut() {
+            *ts = now;
+        }
+        if let Some((_, ts)) = data.scaled_ui_amount_config.as_mut() {
+            *ts = now;
+        }
+        Some(data)
     }
 
     pub fn account_to_rpc_keyed_account<T: ReadableAccount>(
@@ -4496,30 +4502,16 @@ impl SurfnetSvm {
             }
 
             // For token accounts, we need to provide the mint additional data
-            let additional_data: Option<AccountAdditionalDataV3> = if account.owner
-                == spl_token_interface::id()
-                || account.owner == spl_token_2022_interface::id()
-            {
-                if let Ok(token_account) = TokenAccount::unpack(&account.data) {
-                    self.account_associated_data
-                        .get(&token_account.mint().to_string())
-                        .ok()
-                        .flatten()
-                        .and_then(|data| data.try_into().ok())
-                } else {
-                    self.account_associated_data
-                        .get(&pubkey.to_string())
-                        .ok()
-                        .flatten()
-                        .and_then(|data| data.try_into().ok())
-                }
+            let mint = if is_supported_token_program(&account.owner) {
+                TokenAccount::unpack(&account.data).map_or(*pubkey, |t| t.mint())
             } else {
-                self.account_associated_data
-                    .get(&pubkey.to_string())
-                    .ok()
-                    .flatten()
-                    .and_then(|data| data.try_into().ok())
+                *pubkey
             };
+            let additional_data =
+                self.mint_additional_data(&mint)
+                    .map(|data| AccountAdditionalDataV3 {
+                        spl_token_additional_data: Some(data),
+                    });
 
             let ui_account =
                 self.encode_ui_account(pubkey, account, encoding, additional_data, None);
@@ -4657,7 +4649,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::storage::tests::TestType;
+    use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -4712,6 +4704,91 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    #[test]
+    fn bundle_commit_appends_only_new_queue_entries_and_geyser_indices() {
+        let (mut live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let first_recipient = Pubkey::new_unique();
+        let second_recipient = Pubkey::new_unique();
+        let first = live_svm
+            .airdrop(&first_recipient, 1_000_000)
+            .expect("initial airdrop should be accepted")
+            .expect("initial airdrop should succeed");
+        let mut sandbox = live_svm.clone_for_bundle_sandbox();
+        let second = sandbox
+            .svm
+            .airdrop(&second_recipient, 1_000_000)
+            .expect("sandbox airdrop should be accepted")
+            .expect("sandbox airdrop should succeed");
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+
+        live_svm
+            .commit_sandbox(sandbox, bundle_status_tx)
+            .expect("sandbox should commit");
+
+        let queued_signatures = live_svm
+            .transactions_queued_for_confirmation
+            .iter()
+            .map(|(transaction, _, _)| transaction.signatures[0])
+            .collect::<Vec<_>>();
+        assert_eq!(queued_signatures, vec![first.signature, second.signature]);
+
+        let geyser_indices = geyser_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                GeyserEvent::NotifyTransaction(event) => Some((
+                    event.transaction_with_status_meta.transaction.signatures[0],
+                    event.index,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            geyser_indices,
+            vec![(first.signature, 0), (second.signature, 1)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bundle_commit_rejects_sandbox_after_live_write_without_slot_change() {
+        let (live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(live_svm);
+        let sandbox = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let slot_before = locker.get_latest_absolute_slot();
+
+        // A cheatcode-style write lands while the bundle executes; the slot does not move.
+        let pubkey = Pubkey::new_unique();
+        let account = Account {
+            lamports: 42,
+            ..Default::default()
+        };
+        let written = account.clone();
+        locker
+            .with_svm_writer(move |svm| svm.set_account(&pubkey, written))
+            .expect("live write should succeed");
+        assert_eq!(locker.get_latest_absolute_slot(), slot_before);
+
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+        let error = locker
+            .with_svm_writer(move |svm| svm.commit_sandbox(sandbox, bundle_status_tx))
+            .expect_err("stale sandbox must not commit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match live state revision")
+        );
+        let live_account = locker
+            .with_svm_reader(|svm| svm.inner.get_account(&pubkey))
+            .expect("account lookup should succeed");
+        assert_eq!(live_account, Some(account));
+        locker.with_svm_reader(|svm| assert!(svm.transactions_queued_for_confirmation.is_empty()));
+        assert!(
+            geyser_rx
+                .try_iter()
+                .all(|event| { !matches!(event, GeyserEvent::NotifyTransaction(_)) })
+        );
     }
 
     /// A Token-2022 vault with a fake extension tail. The forge helper never
@@ -6082,6 +6159,142 @@ mod tests {
             "send should succeed when skip_blockhash_check is enabled: {:?}",
             send_result.err().map(|err| err.err)
         );
+    }
+
+    /// Sends a lone `AdvanceNonceAccount`, whose authority is not the fee payer, over a fresh nonce
+    /// account, once `tamper` has edited that account and the instruction. Signs over the stored
+    /// nonce, or over the live blockhash. A `versioned` send is a v0 message that also transfers
+    /// to an account loaded from a lookup table. Returns the SVM, the nonce address, the stored
+    /// nonce and the outcome.
+    fn send_advance_nonce(
+        live_blockhash: bool,
+        versioned: bool,
+        tamper: fn(&mut Account, &mut solana_instruction::Instruction),
+    ) -> (SurfnetSvm, Pubkey, Hash, Result<(), TransactionError>) {
+        use solana_nonce::{
+            state::{Data, DurableNonce, State},
+            versions::Versions,
+        };
+
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (payer, authority, nonce) = (Keypair::new(), Keypair::new(), Pubkey::new_unique());
+        svm.airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        let stored = DurableNonce::from_blockhash(&Hash::new_unique());
+        let state = State::Initialized(Data::new(authority.pubkey(), stored, 5_000));
+        let mut account = Account {
+            lamports: 1_000_000_000,
+            data: bincode::serialize(&Versions::new(state)).unwrap(),
+            owner: system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let mut advance = system_instruction::advance_nonce_account(&nonce, &authority.pubkey());
+        tamper(&mut account, &mut advance);
+        svm.set_account(&nonce, account).unwrap();
+
+        let blockhash = if live_blockhash {
+            svm.latest_blockhash()
+        } else {
+            *stored.as_hash()
+        };
+        let message = if versioned {
+            use solana_address_lookup_table_interface::state::{
+                AddressLookupTable, LookupTableMeta,
+            };
+
+            let (table, recipient) = (Pubkey::new_unique(), Pubkey::new_unique());
+            let lookup_table = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: vec![recipient].into(),
+            };
+            svm.set_account(
+                &table,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: lookup_table.serialize_for_tests().unwrap(),
+                    owner: solana_address_lookup_table_interface::program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000_000);
+            let message = solana_message::v0::Message::try_compile(
+                &payer.pubkey(),
+                &[advance, transfer],
+                &[solana_message::AddressLookupTableAccount {
+                    key: table,
+                    addresses: vec![recipient],
+                }],
+                blockhash,
+            )
+            .unwrap();
+            assert_eq!(message.address_table_lookups[0].writable_indexes, [0]);
+            VersionedMessage::V0(message)
+        } else {
+            VersionedMessage::Legacy(Message::new_with_blockhash(
+                &[advance],
+                Some(&payer.pubkey()),
+                &blockhash,
+            ))
+        };
+        let static_keys = message.static_account_keys();
+        let signers: Vec<&Keypair> = [&payer, &authority]
+            .into_iter()
+            .filter(|signer| {
+                static_keys[..message.header().num_required_signatures as usize]
+                    .contains(&signer.pubkey())
+            })
+            .collect();
+        let tx = VersionedTransaction::try_new(message, &signers).unwrap();
+        let result = svm
+            .send_transaction(tx, false, false)
+            .map(|_| ())
+            .map_err(|e| e.err);
+        (svm, nonce, *stored.as_hash(), result)
+    }
+
+    #[test_case(false; "signed over the stored nonce")]
+    #[test_case(true; "signed over a live blockhash")]
+    fn test_durable_nonce_transaction_is_accepted_and_advances_the_nonce(live_blockhash: bool) {
+        for versioned in [false, true] {
+            let (svm, nonce, stored, result) =
+                send_advance_nonce(live_blockhash, versioned, |_, _| {});
+
+            assert_eq!(result, Ok(()), "versioned: {versioned}");
+            let account = svm.get_account(&nonce).unwrap().unwrap();
+            let versions: solana_nonce::versions::Versions =
+                bincode::deserialize(&account.data).unwrap();
+            assert!(
+                matches!(
+                    versions.state(),
+                    solana_nonce::state::State::Initialized(data) if data.blockhash() != stored
+                ),
+                "versioned: {versioned}"
+            );
+        }
+    }
+
+    #[test_case(|account, _| account.owner = Pubkey::new_unique(); "nonce account not owned by the system program")]
+    #[test_case(|account, _| account.data[..4].copy_from_slice(&0u32.to_le_bytes()); "legacy nonce version")]
+    #[test_case(|account, _| account.data.push(0); "nonce account larger than a nonce")]
+    #[test_case(|_, advance| advance.accounts[0].is_writable = false; "nonce account not writable")]
+    #[test_case(|_, advance| advance.accounts[2].is_signer = false; "nonce authority did not sign")]
+    fn test_invalid_durable_nonce_transaction_is_rejected(
+        tamper: fn(&mut Account, &mut solana_instruction::Instruction),
+    ) {
+        for versioned in [false, true] {
+            let (_svm, _nonce, _stored, result) = send_advance_nonce(false, versioned, tamper);
+
+            assert_eq!(
+                result,
+                Err(TransactionError::BlockhashNotFound),
+                "versioned: {versioned}"
+            );
+        }
     }
 
     // Feature configuration tests
@@ -7873,6 +8086,74 @@ mod tests {
             read(ALLOWED_OFFSET),
             5_678,
             "the second override must apply"
+        );
+    }
+
+    /// The epoch, slot index and epoch length are the ones the epoch schedule gives the absolute
+    /// slot, at start and as blocks cross an epoch boundary, with and without warmup.
+    #[test]
+    fn epoch_info_follows_the_absolute_slot() {
+        for schedule in [
+            EpochSchedule::without_warmup(),
+            EpochSchedule::custom(432_000, 432_000, true),
+        ] {
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.inner.set_sysvar(&schedule);
+            let mut seen = vec![SurfnetSvm::default_epoch_info(&schedule)];
+            svm.latest_epoch_info.absolute_slot = schedule.get_first_slot_in_epoch(1) - 2;
+            for _ in 0..3 {
+                svm.confirm_current_block().unwrap();
+                seen.push(svm.latest_epoch_info.clone());
+            }
+
+            let actual = seen
+                .iter()
+                .map(|info| {
+                    (
+                        info.absolute_slot,
+                        info.epoch,
+                        info.slot_index,
+                        info.slots_in_epoch,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = seen
+                .iter()
+                .map(|info| {
+                    let (epoch, slot_index) = schedule.get_epoch_and_slot_index(info.absolute_slot);
+                    (
+                        info.absolute_slot,
+                        epoch,
+                        slot_index,
+                        schedule.get_slots_in_epoch(epoch),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "warmup: {}", schedule.warmup);
+        }
+    }
+
+    /// Garbage collection rebuilds LiteSVM, and must keep the epoch schedule the surfnet was
+    /// started with: the epoch info is derived from it.
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn garbage_collection_keeps_the_epoch_schedule(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let gc_slot = *GARBAGE_COLLECTION_INTERVAL_SLOTS;
+        svm.latest_epoch_info.absolute_slot = gc_slot;
+        svm.latest_epoch_info.slot_index = gc_slot;
+
+        svm.confirm_current_block().unwrap();
+
+        let info = &svm.latest_epoch_info;
+        assert_eq!(
+            (
+                svm.inner.get_sysvar::<EpochSchedule>(),
+                info.absolute_slot,
+                info.epoch,
+                info.slot_index
+            ),
+            (EpochSchedule::without_warmup(), gc_slot + 1, 0, gc_slot + 1)
         );
     }
 }

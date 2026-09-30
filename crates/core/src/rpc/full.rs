@@ -41,7 +41,8 @@ use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
         decode_and_deserialize, decode_rpc_versioned_transaction,
-        transform_tx_metadata_to_ui_accounts, verify_pubkey,
+        transform_tx_metadata_to_ui_accounts, verify_and_parse_signatures_for_address_params,
+        verify_pubkey,
     },
 };
 use crate::{
@@ -2029,7 +2030,9 @@ impl Full for SurfpoolFullRpc {
                     .set_recent_blockhash(latest_blockhash);
                 Some(RpcBlockhash {
                     blockhash: latest_blockhash.to_string(),
-                    last_valid_block_height: latest_epoch_info.block_height,
+                    // The latest blockhash was minted at the current block height.
+                    last_valid_block_height: latest_epoch_info.block_height
+                        + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
                 })
             } else {
                 None
@@ -2432,10 +2435,17 @@ impl Full for SurfpoolFullRpc {
         address: String,
         config: Option<RpcSignaturesForAddressConfig>,
     ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>> {
-        let pubkey = match verify_pubkey(&address) {
-            Ok(s) => s,
-            Err(e) => return e.into(),
-        };
+        let RpcSignaturesForAddressConfig {
+            before,
+            until,
+            limit,
+            ..
+        } = config.clone().unwrap_or_default();
+        let pubkey =
+            match verify_and_parse_signatures_for_address_params(address, before, until, limit) {
+                Ok((pubkey, ..)) => pubkey,
+                Err(e) => return Box::pin(async move { Err(e) }),
+            };
         let SurfnetRpcContext {
             svm_locker,
             remote_ctx,
@@ -3309,6 +3319,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_rejects_invalid_params() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let bad = || Some("not-a-signature".to_string());
+
+        for config in [
+            RpcSignaturesForAddressConfig {
+                limit: Some(0),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                limit: Some(1001),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                before: bad(),
+                ..Default::default()
+            },
+            RpcSignaturesForAddressConfig {
+                until: bad(),
+                ..Default::default()
+            },
+        ] {
+            let err = setup
+                .rpc
+                .get_signatures_for_address(
+                    Some(setup.context.clone()),
+                    Pubkey::new_unique().to_string(),
+                    Some(config.clone()),
+                )
+                .await
+                .expect_err(&format!("{config:?} should be rejected"));
+            assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_signature_statuses() {
         let pks = (0..10).map(|_| Pubkey::new_unique());
         let valid_txs = pks.len();
@@ -4023,10 +4069,17 @@ mod tests {
             .context
             .svm_locker
             .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
-        let block_height = setup
-            .context
-            .svm_locker
-            .with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.block_height);
+        let latest = setup
+            .rpc
+            .get_latest_blockhash(
+                Some(setup.context.clone()),
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot: None,
+                }),
+            )
+            .unwrap()
+            .value;
         let bad_blockhash = Hash::new_unique();
 
         let _ = setup
@@ -4105,12 +4158,11 @@ mod tests {
             simulation_res.value.err, None,
             "Unexpected simulation error"
         );
+        // As on a validator, the replacement is valid for exactly as long as `getLatestBlockhash`
+        // says the same blockhash is.
         assert_eq!(
             simulation_res.value.replacement_blockhash,
-            Some(RpcBlockhash {
-                blockhash: recent_blockhash.to_string(),
-                last_valid_block_height: block_height
-            }),
+            Some(latest),
             "Replacement blockhash should be the latest blockhash"
         );
     }
