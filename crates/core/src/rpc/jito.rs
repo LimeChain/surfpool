@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_account_decoder::{UiAccount, UiAccountEncoding, encode_ui_account};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_commitment_config::CommitmentConfig;
+use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
 use solana_signature::Signature;
@@ -18,8 +20,9 @@ use surfpool_types::{
 
 use super::{RunloopContext, utils::decode_and_deserialize};
 use crate::{
+    error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
-    surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox},
+    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::BundleSandbox},
 };
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
@@ -28,6 +31,9 @@ const MAX_BUNDLE_SIZE: usize = 5;
 /// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
+
+/// Times a bundle is re-executed when live state changes before its sandbox commits.
+const MAX_BUNDLE_COMMIT_ATTEMPTS: usize = 3;
 
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
@@ -593,6 +599,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                ..
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -854,15 +861,78 @@ impl Jito for SurfpoolJitoRpc {
 
 /// Executes decoded Jito bundle transactions atomically.
 ///
-/// Transactions run sequentially against an isolated sandbox. If every
-/// transaction succeeds, the sandbox state and buffered notifications are
-/// committed to the live SVM and the Jito bundle ID is returned. On failure,
-/// the sandbox is discarded and the live SVM is unchanged.
+/// Transactions run sequentially against an isolated sandbox. Required remote
+/// accounts are prefetched into the live SVM in batches before the sandbox is
+/// created. If every transaction succeeds, the sandbox state and buffered
+/// notifications are committed to the live SVM and the Jito bundle ID is
+/// returned. On failure, execution effects are discarded while prefetched
+/// accounts remain cached.
 pub(crate) async fn process_bundle(
     svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     decoded_txs: Vec<VersionedTransaction>,
 ) -> std::result::Result<String, String> {
-    // -- Phase A: Sandbox execution ---------------------------------------------------------
+    prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // RPC handlers (e.g. cheatcodes) can write live state while the sandbox executes, since
+    // the live lock is not held across execution. A stale sandbox is never committed; the
+    // bundle is re-executed against a fresh snapshot instead.
+    let mut attempt = 1;
+    let bundle_signatures = loop {
+        let (sandbox, bundle_signatures) =
+            execute_bundle_in_sandbox(svm_locker, &decoded_txs).await?;
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        let committed = svm_locker
+            .with_svm_writer(move |live| {
+                if live.is_stale_bundle_sandbox(&sandbox) {
+                    return Ok(false);
+                }
+                live.commit_sandbox(sandbox, bundle_status_tx).map(|_| true)
+            })
+            .map_err(|e| {
+                format!("Jito bundle commit failed after successful sandbox execution: {e}")
+            })?;
+        if committed {
+            break bundle_signatures;
+        }
+        if attempt >= MAX_BUNDLE_COMMIT_ATTEMPTS {
+            return Err(format!(
+                "Jito bundle couldn't be committed: live state changed during execution {attempt} times"
+            ));
+        }
+        attempt += 1;
+    };
+
+    let concatenated_signatures = bundle_signatures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut hasher = Sha256::new();
+    hasher.update(concatenated_signatures.as_bytes());
+    let bundle_id = hex::encode(hasher.finalize());
+
+    svm_locker
+        .store_bundle(
+            bundle_id.clone(),
+            bundle_signatures.iter().map(ToString::to_string).collect(),
+        )
+        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
+
+    Ok(bundle_id)
+}
+
+/// Runs every bundle transaction against a fresh sandbox cloned from live state.
+///
+/// Returns the executed sandbox, ready for
+/// [`SurfnetSvm::commit_sandbox`](crate::surfnet::svm::SurfnetSvm::commit_sandbox),
+/// and the bundle's signatures in order. Nothing is written to the live SVM.
+async fn execute_bundle_in_sandbox(
+    svm_locker: &SurfnetSvmLocker,
+    decoded_txs: &[VersionedTransaction],
+) -> std::result::Result<(BundleSandbox, Vec<Signature>), String> {
     let bundle_sandbox =
         svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
@@ -870,12 +940,13 @@ pub(crate) async fn process_bundle(
         svm: sandbox_svm,
         geyser_rx,
         simnet_rx,
+        confirmation_queue_base_len,
+        base_state_revision,
     } = bundle_sandbox;
     let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
-    // Bundles deliberately use only locally-hydrated state. Do not add a
-    // remote context here without reconsidering the runloop serialization
-    // interval and its timeout policy.
+    // Prefetching above is the only remote interaction. Transactions execute
+    // against the hydrated sandbox, preventing per-transaction RPC requests.
     let remote_ctx = &None;
     let skip_preflight = true;
     let sigverify = true;
@@ -923,40 +994,101 @@ pub(crate) async fn process_bundle(
         }
     }
 
-    // -- Phase B: Atomic commit -------------------------------------------------------------
     let sandbox_svm = Arc::try_unwrap(sandbox_locker.0)
         .map_err(|_| "Jito bundle sandbox remained shared after execution".to_string())?
         .into_inner();
-    let reassembled = BundleSandbox {
+    let sandbox = BundleSandbox {
         svm: sandbox_svm,
         geyser_rx,
         simnet_rx,
+        confirmation_queue_base_len,
+        base_state_revision,
     };
-    let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+
+    Ok((sandbox, bundle_signatures))
+}
+
+/// Hydrates accounts needed by a bundle into the live SVM before snapshotting.
+///
+/// Static account keys and lookup-table accounts are fetched together. Once
+/// lookup tables are available locally, their loaded addresses are resolved
+/// and fetched in one further batch. Fetch and lookup-table errors are
+/// returned to the caller.
+async fn prefetch_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    transactions: &[VersionedTransaction],
+) -> SurfpoolResult<()> {
+    if remote_ctx.is_none() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut accounts = Vec::new();
+    for transaction in transactions {
+        for pubkey in svm_locker.get_pubkeys_from_message(&transaction.message, None) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+        for pubkey in get_address_lookup_table_pubkeys(&transaction.message) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &accounts).await?;
+
+    // ALT contents are unavailable until their accounts have been hydrated.
+    // Resolve them locally, then include every loaded address in one second
+    // batch for the bundle (rather than fetching per transaction).
+    let mut loaded_accounts = Vec::new();
+    for transaction in transactions {
+        if let Some(loaded) = svm_locker
+            .get_loaded_addresses(&None, &transaction.message)
+            .await?
+        {
+            for pubkey in loaded.all_loaded_addresses() {
+                add_unique_bundle_account(&mut loaded_accounts, &mut seen, *pubkey);
+            }
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &loaded_accounts).await
+}
+
+fn add_unique_bundle_account(
+    accounts: &mut Vec<Pubkey>,
+    seen: &mut HashSet<Pubkey>,
+    pubkey: Pubkey,
+) {
+    if seen.insert(pubkey) {
+        accounts.push(pubkey);
+    }
+}
+
+async fn hydrate_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    accounts: &[Pubkey],
+) -> SurfpoolResult<()> {
+    if accounts.is_empty() {
+        return Ok(());
+    }
 
     svm_locker
-        .with_svm_writer(move |original| original.commit_sandbox(reassembled, bundle_status_tx))
-        .map_err(|e| {
-            format!("Jito bundle commit failed after successful sandbox execution: {e}")
-        })?;
+        .get_multiple_accounts(remote_ctx, accounts, None)
+        .await?;
+    Ok(())
+}
 
-    let concatenated_signatures = bundle_signatures
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut hasher = Sha256::new();
-    hasher.update(concatenated_signatures.as_bytes());
-    let bundle_id = hex::encode(hasher.finalize());
-
-    svm_locker
-        .store_bundle(
-            bundle_id.clone(),
-            bundle_signatures.iter().map(ToString::to_string).collect(),
-        )
-        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
-
-    Ok(bundle_id)
+/// Returns the account keys of address lookup tables referenced by a message.
+pub fn get_address_lookup_table_pubkeys(message: &VersionedMessage) -> Vec<Pubkey> {
+    match message {
+        VersionedMessage::V0(message) => message
+            .address_table_lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect(),
+        VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,9 +1267,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        rpc::full::{Full, SurfpoolFullRpc},
-        runloops::start_block_production_runloop,
-        tests::helpers::TestSetup,
+        rpc::full::Full, runloops::start_block_production_runloop, tests::helpers::TestSetup,
     };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -1193,8 +1323,11 @@ mod tests {
                 .expect("bundle command test runtime should start");
             while let Ok(command) = commands_rx.recv() {
                 if let SimnetCommand::ProcessBundle(_, transactions, reply_tx) = command {
-                    let _ =
-                        reply_tx.send(runtime.block_on(process_bundle(&svm_locker, transactions)));
+                    let _ = reply_tx.send(runtime.block_on(process_bundle(
+                        &svm_locker,
+                        &None,
+                        transactions,
+                    )));
                 }
             }
         });

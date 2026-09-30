@@ -28,7 +28,7 @@ use solana_transaction_status::UiTransactionEncoding;
 
 use super::{State, SurfnetRpcContext, SurfpoolWebsocketMeta};
 use crate::{
-    rpc::utils::MAX_SUPPORTED_TRANSACTION_VERSION,
+    rpc::utils::{MAX_SUPPORTED_TRANSACTION_VERSION, optimize_filters, verify_filters},
     surfnet::{
         GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
     },
@@ -1811,7 +1811,16 @@ impl Rpc for SurfpoolWsRpc {
             }
         };
 
-        let config = config.unwrap_or_default();
+        let mut config = config.unwrap_or_default();
+        if let Some(filters) = config.filters.as_mut() {
+            if let Err(error) = verify_filters(filters) {
+                if subscriber.reject(error).is_err() {
+                    log::error!("Failed to reject subscriber for invalid filters.");
+                }
+                return;
+            }
+            optimize_filters(filters);
+        }
 
         let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
         let sub_id = SubscriptionId::Number(id as u64);
@@ -2178,5 +2187,51 @@ impl Rpc for SurfpoolWsRpc {
             });
         };
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_program_subscribe_rejects_invalid_filters() {
+        let rpc = SurfpoolWsRpc {
+            uid: atomic::AtomicUsize::new(0),
+            signature_subscription_map: Default::default(),
+            account_subscription_map: Default::default(),
+            program_subscription_map: Default::default(),
+            slot_subscription_map: Default::default(),
+            slots_updates_subscription_map: Default::default(),
+            logs_subscription_map: Default::default(),
+            snapshot_subscription_map: Default::default(),
+            tokio_handle: tokio::runtime::Handle::current(),
+        };
+
+        for filters in [
+            vec![RpcFilterType::DataSize(3); 5],
+            vec![RpcFilterType::Memcmp(Memcmp::new(
+                0,
+                MemcmpEncodedBytes::Base58("0OIl".to_string()),
+            ))],
+        ] {
+            let (subscriber, id_rx, _) = Subscriber::new_test("programSubscribe");
+            rpc.program_subscribe(
+                None,
+                subscriber,
+                Pubkey::new_unique().to_string(),
+                Some(RpcProgramSubscribeConfig {
+                    filters: Some(filters.clone()),
+                    ..Default::default()
+                }),
+            );
+            let err = id_rx
+                .await
+                .unwrap()
+                .expect_err(&format!("filters {filters:?} should be rejected"));
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+        }
     }
 }

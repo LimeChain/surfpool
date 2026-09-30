@@ -49,7 +49,7 @@ serde_derive = { workspace = true }                                  # must matc
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 serde_yaml = "0.9"
-solana-account = { workspace = true }
+solana-account = { workspace = true, features = ["bincode"] }
 solana-account-decoder = { workspace = true }
 solana-address-lookup-table-interface = { workspace = true }
 solana-client = { workspace = true }
@@ -68,6 +68,7 @@ solana-keypair = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true }
+solana-nonce-account = { workspace = true }
 solana-packet = { workspace = true }
 solana-program-option = { workspace = true }
 solana-program-pack = { workspace = true }
