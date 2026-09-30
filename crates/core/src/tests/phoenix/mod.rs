@@ -2,24 +2,18 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use phoenix_rise_accounts::{
-    PhoenixAccount,
     global_config::GlobalConfig,
     pda::derive_spline_collection_address,
     perp_asset_map::PerpAssetMap,
-    trader::{TRADER_CAPABILITY_HOT, Trader, TraderHeader},
+    trader::{Trader, TraderHeader},
 };
 use solana_account::Account;
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::{
-    config::RpcAccountInfoConfig,
-    filter::{Memcmp, RpcFilterType},
-};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
@@ -27,13 +21,15 @@ use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 use crate::{
     scenarios::{
         TemplateRegistry,
-        protocols::phoenix_eternal::v1::state_builder::{
-            PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
-            build_phoenix_collateral_scenario, phoenix_market_symbols,
+        protocols::phoenix_eternal::v1::{
+            collateral::{index_trader_state_range, index_trader_state_ranges},
+            state_builder::{
+                PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
+                build_phoenix_collateral_scenario, phoenix_market_symbols,
+            },
         },
     },
     surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
-    types::RemoteRpcResult,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -71,75 +67,49 @@ fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// A live hot Trader with collateral and a long position, so a downward mark shock has
-/// something to act on. Traders come and go, so the test discovers one through the program's
-/// own account list rather than pinning an address that may be closed tomorrow.
-async fn live_trader_with_position() -> Pubkey {
-    // The list carries only collateral (offset 88) and the capability flags (96) of every
-    // Trader; the full accounts, mostly 5 KB each, are read for the hot ones with collateral.
-    let listed = client()
-        .get_program_accounts(
-            &PHOENIX_ETERNAL_PROGRAM_ID,
-            RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                commitment: Some(CommitmentConfig::confirmed()),
-                data_slice: Some(UiDataSliceConfig {
-                    offset: 88,
-                    length: 12,
-                }),
-                ..RpcAccountInfoConfig::default()
-            },
-            Some(vec![RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
-                0,
-                &PhoenixAccount::Trader.discriminant(),
-            ))]),
-        )
-        .await;
-    let listed = match listed {
-        Ok(RemoteRpcResult::Ok(accounts)) => accounts,
-        // The protocol keeps its own trader index, but phoenix-rise-accounts exposes only the
-        // arena metadata, so the program's account list is the reader we have.
-        Ok(RemoteRpcResult::MethodNotSupported) => panic!(
-            "environment: this endpoint does not support getProgramAccounts, which these tests \
-             need to find a live trader. Set {RPC_URL_ENV} to an endpoint that supports it. \
-             Nothing is proven or disproven about the integration."
-        ),
-        Err(error) => panic!("failed to list live Phoenix traders: {error}"),
-    };
-    let candidates: Vec<Pubkey> = listed
+/// A live hot Trader with collateral and a position, so the margin views have something to act
+/// on. Traders come and go, so the test discovers one rather than pinning an address that may
+/// be closed tomorrow. The GlobalTraderIndex lists every hot Trader with the collateral Hawkeye
+/// reads, so only a few Trader accounts are read, for their positions and for the hot flag the
+/// collateral stress keys off. Those positions can lag behind what Hawkeye reads, which the
+/// tests check through the program itself.
+async fn live_trader_with_position(index: &Account) -> Pubkey {
+    let mut candidates: Vec<Pubkey> = index_trader_state_ranges(index)
+        .expect("live GlobalTraderIndex should walk")
         .into_iter()
-        .filter_map(|(pubkey, account)| {
-            let data = account.to_account()?.data;
-            let collateral = i64::from_le_bytes(data.get(..8)?.try_into().ok()?);
-            let flags = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?);
-            (collateral > 0 && flags & TRADER_CAPABILITY_HOT != 0).then_some(pubkey)
+        .filter(|(_, range)| {
+            i64::from_le_bytes(index.data[range.start..range.start + 8].try_into().unwrap()) > 0
         })
+        .map(|(pubkey, _)| pubkey)
         .collect();
+    candidates.sort_unstable();
 
-    for chunk in candidates.chunks(100) {
+    for chunk in candidates.chunks(20) {
         let accounts = client()
             .get_multiple_accounts(chunk, CommitmentConfig::confirmed())
             .await
             .unwrap_or_else(|e| panic!("failed to read live Phoenix traders: {e}"));
         for (pubkey, account) in chunk.iter().zip(accounts) {
-            // A trader closed since the list was read is skipped, not an error.
+            // A trader closed since the index was read is skipped, not an error.
             let Ok(account) = account.map_account() else {
                 continue;
             };
-            let Ok(trader) = Trader::try_from_account_bytes(&account.data) else {
-                continue;
-            };
-            let state = &trader.header.trader_state;
-            let holds_a_long = trader
+            let trader = Trader::try_from_account_bytes(&account.data).unwrap_or_else(|e| {
+                panic!("{pubkey} is in the GlobalTraderIndex but does not decode as a Trader: {e}")
+            });
+            let holds_a_position = trader
                 .positions()
-                .any(|(_, position)| position.base_lot_position().as_inner() > 0);
-            if state.quote_lot_collateral.as_inner() > 0 && state.is_hot() && holds_a_long {
+                .any(|(_, position)| position.base_lot_position().as_inner() != 0);
+            if trader.header.trader_state.is_hot() && holds_a_position {
                 return *pubkey;
             }
         }
     }
 
-    panic!("no eligible live candidate: no live Phoenix Trader is hot with collateral and a long")
+    panic!(
+        "no eligible live candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
+         collateral and a position"
+    )
 }
 
 /// A zero-copy layout cannot be round-tripped against itself, so drift shows up as an
@@ -270,7 +240,6 @@ fn live_graph_cache() -> &'static tokio::sync::Mutex<Option<PhoenixLiveGraph>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     let (collateral_locker, graph) = phoenix_behavior_locker().await;
-    use crate::scenarios::protocols::phoenix_eternal::v1::collateral::index_trader_state_range;
 
     let account = |key: &Pubkey| {
         collateral_locker
@@ -287,20 +256,38 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     );
     let range = index_trader_state_range(&before_index, &header.key).unwrap();
     let before = hawkeye_margin(&collateral_locker, &graph);
-    assert!(before.collateral_quote_lots > 1);
+    assert!(
+        before.collateral_quote_lots > 0,
+        "no eligible live candidate: the discovered trader has no collateral to stress"
+    );
     assert!(
         before.position_count > 0,
-        "the discovered trader must hold a position for margin to mean anything"
+        "no eligible live candidate: the program sees no position for the discovered trader"
     );
     assert!(
         before.maintenance_margin_quote_lots > 0,
         "no eligible live candidate: the discovered trader's positions require no margin"
     );
-    assert_eq!(before.is_liquidatable, 0, "the fork starts healthy");
+    assert_eq!(
+        before.is_liquidatable, 0,
+        "no eligible live candidate: the discovered trader is already liquidatable"
+    );
 
-    let scenario =
-        build_phoenix_collateral_scenario(graph.trader, &before_trader, "1", Some(&before_index))
-            .unwrap();
+    // Effective collateral moves one-for-one with collateral, whatever else it counts (uPnL,
+    // funding, ...), so this target puts it at half the maintenance margin. A fixed target of 1
+    // left about one live trader in four healthy.
+    let maintenance =
+        i64::try_from(before.maintenance_margin_quote_lots).expect("maintenance margin fits i64");
+    let target =
+        before.collateral_quote_lots - before.effective_collateral_quote_lots + maintenance / 2;
+
+    let scenario = build_phoenix_collateral_scenario(
+        graph.trader,
+        &before_trader,
+        &target.to_string(),
+        Some(&before_index),
+    )
+    .unwrap();
     collateral_locker
         .register_scenario(scenario, Some(graph.clock.slot))
         .unwrap();
@@ -312,7 +299,7 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         .unwrap();
     let after_collateral = hawkeye_margin(&collateral_locker, &graph);
     assert_eq!(
-        after_collateral.collateral_quote_lots, 1,
+        after_collateral.collateral_quote_lots, target,
         "the program reads the collateral the preparation wrote"
     );
     assert!(
@@ -320,11 +307,18 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         "stressing collateral must lower what the risk engine can count on"
     );
 
-    assert_eq!(after_collateral.is_liquidatable, 1);
+    assert_eq!(
+        after_collateral.is_liquidatable,
+        1,
+        "the stress must leave the trader liquidatable: effective collateral {} against \
+         maintenance margin {}",
+        after_collateral.effective_collateral_quote_lots,
+        after_collateral.maintenance_margin_quote_lots
+    );
     let mut expected_trader = before_trader;
-    expected_trader.data[88..96].copy_from_slice(&1_i64.to_le_bytes());
+    expected_trader.data[88..96].copy_from_slice(&target.to_le_bytes());
     let mut expected_index = before_index;
-    expected_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
+    expected_index.data[range.start..range.start + 8].copy_from_slice(&target.to_le_bytes());
     assert_eq!(account(&graph.trader), expected_trader);
     assert_eq!(account(&graph.global_trader_index), expected_index);
 
@@ -348,13 +342,11 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         Some(&index_account),
     )
     .unwrap();
-    let mut shock = phoenix_market_scenario(
+    let mut shock = phoenix_market_override(
         "phoenix-direct-mark-risk-shock",
         graph.perp_asset_map,
         &[("symbol", symbol.as_str()), ("target_ticks", "1")],
-    )
-    .overrides
-    .remove(0);
+    );
     shock.scenario_relative_slot = 1;
     cascade.add_override(shock);
     mark_locker
@@ -394,39 +386,61 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn maintenance_margin_stress_raises_the_live_requirement() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let trader_account = graph.account(&graph.trader);
-    let trader = Trader::try_from_account_bytes(&trader_account.data).unwrap();
-    let (asset_id, _) = trader
-        .positions()
-        .next()
-        .expect("the discovered trader holds a position");
     let map = PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
         .expect("live PerpAssetMap decodes");
-    let entry = map
-        .iter()
-        .map(|entry| entry.expect("live map entry decodes"))
-        .find(|entry| u64::from(entry.metadata.static_market_params().asset_id()) == asset_id)
-        .expect("the position's market is listed");
-    let doubled = entry.metadata.risk_params().risk_factors[0].saturating_mul(2);
+
+    // For a hot Trader the program reads positions from the ActiveTraderBuffer, which the Trader
+    // account's copy can lag behind, so every market's factor is doubled rather than the one
+    // the copy names. The overrides share a slot, and each reads the map the previous one wrote.
+    let mut scenario = surfpool_types::Scenario::new(
+        "phoenix-maintenance-margin-stress".to_string(),
+        "Double every Phoenix market's maintenance factor".to_string(),
+    );
+    let mut doubled = Vec::new();
+    for entry in map.iter() {
+        let entry = entry.expect("live map entry decodes");
+        let factor = entry.metadata.risk_params().risk_factors[0].saturating_mul(2);
+        scenario.add_override(phoenix_market_override(
+            "phoenix-maintenance-margin-stress",
+            graph.perp_asset_map,
+            &[
+                ("symbol", entry.symbol.as_str()),
+                ("maintenance_risk_factor_bps", &factor.to_string()),
+            ],
+        ));
+        doubled.push((entry.symbol.as_str().to_string(), factor));
+    }
 
     let before = hawkeye_margin(&locker, &graph);
+    assert!(
+        before.maintenance_margin_quote_lots > 0,
+        "no eligible live candidate: the discovered trader's positions require no margin"
+    );
     locker
-        .register_scenario(
-            phoenix_market_scenario(
-                "phoenix-maintenance-margin-stress",
-                graph.perp_asset_map,
-                &[
-                    ("symbol", entry.symbol.as_str()),
-                    ("maintenance_risk_factor_bps", &doubled.to_string()),
-                ],
-            ),
-            Some(graph.clock.slot),
-        )
+        .register_scenario(scenario, Some(graph.clock.slot))
         .unwrap();
     locker
         .materialize_overrides_for_slot(&None, graph.clock.slot)
         .await
         .unwrap();
+    // A rejected override is only logged, so each market is checked for the factor it was given.
+    let stressed = locker
+        .with_svm_reader(|svm| svm.get_account(&graph.perp_asset_map))
+        .unwrap()
+        .unwrap();
+    let stressed = PerpAssetMap::try_from_account_bytes(&stressed.data)
+        .expect("stressed PerpAssetMap decodes");
+    for (symbol, factor) in &doubled {
+        let entry = stressed
+            .find_by_symbol(symbol)
+            .expect("symbol lookup should decode")
+            .expect("the stress keeps every market listed");
+        assert_eq!(
+            entry.metadata.risk_params().risk_factors[0],
+            *factor,
+            "{symbol} takes its own doubled factor"
+        );
+    }
     let after = hawkeye_margin(&locker, &graph);
 
     assert_eq!(after.collateral_quote_lots, before.collateral_quote_lots);
@@ -478,7 +492,10 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     let global_trader_index = Pubkey::new_from_array(global.global_trader_index_header_key());
     let active_trader_buffer = Pubkey::new_from_array(global.active_trader_buffer_header_key());
 
-    let map_account = fetch(&[perp_asset_map]).await.remove(0);
+    // One request carries both the market list and the trader index discovery walks.
+    let mut discovery = fetch(&[perp_asset_map, global_trader_index]).await;
+    let map_account = discovery.remove(0);
+    let index_account = discovery.remove(0);
     let map =
         PerpAssetMap::try_from_account_bytes(&map_account.data).expect("live PerpAssetMap decodes");
     let mut markets = Vec::new();
@@ -500,7 +517,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         markets.push((symbol.to_string(), orderbook, spline));
     }
 
-    let trader = live_trader_with_position().await;
+    let trader = live_trader_with_position(&index_account).await;
     addresses.push(trader);
     addresses.push(Pubkey::from_str_const(
         "SysvarC1ock11111111111111111111111111111111",
@@ -662,27 +679,20 @@ const HAWKEYE_MARGIN_RETURN_MAGIC: u64 = 0x955f5b9d3dff253f;
 
 const HAWKEYE_BBO_RETURN_MAGIC: u64 = 0xefca1fa31fa74171;
 
-fn phoenix_market_scenario(
+fn phoenix_market_override(
     template_id: &str,
     perp_asset_map: Pubkey,
     values: &[(&str, &str)],
-) -> surfpool_types::Scenario {
-    let mut scenario = surfpool_types::Scenario::new(
+) -> surfpool_types::OverrideInstance {
+    surfpool_types::OverrideInstance::new(
         template_id.to_string(),
-        "Phoenix market override".to_string(),
-    );
-    scenario.add_override(
-        surfpool_types::OverrideInstance::new(
-            template_id.to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
-        )
-        .with_values(
-            values
-                .iter()
-                .map(|(field, value)| (field.to_string(), serde_json::Value::from(*value)))
-                .collect(),
-        ),
-    );
-    scenario
+        0,
+        surfpool_types::AccountAddress::Pubkey(perp_asset_map.to_string()),
+    )
+    .with_values(
+        values
+            .iter()
+            .map(|(field, value)| (field.to_string(), serde_json::Value::from(*value)))
+            .collect(),
+    )
 }

@@ -254,9 +254,25 @@ async fn prepare_trader_override(
     if hot {
         validate_hot_trader_fields(values)?;
     }
+    let target = values
+        .get(COLLATERAL_FIELD)
+        .map(parse_quote_lot_collateral)
+        .transpose()?;
+    // A hot Trader's collateral is read from its GlobalTraderIndex record, so the record is what
+    // the target is checked against and patched in.
+    let index = match target {
+        Some(_) if hot => {
+            Some(phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?)
+        }
+        _ => None,
+    };
     let mut values = values.clone();
-    if let Some(value) = values.get_mut(COLLATERAL_FIELD) {
-        *value = serde_json::Value::from(parse_quote_lot_collateral(value)?);
+    if let Some(target) = target {
+        ensure_collateral_is_lowered(effective_collateral(&header, index.as_ref())?, target)?;
+        values.insert(
+            COLLATERAL_FIELD.to_string(),
+            serde_json::Value::from(target),
+        );
     }
     let idl_versions = svm
         .registered_idls
@@ -269,8 +285,7 @@ async fn prepare_trader_override(
     let data = svm.get_forged_account_data(trader, &account.data, idl, &values)?;
 
     let mut writes = Vec::new();
-    if hot && let Some(collateral) = values.get(COLLATERAL_FIELD) {
-        let mut index = phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?;
+    if let (Some(mut index), Some(collateral)) = (index, values.get(COLLATERAL_FIELD)) {
         let range = index_trader_state_range(&index, &header.key)?;
         let encoded = SurfnetSvm::get_forged_idl_type_data(
             &index.data[range.clone()],
@@ -321,6 +336,21 @@ async fn phoenix_dependency(
     Ok(account)
 }
 
+/// Raising collateral needs a real deposit into the global vault.
+fn ensure_collateral_is_lowered(
+    current_quote_lots: i64,
+    target_quote_lots: i64,
+) -> SurfpoolResult<()> {
+    if target_quote_lots > current_quote_lots {
+        return Err(SurfpoolError::internal(format!(
+            "Phoenix collateral stress can only lower collateral: {current_quote_lots} quote lots \
+             are backed by the global vault, {target_quote_lots} would not be. Deposit first to \
+             raise it."
+        )));
+    }
+    Ok(())
+}
+
 pub fn build_phoenix_collateral_scenario(
     trader: Pubkey,
     trader_account: &Account,
@@ -329,16 +359,11 @@ pub fn build_phoenix_collateral_scenario(
 ) -> SurfpoolResult<Scenario> {
     let target_quote_lots = parse_quote_lot_collateral(&serde_json::json!(target_quote_lots))?;
     let header = trader_header(&trader, trader_account)?;
-
-    // Raising collateral needs a real deposit into the global vault.
-    let current_quote_lots = effective_collateral(&header, global_trader_index)?;
-    if target_quote_lots > current_quote_lots {
-        return Err(SurfpoolError::internal(format!(
-            "Phoenix collateral stress can only lower collateral: {current_quote_lots} quote lots \
-             are backed by the global vault, {target_quote_lots} would not be. Deposit first to \
-             raise it."
-        )));
-    }
+    // Play checks this too; checking here tells an MCP caller before a scenario exists.
+    ensure_collateral_is_lowered(
+        effective_collateral(&header, global_trader_index)?,
+        target_quote_lots,
+    )?;
 
     let template = TemplateRegistry::new()
         .get("phoenix-trader-collateral-stress")

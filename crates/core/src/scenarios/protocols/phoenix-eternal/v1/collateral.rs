@@ -55,10 +55,10 @@ pub fn validate_hot_trader_fields(
     Ok(())
 }
 
-pub fn index_trader_state_range(
-    index: &Account,
-    trader_key: &[u8; 32],
-) -> SurfpoolResult<Range<usize>> {
+/// Every hot Trader the GlobalTraderIndex tree reaches, paired with the byte range of its
+/// TraderState record. The walk starts at the root, so freed nodes, which keep stale keys, flags
+/// and collateral, are skipped. A key reached twice makes the tree invalid.
+pub fn index_trader_state_ranges(index: &Account) -> SurfpoolResult<Vec<(Pubkey, Range<usize>)>> {
     let invalid = || SurfpoolError::internal("Invalid Phoenix GlobalTraderIndex tree");
     if index.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Err(SurfpoolError::internal(
@@ -90,7 +90,8 @@ pub fn index_trader_state_range(
     let read_u32 = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     let mut pending = vec![read_u32(80)];
     let mut visited = HashSet::new();
-    let mut found = None;
+    let mut keys = HashSet::new();
+    let mut ranges = Vec::new();
     while let Some(node) = pending.pop() {
         if node == 0 {
             continue;
@@ -103,19 +104,29 @@ pub fn index_trader_state_range(
         }
         let start = NODES_START + (node as usize - 1) * NODE_LEN;
         pending.extend([read_u32(start), read_u32(start + 4)]);
-        if data[start + 16..start + 48] == trader_key[..] {
-            if found.is_some() {
-                return Err(invalid());
-            }
-            found = Some(start + 48..start + 64);
+        let key = Pubkey::new_from_array(data[start + 16..start + 48].try_into().unwrap());
+        if !keys.insert(key) {
+            return Err(invalid());
         }
+        ranges.push((key, start + 48..start + 64));
     }
     if visited.len() != header.superblock().size() as usize {
         return Err(invalid());
     }
-    found.ok_or_else(|| {
-        SurfpoolError::internal("Hot Phoenix Trader has no reachable GlobalTraderIndex entry")
-    })
+    Ok(ranges)
+}
+
+pub fn index_trader_state_range(
+    index: &Account,
+    trader_key: &[u8; 32],
+) -> SurfpoolResult<Range<usize>> {
+    let trader_key = Pubkey::new_from_array(*trader_key);
+    index_trader_state_ranges(index)?
+        .into_iter()
+        .find_map(|(key, range)| (key == trader_key).then_some(range))
+        .ok_or_else(|| {
+            SurfpoolError::internal("Hot Phoenix Trader has no reachable GlobalTraderIndex entry")
+        })
 }
 
 pub fn effective_collateral(header: &TraderHeader, index: Option<&Account>) -> SurfpoolResult<i64> {
@@ -275,6 +286,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn index_listing_returns_only_reachable_records() {
+        let index = index_account();
+        let mut listed = index_trader_state_ranges(&index).unwrap();
+        listed.sort_by_key(|(_, range)| range.start);
+        assert_eq!(
+            listed,
+            vec![
+                (Pubkey::new_from_array(FIRST_KEY), 144..160),
+                (Pubkey::new_from_array(SECOND_KEY), 208..224),
+            ],
+            "slot 2 is a freed duplicate of FIRST_KEY, unreachable from the root and skipped"
+        );
+
+        let mut duplicated = index_account();
+        duplicated.data[112..144].copy_from_slice(&SECOND_KEY);
+        assert!(
+            index_trader_state_ranges(&duplicated).is_err(),
+            "a key reached twice"
+        );
+    }
+
     #[tokio::test]
     async fn materialization_patches_selected_hot_trader_and_index_record_only() {
         use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
@@ -341,6 +374,7 @@ mod tests {
             "missing account",
             "mismatched key",
             "unsupported field",
+            "raised collateral",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
@@ -357,6 +391,12 @@ mod tests {
                     scenario.overrides[0]
                         .values
                         .insert("traderState.flags".to_string(), serde_json::json!(0));
+                }
+                "raised collateral" => {
+                    scenario.overrides[0].values.insert(
+                        "traderState.quoteLotCollateral".to_string(),
+                        serde_json::json!("112"),
+                    );
                 }
                 "cycle" => write_u32(&mut before_index.data, 96, 2),
                 "missing key" => before_index.data[112..144].copy_from_slice(&[33; 32]),
@@ -394,8 +434,17 @@ mod tests {
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
         let matching = trader_account(FIRST_KEY, 9_999, false);
-        for (on_chain_key, patched) in [(FIRST_KEY, true), (SECOND_KEY, false)] {
-            let scenario = build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+        for (on_chain_key, target, patched) in [
+            (FIRST_KEY, "1", true),
+            (SECOND_KEY, "1", false),
+            (FIRST_KEY, "10000", false),
+        ] {
+            let mut scenario =
+                build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+            scenario.overrides[0].values.insert(
+                "traderState.quoteLotCollateral".to_string(),
+                serde_json::json!(target),
+            );
             let mut on_chain = trader_account(on_chain_key, 9_999, false);
             on_chain.lamports = 1;
             let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
