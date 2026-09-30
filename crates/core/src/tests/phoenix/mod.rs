@@ -1,11 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use phoenix_rise_accounts::{
-    global_config::GlobalConfig,
-    pda::derive_spline_collection_address,
-    perp_asset_map::PerpAssetMap,
-    trader::{Trader, TraderHeader},
+    global_config::GlobalConfig, pda::derive_spline_collection_address,
+    perp_asset_map::PerpAssetMap, trader::TraderHeader,
 };
 use solana_account::Account;
 use solana_clock::Clock;
@@ -22,7 +20,7 @@ use crate::{
     scenarios::{
         TemplateRegistry,
         protocols::phoenix_eternal::v1::{
-            collateral::{index_trader_state_range, index_trader_state_ranges},
+            collateral::{index_trader_state_range, index_trader_state_ranges, trader_header},
             state_builder::{
                 PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
                 build_phoenix_collateral_scenario, phoenix_market_symbols,
@@ -67,49 +65,25 @@ fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// A live hot Trader with collateral and a position, so the margin views have something to act
-/// on. Traders come and go, so the test discovers one rather than pinning an address that may
-/// be closed tomorrow. The GlobalTraderIndex lists every hot Trader with the collateral Hawkeye
-/// reads, so only a few Trader accounts are read, for their positions and for the hot flag the
-/// collateral stress keys off. Those positions can lag behind what Hawkeye reads, which the
-/// tests check through the program itself.
-async fn live_trader_with_position(index: &Account) -> Pubkey {
-    let mut candidates: Vec<Pubkey> = index_trader_state_ranges(index)
-        .expect("live GlobalTraderIndex should walk")
-        .into_iter()
-        .filter(|(_, range)| {
-            i64::from_le_bytes(index.data[range.start..range.start + 8].try_into().unwrap()) > 0
-        })
-        .map(|(pubkey, _)| pubkey)
-        .collect();
-    candidates.sort_unstable();
-
-    for chunk in candidates.chunks(20) {
-        let accounts = client()
-            .get_multiple_accounts(chunk, CommitmentConfig::confirmed())
-            .await
-            .unwrap_or_else(|e| panic!("failed to read live Phoenix traders: {e}"));
-        for (pubkey, account) in chunk.iter().zip(accounts) {
-            // A trader closed since the index was read is skipped, not an error.
-            let Ok(account) = account.map_account() else {
-                continue;
-            };
-            let trader = Trader::try_from_account_bytes(&account.data).unwrap_or_else(|e| {
-                panic!("{pubkey} is in the GlobalTraderIndex but does not decode as a Trader: {e}")
-            });
-            let holds_a_position = trader
-                .positions()
-                .any(|(_, position)| position.base_lot_position().as_inner() != 0);
-            if trader.header.trader_state.is_hot() && holds_a_position {
-                return *pubkey;
-            }
-        }
+/// Hawkeye checks it, because it reads a hot Trader's collateral from the GlobalTraderIndex and
+/// its positions from the ActiveTraderBuffer, and the Trader account's copies of both can lag.
+/// A margin view that fails rejects the trader, and its error is returned.
+fn trader_is_eligible(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> Result<bool, String> {
+    let header = trader_header(&graph.trader, graph.account(&graph.trader)).unwrap_or_else(|e| {
+        panic!(
+            "{} is in the GlobalTraderIndex but is not a valid Trader: {e}",
+            graph.trader
+        )
+    });
+    // The collateral stress keys off the Trader account's hot flag.
+    if !header.trader_state.is_hot() {
+        return Ok(false);
     }
-
-    panic!(
-        "no eligible live candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
-         collateral and a position"
-    )
+    let margin = try_hawkeye_margin(locker, graph)?;
+    Ok(margin.collateral_quote_lots > 0
+        && margin.position_count > 0
+        && margin.maintenance_margin_quote_lots > 0
+        && margin.is_liquidatable == 0)
 }
 
 /// A zero-copy layout cannot be round-tripped against itself, so drift shows up as an
@@ -229,11 +203,10 @@ async fn deployed_program(programdata: Pubkey) -> Vec<u8> {
     bytes
 }
 
-/// Refetching the graph per test is what exhausts a public endpoint: the perp asset map alone
-/// is 1.6MB, so every test reads the same fork state from one cached fetch.
-fn live_graph_cache() -> &'static tokio::sync::Mutex<Option<PhoenixLiveGraph>> {
-    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<PhoenixLiveGraph>>> =
-        std::sync::OnceLock::new();
+fn live_graph_cache() -> &'static tokio::sync::Mutex<Option<Result<PhoenixLiveGraph, String>>> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::Mutex<Option<Result<PhoenixLiveGraph, String>>>,
+    > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
@@ -456,7 +429,16 @@ async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
     let graph = phoenix_live_graph().await;
+    let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+    (locker, graph)
+}
 
+/// A fork holding the deployed programs and every graph account, at the graph's clock.
+fn phoenix_fork(
+    graph: &PhoenixLiveGraph,
+    eternal_program: &[u8],
+    hawkeye_program: &[u8],
+) -> SurfnetSvmLocker {
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
@@ -464,25 +446,26 @@ async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
         svm_writer
             .inner
             .svm
-            .add_program(PHOENIX_ETERNAL_PROGRAM_ID, &eternal_program)
+            .add_program(PHOENIX_ETERNAL_PROGRAM_ID, eternal_program)
             .unwrap();
         svm_writer
             .inner
             .svm
-            .add_program(HAWKEYE_PROGRAM_ID, &hawkeye_program)
+            .add_program(HAWKEYE_PROGRAM_ID, hawkeye_program)
             .unwrap();
         for (address, account) in &graph.accounts {
             svm_writer.set_account(address, account.clone()).unwrap();
         }
     });
-
-    (locker, graph)
+    locker
 }
 
 async fn phoenix_live_graph() -> PhoenixLiveGraph {
     let mut cache = live_graph_cache().lock().await;
-    if let Some(cached) = cache.as_ref() {
-        return cached.clone();
+    match cache.as_ref() {
+        Some(Ok(graph)) => return graph.clone(),
+        Some(Err(reason)) => panic!("{reason}"),
+        None => {}
     }
 
     let global_account = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
@@ -517,29 +500,105 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         markets.push((symbol.to_string(), orderbook, spline));
     }
 
-    let trader = live_trader_with_position(&index_account).await;
-    addresses.push(trader);
-    addresses.push(Pubkey::from_str_const(
-        "SysvarC1ock11111111111111111111111111111111",
-    ));
-    // Read the clock and all dependencies from one bank, after address discovery.
-    let mut fresh = fetch(&addresses).await;
-    let clock: Clock = bincode::deserialize(&fresh.pop().unwrap().data).unwrap();
-    assert!(clock.slot > 0);
-    let accounts = addresses.into_iter().zip(fresh).collect();
+    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
+    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
+    let clock_address = Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+    // Every hot Trader is a candidate, in address order, so the pick moves only when it or a
+    // trader ahead of it changes.
+    let mut candidates: Vec<Pubkey> = index_trader_state_ranges(&index_account)
+        .expect("live GlobalTraderIndex should walk")
+        .into_iter()
+        .map(|(trader, _)| trader)
+        .collect();
+    candidates.sort_unstable();
+    // Every batch re-reads the dependencies and the clock, so each fills a request to the
+    // 100-account cap.
+    let batch_len = 100 - addresses.len() - 1;
+    let mut last_error = None;
+    for batch in candidates.chunks(batch_len) {
+        // Read the clock, every dependency and this batch of traders from one bank, so a trader
+        // is checked, and then tested, on state the programs accept together.
+        let keys: Vec<Pubkey> = addresses
+            .iter()
+            .chain(batch)
+            .chain([&clock_address])
+            .copied()
+            .collect();
+        let mut fetched = client()
+            .get_multiple_accounts(&keys, CommitmentConfig::confirmed())
+            .await
+            .unwrap_or_else(|e| panic!("failed to fetch {keys:?} from mainnet: {e}"))
+            .into_iter();
+        let dependencies: Vec<(Pubkey, Account)> = addresses
+            .iter()
+            .zip(fetched.by_ref())
+            .map(|(address, result)| {
+                let account = result.map_account().unwrap_or_else(|_| {
+                    panic!("{address} no longer exists on mainnet; the test needs a new address")
+                });
+                (*address, account)
+            })
+            .collect();
+        // A trader closed since the index was read is skipped, not an error.
+        let traders: Vec<(Pubkey, Account)> = batch
+            .iter()
+            .zip(fetched.by_ref())
+            .filter_map(|(trader, result)| Some((*trader, result.map_account().ok()?)))
+            .collect();
+        let clock_account = fetched
+            .next()
+            .and_then(|result| result.map_account().ok())
+            .expect("the clock is read with the graph");
+        let clock: Clock = bincode::deserialize(&clock_account.data).unwrap();
+        assert!(clock.slot > 0);
 
-    let graph = PhoenixLiveGraph {
-        clock,
-        accounts,
-        global_trader_index,
-        active_trader_buffer,
-        perp_asset_map,
-        trader,
-        markets,
-    };
-    *cache = Some(graph.clone());
+        let mut graph = PhoenixLiveGraph {
+            clock,
+            accounts: dependencies.iter().chain(&traders).cloned().collect(),
+            global_trader_index,
+            active_trader_buffer,
+            perp_asset_map,
+            trader: Pubkey::default(),
+            markets: markets.clone(),
+        };
+        // A trader that left the index since it was listed is no longer hot.
+        let indexed: HashSet<Pubkey> =
+            index_trader_state_ranges(graph.account(&global_trader_index))
+                .expect("live GlobalTraderIndex should walk")
+                .into_iter()
+                .map(|(trader, _)| trader)
+                .collect();
+        let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+        for (trader, account) in traders
+            .iter()
+            .filter(|(trader, _)| indexed.contains(trader))
+        {
+            graph.trader = *trader;
+            match trader_is_eligible(&locker, &graph) {
+                Ok(false) => {}
+                Err(error) => last_error = Some(format!("{trader}: {error}")),
+                Ok(true) => {
+                    // The rest of the batch was read only to be checked.
+                    graph.accounts = dependencies
+                        .into_iter()
+                        .chain([(*trader, account.clone())])
+                        .collect();
+                    *cache = Some(Ok(graph.clone()));
+                    return graph;
+                }
+            }
+        }
+    }
 
-    graph
+    let reason = format!(
+        "no eligible live candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
+         collateral, a position Hawkeye margins and a healthy account{}",
+        last_error
+            .map(|error| format!("; the last margin view that failed was {error}"))
+            .unwrap_or_default()
+    );
+    *cache = Some(Err(reason.clone()));
+    panic!("{reason}")
 }
 
 #[derive(Clone)]
@@ -569,6 +628,17 @@ fn hawkeye_view(
     discriminant: [u8; 8],
     extra_accounts: &[Pubkey],
 ) -> Vec<u8> {
+    try_hawkeye_view(locker, graph, discriminant, extra_accounts)
+        .unwrap_or_else(|e| panic!("Hawkeye view failed: {e}"))
+}
+
+/// The view's return data, or the transaction error and logs when the view fails.
+fn try_hawkeye_view(
+    locker: &SurfnetSvmLocker,
+    graph: &PhoenixLiveGraph,
+    discriminant: [u8; 8],
+    extra_accounts: &[Pubkey],
+) -> Result<Vec<u8>, String> {
     let payer = Keypair::new();
     let accounts = [
         PHOENIX_ETERNAL_PROGRAM_ID,
@@ -598,22 +668,35 @@ fn hawkeye_view(
         );
         svm.inner
             .send_transaction(transaction)
-            .unwrap()
-            .return_data
-            .data
+            .map(|meta| meta.return_data.data)
+            .map_err(|failed| format!("{:?}, logs: {:?}", failed.err, failed.meta.logs))
     })
 }
 
 fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> HawkeyeMarginView {
-    let data = hawkeye_view(
+    try_hawkeye_margin(locker, graph)
+        .unwrap_or_else(|e| panic!("Hawkeye margin view failed for {}: {e}", graph.trader))
+}
+
+fn try_hawkeye_margin(
+    locker: &SurfnetSvmLocker,
+    graph: &PhoenixLiveGraph,
+) -> Result<HawkeyeMarginView, String> {
+    let data = try_hawkeye_view(
         locker,
         graph,
         HAWKEYE_VIEW_MARGIN_DISCRIMINANT,
         &[graph.trader],
-    );
-    let margin = bytemuck::pod_read_unaligned::<HawkeyeMarginView>(&data);
-    assert_eq!(margin.magic, HAWKEYE_MARGIN_RETURN_MAGIC);
-    margin
+    )?;
+    let margin = bytemuck::try_pod_read_unaligned::<HawkeyeMarginView>(&data)
+        .map_err(|e| format!("the margin view returned {} bytes: {e:?}", data.len()))?;
+    if margin.magic != HAWKEYE_MARGIN_RETURN_MAGIC {
+        return Err(format!(
+            "the margin view returned magic {:#x}",
+            margin.magic
+        ));
+    }
+    Ok(margin)
 }
 
 fn hawkeye_bbo_for_market(
