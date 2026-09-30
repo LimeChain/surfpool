@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account::Account;
 use solana_account_decoder::{
     parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
-    parse_token::{UiTokenAmount, real_number_string_trimmed},
+    parse_token::{UiTokenAmount, token_amount_to_ui_amount_v3},
 };
 use solana_clock::{Epoch, Slot};
 use solana_hash::Hash;
@@ -63,10 +63,7 @@ use surfpool_types::types::{
 };
 use txtx_addon_kit::indexmap::IndexMap;
 
-use crate::{
-    error::{SurfpoolError, SurfpoolResult},
-    surfnet::locker::format_ui_amount,
-};
+use crate::error::{SurfpoolError, SurfpoolResult};
 
 /// Helper function to serialize a Pod type to base64
 fn serialize_pod_to_base64<T: Pod>(value: &T) -> String {
@@ -517,15 +514,10 @@ impl TransactionWithStatusMeta {
                         .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
                             account_index: *i as u8,
                             mint: a.mint().to_string(),
-                            ui_token_amount: UiTokenAmount {
-                                ui_amount: format_ui_amount(a.amount(), mint.decimals()),
-                                decimals: mint.decimals(),
-                                amount: a.amount().to_string(),
-                                ui_amount_string: real_number_string_trimmed(
-                                    a.amount(),
-                                    mint.decimals(),
-                                ),
-                            },
+                            ui_token_amount: token_amount_to_ui_amount_v3(
+                                a.amount(),
+                                &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
+                            ),
                             owner: a.owner().to_string(),
                             program_id: token_program.to_string(),
                         })
@@ -539,15 +531,10 @@ impl TransactionWithStatusMeta {
                         .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
                             account_index: *i as u8,
                             mint: a.mint().to_string(),
-                            ui_token_amount: UiTokenAmount {
-                                ui_amount: format_ui_amount(a.amount(), mint.decimals()),
-                                decimals: mint.decimals(),
-                                amount: a.amount().to_string(),
-                                ui_amount_string: real_number_string_trimmed(
-                                    a.amount(),
-                                    mint.decimals(),
-                                ),
-                            },
+                            ui_token_amount: token_amount_to_ui_amount_v3(
+                                a.amount(),
+                                &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
+                            ),
                             owner: a.owner().to_string(),
                             program_id: token_program.to_string(),
                         })
@@ -733,12 +720,10 @@ impl TransactionWithStatusMeta {
             .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
                 account_index: *i as u8,
                 mint: a.mint().to_string(),
-                ui_token_amount: UiTokenAmount {
-                    ui_amount: format_ui_amount(a.amount(), mint.decimals()),
-                    decimals: mint.decimals(),
-                    amount: a.amount().to_string(),
-                    ui_amount_string: real_number_string_trimmed(a.amount(), mint.decimals()),
-                },
+                ui_token_amount: token_amount_to_ui_amount_v3(
+                    a.amount(),
+                    &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
+                ),
                 owner: a.owner().to_string(),
                 program_id: token_program.to_string(),
             })

@@ -1,6 +1,7 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use jsonrpc_core::futures::future::try_join_all;
 use serde_json::json;
 use solana_account::Account;
 use solana_account_decoder::UiAccount;
@@ -54,6 +55,8 @@ use crate::{
 const DATASOURCE_DEADLINE: Duration = Duration::from_secs(60);
 const DATASOURCE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DATASOURCE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Maximum number of pubkeys accepted by a single `getMultipleAccounts` request.
+const MAX_MULTIPLE_ACCOUNTS: usize = 100;
 
 fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
     let endpoint =
@@ -281,6 +284,31 @@ impl SurfnetRemoteClient {
         Ok(result)
     }
 
+    /// Fetches raw accounts via `getMultipleAccounts`, splitting the request into
+    /// batches of [`MAX_MULTIPLE_ACCOUNTS`] to stay within the RPC limit. Batches
+    /// are requested concurrently, so a slow datasource costs one request
+    /// deadline rather than one per batch. Results are returned in the same
+    /// order as `pubkeys`.
+    async fn fetch_multiple_accounts_chunked(
+        &self,
+        pubkeys: &[Pubkey],
+        commitment_config: CommitmentConfig,
+    ) -> SurfpoolResult<Vec<Option<Account>>> {
+        let batches = try_join_all(
+            pubkeys
+                .chunks(MAX_MULTIPLE_ACCOUNTS)
+                .map(|chunk| async move {
+                    self.client
+                        .get_multiple_accounts_with_commitment(chunk, commitment_config)
+                        .await
+                        .map(|response| response.value)
+                        .map_err(SurfpoolError::get_multiple_accounts)
+                }),
+        )
+        .await?;
+        Ok(batches.into_iter().flatten().collect())
+    }
+
     pub async fn get_multiple_accounts(
         &self,
         pubkeys: &[Pubkey],
@@ -290,11 +318,8 @@ impl SurfnetRemoteClient {
         let fetch_start = std::time::Instant::now();
 
         let remote_accounts = self
-            .client
-            .get_multiple_accounts_with_commitment(pubkeys, commitment_config)
-            .await
-            .map_err(SurfpoolError::get_multiple_accounts)?
-            .value;
+            .fetch_multiple_accounts_chunked(pubkeys, commitment_config)
+            .await?;
         debug!("Fetched {:?} accounts from remote", pubkeys);
         debug!(
             "Found accounts for pubkeys: {:#?}",
@@ -358,11 +383,8 @@ impl SurfnetRemoteClient {
             let account_pubkeys: Vec<Pubkey> = account_buffer.iter().map(|p| p.2).collect();
 
             let binding_remote_accounts = self
-                .client
-                .get_multiple_accounts_with_commitment(&account_pubkeys, commitment_config)
-                .await
-                .map_err(SurfpoolError::get_multiple_accounts)?
-                .value;
+                .fetch_multiple_accounts_chunked(&account_pubkeys, commitment_config)
+                .await?;
 
             debug!(
                 "Fetched {} additional accounts from remote",
@@ -905,6 +927,113 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, RpcRequest::GetMultipleAccounts);
         assert_eq!(requests[0].1[1]["commitment"], "confirmed");
+    }
+
+    /// Answers `getMultipleAccounts` with one account per requested pubkey whose
+    /// data is that pubkey's bytes. Earlier requests answer later, so batches
+    /// complete out of order.
+    struct EchoesPubkeysInReverseOrder {
+        requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl RpcSender for EchoesPubkeysInReverseOrder {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            let request_index = {
+                let mut requests = self
+                    .requests
+                    .lock()
+                    .expect("request recorder mutex should not be poisoned");
+                requests.push((request, params.clone()));
+                requests.len()
+            };
+            tokio::time::sleep(Duration::from_millis(30 / request_index as u64)).await;
+
+            let accounts: Vec<serde_json::Value> = params[0]
+                .as_array()
+                .expect("getMultipleAccounts params should start with pubkeys")
+                .iter()
+                .map(|pubkey| {
+                    let pubkey = Pubkey::from_str(pubkey.as_str().unwrap()).unwrap();
+                    let account = Account {
+                        lamports: 1,
+                        data: pubkey.to_bytes().to_vec(),
+                        owner: Pubkey::default(),
+                        executable: false,
+                        rent_epoch: 0,
+                    };
+                    json!(solana_account_decoder::encode_ui_account(
+                        &pubkey,
+                        &account,
+                        solana_account_decoder::UiAccountEncoding::Base64,
+                        None,
+                        None,
+                    ))
+                })
+                .collect();
+            Ok(json!({
+                "context": { "slot": 1 },
+                "value": accounts,
+            }))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://echoes-pubkeys.example".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_account_fetch_batches_requests_over_the_rpc_limit() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                EchoesPubkeysInReverseOrder {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        };
+
+        let pubkeys: Vec<Pubkey> = (0..MAX_MULTIPLE_ACCOUNTS * 2 + 50)
+            .map(|_| Pubkey::new_unique())
+            .collect();
+        let results = client
+            .get_multiple_accounts(&pubkeys, CommitmentConfig::confirmed())
+            .await
+            .expect("remote account fetch should succeed");
+
+        assert_eq!(results.len(), pubkeys.len());
+        for (result, pubkey) in results.iter().zip(&pubkeys) {
+            let GetAccountResult::FoundAccount(found, account, _) = result else {
+                panic!("expected an account for {pubkey}");
+            };
+            assert_eq!(found, pubkey);
+            assert_eq!(account.data, pubkey.to_bytes());
+        }
+
+        let requests = requests
+            .lock()
+            .expect("request recorder mutex should not be poisoned");
+        let batch_sizes: Vec<usize> = requests
+            .iter()
+            .map(|(request, params)| {
+                assert_eq!(*request, RpcRequest::GetMultipleAccounts);
+                params[0].as_array().map_or(0, Vec::len)
+            })
+            .collect();
+        assert_eq!(
+            batch_sizes,
+            vec![MAX_MULTIPLE_ACCOUNTS, MAX_MULTIPLE_ACCOUNTS, 50]
+        );
     }
 
     #[test]

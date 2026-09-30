@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_account_decoder::{UiAccount, UiAccountEncoding, encode_ui_account};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_commitment_config::CommitmentConfig;
+use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
 use solana_signature::Signature;
@@ -13,13 +15,14 @@ use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEnco
 use surfpool_types::{
     JitoBundleStatus, RpcBundleExecutionError, RpcBundleRequest, RpcBundleSimulationSummary,
     RpcSimulateBundleConfig, RpcSimulateBundleResult, RpcSimulateBundleTransactionResult,
-    TransactionStatusEvent,
+    SimnetCommand, TransactionStatusEvent,
 };
 
 use super::{RunloopContext, utils::decode_and_deserialize};
 use crate::{
+    error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
-    surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox},
+    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::BundleSandbox},
 };
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
@@ -28,6 +31,9 @@ const MAX_BUNDLE_SIZE: usize = 5;
 /// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
+
+/// Times a bundle is re-executed when live state changes before its sandbox commits.
+const MAX_BUNDLE_COMMIT_ATTEMPTS: usize = 3;
 
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
@@ -307,143 +313,28 @@ impl Jito for SurfpoolJitoRpc {
                 decoded_txs.push(tx);
             }
 
-            // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
-
-            let BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            } = bundle_sandbox;
-
-            let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
-
-            let remote_ctx = &None;
-            let skip_preflight = true;
-            let sigverify = true;
-
-            let mut bundle_signatures: Vec<Signature> = Vec::with_capacity(decoded_txs.len());
-            for (idx, tx) in decoded_txs.iter().enumerate() {
-                let (status_tx, status_rx) = crossbeam_channel::bounded(1);
-
-                // Awaiting directly here lets the surrounding JSON-RPC runtime drive the
-                // future. We must NOT use `hiro_system_kit::nestable_block_on` because the
-                // HTTP worker thread is already inside a tokio runtime and `block_on` on the
-                // current handle panics with "Cannot start a runtime from within a runtime".
-                let process_res = sandbox_locker
-                    .process_transaction(
-                        remote_ctx,
-                        tx.clone(),
-                        status_tx,
-                        skip_preflight,
-                        sigverify,
-                    )
-                    .await;
-
-                bundle_signatures.push(tx.signatures[0]);
-
-                if let Err(e) = process_res {
-                    // Dropping `sandbox_locker` discards all overlay state and the cloned
-                    // LiteSVM, so the original VM is byte-identical to its pre-bundle state.
-                    return Err(Error::invalid_params(format!(
-                        "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
-                        idx + 1
-                    )));
-                }
-
-                // `process_transaction` only returns after the sandbox has run the tx and
-                // dispatched a status event, so `try_recv`/`recv_timeout` will not actually
-                // park the worker for any meaningful time; the 2s timeout is a hard ceiling
-                // for an unexpectedly missed status.
-                match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                    Ok(TransactionStatusEvent::Success(_)) => {}
-                    Ok(TransactionStatusEvent::SimulationFailure(other)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: simulation failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
-                        )));
-                    }
-                    Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Execution failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
-                        )));
-                    }
-                    Ok(TransactionStatusEvent::VerificationFailure(ver_fail_err)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Verification failed for transaction {}: {:?}",
-                            idx + 1,
-                            ver_fail_err
-                        )));
-                    }
-                    Err(_) => {
-                        return Err(RpcCustomError::NodeUnhealthy {
-                            num_slots_behind: None,
-                        }
-                        .into());
-                    }
-                }
-            }
-
-            // -- Phase B: Atomic commit -----------------------------------------------------
-            // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
-            // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
-            let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
-                Ok(rwlock) => rwlock.into_inner(),
-                Err(_) => {
-                    // Should never happen: sandbox_locker was constructed locally and never
-                    // shared.
-                    return Err(Error::internal_error());
-                }
-            };
-            let reassembled = BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            };
-
-            // Use a discardable status channel for the bundle. The runloop will use it to
-            // attempt sending Confirmed/Finalized updates; nobody reads it so try_send fails
-            // silently.
-            let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
-
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
-                .map_err(|e| {
-                    Error::invalid_params(format!(
-                        "Jito bundle commit failed after successful sandbox execution: {e}"
-                    ))
+            // Bundles must use the same serialized execution lane as ordinary transactions.
+            // The runloop owns the snapshot -> sandbox execution -> commit sequence, so a
+            // ProcessTransaction command cannot mutate the live VM between snapshot and commit.
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            ctx.simnet_commands_tx
+                .send(SimnetCommand::ProcessBundle(ctx.id, decoded_txs, reply_tx))
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
                 })?;
 
-            // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
-            // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
-            let concatenated_signatures = bundle_signatures
-                .iter()
-                .map(|sig| sig.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut hasher = Sha256::new();
-            hasher.update(concatenated_signatures.as_bytes());
-            let bundle_id = hex::encode(hasher.finalize());
-
-            ctx.svm_locker.store_bundle(
-                bundle_id.clone(),
-                bundle_signatures
-                    .iter()
-                    .map(|sig| sig.to_string())
-                    .collect(),
-            )?;
-            Ok(bundle_id)
+            // The runloop may take the full bundle-execution interval before replying.
+            // Receive on Tokio's blocking pool so this JSON-RPC future never parks a
+            // runtime worker thread.
+            tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                })?
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                })?
+                .map_err(Error::invalid_params)
         })
     }
 
@@ -708,6 +599,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                ..
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -967,6 +859,238 @@ impl Jito for SurfpoolJitoRpc {
     }
 }
 
+/// Executes decoded Jito bundle transactions atomically.
+///
+/// Transactions run sequentially against an isolated sandbox. Required remote
+/// accounts are prefetched into the live SVM in batches before the sandbox is
+/// created. If every transaction succeeds, the sandbox state and buffered
+/// notifications are committed to the live SVM and the Jito bundle ID is
+/// returned. On failure, execution effects are discarded while prefetched
+/// accounts remain cached.
+pub(crate) async fn process_bundle(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    decoded_txs: Vec<VersionedTransaction>,
+) -> std::result::Result<String, String> {
+    prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // RPC handlers (e.g. cheatcodes) can write live state while the sandbox executes, since
+    // the live lock is not held across execution. A stale sandbox is never committed; the
+    // bundle is re-executed against a fresh snapshot instead.
+    let mut attempt = 1;
+    let bundle_signatures = loop {
+        let (sandbox, bundle_signatures) =
+            execute_bundle_in_sandbox(svm_locker, &decoded_txs).await?;
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        let committed = svm_locker
+            .with_svm_writer(move |live| {
+                if live.is_stale_bundle_sandbox(&sandbox) {
+                    return Ok(false);
+                }
+                live.commit_sandbox(sandbox, bundle_status_tx).map(|_| true)
+            })
+            .map_err(|e| {
+                format!("Jito bundle commit failed after successful sandbox execution: {e}")
+            })?;
+        if committed {
+            break bundle_signatures;
+        }
+        if attempt >= MAX_BUNDLE_COMMIT_ATTEMPTS {
+            return Err(format!(
+                "Jito bundle couldn't be committed: live state changed during execution {attempt} times"
+            ));
+        }
+        attempt += 1;
+    };
+
+    let concatenated_signatures = bundle_signatures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut hasher = Sha256::new();
+    hasher.update(concatenated_signatures.as_bytes());
+    let bundle_id = hex::encode(hasher.finalize());
+
+    svm_locker
+        .store_bundle(
+            bundle_id.clone(),
+            bundle_signatures.iter().map(ToString::to_string).collect(),
+        )
+        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
+
+    Ok(bundle_id)
+}
+
+/// Runs every bundle transaction against a fresh sandbox cloned from live state.
+///
+/// Returns the executed sandbox, ready for
+/// [`SurfnetSvm::commit_sandbox`](crate::surfnet::svm::SurfnetSvm::commit_sandbox),
+/// and the bundle's signatures in order. Nothing is written to the live SVM.
+async fn execute_bundle_in_sandbox(
+    svm_locker: &SurfnetSvmLocker,
+    decoded_txs: &[VersionedTransaction],
+) -> std::result::Result<(BundleSandbox, Vec<Signature>), String> {
+    let bundle_sandbox =
+        svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+
+    let BundleSandbox {
+        svm: sandbox_svm,
+        geyser_rx,
+        simnet_rx,
+        confirmation_queue_base_len,
+        base_state_revision,
+    } = bundle_sandbox;
+    let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+
+    // Prefetching above is the only remote interaction. Transactions execute
+    // against the hydrated sandbox, preventing per-transaction RPC requests.
+    let remote_ctx = &None;
+    let skip_preflight = true;
+    let sigverify = true;
+
+    let mut bundle_signatures = Vec::with_capacity(decoded_txs.len());
+    for (idx, tx) in decoded_txs.iter().enumerate() {
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        let process_res = sandbox_locker
+            .process_transaction(remote_ctx, tx.clone(), status_tx, skip_preflight, sigverify)
+            .await;
+
+        bundle_signatures.push(tx.signatures[0]);
+        if let Err(e) = process_res {
+            return Err(format!(
+                "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
+                idx + 1
+            ));
+        }
+
+        match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(TransactionStatusEvent::Success(_)) => {}
+            Ok(TransactionStatusEvent::SimulationFailure(other)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: simulation failed for transaction {}: {other:?}",
+                    idx + 1
+                ));
+            }
+            Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: Execution failed for transaction {}: {other:?}",
+                    idx + 1
+                ));
+            }
+            Ok(TransactionStatusEvent::VerificationFailure(error)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: Verification failed for transaction {}: {error:?}",
+                    idx + 1
+                ));
+            }
+            Err(_) => {
+                return Err(
+                    "Jito bundle processing did not produce a transaction status".to_string(),
+                );
+            }
+        }
+    }
+
+    let sandbox_svm = Arc::try_unwrap(sandbox_locker.0)
+        .map_err(|_| "Jito bundle sandbox remained shared after execution".to_string())?
+        .into_inner();
+    let sandbox = BundleSandbox {
+        svm: sandbox_svm,
+        geyser_rx,
+        simnet_rx,
+        confirmation_queue_base_len,
+        base_state_revision,
+    };
+
+    Ok((sandbox, bundle_signatures))
+}
+
+/// Hydrates accounts needed by a bundle into the live SVM before snapshotting.
+///
+/// Static account keys and lookup-table accounts are fetched together. Once
+/// lookup tables are available locally, their loaded addresses are resolved
+/// and fetched in one further batch. Fetch and lookup-table errors are
+/// returned to the caller.
+async fn prefetch_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    transactions: &[VersionedTransaction],
+) -> SurfpoolResult<()> {
+    if remote_ctx.is_none() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut accounts = Vec::new();
+    for transaction in transactions {
+        for pubkey in svm_locker.get_pubkeys_from_message(&transaction.message, None) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+        for pubkey in get_address_lookup_table_pubkeys(&transaction.message) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &accounts).await?;
+
+    // ALT contents are unavailable until their accounts have been hydrated.
+    // Resolve them locally, then include every loaded address in one second
+    // batch for the bundle (rather than fetching per transaction).
+    let mut loaded_accounts = Vec::new();
+    for transaction in transactions {
+        if let Some(loaded) = svm_locker
+            .get_loaded_addresses(&None, &transaction.message)
+            .await?
+        {
+            for pubkey in loaded.all_loaded_addresses() {
+                add_unique_bundle_account(&mut loaded_accounts, &mut seen, *pubkey);
+            }
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &loaded_accounts).await
+}
+
+fn add_unique_bundle_account(
+    accounts: &mut Vec<Pubkey>,
+    seen: &mut HashSet<Pubkey>,
+    pubkey: Pubkey,
+) {
+    if seen.insert(pubkey) {
+        accounts.push(pubkey);
+    }
+}
+
+async fn hydrate_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    accounts: &[Pubkey],
+) -> SurfpoolResult<()> {
+    if accounts.is_empty() {
+        return Ok(());
+    }
+
+    svm_locker
+        .get_multiple_accounts(remote_ctx, accounts, None)
+        .await?;
+    Ok(())
+}
+
+/// Returns the account keys of address lookup tables referenced by a message.
+pub fn get_address_lookup_table_pubkeys(message: &VersionedMessage) -> Vec<Pubkey> {
+    match message {
+        VersionedMessage::V0(message) => message
+            .address_table_lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect(),
+        VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // simulate_bundle helpers
 //
@@ -1123,31 +1247,54 @@ fn build_tx_result(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-        time::Duration,
-    };
+    use std::sync::{LazyLock, Mutex};
 
     use sha2::{Digest, Sha256};
     use solana_keypair::Keypair;
     use solana_message::{VersionedMessage, v0::Message as V0Message};
+    use solana_program_runtime::{
+        declare_process_instruction, solana_sbpf::program::BuiltinFunctionDefinition,
+    };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::versioned::VersionedTransaction;
     use solana_transaction_status::TransactionConfirmationStatus as SolanaTxConfirmationStatus;
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus, TransactionStatusEvent};
+    use surfpool_types::{
+        BlockProductionMode, ClockCommand, ClockEvent, SimnetCommand, SimnetConfig,
+        TransactionStatusEvent,
+    };
 
     use super::*;
     use crate::{
-        tests::helpers::TestSetup,
-        types::{SurfnetTransactionStatus, TransactionWithStatusMeta},
+        rpc::full::Full, runloops::start_block_production_runloop, tests::helpers::TestSetup,
     };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+    type BundleExecutionPause = (
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    );
+
+    static BUNDLE_EXECUTION_PAUSE: LazyLock<Mutex<Option<BundleExecutionPause>>> =
+        LazyLock::new(|| Mutex::new(None));
+
+    declare_process_instruction!(PauseBundleBuiltin, 1, |_invoke_context| {
+        let pause = BUNDLE_EXECUTION_PAUSE
+            .lock()
+            .expect("bundle execution pause should not be poisoned")
+            .take();
+        if let Some((snapshot_tx, resume_rx)) = pause {
+            let _ = snapshot_tx.send(());
+            let _ = resume_rx.recv();
+        }
+        Ok(())
+    });
+
+    impl PauseBundleBuiltin {
+        const ID: Pubkey = Pubkey::new_from_array([42; 32]);
+    }
 
     fn build_v0_transaction(
         payer: &Pubkey,
@@ -1159,6 +1306,33 @@ mod tests {
             V0Message::try_compile(payer, instructions, &[], *recent_blockhash).unwrap(),
         );
         VersionedTransaction::try_new(msg, signers).unwrap()
+    }
+
+    /// Unit tests do not start the production runloop, so provide the same
+    /// serialized command lane for tests that await `sendBundle`.
+    fn new_bundle_setup() -> TestSetup<SurfpoolJitoRpc> {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, commands_tx);
+        let svm_locker = setup.context.svm_locker.clone();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("bundle command test runtime should start");
+            while let Ok(command) = commands_rx.recv() {
+                if let SimnetCommand::ProcessBundle(_, transactions, reply_tx) = command {
+                    let _ = reply_tx.send(runtime.block_on(process_bundle(
+                        &svm_locker,
+                        &None,
+                        transactions,
+                    )));
+                }
+            }
+        });
+
+        setup
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1205,6 +1379,273 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_bundle_enqueues_process_bundle_and_awaits_its_reply() {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, commands_tx);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let expected_signature = tx.signatures[0];
+        let encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+        let context = setup.context.clone();
+        let rpc_task = tokio::spawn(async move {
+            SurfpoolJitoRpc
+                .send_bundle(Some(context), vec![encoded], None)
+                .await
+        });
+
+        let command = tokio::task::block_in_place(|| {
+            commands_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("sendBundle should enqueue a command")
+        });
+        let SimnetCommand::ProcessBundle(_, transactions, reply_tx) = command else {
+            panic!("sendBundle must enqueue ProcessBundle");
+        };
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].signatures[0], expected_signature);
+        reply_tx
+            .send(Ok("bundle-id-from-runloop".to_string()))
+            .expect("sendBundle must still be waiting for the runloop reply");
+
+        assert_eq!(
+            rpc_task
+                .await
+                .expect("sendBundle task should not panic")
+                .expect("runloop success should become an RPC success"),
+            "bundle-id-from-runloop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_transaction_submitted_during_bundle_execution_runs_after_bundle_commit() {
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, commands_tx.clone());
+        let svm_locker = setup.context.svm_locker.clone();
+
+        let (clock_events_tx, clock_events_rx) = crossbeam_channel::unbounded::<ClockEvent>();
+        let (clock_commands_tx, _clock_commands_rx) =
+            crossbeam_channel::unbounded::<ClockCommand>();
+        let simnet_config = SimnetConfig::default();
+        let runloop = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runloop test runtime should start")
+                .block_on(async {
+                    start_block_production_runloop(
+                        clock_events_rx,
+                        clock_commands_tx,
+                        commands_rx,
+                        commands_tx,
+                        svm_locker,
+                        BlockProductionMode::Manual,
+                        &None,
+                        None,
+                        &simnet_config,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+        });
+
+        let bundle_payer = Keypair::new();
+        let bundle_recipient = Pubkey::new_unique();
+        let transaction_payer = Keypair::new();
+        let transaction_recipient = Pubkey::new_unique();
+        let airdrop_recipient = Pubkey::new_unique();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.inner
+                .svm
+                .add_builtin(PauseBundleBuiltin::ID, PauseBundleBuiltin::register);
+            svm.airdrop(&bundle_payer.pubkey(), 2 * LAMPORTS_PER_SOL)
+                .expect("bundle payer airdrop should be accepted")
+                .expect("bundle payer airdrop transaction should succeed");
+            svm.airdrop(&transaction_payer.pubkey(), 2 * LAMPORTS_PER_SOL)
+                .expect("transaction payer airdrop should be accepted")
+                .expect("transaction payer airdrop transaction should succeed");
+        });
+
+        let bundle_tx = build_v0_transaction(
+            &bundle_payer.pubkey(),
+            &[&bundle_payer],
+            &[
+                solana_instruction::Instruction {
+                    program_id: PauseBundleBuiltin::ID,
+                    accounts: vec![],
+                    data: vec![],
+                },
+                system_instruction::transfer(
+                    &bundle_payer.pubkey(),
+                    &bundle_recipient,
+                    LAMPORTS_PER_SOL,
+                ),
+            ],
+            &recent_blockhash,
+        );
+        let regular_tx = build_v0_transaction(
+            &transaction_payer.pubkey(),
+            &[&transaction_payer],
+            &[system_instruction::transfer(
+                &transaction_payer.pubkey(),
+                &transaction_recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        *BUNDLE_EXECUTION_PAUSE
+            .lock()
+            .expect("bundle execution pause should not be poisoned") =
+            Some((snapshot_tx, resume_rx));
+
+        let encoded_bundle_tx = bs58::encode(bincode::serialize(&bundle_tx).unwrap()).into_string();
+        let context = setup.context.clone();
+        let bundle_task = tokio::spawn(async move {
+            SurfpoolJitoRpc
+                .send_bundle(Some(context), vec![encoded_bundle_tx], None)
+                .await
+        });
+
+        tokio::task::spawn_blocking(move || {
+            snapshot_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("bundle should pause after taking its sandbox snapshot")
+        })
+        .await
+        .expect("snapshot wait task should not panic");
+
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::ProcessTransaction(
+                None,
+                regular_tx,
+                status_tx,
+                true,
+                Some(false),
+            ))
+            .expect("regular transaction should be accepted while bundle is executing");
+
+        let airdrop_context = setup.context.clone();
+        let airdrop_task = std::thread::spawn(move || {
+            SurfpoolFullRpc.request_airdrop(
+                Some(airdrop_context),
+                airdrop_recipient.to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !airdrop_task.is_finished(),
+            "requestAirdrop must wait for the bundle's serialized execution interval"
+        );
+        let airdrop_balance_during_bundle = setup.context.svm_locker.with_svm_reader(|svm| {
+            svm.get_account(&airdrop_recipient)
+                .expect("airdrop recipient lookup should succeed")
+                .map(|account| account.lamports)
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            airdrop_balance_during_bundle, 0,
+            "requestAirdrop must not mutate the live VM before the bundle commits"
+        );
+
+        let status_probe = status_rx.clone();
+        let status_arrived_early = tokio::task::spawn_blocking(move || {
+            status_probe.recv_timeout(std::time::Duration::from_millis(100))
+        })
+        .await
+        .expect("status probe should not panic");
+        assert!(
+            status_arrived_early.is_err(),
+            "the runloop must not execute the regular transaction before the bundle commits"
+        );
+
+        resume_tx
+            .send(())
+            .expect("paused bundle should still be waiting to resume");
+        bundle_task
+            .await
+            .expect("bundle RPC task should not panic")
+            .expect("bundle should succeed");
+
+        let transaction_status = tokio::task::spawn_blocking(move || {
+            status_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .expect("transaction status wait should not panic")
+        .expect("regular transaction should execute after the bundle");
+        assert!(matches!(
+            transaction_status,
+            TransactionStatusEvent::Success(_)
+        ));
+        airdrop_task
+            .join()
+            .expect("requestAirdrop task should not panic")
+            .expect("requestAirdrop should succeed after the bundle commits");
+
+        let (bundle_balance, transaction_balance, airdrop_balance) =
+            setup.context.svm_locker.with_svm_reader(|svm| {
+                let bundle_balance = svm
+                    .get_account(&bundle_recipient)
+                    .expect("bundle recipient lookup should succeed")
+                    .map(|account| account.lamports)
+                    .unwrap_or_default();
+                let transaction_balance = svm
+                    .get_account(&transaction_recipient)
+                    .expect("transaction recipient lookup should succeed")
+                    .map(|account| account.lamports)
+                    .unwrap_or_default();
+                let airdrop_balance = svm
+                    .get_account(&airdrop_recipient)
+                    .expect("airdrop recipient lookup should succeed")
+                    .map(|account| account.lamports)
+                    .unwrap_or_default();
+                (bundle_balance, transaction_balance, airdrop_balance)
+            });
+        assert_eq!(bundle_balance, LAMPORTS_PER_SOL);
+        assert_eq!(transaction_balance, LAMPORTS_PER_SOL);
+        assert_eq!(airdrop_balance, LAMPORTS_PER_SOL);
+
+        setup
+            .context
+            .simnet_commands_tx
+            .send(SimnetCommand::Terminate(None))
+            .expect("runloop should accept termination");
+        drop(clock_events_tx);
+        runloop
+            .join()
+            .expect("runloop thread should not panic")
+            .expect("runloop should stop cleanly");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1277,7 +1718,7 @@ mod tests {
     async fn test_send_bundle_single_transaction() {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
-        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let setup = new_bundle_setup();
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -1342,7 +1783,7 @@ mod tests {
         let payer = Keypair::new();
         let recipient1 = Pubkey::new_unique();
         let recipient2 = Pubkey::new_unique();
-        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let setup = new_bundle_setup();
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -1431,60 +1872,7 @@ mod tests {
         let payer = Keypair::new();
         let recipient = Keypair::new();
 
-        // Use mempool-backed setup so we can assert that a sandbox failure does NOT enqueue any
-        // ProcessTransaction commands
-        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
-        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
-
-        // Drain any ProcessTransaction commands so `sendTransaction` cannot block this test even
-        // if Phase 2 is accidentally reached. We track whether anything was sent.
-        let observed_process_tx = Arc::new(AtomicUsize::new(0));
-        let stop_drain = Arc::new(AtomicBool::new(false));
-        let observed_process_tx_clone = observed_process_tx.clone();
-        let stop_drain_clone = stop_drain.clone();
-        let svm_locker_clone = setup.context.svm_locker.clone();
-        let drain_handle = hiro_system_kit::thread_named("mempool_drain_dependent_bundle")
-            .spawn(move || {
-                while !stop_drain_clone.load(Ordering::SeqCst) {
-                    let Ok(cmd) = mempool_rx.recv_timeout(Duration::from_millis(200)) else {
-                        continue;
-                    };
-                    match cmd {
-                        SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _) => {
-                            observed_process_tx_clone.fetch_add(1, Ordering::SeqCst);
-
-                            // Minimal bookkeeping (mirrors other bundle tests) + unblock the RPC.
-                            let sig = tx.signatures[0];
-                            let mut writer = svm_locker_clone.0.blocking_write();
-                            let slot = writer.get_latest_absolute_slot();
-                            writer.transactions_queued_for_confirmation.push_back((
-                                tx.clone(),
-                                status_tx.clone(),
-                                None,
-                            ));
-                            let tx_with_status_meta = TransactionWithStatusMeta {
-                                slot,
-                                transaction: tx,
-                                ..Default::default()
-                            };
-                            let mutated_accounts = std::collections::HashSet::new();
-                            let _ = writer.transactions.store(
-                                sig.to_string(),
-                                SurfnetTransactionStatus::processed(
-                                    tx_with_status_meta,
-                                    mutated_accounts,
-                                ),
-                            );
-
-                            let _ = status_tx.send(TransactionStatusEvent::Success(
-                                TransactionConfirmationStatus::Confirmed,
-                            ));
-                        }
-                        _ => continue,
-                    }
-                }
-            })
-            .unwrap();
+        let setup = new_bundle_setup();
 
         let recent_blockhash = setup
             .context
@@ -1546,9 +1934,6 @@ mod tests {
             err.message
         );
 
-        stop_drain.store(true, Ordering::SeqCst);
-        let _ = drain_handle.join();
-
         let recp_pubkey = recipient.pubkey();
         let recp_bal = setup
             .context
@@ -1563,18 +1948,11 @@ mod tests {
             recp_bal, 0,
             "expected jito bundle to not take effect after bundle failure"
         );
-
-        // If sandbox failure happens as expected, Phase 2 should never run.
-        assert_eq!(
-            observed_process_tx.load(Ordering::SeqCst),
-            0,
-            "Expected zero mempool ProcessTransaction commands; sandbox failure should prevent Phase 2"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_send_bundle_simulation_failure_returns_not_atomic_error() {
-        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let setup = new_bundle_setup();
 
         // Build a tx that should fail during `simulateTransaction` because the payer
         // has no lamports (no explicit airdrop in this test).
@@ -1620,8 +1998,7 @@ mod tests {
     async fn test_send_bundle_persists_bundle_signatures() {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
-        let (mempool_tx, _) = crossbeam_channel::unbounded();
-        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
+        let setup = new_bundle_setup();
 
         let recent_blockhash = setup
             .context
@@ -1747,7 +2124,7 @@ mod tests {
         let payer = Keypair::new();
         let recipient1 = Pubkey::new_unique();
         let recipient2 = Pubkey::new_unique();
-        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let setup = new_bundle_setup();
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -1913,7 +2290,7 @@ mod tests {
         // unknown index, matching Jito's wire contract.
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
-        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let setup = new_bundle_setup();
         let recent_blockhash = setup
             .context
             .svm_locker

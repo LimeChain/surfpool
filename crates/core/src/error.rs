@@ -85,6 +85,14 @@ impl From<solana_client::client_error::ClientError> for SurfpoolError {
 }
 
 impl SurfpoolError {
+    pub(crate) fn bundle_sandbox_stale(sandbox_revision: u64, live_revision: u64) -> Self {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!(
+            "Bundle sandbox state revision {sandbox_revision} does not match live state revision {live_revision}"
+        )));
+        Self(error)
+    }
+
     pub fn from_try_send_error<T>(e: TrySendError<T>) -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(

@@ -2589,6 +2589,7 @@ mod tests {
         UiAccountData, UiAccountEncoding, parse_account_data::ParsedAccount,
     };
     use solana_keypair::Keypair;
+    use solana_loader_v3_interface::state::UpgradeableLoaderState;
     use solana_program_pack::Pack;
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
@@ -5007,6 +5008,175 @@ mod tests {
              If it succeeded, the noop placeholder is still being executed instead of \
              the written program bytes."
         );
+    }
+
+    fn invoke_program(
+        client: &TestSetup<SurfnetCheatcodesRpc>,
+        program_id: &Pubkey,
+    ) -> std::result::Result<(), String> {
+        let payer = Keypair::new();
+        client
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+        let recent_blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let invoke_ix = solana_instruction::Instruction {
+            program_id: *program_id,
+            accounts: vec![],
+            data: vec![],
+        };
+        let message = solana_message::Message::new_with_blockhash(
+            &[invoke_ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        );
+        let tx = VersionedTransaction::try_new(
+            solana_message::VersionedMessage::Legacy(message),
+            &[&payer],
+        )
+        .unwrap();
+        client
+            .context
+            .svm_locker
+            .simulate_transaction(tx, false)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e.err))
+    }
+
+    fn programdata_account(
+        client: &TestSetup<SurfnetCheatcodesRpc>,
+        program_id: &Pubkey,
+    ) -> Account {
+        let programdata_address = solana_loader_v3_interface::get_program_data_address(program_id);
+        client
+            .context
+            .svm_locker
+            .get_account_local(&programdata_address)
+            .inner
+            .map_account()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_program_authority_keeps_elf_at_programdata_offset() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let program_id = Keypair::new().pubkey();
+        let elf = crate::surfnet::noop_program::NOOP_PROGRAM_ELF;
+        let metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+        let initial_authority = Pubkey::new_unique();
+
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.to_string(),
+                hex::encode(elf),
+                0,
+                Some(initial_authority.to_string()),
+            )
+            .await
+            .unwrap();
+        invoke_program(&client, &program_id).unwrap();
+
+        for new_authority in [None, Some(Pubkey::new_unique())] {
+            client
+                .rpc
+                .set_program_authority(
+                    Some(client.context.clone()),
+                    program_id.to_string(),
+                    new_authority.map(|a| a.to_string()),
+                )
+                .await
+                .unwrap();
+
+            invoke_program(&client, &program_id).unwrap_or_else(|e| {
+                panic!("program not executable after authority {new_authority:?}: {e}")
+            });
+            let programdata = programdata_account(&client, &program_id);
+            assert!(matches!(
+                bincode::deserialize(&programdata.data).unwrap(),
+                UpgradeableLoaderState::ProgramData { upgrade_authority_address, .. }
+                    if upgrade_authority_address == new_authority
+            ));
+            assert_eq!(programdata.data.len(), metadata_size + elf.len());
+            assert_eq!(&programdata.data[metadata_size..], elf);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_program_without_authority_on_immutable_program() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let program_id = Keypair::new().pubkey();
+        let elf = crate::surfnet::noop_program::NOOP_PROGRAM_ELF;
+        let metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+        let programdata_address = solana_loader_v3_interface::get_program_data_address(&program_id);
+
+        // An immutable program as cloned from mainnet: authority None, ELF at byte 45.
+        let mut programdata = vec![0u8; metadata_size + elf.len()];
+        bincode::serialize_into(
+            &mut programdata[..metadata_size],
+            &UpgradeableLoaderState::ProgramData {
+                slot: 0,
+                upgrade_authority_address: None,
+            },
+        )
+        .unwrap();
+        programdata[metadata_size..].copy_from_slice(elf);
+        let upgradeable = solana_sdk_ids::bpf_loader_upgradeable::id();
+        set_account(
+            &client,
+            &programdata_address,
+            &Account {
+                lamports: 1_000_000_000,
+                data: programdata,
+                owner: upgradeable,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        set_account(
+            &client,
+            &program_id,
+            &Account {
+                lamports: 1_000_000_000,
+                data: bincode::serialize(&UpgradeableLoaderState::Program {
+                    programdata_address,
+                })
+                .unwrap(),
+                owner: upgradeable,
+                executable: true,
+                rent_epoch: 0,
+            },
+        );
+        invoke_program(&client, &program_id).unwrap();
+
+        client
+            .rpc
+            .write_program(
+                Some(client.context.clone()),
+                program_id.to_string(),
+                hex::encode(elf),
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let programdata = programdata_account(&client, &program_id);
+        assert!(matches!(
+            bincode::deserialize::<UpgradeableLoaderState>(&programdata.data).unwrap(),
+            UpgradeableLoaderState::ProgramData {
+                upgrade_authority_address: None,
+                ..
+            }
+        ));
+        assert_eq!(&programdata.data[metadata_size..], elf);
+        invoke_program(&client, &program_id).unwrap();
     }
 
     #[test]

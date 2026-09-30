@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::any::type_name;
 
 use base64::prelude::*;
@@ -8,10 +6,12 @@ use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
     rpc_filter::RpcFilterType,
-    rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
+    rpc_request::{
+        MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, MAX_GET_PROGRAM_ACCOUNT_FILTERS,
+        TokenAccountsFilter,
+    },
 };
 use solana_commitment_config::CommitmentConfig;
-use solana_hash::Hash;
 use solana_message::{
     AccountKeys, VersionedMessage,
     v1::{MAX_TRANSACTION_SIZE, V1_PREFIX},
@@ -39,15 +39,27 @@ pub fn convert_transaction_metadata_from_canonical(
     }
 }
 
-fn optimize_filters(filters: &mut [RpcFilterType]) {
+pub(crate) fn optimize_filters(filters: &mut [RpcFilterType]) {
     filters.iter_mut().for_each(|filter_type| {
-        if let RpcFilterType::Memcmp(compare) = filter_type {
-            if let Err(err) = compare.convert_to_raw_bytes() {
-                // All filters should have been previously verified
-                warn!("Invalid filter: bytes could not be decoded, {err}");
-            }
+        if let RpcFilterType::Memcmp(compare) = filter_type
+            && let Err(err) = compare.convert_to_raw_bytes()
+        {
+            // All filters should have been previously verified
+            warn!("Invalid filter: bytes could not be decoded, {err}");
         }
     })
+}
+
+pub(crate) fn verify_filters(filters: &[RpcFilterType]) -> Result<()> {
+    if filters.len() > MAX_GET_PROGRAM_ACCOUNT_FILTERS {
+        return Err(Error::invalid_params(format!(
+            "Too many filters provided; max {MAX_GET_PROGRAM_ACCOUNT_FILTERS}"
+        )));
+    }
+    for filter in filters {
+        verify_filter(filter)?;
+    }
+    Ok(())
 }
 
 fn verify_filter(input: &RpcFilterType) -> Result<()> {
@@ -73,19 +85,13 @@ pub fn verify_pubkeys(input: &[String]) -> SurfpoolResult<Vec<Pubkey>> {
         .collect::<SurfpoolResult<Vec<_>>>()
 }
 
-fn verify_hash(input: &str) -> Result<Hash> {
-    input
-        .parse()
-        .map_err(|e| Error::invalid_params(format!("Invalid param: {e:?}")))
-}
-
 fn verify_signature(input: &str) -> Result<Signature> {
     input
         .parse()
         .map_err(|e| Error::invalid_params(format!("Invalid param: {e:?}")))
 }
 
-fn verify_token_account_filter(
+pub(crate) fn verify_token_account_filter(
     token_account_filter: RpcTokenAccountsFilter,
 ) -> Result<TokenAccountsFilter> {
     match token_account_filter {
@@ -100,7 +106,7 @@ fn verify_token_account_filter(
     }
 }
 
-fn verify_and_parse_signatures_for_address_params(
+pub(crate) fn verify_and_parse_signatures_for_address_params(
     address: String,
     before: Option<String>,
     until: Option<String>,
@@ -304,6 +310,7 @@ pub fn adjust_default_transaction_config(config: &mut RpcTransactionConfig) {
 
 #[cfg(test)]
 mod tests {
+    use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_message::{
         MESSAGE_VERSION_PREFIX, MessageHeader, compiled_instruction::CompiledInstruction, legacy,

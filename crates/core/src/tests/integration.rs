@@ -1211,7 +1211,7 @@ where
     };
 
     let payer = Keypair::new();
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     setup
         .rpc
         .request_airdrop(
@@ -4584,6 +4584,8 @@ fn boot_simnet(
         simnets: vec![SimnetConfig {
             slot_time: slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS),
             block_production_mode,
+            offline_mode: true,
+            remote_rpc_url: None,
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -4822,6 +4824,71 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
     );
 
     println!("Time travel to absolute timestamp test passed successfully!");
+}
+
+/// After each kind of time travel the Clock sysvar holds the absolute slot, as it does after
+/// every block, the epoch info agrees with the epoch schedule, and the slot moved as far as asked.
+#[test]
+fn time_travel_keeps_the_clock_on_the_absolute_slot() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Manual, Some(400), TestType::no_db())
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    let state = || {
+        svm_locker.with_svm_reader(|svm| {
+            (
+                svm.inner.get_sysvar::<Clock>(),
+                svm.latest_epoch_info.clone(),
+                svm.inner.get_sysvar::<EpochSchedule>(),
+                svm.updated_at,
+            )
+        })
+    };
+
+    let one_day_in_slots = 24 * 60 * 60 * 1000 / 400;
+    for travel in 0..3 {
+        let (_, before, schedule, updated_at) = state();
+        let (config, expected_slot) = match travel {
+            0 => (
+                TimeTravelConfig::AbsoluteTimestamp(updated_at + one_day_in_slots * 400),
+                before.absolute_slot + one_day_in_slots,
+            ),
+            1 => {
+                let slot = before.absolute_slot + 500_000;
+                (TimeTravelConfig::AbsoluteSlot(slot), slot)
+            }
+            _ => (
+                TimeTravelConfig::AbsoluteEpoch(before.epoch + 2),
+                schedule.get_first_slot_in_epoch(before.epoch + 2),
+            ),
+        };
+
+        rpc_server
+            .time_travel(Some(runloop_context.clone()), Some(config))
+            .expect("time travel should succeed");
+
+        let (clock, after, schedule, _) = state();
+        assert_eq!(
+            (clock.slot, clock.epoch, after.absolute_slot),
+            (after.absolute_slot, after.epoch, expected_slot),
+            "{config:?}"
+        );
+        assert_eq!(
+            schedule.get_epoch_and_slot_index(after.absolute_slot),
+            (after.epoch, after.slot_index),
+            "{config:?}"
+        );
+    }
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -11885,7 +11952,7 @@ async fn test_request_airdrop_rejects_zero_amount() {
         tests::helpers::TestSetup,
     };
 
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     let recipient = Pubkey::new_unique();
     let err = setup
         .rpc
@@ -11902,7 +11969,7 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
         tests::helpers::TestSetup,
     };
 
-    let setup = TestSetup::new(SurfpoolFullRpc);
+    let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
     let recipient = Pubkey::new_unique();
     let err = setup
         .rpc

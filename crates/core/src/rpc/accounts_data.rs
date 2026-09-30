@@ -2,24 +2,27 @@ use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_derive::rpc;
 use solana_account_decoder::{
     UiAccount,
-    parse_account_data::SplTokenAdditionalDataV2,
-    parse_token::{TokenAccountType, UiTokenAmount, parse_token_v3, real_number_string_trimmed},
+    parse_token::{UiTokenAmount, token_amount_to_ui_amount_v3},
 };
 use solana_client::{
     rpc_config::RpcAccountInfoConfig,
     rpc_response::{RpcBlockCommitment, RpcResponseContext},
 };
-use solana_clock::Slot;
+use solana_clock::{Clock, Slot};
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_runtime::commitment::BlockCommitmentArray;
+use spl_token_2022_interface::extension::StateWithExtensions;
 
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::{State, utils::verify_pubkey},
-    surfnet::locker::{SvmAccessContext, is_supported_token_program},
-    types::{MintAccount, TokenAccount},
+    surfnet::{
+        locker::{SvmAccessContext, is_supported_token_program},
+        svm::spl_token_additional_data,
+    },
+    types::TokenAccount,
 };
 
 #[rpc]
@@ -542,7 +545,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
 
             let token_account = token_account_result.map_account()?;
 
-            let (mint_pubkey, _amount) = if is_supported_token_program(&token_account.owner) {
+            let (mint_pubkey, amount) = if is_supported_token_program(&token_account.owner) {
                 let unpacked_token_account = TokenAccount::unpack(&token_account.data)?;
                 (
                     unpacked_token_account.mint(),
@@ -567,34 +570,26 @@ impl AccountsData for SurfpoolAccountsDataRpc {
 
             let mint_account = mint_account_result.map_account()?;
 
-            let token_decimals = if is_supported_token_program(&mint_account.owner) {
-                let unpacked_mint_account = MintAccount::unpack(&mint_account.data)?;
-                unpacked_mint_account.decimals()
-            } else {
+            if !is_supported_token_program(&mint_account.owner) {
                 return Err(SurfpoolError::invalid_account_data(
                     mint_pubkey,
                     "Mint account is not owned by Token or Token-2022 program",
                     None::<String>,
                 )
                 .into());
-            };
+            }
+            let mint_data = svm_locker
+                .with_svm_reader(|svm| {
+                    spl_token_additional_data(
+                        &mint_account.data,
+                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
+                    )
+                })
+                .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
-                value: {
-                    parse_token_v3(
-                        &token_account.data,
-                        Some(&SplTokenAdditionalDataV2 {
-                            decimals: token_decimals,
-                            ..Default::default()
-                        }),
-                    )
-                    .ok()
-                    .and_then(|t| match t {
-                        TokenAccountType::Account(account) => Some(account.token_amount),
-                        _ => None,
-                    })
-                },
+                value: Some(token_amount_to_ui_amount_v3(amount, &mint_data)),
             })
         })
     }
@@ -638,49 +633,24 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 .into());
             }
 
-            let mint_data = MintAccount::unpack(&mint_account.data)?;
+            let supply = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(
+                &mint_account.data,
+            )
+            .map_err(|_| SurfpoolError::unpack_mint_account())?
+            .base
+            .supply;
+            let mint_data = svm_locker
+                .with_svm_reader(|svm| {
+                    spl_token_additional_data(
+                        &mint_account.data,
+                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
+                    )
+                })
+                .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
-                value: {
-                    parse_token_v3(
-                        &mint_account.data,
-                        Some(&SplTokenAdditionalDataV2 {
-                            decimals: mint_data.decimals(),
-                            ..Default::default()
-                        }),
-                    )
-                    .ok()
-                    .and_then(|t| match t {
-                        TokenAccountType::Mint(mint) => {
-                            let supply_u64 = mint.supply.parse::<u64>().unwrap_or(0);
-                            let ui_amount = if supply_u64 == 0 {
-                                Some(0.0)
-                            } else {
-                                let divisor = 10_u64.pow(mint.decimals as u32);
-                                Some(supply_u64 as f64 / divisor as f64)
-                            };
-
-                            Some(UiTokenAmount {
-                                amount: mint.supply.clone(),
-                                decimals: mint.decimals,
-                                ui_amount,
-                                ui_amount_string: real_number_string_trimmed(
-                                    supply_u64,
-                                    mint.decimals,
-                                ),
-                            })
-                        }
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        SurfpoolError::invalid_account_data(
-                            mint_pubkey,
-                            "Failed to parse token mint account",
-                            None::<String>,
-                        )
-                    })?
-                },
+                value: token_amount_to_ui_amount_v3(supply, &mint_data),
             })
         })
     }
@@ -689,6 +659,9 @@ impl AccountsData for SurfpoolAccountsDataRpc {
 #[cfg(test)]
 mod tests {
     use solana_account::Account;
+    use solana_account_decoder::{
+        parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
+    };
     use solana_keypair::Keypair;
     use solana_program_option::COption;
     use solana_program_pack::Pack;
@@ -700,7 +673,10 @@ mod tests {
         address::get_associated_token_address_with_program_id,
         instruction::create_associated_token_account,
     };
-    use spl_token_2022_interface::instruction::{initialize_mint2, mint_to, transfer_checked};
+    use spl_token_2022_interface::{
+        extension::scaled_ui_amount::ScaledUiAmountConfig,
+        instruction::{initialize_mint2, mint_to, transfer_checked},
+    };
     use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint};
 
     use super::*;
@@ -940,6 +916,242 @@ mod tests {
         assert_eq!(res.value.amount, "1000000000000");
         assert_eq!(res.value.decimals, 6);
         assert_eq!(res.value.ui_amount_string, "1000000");
+    }
+
+    /// A Token-2022 mint with `ScaledUiAmount` (x1, becoming x2 at t=1000) and one holder
+    /// of 1_000_000 raw units, written while the test clock is at t=123.
+    fn set_scaled_mint(
+        setup: &TestSetup<SurfpoolAccountsDataRpc>,
+        decimals: u8,
+    ) -> (Pubkey, Pubkey, ScaledUiAmountConfig) {
+        use spl_token_2022_interface::{
+            extension::{BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut},
+            state::{Account as Token2022Account, AccountState, Mint as Token2022Mint},
+        };
+        let (mint, holder) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+            ExtensionType::ScaledUiAmount,
+        ])
+        .unwrap();
+        let mut mint_data = vec![0; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut mint_data).unwrap();
+        let config = state.init_extension::<ScaledUiAmountConfig>(true).unwrap();
+        config.multiplier = 1.0.into();
+        config.new_multiplier = 2.0.into();
+        config.new_multiplier_effective_timestamp = 1_000.into();
+        let config = *config;
+        state.base = Token2022Mint {
+            supply: 1_000_000,
+            decimals,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+
+        let mut holder_data = vec![0; Token2022Account::LEN];
+        Token2022Account {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut holder_data);
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            for (pubkey, data) in [(mint, mint_data), (holder, holder_data)] {
+                let account = Account {
+                    lamports: svm.inner.minimum_balance_for_rent_exemption(data.len()),
+                    data,
+                    owner: spl_token_2022_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                };
+                svm.set_account(&pubkey, account).unwrap();
+            }
+        });
+        (mint, holder, config)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_ui_amounts_apply_mint_extensions_at_current_clock() {
+        use crate::rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc};
+
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, holder, config) = set_scaled_mint(&setup, 6);
+        // The new multiplier takes effect after the mint was indexed.
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            let mut clock = svm.inner.get_sysvar::<solana_clock::Clock>();
+            clock.unix_timestamp = 2_000;
+            svm.inner.set_sysvar(&clock);
+        });
+        let expected = token_amount_to_ui_amount_v3(
+            1_000_000,
+            &SplTokenAdditionalDataV2 {
+                decimals: 6,
+                scaled_ui_amount_config: Some((config, 2_000)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(expected.ui_amount, Some(2.0));
+
+        let supply = setup
+            .rpc
+            .get_token_supply(Some(setup.context.clone()), mint.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(supply, expected);
+
+        let balance = setup
+            .rpc
+            .get_token_account_balance(Some(setup.context.clone()), holder.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(balance, Some(expected.clone()));
+
+        let largest = SurfpoolAccountsScanRpc
+            .get_token_largest_accounts(Some(setup.context), mint.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(largest.len(), 1);
+        assert_eq!(largest[0].amount, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_interest_bearing_amounts_accrue_to_current_clock() {
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+                interest_bearing_mint::InterestBearingConfig,
+            },
+            state::{Account as Token2022Account, Mint as Token2022Mint},
+        };
+
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, holder) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let t0 = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>().unix_timestamp);
+        let t1 = t0 + 365 * 24 * 60 * 60;
+
+        let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+            ExtensionType::InterestBearingConfig,
+        ])
+        .unwrap();
+        let mut mint_data = vec![0; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut mint_data).unwrap();
+        let config = state.init_extension::<InterestBearingConfig>(true).unwrap();
+        config.initialization_timestamp = t0.into();
+        config.last_update_timestamp = t0.into();
+        config.pre_update_average_rate = 500.into();
+        config.current_rate = 500.into();
+        let config = *config;
+        state.base = Token2022Mint {
+            supply: 1_000_000,
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+
+        let mut holder_data = vec![0; Token2022Account::LEN];
+        Token2022Account {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount: 1_000_000,
+            state: spl_token_2022_interface::state::AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut holder_data);
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            for (pubkey, data) in [(mint, mint_data), (holder, holder_data)] {
+                let account = Account {
+                    lamports: svm.inner.minimum_balance_for_rent_exemption(data.len()),
+                    data,
+                    owner: spl_token_2022_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                };
+                svm.set_account(&pubkey, account).unwrap();
+            }
+            let mut clock = svm.inner.get_sysvar::<Clock>();
+            clock.unix_timestamp = t1;
+            svm.inner.set_sysvar(&clock);
+        });
+
+        let amount_at = |ts| {
+            token_amount_to_ui_amount_v3(
+                1_000_000,
+                &SplTokenAdditionalDataV2 {
+                    decimals: 6,
+                    interest_bearing_config: Some((config, ts)),
+                    ..Default::default()
+                },
+            )
+        };
+        let expected = amount_at(t1);
+        assert_ne!(expected, amount_at(t0));
+
+        let balance = setup
+            .rpc
+            .get_token_account_balance(Some(setup.context.clone()), holder.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(balance, Some(expected.clone()));
+
+        let account = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context),
+                holder.to_string(),
+                Some(RpcAccountInfoConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::JsonParsed),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let solana_account_decoder::UiAccountData::Json(parsed) = account.data else {
+            panic!("holder was not jsonParsed");
+        };
+        assert_eq!(
+            parsed.parsed["info"]["tokenAmount"],
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_token_supply_does_not_overflow_for_twenty_decimals() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, _, config) = set_scaled_mint(&setup, 20);
+        let expected = token_amount_to_ui_amount_v3(
+            1_000_000,
+            &SplTokenAdditionalDataV2 {
+                decimals: 20,
+                scaled_ui_amount_config: Some((config, 123)),
+                ..Default::default()
+            },
+        );
+
+        let supply = setup
+            .rpc
+            .get_token_supply(Some(setup.context), mint.to_string(), None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(supply, expected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
