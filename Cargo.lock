@@ -6136,23 +6136,23 @@ dependencies = [
 
 [[package]]
 name = "phoenix-rise-accounts"
-version = "0.3.4"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "549b130422dfd976cef8d5f82394cbb5491d18355a77eaead7fa092b90844bdd"
+checksum = "5935fbffbb20cc6f168a11bfca4519797f65ad34fa027fd80c3e2ee00bc7866e"
 dependencies = [
  "borsh 1.7.0",
  "bytemuck",
  "phoenix-rise-math",
  "sha2-const-stable",
- "solana-pubkey 3.0.0",
+ "solana-pubkey 4.2.0",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "phoenix-rise-math"
-version = "0.3.4"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f6c10d1a8fd19901084fe96a17404e2946a0de9645ad788dc096fa986fed7a3"
+checksum = "c3c26875c5a22a98b4b085ee9cb0d045dc60f0ad0f2bbd1f9fbd2228c2e0d760"
 dependencies = [
  "borsh 1.7.0",
  "bytemuck",
@@ -12195,7 +12195,6 @@ dependencies = [
  "opentelemetry_sdk 0.28.0",
  "p256",
  "phoenix-rise-accounts",
- "phoenix-rise-math",
  "prometheus",
  "reqwest 0.12.28",
  "scheduled-thread-pool",

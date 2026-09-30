@@ -97,8 +97,8 @@ async fn live_trader_with_position() -> Pubkey {
         .await;
     let listed = match listed {
         Ok(RemoteRpcResult::Ok(accounts)) => accounts,
-        // The protocol keeps its own trader index, but 0.3.4 exposes only the arena
-        // metadata, so the program's account list is the reader we have.
+        // The protocol keeps its own trader index, but phoenix-rise-accounts exposes only the
+        // arena metadata, so the program's account list is the reader we have.
         Ok(RemoteRpcResult::MethodNotSupported) => panic!(
             "environment: this endpoint does not support getProgramAccounts, which these tests \
              need to find a live trader. Set {RPC_URL_ENV} to an endpoint that supports it. \

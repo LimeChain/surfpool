@@ -5,7 +5,6 @@ use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError,
     perp_asset_map::{PerpAssetMap, PerpAssetMetadata, PriceComponent},
 };
-use phoenix_rise_math::quantities::Ticks;
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
@@ -78,13 +77,14 @@ fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) 
     )
 }
 
-fn checked_ticks(account_pubkey: &Pubkey, ticks: u64) -> SurfpoolResult<Ticks> {
-    Ticks::new_checked(ticks).map_err(|_| {
-        price_patch_error(
+fn checked_ticks(account_pubkey: &Pubkey, ticks: u64) -> SurfpoolResult<u64> {
+    if ticks > u64::from(u32::MAX) {
+        return Err(price_patch_error(
             account_pubkey,
             format!("price ticks {ticks} exceed the Phoenix u32 tick range"),
-        )
-    })
+        ));
+    }
+    Ok(ticks)
 }
 
 fn patch_direct_mark(
@@ -99,7 +99,7 @@ fn patch_direct_mark(
         let price_len = size_of::<PriceComponent>();
         let mut price = bytemuck::pod_read_unaligned::<PriceComponent>(&bytes[..price_len]);
         price.mark_price.price.slot = mark_slot;
-        price.mark_price.price.ticks = target_ticks;
+        price.mark_price.price.ticks = bytemuck::cast(target_ticks);
         bytes[..price_len].copy_from_slice(bytemuck::bytes_of(&price));
     })
 }
