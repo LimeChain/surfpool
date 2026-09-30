@@ -37,17 +37,28 @@ The exponent is live state and changed during validation. Set exponent and coeff
 
 ## Picking a market
 
-Every template now starts with a market picker. Choose one of the two SolFi markets that currently
-has meaningful swap liquidity:
+Every template starts with a searchable market picker. The committed catalog is generated from
+every 1,728-byte market owned by the SolFi program, including markets with empty vaults. Market
+templates target the market account, price and freshness templates target its embedded oracle, and
+the vault template exposes both embedded token vaults. If a newly created market is not in the
+catalog yet, Studio also accepts its market, oracle or vault address directly as appropriate for the
+selected template.
+
+Two commonly useful markets are:
 
 | Choice      | Best suited for                                      |
 | ----------- | ---------------------------------------------------- |
 | WSOL / USDC | SOL price shocks, spread changes and liquidity tests |
 | USDT / USDC | Stablecoin depegs and stablecoin liquidity tests     |
 
-The picker supplies the correct market or oracle account to the template automatically. The vault
-template asks for both the market and the token vault because each market has one vault for each
-side of a swap. Users do not need to copy account addresses into these templates.
+The picker supplies the correct market, oracle or vault account to the template automatically.
+Users normally do not need to copy account addresses into these templates. Empty markets remain
+selectable for initialization, refusal and recovery scenarios. Their presence in the picker is not
+a promise that a swap can currently settle. Maintainers can refresh the committed catalog with:
+
+```bash
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com node generate-markets.js
+```
 
 Do not reuse an oracle or vault merely because the token pair looks similar. Use
 `fetchBeforeUse: true` so the selected account is forked before its bytes are changed.
@@ -271,7 +282,7 @@ reset a vault unless restoring the same inventory after every transaction is del
 
 | Symptom                                                        | Fix                                                                                        |
 | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Price or spread override writes correctly but the swap rejects | Apply `solfi-freshness` for the scenario window. Expiry is checked before pricing         |
+| Price or spread override writes correctly but the swap rejects | Apply `solfi-freshness` for the scenario window. Expiry is checked before pricing          |
 | `Custom(23)`                                                   | The oracle validity horizon is behind the executing slot                                   |
 | `Custom(18)` after lowering a vault                            | The payout vault cannot settle the requested output                                        |
 | Constant spread is smaller than requested                      | Account for `oracle_scale`, neutralize the age/additional curves, and raise `max_widening` |
