@@ -18,7 +18,10 @@ use super::collateral::{
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     scenarios::TemplateRegistry,
-    surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    surfnet::{
+        remote::SurfnetRemoteClient,
+        svm::{AccountUpdatePolicy, SurfnetSvm},
+    },
 };
 
 pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
@@ -168,38 +171,40 @@ fn forge_phoenix_override(
     account_values: &HashMap<String, serde_json::Value>,
     materialization_slot: u64,
 ) -> SurfpoolResult<Vec<u8>> {
-    let mut fields: Vec<&str> = account_values.keys().map(String::as_str).collect();
-    fields.sort_unstable();
+    // Only the codec's inputs are read: other keys, such as PerpAssetMap fields a client copied
+    // from the decoded account, cannot be written through this codec.
     let symbol = || {
-        account_values[MARKET_SYMBOL_FIELD]
-            .as_str()
+        account_values
+            .get(MARKET_SYMBOL_FIELD)
+            .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))
     };
-    let ticks =
-        |field: &str| parse_decimal(&account_values[field], field, "an unsigned 64-bit integer");
-    match fields.as_slice() {
-        [MARKET_SYMBOL_FIELD, DIRECT_MARK_TICKS_FIELD] => patch_direct_mark(
+    match (
+        account_values.get(DIRECT_MARK_TICKS_FIELD),
+        account_values.get(MAINTENANCE_FACTOR_FIELD),
+    ) {
+        (Some(ticks), None) => patch_direct_mark(
             account_pubkey,
             &account.data,
             symbol()?,
-            ticks(DIRECT_MARK_TICKS_FIELD)?,
+            parse_decimal(ticks, DIRECT_MARK_TICKS_FIELD, "an unsigned 64-bit integer")?,
             materialization_slot,
         ),
-        [MAINTENANCE_FACTOR_FIELD, MARKET_SYMBOL_FIELD] => patch_maintenance_factor(
+        (None, Some(factor)) => patch_maintenance_factor(
             account_pubkey,
             &account.data,
             symbol()?,
             parse_decimal::<core::num::NonZeroU16>(
-                &account_values[MAINTENANCE_FACTOR_FIELD],
+                factor,
                 MAINTENANCE_FACTOR_FIELD,
                 "basis points from 1 to 65535",
             )?
             .get(),
         ),
         _ => Err(SurfpoolError::internal(
-            "Phoenix map overrides accept symbol + target_ticks or \
-             symbol + maintenance_risk_factor_bps",
+            "Phoenix map overrides take symbol plus exactly one of target_ticks or \
+             maintenance_risk_factor_bps",
         )),
     }
 }
@@ -307,12 +312,12 @@ async fn phoenix_dependency(
     let (client, commitment) = remote_ctx.as_ref().ok_or_else(|| {
         SurfpoolError::internal(format!("Phoenix dependency {address} is missing locally"))
     })?;
-    let account = client
-        .get_account(address, *commitment)
-        .await?
-        .map_account()?;
-    // Fill the fork gap once instead of refetching the same dependency per override.
-    svm.inner.set_account(*address, account.clone())?;
+    let fetched = client.get_account(address, *commitment).await?;
+    let account = fetched.clone().map_account()?;
+    // Fill the fork gap once instead of refetching the same dependency per override, the way a
+    // fork read does: the account is also indexed by owner, so getProgramAccounts serves the
+    // local copy the override then patches.
+    svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
     Ok(account)
 }
 
@@ -577,6 +582,58 @@ mod tests {
                 .collect();
             forge_phoenix_override(&Pubkey::new_unique(), &perp_asset_map_account(), &values, 1)
                 .unwrap_or_else(|error| panic!("{}: {error}", template.id));
+        }
+    }
+
+    #[test]
+    fn market_overrides_ignore_keys_outside_the_codec_inputs() {
+        // An editor that starts from the decoded map sends its top-level scalars and arrays too.
+        let account = perp_asset_map_account();
+        for (field, value) in [
+            (DIRECT_MARK_TICKS_FIELD, "1"),
+            (MAINTENANCE_FACTOR_FIELD, "10000"),
+        ] {
+            let clean = HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (field.to_string(), serde_json::json!(value)),
+            ]);
+            let mut editor = clean.clone();
+            editor.insert("numAssets".to_string(), serde_json::json!(1));
+            editor.insert(
+                "padding0".to_string(),
+                serde_json::json!([0, 0, 0, 0, 0, 0]),
+            );
+            assert_eq!(
+                forge_phoenix_override(&Pubkey::new_unique(), &account, &editor, 123).unwrap(),
+                forge_phoenix_override(&Pubkey::new_unique(), &account, &clean, 123).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn market_overrides_need_a_symbol_and_exactly_one_codec_input() {
+        let account = perp_asset_map_account();
+        let symbol = (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL"));
+        let ticks = (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1"));
+        let factor = (
+            MAINTENANCE_FACTOR_FIELD.to_string(),
+            serde_json::json!("10000"),
+        );
+        for values in [
+            vec![symbol.clone()],
+            vec![symbol.clone(), ticks.clone(), factor.clone()],
+            vec![ticks.clone()],
+            vec![factor.clone()],
+            vec![
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!(1)),
+                ticks.clone(),
+            ],
+        ] {
+            let values = HashMap::from_iter(values);
+            assert!(
+                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err(),
+                "{values:?}"
+            );
         }
     }
 }

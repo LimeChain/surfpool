@@ -36,8 +36,10 @@ pub fn trader_header(trader: &Pubkey, account: &Account) -> SurfpoolResult<Trade
     Ok(header)
 }
 
-/// A hot Trader's TraderState is mirrored in the GlobalTraderIndex and the mirror update carries
-/// only the collateral, so any other TraderState write would leave the two copies disagreeing.
+/// A hot Trader's TraderState is also stored in its GlobalTraderIndex record, and Phoenix's
+/// margin view (Hawkeye) reads collateral from that record, not from the Trader. Only collateral
+/// is written to the record here, so any other TraderState field is refused rather than set on
+/// the Trader alone.
 pub fn validate_hot_trader_fields(
     values: &HashMap<String, serde_json::Value>,
 ) -> SurfpoolResult<()> {
@@ -387,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_patches_a_cold_trader_and_skips_a_mismatched_header_key() {
+    async fn materialization_patches_cold_trader_and_skips_mismatched_header_key() {
         use crate::surfnet::svm::SurfnetSvm;
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
@@ -409,5 +411,54 @@ mod tests {
             }
             assert_eq!(svm.get_account(&trader).unwrap().unwrap(), expected);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialization_indexes_fetched_global_trader_index_by_owner() {
+        use base64::{Engine, prelude::BASE64_STANDARD};
+        use solana_commitment_config::CommitmentConfig;
+
+        use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
+        use crate::{
+            surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
+            tests::helpers::canned_rpc,
+        };
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut before_trader = trader_account(FIRST_KEY, 9_999, true);
+        before_trader.lamports = 1;
+        let mut remote_index = index_account();
+        remote_index.lamports = 1;
+        let scenario =
+            build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&remote_index))
+                .unwrap();
+        // The fork holds the Trader but has never read the index, so the override fetches it.
+        let url = canned_rpc(format!(
+            r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+            BASE64_STANDARD.encode(&remote_index.data),
+            PHOENIX_ETERNAL_PROGRAM_ID,
+            remote_index.data.len()
+        ))
+        .await;
+        let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&trader, before_trader).unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&remote, 100)
+            .await
+            .unwrap();
+
+        // getProgramAccounts serves the local copy of an account only when it is indexed by owner.
+        let owned = svm
+            .get_account_owned_by(&PHOENIX_ETERNAL_PROGRAM_ID)
+            .unwrap();
+        let (_, index) = owned
+            .iter()
+            .find(|(pubkey, _)| *pubkey == PHOENIX_GLOBAL_TRADER_INDEX)
+            .expect("the fetched index must be indexed by owner");
+        let mut expected = remote_index;
+        expected.data[144..152].copy_from_slice(&1_i64.to_le_bytes());
+        assert_eq!(index, &expected);
     }
 }
