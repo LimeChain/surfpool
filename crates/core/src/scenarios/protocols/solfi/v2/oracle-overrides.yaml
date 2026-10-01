@@ -9,238 +9,6 @@ tags:
   - prop-amm
   - oracle
 
-constants:
-  market:
-    label: 'SolFi market'
-    description: 'Choose a generated SolFi market or enter its oracle address manually in Studio.'
-    options:
-      - id: 'sol-usdc-65ZHSA'
-        label: 'SOL / USDC'
-        description: 'Oracle used by SolFi market 65ZH…iDUc.'
-        value: '2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou'
-        metadata:
-          market: '65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc'
-          pair: 'SOL/USDC'
-          oracle: '2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou'
-          base_vault: 'CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A'
-          quote_vault: 'GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic'
-          base_mint: 'So11111111111111111111111111111111111111112'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'usdt-usdc-FkEB6u'
-        label: 'USDT / USDC'
-        description: 'Oracle used by SolFi market FkEB…wR32.'
-        value: 'CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G'
-        metadata:
-          market: 'FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32'
-          pair: 'USDT/USDC'
-          oracle: 'CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G'
-          base_vault: '5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc'
-          quote_vault: 'ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc'
-          base_mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: '2z-usdc-8BrwYA'
-        label: '2Z / USDC'
-        description: 'Oracle used by SolFi market 8Brw…YjRC.'
-        value: '4LSXFMNRw8k3h7c95f7kPM8aphUswqcgvi8pTmfeL2T1'
-        metadata:
-          market: '8BrwYAr1K11sG8GvM8vUFAw45Mm1mLCuTd4ynhNMYjRC'
-          pair: '2Z/USDC'
-          oracle: '4LSXFMNRw8k3h7c95f7kPM8aphUswqcgvi8pTmfeL2T1'
-          base_vault: '5FZKutHWyThPkdvD7QfFzNjgKmjVifodJG4unQg5c68N'
-          quote_vault: 'FQahmDHnxR6z3akoiN1QCLddfffYn3QwrA6XbHSUdVCb'
-          base_mint: 'J6pQQ3FAcJQeWPPGppWRb4nM8jU3wLyYbRrLh7feMfvd'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: '3zle-9wbg-usdc-GxZwsA'
-        label: '3ZLe…9wBG / USDC'
-        description: 'Oracle used by SolFi market GxZw…xn6Y.'
-        value: '3rrHmsPXA5JNtvDCvs6xmt5uQ6wY7ZoUZZJTLJx4UkzW'
-        metadata:
-          market: 'GxZwsApah3Bsgg14dG7MUtnPCQbGiDqFEwyWYZvDxn6Y'
-          pair: '3ZLe…9wBG/USDC'
-          oracle: '3rrHmsPXA5JNtvDCvs6xmt5uQ6wY7ZoUZZJTLJx4UkzW'
-          base_vault: 'Fr7fwhPHNngHRF6MyAi7cUgQjjwmZ2hvsy5Vcav9RwRr'
-          quote_vault: 'F8S5jSBUBDBoVtg3uX2CU9LAC1UUKTMW9b4nSQtxTaod'
-          base_mint: '3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: '8jx8-pump-usdc-72ekvC'
-        label: '8Jx8…pump / USDC'
-        description: 'Oracle used by SolFi market 72ek…Pupi.'
-        value: 'DNTdSZXtejmGQkR4RuwgkCnrmbUwUeSs4vRKfEfhc9jZ'
-        metadata:
-          market: '72ekvC4bc94sg8BVvqNYHDugFatPbxbyYFQDaL9EPupi'
-          pair: '8Jx8…pump/USDC'
-          oracle: 'DNTdSZXtejmGQkR4RuwgkCnrmbUwUeSs4vRKfEfhc9jZ'
-          base_vault: 'F5qyjrARU5D1xS1vuJgVeKBBiN8czDZBdrcwy88machT'
-          quote_vault: 'EzcGu2rqBDkAGNsVW9qWHoqCuFB1jc8eTqNKAdVtqzw4'
-          base_mint: '8Jx8AAHj86wbQgUTjGuj6GTTL5Ps3cqxKRTvpaJApump'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'base-quote-HYKRMK'
-        label: 'Base / Quote'
-        description: 'Oracle used by SolFi market HYKR…eMr6.'
-        value: 'Z1AoAt66AH9qs8uPt1RnBrKKcT3qazf5jEBWceoKzPT'
-        metadata:
-          market: 'HYKRMKiXfs1CedDsUHNyaVmEyuw7gj3E3uY6gJgUeMr6'
-          pair: 'Base/Quote'
-          oracle: 'Z1AoAt66AH9qs8uPt1RnBrKKcT3qazf5jEBWceoKzPT'
-          base_vault: 'cDybHnLgzRj56UJiEkrqiDzd3FVfa5TdLjE8DEk61bK'
-          quote_vault: '45MKjgqonH7phoz8BdgpVCFBuctiGnuR96ad4YefJvLg'
-      - id: 'g7vq-knwg-usdc-394qso'
-        label: 'G7vQ…KNwG / USDC'
-        description: 'Oracle used by SolFi market 394q…TVpY.'
-        value: 'AwppY62pZj9WApQ4r8ezKY69nadWjmEiASwpU6WCY1Ni'
-        metadata:
-          market: '394qso4LKsjjHchKu6S8A1Nt9iEryNPyU5cFN79RTVpY'
-          pair: 'G7vQ…KNwG/USDC'
-          oracle: 'AwppY62pZj9WApQ4r8ezKY69nadWjmEiASwpU6WCY1Ni'
-          base_vault: 'HKUot2dXijWG6yQPoQnsz9ySbnkZtX67V2nHVwCJnbUF'
-          quote_vault: 'A3AqWwNjmVsuBpxjAdrya7pmhUjbXuf22kkNXY5Cw3uu'
-          base_mint: 'G7vQWurMkMMm2dU3iZpXYFTHT9Biio4F4gZCrwFpKNwG'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'hype-usdc-2e25gR'
-        label: 'HYPE / USDC'
-        description: 'Oracle used by SolFi market 2e25…u1yL.'
-        value: '9WDWUT9tx9Z2DKgiuzSsPS3dEBTRnPrzpuWrMHaRgACU'
-        metadata:
-          market: '2e25gRiddjn968aXrLt1oZw3BZ4fYD5D8mCv7uKxu1yL'
-          pair: 'HYPE/USDC'
-          oracle: '9WDWUT9tx9Z2DKgiuzSsPS3dEBTRnPrzpuWrMHaRgACU'
-          base_vault: '7DEGUxRtaphAUcdwvZTjVUM2yUM7r3EVWu16FxRZrYjP'
-          quote_vault: '7RhQGDQgSx3YrQHBjG2BVdZpm8c54o6uSW9p6ckyb8uQ'
-          base_mint: '98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'met-usdc-HH2HgS'
-        label: 'MET / USDC'
-        description: 'Oracle used by SolFi market HH2H…jUi5.'
-        value: '4G3szXUscfmzPJgzrCwZ5ecu9cQNeXjFRmimMmyPANsA'
-        metadata:
-          market: 'HH2HgSHxgFjyzUd2dv9k68D5RQbBZWtpYan1gx8kjUi5'
-          pair: 'MET/USDC'
-          oracle: '4G3szXUscfmzPJgzrCwZ5ecu9cQNeXjFRmimMmyPANsA'
-          base_vault: '3m9g6eKt1QVQQcTwrZbLSj9pMBKsDt6tHk5s4VrrQXnR'
-          quote_vault: '5K8t4kEN8uBVMxmwiiz53g14XzogH5SvDtC3BEXGefs3'
-          base_mint: 'METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'mon-usdc-2Q6S8p'
-        label: 'MON / USDC'
-        description: 'Oracle used by SolFi market 2Q6S…CanY.'
-        value: '6RwCEKk7rR1ph5XNUMUqght4eHYpFhcaURWJrXb4FE3E'
-        metadata:
-          market: '2Q6S8p9iZNzMvpTemiC56HqCJ3F3szNoyRkvqEKfCanY'
-          pair: 'MON/USDC'
-          oracle: '6RwCEKk7rR1ph5XNUMUqght4eHYpFhcaURWJrXb4FE3E'
-          base_vault: 'bKWEuahcKutLrCnhMoqAoizAsNdEuuK2AR1sUfayZUS'
-          quote_vault: 'FqDQsR72Ej99XMoiLRkeNZWHBQ2Fe6eaikEzmhjYavrZ'
-          base_mint: 'CrAr4RRJMBVwRsZtT62pEhfA9H5utymC2mVx8e7FreP2'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'pump-usdc-2kfQuY'
-        label: 'PUMP / USDC'
-        description: 'Oracle used by SolFi market 2kfQ…BWyV.'
-        value: '5VTjvi4XhRCXUSitDGJXVp5iZpU2sypNAT5EvEvaXR6j'
-        metadata:
-          market: '2kfQuYG2FVZL2RqqKEttcdadbPWP4c7b6AFQztNcBWyV'
-          pair: 'PUMP/USDC'
-          oracle: '5VTjvi4XhRCXUSitDGJXVp5iZpU2sypNAT5EvEvaXR6j'
-          base_vault: '8PbjFCfVNHH5PwP7xJj4JnGom397ybK3mLzw9164nZ4K'
-          quote_vault: 'CMghWj6TEDfGTN5CSzo9p27kPMb73fsDPM22LqTe2C9y'
-          base_mint: 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'saros-usdc-BmVBqF'
-        label: 'SAROS / USDC'
-        description: 'Oracle used by SolFi market BmVB…riGR.'
-        value: '3NMyurZzSXmrvRo2da3LBaajZC511WsnVRQUoE3SFx4D'
-        metadata:
-          market: 'BmVBqFL8LD2KiBsDE8fWXLZ2MWVgPR1qor55MCimriGR'
-          pair: 'SAROS/USDC'
-          oracle: '3NMyurZzSXmrvRo2da3LBaajZC511WsnVRQUoE3SFx4D'
-          base_vault: '4BWf2i81ESpV7pe8AmNW3zPX4NzENcMJ3b4oFqSYAgps'
-          quote_vault: 'DaddGy5VX5VoTWvEsvThDcJS859esceerXtRaovSX2pn'
-          base_mint: 'SarosY6Vscao718M4A778z4CGtvcwcGef5M9MEH1LGL'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'sol-usdc-AZEKRY'
-        label: 'SOL / USDC'
-        description: 'Oracle used by SolFi market AZEK…fDpQ.'
-        value: '2b8p8ZUcXRV3GQhc2j5pSAaQXpaa4ML6r7pCN9NoBGgi'
-        metadata:
-          market: 'AZEKRYWew6zAyoksytTeBFJRHyYdwycPMBn1P2QgfDpQ'
-          pair: 'SOL/USDC'
-          oracle: '2b8p8ZUcXRV3GQhc2j5pSAaQXpaa4ML6r7pCN9NoBGgi'
-          base_vault: 'LNgaY8wE76tVikn1fyexrxgr2D4CAKy1LLhCE3B2ZWp'
-          quote_vault: '6f2DF6HTxPwohXqXeQvYYspMYvaytfY67XeJRWfpQMsM'
-          base_mint: 'So11111111111111111111111111111111111111112'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'sol-usdc-Bnwc3w'
-        label: 'SOL / USDC'
-        description: 'Oracle used by SolFi market Bnwc…giD7.'
-        value: '2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou'
-        metadata:
-          market: 'Bnwc3wzE8PYYvgtbriRn9RpRnDH1TvJJthJVacrbgiD7'
-          pair: 'SOL/USDC'
-          oracle: '2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou'
-          base_vault: 'AWfKSoaoaN6WzLBF8z7dR5Kf7WRnS4cwHENLXrtnPeui'
-          quote_vault: 'BsfBeWT6fLeJ1FnzSaFugECnDvhi5to6zsF7BUU1Sy9w'
-          base_mint: 'So11111111111111111111111111111111111111112'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'usd1-usdc-2sp6rC'
-        label: 'USD1 / USDC'
-        description: 'Oracle used by SolFi market 2sp6…Ddw3.'
-        value: 'By9zHEbZJvYrBws27SqPXggfSAH3fjnJcdxKgdogyXUm'
-        metadata:
-          market: '2sp6rCc4VaXJ5qCbrPukpQVjZVZey42pj7QkynYNDdw3'
-          pair: 'USD1/USDC'
-          oracle: 'By9zHEbZJvYrBws27SqPXggfSAH3fjnJcdxKgdogyXUm'
-          base_vault: 'CRF6Tegjtv3k9tuvKKbXroq4UmKXh9ZP92tn17sjjsFY'
-          quote_vault: 'CT8B2qJAqy93GAU5Qor9s5xGGQEoiEwSSNRPAaDFYrgL'
-          base_mint: 'USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'useless-usdc-5Q6oe4'
-        label: 'USELESS / USDC'
-        description: 'Oracle used by SolFi market 5Q6o…PEiG.'
-        value: '6LRUvVthoRGUSfJMqewZtFRmp2fK96xoUn6AyahqxxBw'
-        metadata:
-          market: '5Q6oe47U9WxMhvnEjpi6AnZZPMBcatcWKUTfLkguPEiG'
-          pair: 'USELESS/USDC'
-          oracle: '6LRUvVthoRGUSfJMqewZtFRmp2fK96xoUn6AyahqxxBw'
-          base_vault: 'AGyNaq9rcwW7KWom4tDWFyetmK7y8Z51TUtBZHUvQhS2'
-          quote_vault: 'AGB8Ufg8kb89PQYukZte7VmFvsBandvhwpjF7VkYphoC'
-          base_mint: 'Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'wlfi-usdc-ErP5XN'
-        label: 'WLFI / USDC'
-        description: 'Oracle used by SolFi market ErP5…v7sn.'
-        value: '5PE4Z3LEzeUW6UYqGmpmswPwo7TVu3R7chXbCBSBaCZ5'
-        metadata:
-          market: 'ErP5XNqqLXN99hoa4JnHB199rcetMjMdEoJwnphwv7sn'
-          pair: 'WLFI/USDC'
-          oracle: '5PE4Z3LEzeUW6UYqGmpmswPwo7TVu3R7chXbCBSBaCZ5'
-          base_vault: '55ZkikF6FSsfR6JNgwGCmpyasCXcQhppM2w5u7E9kBRm'
-          quote_vault: 'GMnRRzsS65ovHFWdqjEALJrZtr1MQNVTz2KGNWqME1gs'
-          base_mint: 'WLFinEv6ypjkczcS83FZqFpgFZYwQXutRbxGe7oC16g'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'zec-usdc-BjBHvb'
-        label: 'ZEC / USDC'
-        description: 'Oracle used by SolFi market BjBH…6fLT.'
-        value: '7GELMFc4yK1jBMZHsoPhHYYhKTPgmpK7doFPVx62Kiy1'
-        metadata:
-          market: 'BjBHvbqgQCRmvZ6u3VzGrHn3QZ1NfmMRujoqjeaK6fLT'
-          pair: 'ZEC/USDC'
-          oracle: '7GELMFc4yK1jBMZHsoPhHYYhKTPgmpK7doFPVx62Kiy1'
-          base_vault: '4vNNXQToBfWDZPmUJNTWWiGLyYGiBLGZp1zryJ5D2dG1'
-          quote_vault: 'E5RBZvCx3gZwgCf3y4hog7xZZVCahx3sehgJcgU9RzBT'
-          base_mint: 'A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-      - id: 'zenzec-usdc-7TKsqW'
-        label: 'zenZEC / USDC'
-        description: 'Oracle used by SolFi market 7TKs…ib4E.'
-        value: '7GELMFc4yK1jBMZHsoPhHYYhKTPgmpK7doFPVx62Kiy1'
-        metadata:
-          market: '7TKsqWxU9QkPYVLdjjR1V67ky3FnYogjntUpNLexib4E'
-          pair: 'zenZEC/USDC'
-          oracle: '7GELMFc4yK1jBMZHsoPhHYYhKTPgmpK7doFPVx62Kiy1'
-          base_vault: '2y9v1dGFaciiDTkLVtWK1WZbLF1gp2GVQTgTg1MRMxGL'
-          quote_vault: '7wWw8bV7NQzt4tvM1juCFi4EtnvyUbhLzPuQ4zDFdLhR'
-          base_mint: 'JDt9rRGaieF6aN1cJkXFeUmsy7ZE4yY3CZb8tVMXVroS'
-          quote_mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
-
 templates:
   - id: solfi-price
     name: Override Price
@@ -248,7 +16,6 @@ templates:
     idl_account_name: XorPriceOracle
     address:
       type: pubkey
-      value: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
     properties:
       - path: price_exponent
         offset: 0
@@ -267,6 +34,16 @@ templates:
           Unsigned coefficient before SolFi's fixed XOR encoding. Human price is coefficient times
           10^exponent times 10^(base_decimals - quote_decimals).
     llm_context: |
+      FINDING THE ORACLE WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Discover the SolFi market with getProgramAccounts for program
+         SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF using base64 encoding. Do not rely on a fixed
+         account-size filter. Identify the pair by querying the SPL token vaults stored at market
+         bytes 120..152 and 152..184 and matching both vault mints.
+      2. Decode bytes 24..56 of the matched market as the oracle public key. Fetch it and require the
+         expected SolFi oracle layout before writing.
+      3. Put that oracle in the override as {"account":{"pubkey":"<oracle>"}} and set
+         fetchBeforeUse: true. Do not target the market account with this template.
+
       PRECONDITION - SET BOTH PRICE FIELDS. The exponent is live operator state and changed during
       validation, so changing only the coefficient can produce a different human price later.
 
@@ -302,7 +79,6 @@ templates:
     idl_account_name: XorPriceOracle
     address:
       type: pubkey
-      value: 2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou
     properties:
       - path: publication_slot
         offset: 16
@@ -321,6 +97,16 @@ templates:
         label: Valid-until offset
         description: Relative validity horizon; 200 keeps the oracle valid for 200 slots.
     llm_context: |
+      FINDING THE ORACLE WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Discover the SolFi market with getProgramAccounts for program
+         SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF using base64 encoding. Do not rely on a fixed
+         account-size filter. Identify the pair by querying the SPL token vaults stored at market
+         bytes 120..152 and 152..184 and matching both vault mints.
+      2. Decode bytes 24..56 of the matched market as the oracle public key. Fetch it and require the
+         expected SolFi oracle layout before writing.
+      3. Put that oracle in the override as {"account":{"pubkey":"<oracle>"}} and set
+         fetchBeforeUse: true. Do not target the market account with this template.
+
       This is one freshness template, covering both fields SolFi requires for a genuinely current
       oracle. Use it as a prerequisite for price and spread scenarios that span multiple slots.
 

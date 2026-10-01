@@ -1439,11 +1439,11 @@ mod tests {
             .expect("SolFi template detail");
         assert_ne!(result.is_error, Some(true));
         let solfi = json_of(&result);
-        assert_eq!(
-            solfi["address"],
-            serde_json::json!({ "pubkey": "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou" })
-        );
-        assert_eq!(solfi["constants"]["market"]["optionsCount"], 2);
+        assert_eq!(solfi["address"], serde_json::json!({ "pubkey": "" }));
+        assert_eq!(solfi["constants"], serde_json::json!({}));
+        assert!(solfi["llmContext"].as_str().is_some_and(|context| {
+            context.contains("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF")
+        }));
     }
 
     #[tokio::test]

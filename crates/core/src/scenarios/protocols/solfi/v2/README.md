@@ -37,28 +37,24 @@ The exponent is live state and changed during validation. Set exponent and coeff
 
 ## Picking a market
 
-Every template starts with a searchable market picker. The committed catalog is generated from
-every 1,728-byte market owned by the SolFi program, including markets with empty vaults. Market
-templates target the market account, price and freshness templates target its embedded oracle, and
-the vault template exposes both embedded token vaults. If a newly created market is not in the
-catalog yet, Studio also accepts its market, oracle or vault address directly as appropriate for the
-selected template.
+Studio offers a short list of useful markets and also accepts a market, oracle or vault address
+directly. Market templates target the market account, price and freshness templates target its
+embedded oracle, and the vault template targets one of its SPL-token vaults. The backend templates
+do not embed a market catalog.
 
-Two commonly useful markets are:
+Studio currently highlights four useful markets:
 
 | Choice      | Best suited for                                      |
 | ----------- | ---------------------------------------------------- |
 | WSOL / USDC | SOL price shocks, spread changes and liquidity tests |
 | USDT / USDC | Stablecoin depegs and stablecoin liquidity tests     |
+| HYPE / USDC | Altcoin price, spread and inventory stress tests     |
+| PUMP / USDC | Volatile-token price and liquidity stress tests      |
 
-The picker supplies the correct market, oracle or vault account to the template automatically.
-Users normally do not need to copy account addresses into these templates. Empty markets remain
-selectable for initialization, refusal and recovery scenarios. Their presence in the picker is not
-a promise that a swap can currently settle. Maintainers can refresh the committed catalog with:
-
-```bash
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com node generate-markets.js
-```
+The picker supplies the correct market, oracle or vault account for its featured choices. For any
+other pair, use the template's LLM guidance to discover the market from the SolFi program, verify the
+pair through both vault mints, and select the corresponding target account. Empty markets are valid
+SolFi state, but their presence on chain is not a promise that a swap can currently settle.
 
 Do not reuse an oracle or vault merely because the token pair looks similar. Use
 `fetchBeforeUse: true` so the selected account is forked before its bytes are changed.

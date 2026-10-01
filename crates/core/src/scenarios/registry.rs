@@ -1719,95 +1719,31 @@ templates: []
     }
 
     #[test]
-    fn solfi_templates_expose_valid_direct_account_choices() {
+    fn solfi_templates_require_caller_selected_accounts() {
         let registry = TemplateRegistry::new();
-        let cases = [
-            (
-                "solfi-price",
-                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
-                19,
-                &[
-                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
-                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
-                ][..],
-            ),
-            (
-                "solfi-freshness",
-                "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
-                19,
-                &[
-                    "2ny7eGyZCoeEVTkNLf5HcnJFBKkyA4p4gcrtb3b8y8ou",
-                    "CyCUgmaCYUZxbux3J2svDzxSryVFMtZNPrnMKS41nc4G",
-                ][..],
-            ),
-            (
-                "solfi-spread",
-                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
-                19,
-                &[
-                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
-                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
-                ][..],
-            ),
-            (
-                "solfi-size-impact",
-                "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
-                19,
-                &[
-                    "65ZHSArs5XxPseKQbB1B4r16vDxMWnCxHMzogDAqiDUc",
-                    "FkEB6uvyzuoaGpgs4yRtFtxC4WJxhejNFbUkj5R6wR32",
-                ][..],
-            ),
-            (
-                "solfi-vault-balance",
-                "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
-                38,
-                &[
-                    "CRo8DBwrmd97DJfAnvCv96tZPL5Mktf2NZy2ZnhDer1A",
-                    "GhFfLFSprPpfoRaWakPMmJTMJBHuz6C694jYwxy2dAic",
-                    "5bHD9xdEzJdkVuhs54mGPC9BZgUshqgMg4tqmTwhWggc",
-                    "ARWaajRJyF6PKQryJ4HLzLBfTWM2qmVQUQVtBjk6PgPc",
-                ][..],
-            ),
-        ];
-
-        let mut checked = 0;
-        for (template_id, default_address, expected_count, expected) in cases {
+        for template_id in [
+            "solfi-price",
+            "solfi-freshness",
+            "solfi-spread",
+            "solfi-size-impact",
+            "solfi-vault-balance",
+        ] {
             let template = registry.get(template_id).expect("SolFi template");
             assert_eq!(
                 template.address,
-                surfpool_types::AccountAddress::Pubkey(default_address.to_string()),
-                "{template_id} should default to the first catalog entry"
+                surfpool_types::AccountAddress::Pubkey(String::new()),
+                "{template_id} must require an explicit target account"
             );
-            let options = &template
-                .constants
-                .get("market")
-                .expect("Tessera-style market options")
-                .options;
-            assert_eq!(options.len(), expected_count, "{template_id}");
-            assert_eq!(options[0].value, default_address, "{template_id}");
-
-            for expected_address in expected {
-                let option = options
-                    .iter()
-                    .find(|option| option.value == *expected_address)
-                    .unwrap_or_else(|| panic!("{template_id} is missing {expected_address}"));
-                assert_eq!(
-                    Pubkey::from_str(&option.value).expect("valid selectable pubkey"),
-                    Pubkey::from_str(expected_address).expect("valid expected pubkey"),
-                    "{template_id}:{}",
-                    option.id
-                );
-            }
-            for option in options {
-                Pubkey::from_str(&option.value).expect("every generated choice is a valid pubkey");
-                assert!(option.metadata.contains_key("market"));
-                checked += 1;
-            }
+            assert!(
+                template.constants.is_empty(),
+                "{template_id} must not embed a backend account catalog"
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF")
+                ),
+                "{template_id} must explain how to discover its target account"
+            );
         }
-        assert_eq!(
-            checked, 114,
-            "every selectable SolFi target must be checked"
-        );
     }
 }
