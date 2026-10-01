@@ -194,7 +194,7 @@ kamino-swap-order
 | Price rejected for TWAP divergence | Move the matching entry with `kamino-scope-twap`, or raise `max_twap_divergence_bps` |
 | Your override silently did nothing | The field name does not exist in the IDL - surfpool logs a `warn!` and drops the whole override. Check the log |
 | `exceeds what a JSON number can hold exactly` | Pass large `u128`/`i128` values as decimal strings, e.g. `"1152921504606846976000"`. Plain JSON numbers are fine below 2^53 |
-| `Account with discriminator ... not found in IDL` | The account is not Anchor-based (e.g. Raydium AMM v4). It cannot be overridden through the IDL path |
+| `matches no account type declared by the owner program's IDL` | No declared type has this discriminator; a type declared without one (Raydium AMM v4) also has to fill the account exactly |
 | `Failed to resolve account address` | The `pubkey` is not valid base58 |
 | A value the program recomputes will not stay put | Pin the input it reads instead: Scope price over a Reserve's cached price, `liquidation_threshold_pct` over the Obligation's health fields |
 
