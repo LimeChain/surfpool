@@ -169,10 +169,6 @@ pub struct CreatePhoenixCollateralScenarioParams {
         description = "Exact signed collateral target in quote lots, encoded as a decimal string."
     )]
     pub target_quote_lots: String,
-    #[schemars(
-        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
-    )]
-    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -433,15 +429,24 @@ impl TokenAddressResponse {
 }
 
 impl Surfpool {
-    /// Reads through the surfnet's own RPC: local state wins, only missing
-    /// accounts fall back to its remote source.
     async fn fetch_surfnet_accounts(
         &self,
         surfnet_port: Option<u16>,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>, String> {
         let port = surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
-        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{port}"));
+        self.fetch_accounts_at(&format!("http://127.0.0.1:{port}"), pubkeys)
+            .await
+    }
+
+    /// Reads through the surfnet's own RPC: local state wins, only missing
+    /// accounts fall back to its remote source.
+    async fn fetch_accounts_at(
+        &self,
+        rpc_url: &str,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, String> {
+        let client = SurfnetRemoteClient::new(rpc_url);
         let accounts = client
             .get_multiple_accounts(pubkeys, CommitmentConfig::confirmed())
             .await
@@ -453,14 +458,36 @@ impl Surfpool {
             .collect())
     }
 
+    /// The RPC URL Studio plays scenarios on, from the same `/config` its pages read.
+    async fn studio_rpc_url(&self, studio_url: &str) -> Result<String, String> {
+        let endpoint = format!("{studio_url}/config");
+        let config = async {
+            reqwest::get(&endpoint)
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+        }
+        .await
+        .map_err(|error| format!("Failed to read Studio's config at {endpoint}: {error}"))?;
+        config
+            .get("rpc_url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("Studio's config at {endpoint} has no rpc_url"))
+    }
+
     async fn build_phoenix_collateral_scenario_from_surfnet(
         &self,
+        studio_url: &str,
         params: &CreatePhoenixCollateralScenarioParams,
     ) -> Result<Scenario, String> {
         let trader = Pubkey::from_str(params.trader.trim())
             .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
+        // Studio plays the scenario on its own surfnet, so the Trader is checked there.
+        let rpc_url = self.studio_rpc_url(studio_url).await?;
         let accounts = self
-            .fetch_surfnet_accounts(params.surfnet_port, &[trader, PHOENIX_GLOBAL_TRADER_INDEX])
+            .fetch_accounts_at(&rpc_url, &[trader, PHOENIX_GLOBAL_TRADER_INDEX])
             .await?;
         let trader_account = accounts[0]
             .as_ref()
@@ -1095,14 +1122,18 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. Only lowers collateral: a target above the trader's effective collateral is refused, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: a target above the trader's effective collateral is refused, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
     )]
     async fn create_phoenix_collateral_scenario(
         &self,
         Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
     ) -> Result<CallToolResult, McpError> {
+        let studio_url = format!(
+            "http://127.0.0.1:{}",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
         let scenario = match self
-            .build_phoenix_collateral_scenario_from_surfnet(&params)
+            .build_phoenix_collateral_scenario_from_surfnet(&studio_url, &params)
             .await
         {
             Ok(scenario) => scenario,

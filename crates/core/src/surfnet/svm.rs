@@ -3145,7 +3145,6 @@ impl SurfnetSvm {
                     &account_pubkey,
                     &account,
                     &account_values,
-                    target_slot,
                     remote_ctx,
                 )
                 .await

@@ -48,7 +48,7 @@ templates:
         description: Exact mark-price ticks, at least 1, encoded as a decimal string
     llm_context: |
       This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot
-      with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
+      with the current slot. It does not simulate an oracle, orderbook, spline, or trade.
       Pass target_ticks as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
       Resolve the market with list_phoenix_markets: a market named by its orderbook address takes

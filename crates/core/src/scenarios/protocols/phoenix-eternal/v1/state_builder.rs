@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError,
     perp_asset_map::{PerpAssetMap, PerpAssetMetadata, PriceComponent},
+    trader::TraderHeader,
 };
 use solana_account::Account;
+use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
@@ -104,17 +106,14 @@ fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) 
     )
 }
 
-fn checked_ticks(account_pubkey: &Pubkey, ticks: u64) -> SurfpoolResult<u64> {
+fn checked_ticks(ticks: u64) -> SurfpoolResult<u64> {
     // Margin is the mark times the tick size, so a zero mark would zero the margin of every
     // position in the market instead of shocking it.
     if ticks == 0 || ticks > u64::from(u32::MAX) {
-        return Err(price_patch_error(
-            account_pubkey,
-            format!(
-                "price ticks {ticks} are outside the Phoenix mark range 1..={}",
-                u32::MAX
-            ),
-        ));
+        return Err(SurfpoolError::internal(format!(
+            "price ticks {ticks} are outside the Phoenix mark range 1..={}",
+            u32::MAX
+        )));
     }
     Ok(ticks)
 }
@@ -126,7 +125,7 @@ fn patch_direct_mark(
     target_ticks: u64,
     mark_slot: u64,
 ) -> SurfpoolResult<Vec<u8>> {
-    let target_ticks = checked_ticks(account_pubkey, target_ticks)?;
+    let target_ticks = checked_ticks(target_ticks)?;
     patch_market_metadata(account_pubkey, data, symbol, |_, bytes| {
         let price_len = size_of::<PriceComponent>();
         let mut price = bytemuck::pod_read_unaligned::<PriceComponent>(&bytes[..price_len]);
@@ -149,13 +148,10 @@ fn patch_maintenance_factor(
         // Liquidatable tier.
         let backstop = metadata.risk_params().risk_factors[1];
         if factor <= backstop || factor > MAX_RISK_FACTOR_BPS {
-            return Err(price_patch_error(
-                account_pubkey,
-                format!(
-                    "{MAINTENANCE_FACTOR_FIELD} {factor} must be above {symbol}'s backstop \
-                     factor {backstop} and at most {MAX_RISK_FACTOR_BPS}"
-                ),
-            ));
+            return Err(SurfpoolError::internal(format!(
+                "{MAINTENANCE_FACTOR_FIELD} {factor} must be above {symbol}'s backstop factor \
+                 {backstop} and at most {MAX_RISK_FACTOR_BPS}"
+            )));
         }
         // The metadata layout type is private to the crate, so the field offset comes from the view.
         let offset = metadata.risk_params().risk_factors.as_ptr() as usize
@@ -181,12 +177,7 @@ fn patch_market_metadata(
     let entry = map
         .find_by_symbol(symbol)
         .map_err(decode_error)?
-        .ok_or_else(|| {
-            price_patch_error(
-                account_pubkey,
-                format!("Phoenix market {symbol} was not found"),
-            )
-        })?;
+        .ok_or_else(|| SurfpoolError::internal(format!("Phoenix market {symbol} was not found")))?;
     let metadata_bytes = entry.metadata.as_bytes();
     let metadata_offset = unique_subslice_offset(data, metadata_bytes).ok_or_else(|| {
         price_patch_error(
@@ -216,7 +207,7 @@ fn forge_phoenix_override(
     account_pubkey: &Pubkey,
     account: &Account,
     account_values: &HashMap<String, serde_json::Value>,
-    materialization_slot: u64,
+    mark_slot: u64,
 ) -> SurfpoolResult<Vec<u8>> {
     // Only the codec's inputs are read: other keys, such as PerpAssetMap fields a client copied
     // from the decoded account, cannot be written through this codec.
@@ -236,7 +227,7 @@ fn forge_phoenix_override(
             &account.data,
             symbol()?,
             parse_decimal(ticks, DIRECT_MARK_TICKS_FIELD, "an unsigned 64-bit integer")?,
-            materialization_slot,
+            mark_slot,
         ),
         (None, Some(factor)) => patch_maintenance_factor(
             account_pubkey,
@@ -257,7 +248,6 @@ pub async fn prepare_phoenix_override(
     account_pubkey: &Pubkey,
     account: &Account,
     values: &HashMap<String, serde_json::Value>,
-    materialization_slot: u64,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
@@ -265,8 +255,8 @@ pub async fn prepare_phoenix_override(
     }
     match phoenix_account_kind(&account.data) {
         Some(PhoenixAccount::PerpAssetMap) => {
-            let data =
-                forge_phoenix_override(account_pubkey, account, values, materialization_slot)?;
+            let mark_slot = svm.inner.get_sysvar::<Clock>().slot;
+            let data = forge_phoenix_override(account_pubkey, account, values, mark_slot)?;
             Ok(Some(vec![(
                 *account_pubkey,
                 Account {
@@ -325,6 +315,19 @@ async fn prepare_trader_override(
         .ok_or_else(|| SurfpoolError::internal("No IDL registered for Phoenix Eternal"))?
         .1;
     let data = svm.get_forged_account_data(trader, &account.data, idl, &values)?;
+    if !hot {
+        let forged = TraderHeader::try_read_from_account_bytes(&data).map_err(|error| {
+            SurfpoolError::invalid_account_data(
+                trader,
+                "Expected a valid Phoenix Eternal Trader account",
+                Some(error),
+            )
+        })?;
+        ensure_collateral_is_lowered(
+            header.trader_state.quote_lot_collateral.as_inner(),
+            forged.trader_state.quote_lot_collateral.as_inner(),
+        )?;
+    }
 
     let mut writes = Vec::new();
     if let (Some(mut index), Some(collateral)) = (index, values.get(COLLATERAL_FIELD)) {
@@ -443,12 +446,16 @@ fn parse_decimal<T: core::str::FromStr>(
     field: &str,
     expected: &str,
 ) -> SurfpoolResult<T> {
-    value
-        .as_str()
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| {
-            SurfpoolError::internal(format!("{field} must be {expected} encoded as a string"))
-        })
+    let parsed = match value {
+        serde_json::Value::String(text) => text.parse().ok(),
+        serde_json::Value::Number(number) if number.is_u64() => number.to_string().parse().ok(),
+        _ => None,
+    };
+    parsed.ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "{field} must be {expected}, as a decimal string or a whole number"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -588,6 +595,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn direct_mark_is_stamped_with_the_clock_slot() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.inner
+            .set_account(PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
+            .unwrap();
+        let mut clock = svm.inner.get_sysvar::<Clock>();
+        clock.slot = 1_000;
+        svm.inner.set_sysvar(&clock);
+        let template = TemplateRegistry::new()
+            .get("phoenix-direct-mark-risk-shock")
+            .expect("template")
+            .clone();
+        let mut scenario = Scenario::new("mark".to_string(), "mark".to_string());
+        scenario.add_override(
+            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
+            ])),
+        );
+        // Registered for an earlier slot, which surfnet_registerScenario allows, and played at once.
+        svm.register_scenario(scenario, Some(900)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 900)
+            .await
+            .unwrap();
+
+        let account = svm
+            .inner
+            .get_account(&PHOENIX_PERP_ASSET_MAP)
+            .unwrap()
+            .unwrap();
+        let price = PerpAssetMap::try_from_account_bytes(&account.data)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap()
+            .metadata
+            .oracle_price()
+            .mark_price
+            .price;
+        assert_eq!(
+            (price.ticks.as_inner(), price.slot),
+            (1, 1_000),
+            "the mark must be fresh at the slot the program reads it, not the scheduled one"
+        );
+    }
+
     #[test]
     fn maintenance_factor_patches_only_the_selected_market_factor() {
         let account = perp_asset_map_account();
@@ -692,6 +747,12 @@ mod tests {
         );
 
         for template in market_templates {
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(PHOENIX_PERP_ASSET_MAP.to_string()),
+                "{}",
+                template.id
+            );
             let values = template
                 .properties
                 .iter()
@@ -758,6 +819,34 @@ mod tests {
                 forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err(),
                 "{values:?}"
             );
+        }
+    }
+
+    #[test]
+    fn market_inputs_take_whole_json_numbers_as_well_as_strings() {
+        let account = perp_asset_map_account();
+        let forge = |field: &str, value: serde_json::Value| {
+            let values = HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (field.to_string(), value),
+            ]);
+            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123)
+        };
+        for (field, text, number) in [
+            (DIRECT_MARK_TICKS_FIELD, "1", 1),
+            (MAINTENANCE_FACTOR_FIELD, "10000", 10_000),
+        ] {
+            assert_eq!(
+                forge(field, serde_json::json!(number)).unwrap(),
+                forge(field, serde_json::json!(text)).unwrap(),
+                "{field}"
+            );
+            for rejected in [serde_json::json!(-1), serde_json::json!(1.5)] {
+                assert!(
+                    forge(field, rejected.clone()).is_err(),
+                    "{field}: {rejected}"
+                );
+            }
         }
     }
 }

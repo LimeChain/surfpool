@@ -462,6 +462,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn materialization_refuses_cold_trader_writes_that_raise_collateral() {
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let matching = trader_account(FIRST_KEY, 9_999, false);
+        // The whole TraderState is written too, so the collateral it ends with is checked.
+        for (case, collateral, patched) in [
+            ("raise through traderState", 20_000_i64, false),
+            ("lower through traderState", 1, true),
+        ] {
+            let mut scenario =
+                build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+            scenario.overrides[0].values = HashMap::from([(
+                "traderState".to_string(),
+                serde_json::json!({
+                    "quoteLotCollateral": collateral,
+                    "flags": 0,
+                    "padding": [0],
+                    "globalPositionSequenceNumber": 0,
+                    "makerFeeOverrideMultiplier": 0,
+                    "takerFeeOverrideMultiplier": 0,
+                }),
+            )]);
+            let mut on_chain = matching.clone();
+            on_chain.lamports = 1;
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.set_account(&trader, on_chain.clone()).unwrap();
+            svm.register_scenario(scenario, Some(100)).unwrap();
+            svm.materialize_overrides_for_slot(&None, 100)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
+
+            let mut expected = on_chain;
+            if patched {
+                expected.data[88..96].copy_from_slice(&collateral.to_le_bytes());
+            }
+            assert_eq!(
+                svm.get_account(&trader).unwrap().unwrap(),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn materialization_indexes_fetched_global_trader_index_by_owner() {
         use base64::{Engine, prelude::BASE64_STANDARD};

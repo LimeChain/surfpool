@@ -1184,16 +1184,8 @@ mod tests {
         let mut errors = Vec::new();
 
         for template in registry.all() {
-            // Phoenix market templates feed the typed PerpAssetMap codec, so their inputs
-            // (market symbol, ticks, risk factor) are codec arguments, not IDL fields.
-            if template.protocol == "Phoenix Eternal" && template.account_type == "PerpAssetMap" {
-                continue;
-            }
             for property in &template.properties {
-                // constant_ref and dynamic_ref properties are UI dropdowns (e.g. token or
-                // market pickers), not account fields, so they are not expected to resolve
-                // against the IDL.
-                if property.is_constant_ref() || property.is_dynamic_ref() {
+                if property.is_constant_ref() || property.value_type.is_some() {
                     continue;
                 }
                 if let Err(e) = surfpool_types::resolve_idl_type(

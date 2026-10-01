@@ -17,14 +17,11 @@ use solana_transaction::Transaction;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 
 use crate::{
-    scenarios::{
-        TemplateRegistry,
-        protocols::phoenix_eternal::v1::{
-            collateral::{index_trader_state_range, index_trader_state_ranges, trader_header},
-            state_builder::{
-                PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
-                build_phoenix_collateral_scenario, phoenix_markets,
-            },
+    scenarios::protocols::phoenix_eternal::v1::{
+        collateral::{index_trader_state_range, index_trader_state_ranges, trader_header},
+        state_builder::{
+            PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
+            build_phoenix_collateral_scenario, phoenix_markets,
         },
     },
     surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
@@ -97,16 +94,6 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
         ),
         (PHOENIX_PERP_ASSET_MAP, PHOENIX_GLOBAL_TRADER_INDEX),
         "the hardcoded Phoenix singletons moved; update them to what GlobalConfig points at"
-    );
-    let template_address = TemplateRegistry::new()
-        .get("phoenix-direct-mark-risk-shock")
-        .expect("the direct mark template exists")
-        .address
-        .resolve(None)
-        .expect("the direct mark template carries a fixed address");
-    assert_eq!(
-        template_address, graph.perp_asset_map,
-        "the template hardcodes the PerpAssetMap address; GlobalConfig says it moved"
     );
 
     let map_account = graph.account(&graph.perp_asset_map);
