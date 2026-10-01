@@ -11,7 +11,9 @@ tags:
 templates:
   - id: phoenix-trader-collateral-stress
     name: Phoenix Trader Collateral Stress
-    description: Set exact signed quote-lot collateral on a Phoenix Trader and its effective GlobalTraderIndex entry when hot.
+    description: >-
+      Set exact signed quote-lot collateral on a Phoenix Trader and its effective GlobalTraderIndex
+      entry when hot.
     idl_account_name: Trader
     properties:
       - path: traderState.quoteLotCollateral
@@ -20,14 +22,16 @@ templates:
     llm_context: |
       This prepares collateral stress state. It does not execute liquidation.
       Only lower collateral; raising it needs a real deposit into the global vault.
-      For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at slot 1 in one create_scenario call.
+      For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
+      slot 1 in one create_scenario call.
       Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
     address:
       type: pubkey
 
   - id: phoenix-direct-mark-risk-shock
     name: Phoenix Direct Mark Risk Shock
-    description: Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
+    description: >-
+      Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -39,12 +43,15 @@ templates:
       - path: target_ticks
         value_type: string
         label: Target Mark Ticks
-        description: Exact unsigned mark-price ticks encoded as a decimal string
+        description: Exact mark-price ticks, at least 1, encoded as a decimal string
     llm_context: |
-      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
-      Pass target_ticks as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
-      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes the symbol listed with
-      that address, and a relative move (such as a 40% drop) is computed from its markTicks there.
+      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot
+      with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
+      Pass target_ticks as a decimal string.
+      The account is the singleton PerpAssetMap, so this template carries its address.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
+      the symbol listed with that address, and a relative move (such as a 40% drop) is computed
+      from its markTicks there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
     address:
@@ -53,7 +60,8 @@ templates:
 
   - id: phoenix-maintenance-margin-stress
     name: Phoenix Maintenance Margin Stress
-    description: Set the maintenance margin risk factor for one market in the Phoenix Eternal PerpAssetMap.
+    description: >-
+      Set the maintenance margin risk factor for one market in the Phoenix Eternal PerpAssetMap.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -65,13 +73,20 @@ templates:
       - path: maintenance_risk_factor_bps
         value_type: string
         label: Maintenance Risk Factor (bps)
-        description: Maintenance margin risk factor in basis points, encoded as a decimal string
+        description: >-
+          Maintenance margin risk factor in basis points, above the market's backstop factor and at
+          most 10000, encoded as a decimal string
     llm_context: |
-      This changes how much collateral positions in one market need to stay healthy. It does not change prices, collateral or positions, and does not execute liquidation.
-      The maintenance margin scales linearly with the factor. Live markets use 5000, so 10000 doubles and 15000 triples the requirement.
-      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes the symbol listed with
-      that address, and its current factor is maintenanceRiskFactorBps there.
-      Pass the factor as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
+      This changes how much collateral positions in one market need to stay healthy.
+      It does not change prices, collateral or positions, and does not execute liquidation.
+      The maintenance margin scales linearly with the factor.
+      Live markets use 5000 with a backstop factor of 2000, so 10000 doubles the requirement, the
+      most it can be raised: Phoenix reads a factor above 10000 as 10000.
+      A factor at or below the backstop one is refused, since it would leave no Liquidatable tier.
+      Pass the factor as a decimal string.
+      The account is the singleton PerpAssetMap, so this template carries its address.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
+      the symbol listed with that address, and its current factor is maintenanceRiskFactorBps there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
     address:

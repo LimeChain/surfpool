@@ -39,6 +39,7 @@ const COLLATERAL_FIELD: &str = "traderState.quoteLotCollateral";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
 const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
+const MAX_RISK_FACTOR_BPS: u16 = 10_000;
 const PREPARATION_SLOT: u64 = 0;
 
 /// What a caller can name a market by, and the live values a relative change starts from.
@@ -102,10 +103,15 @@ fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) 
 }
 
 fn checked_ticks(account_pubkey: &Pubkey, ticks: u64) -> SurfpoolResult<u64> {
-    if ticks > u64::from(u32::MAX) {
+    // Margin is the mark times the tick size, so a zero mark would zero the margin of every
+    // position in the market instead of shocking it.
+    if ticks == 0 || ticks > u64::from(u32::MAX) {
         return Err(price_patch_error(
             account_pubkey,
-            format!("price ticks {ticks} exceed the Phoenix u32 tick range"),
+            format!(
+                "price ticks {ticks} are outside the Phoenix mark range 1..={}",
+                u32::MAX
+            ),
         ));
     }
     Ok(ticks)
@@ -125,6 +131,7 @@ fn patch_direct_mark(
         price.mark_price.price.slot = mark_slot;
         price.mark_price.price.ticks = bytemuck::cast(target_ticks);
         bytes[..price_len].copy_from_slice(bytemuck::bytes_of(&price));
+        Ok(())
     })
 }
 
@@ -135,10 +142,24 @@ fn patch_maintenance_factor(
     factor: u16,
 ) -> SurfpoolResult<Vec<u8>> {
     patch_market_metadata(account_pubkey, data, symbol, |metadata, bytes| {
+        // risk_factors is [maintenance, backstop, high_risk], and the risk tier is checked from
+        // the backstop up, so a maintenance factor at or below the backstop one leaves no
+        // Liquidatable tier.
+        let backstop = metadata.risk_params().risk_factors[1];
+        if factor <= backstop || factor > MAX_RISK_FACTOR_BPS {
+            return Err(price_patch_error(
+                account_pubkey,
+                format!(
+                    "{MAINTENANCE_FACTOR_FIELD} {factor} must be above {symbol}'s backstop \
+                     factor {backstop} and at most {MAX_RISK_FACTOR_BPS}"
+                ),
+            ));
+        }
         // The metadata layout type is private to the crate, so the field offset comes from the view.
         let offset = metadata.risk_params().risk_factors.as_ptr() as usize
             - metadata.as_bytes().as_ptr() as usize;
         bytes[offset..offset + 2].copy_from_slice(&factor.to_le_bytes());
+        Ok(())
     })
 }
 
@@ -146,7 +167,7 @@ fn patch_market_metadata(
     account_pubkey: &Pubkey,
     data: &[u8],
     symbol: &str,
-    update: impl FnOnce(&PerpAssetMetadata, &mut [u8]),
+    update: impl FnOnce(&PerpAssetMetadata, &mut [u8]) -> SurfpoolResult<()>,
 ) -> SurfpoolResult<Vec<u8>> {
     let decode_error = |error: PhoenixAccountDecodeError| {
         price_patch_error(
@@ -175,7 +196,7 @@ fn patch_market_metadata(
     update(
         &entry.metadata,
         &mut patched[metadata_offset..metadata_offset + metadata_bytes.len()],
-    );
+    )?;
     Ok(patched)
 }
 
@@ -219,12 +240,7 @@ fn forge_phoenix_override(
             account_pubkey,
             &account.data,
             symbol()?,
-            parse_decimal::<core::num::NonZeroU16>(
-                factor,
-                MAINTENANCE_FACTOR_FIELD,
-                "basis points from 1 to 65535",
-            )?
-            .get(),
+            parse_decimal(factor, MAINTENANCE_FACTOR_FIELD, "basis points")?,
         ),
         _ => Err(SurfpoolError::internal(
             "Phoenix map overrides take symbol plus exactly one of target_ticks or \
@@ -554,6 +570,20 @@ mod tests {
         let price = after.metadata.oracle_price().mark_price.price;
         assert_eq!((price.ticks.as_inner(), price.slot), (1, 123));
         assert_eq!(patched.len(), account.data.len());
+
+        for rejected in ["0", "4294967296"] {
+            let values = HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (
+                    DIRECT_MARK_TICKS_FIELD.to_string(),
+                    serde_json::json!(rejected),
+                ),
+            ]);
+            assert!(
+                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err(),
+                "{rejected}"
+            );
+        }
     }
 
     #[test]
@@ -588,15 +618,25 @@ mod tests {
             .count();
         assert!(changed <= 2, "only the factor's two bytes may change");
 
-        for rejected in ["0", "65536", "1.5"] {
+        let maintenance = |factor: &str| {
             let values = HashMap::from([
                 (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
                 (
                     MAINTENANCE_FACTOR_FIELD.to_string(),
-                    serde_json::json!(rejected),
+                    serde_json::json!(factor),
                 ),
             ]);
-            assert!(forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err());
+            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123)
+        };
+        // Just above the backstop factor still leaves a Liquidatable tier.
+        let lowest = before[1] + 1;
+        assert_eq!(
+            factors(&maintenance(&lowest.to_string()).unwrap()),
+            [lowest, before[1], before[2]]
+        );
+        // At or below the backstop factor, above 100%, or not basis points.
+        for rejected in [&before[1].to_string(), "0", "10001", "65536", "1.5"] {
+            assert!(maintenance(rejected).is_err(), "{rejected}");
         }
     }
 
@@ -607,7 +647,7 @@ mod tests {
         let mut account = perp_asset_map_account();
         for (field, value) in [
             (DIRECT_MARK_TICKS_FIELD, "777"),
-            (MAINTENANCE_FACTOR_FIELD, "12345"),
+            (MAINTENANCE_FACTOR_FIELD, "9000"),
         ] {
             let values = HashMap::from([
                 (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
@@ -623,7 +663,7 @@ mod tests {
                 symbol: "SOL".to_string(),
                 orderbook: Pubkey::from_str_const("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2"),
                 mark_ticks: 777,
-                maintenance_risk_factor_bps: 12_345,
+                maintenance_risk_factor_bps: 9_000,
             }]
         );
 
@@ -653,10 +693,10 @@ mod tests {
                 .properties
                 .iter()
                 .map(|property| {
-                    let value = if property.path == MARKET_SYMBOL_FIELD {
-                        "SOL"
-                    } else {
-                        "1"
+                    let value = match property.path.as_str() {
+                        MARKET_SYMBOL_FIELD => "SOL",
+                        MAINTENANCE_FACTOR_FIELD => "10000",
+                        _ => "1",
                     };
                     (property.path.clone(), serde_json::json!(value))
                 })

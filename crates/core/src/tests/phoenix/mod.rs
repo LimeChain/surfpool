@@ -377,7 +377,10 @@ async fn maintenance_margin_stress_raises_the_live_requirement() {
     let mut doubled = Vec::new();
     for entry in map.iter() {
         let entry = entry.expect("live map entry decodes");
-        let factor = entry.metadata.risk_params().risk_factors[0].saturating_mul(2);
+        // Doubled up to 100%, the most a factor can be.
+        let factor = entry.metadata.risk_params().risk_factors[0]
+            .saturating_mul(2)
+            .min(10_000);
         scenario.add_override(phoenix_market_override(
             "phoenix-maintenance-margin-stress",
             graph.perp_asset_map,
