@@ -41,10 +41,19 @@ const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
 const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
 const PREPARATION_SLOT: u64 = 0;
 
-pub fn phoenix_market_symbols(
+/// What a caller can name a market by, and the live values a relative change starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoenixMarket {
+    pub symbol: String,
+    pub orderbook: Pubkey,
+    pub mark_ticks: u64,
+    pub maintenance_risk_factor_bps: u16,
+}
+
+pub fn phoenix_markets(
     perp_asset_map: Pubkey,
     account: &Account,
-) -> SurfpoolResult<Vec<String>> {
+) -> SurfpoolResult<Vec<PhoenixMarket>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Err(SurfpoolError::invalid_account_owner(
             perp_asset_map,
@@ -59,14 +68,29 @@ pub fn phoenix_market_symbols(
         )
     };
     let map = PerpAssetMap::try_from_account_bytes(&account.data).map_err(invalid)?;
-    let mut symbols = map
+    let mut markets = map
         .iter()
-        .map(|entry| entry.map(|entry| entry.symbol.as_str().to_string()))
+        .map(|entry| {
+            entry.map(|entry| PhoenixMarket {
+                symbol: entry.symbol.as_str().to_string(),
+                orderbook: Pubkey::new_from_array(
+                    entry.metadata.static_market_params().market_account,
+                ),
+                mark_ticks: entry
+                    .metadata
+                    .oracle_price()
+                    .mark_price
+                    .price
+                    .ticks
+                    .as_inner(),
+                maintenance_risk_factor_bps: entry.metadata.risk_params().risk_factors[0],
+            })
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(invalid)?;
-    symbols.sort_unstable();
+    markets.sort_unstable_by(|left, right| left.symbol.cmp(&right.symbol));
 
-    Ok(symbols)
+    Ok(markets)
 }
 
 fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) -> SurfpoolError {
@@ -578,6 +602,38 @@ mod tests {
 
     // These templates' fields are codec inputs, not IDL paths, so the registry's IDL check
     // cannot cover them; this ties the YAML field names to what the codec accepts.
+    #[test]
+    fn market_list_reports_what_the_market_writers_wrote() {
+        let mut account = perp_asset_map_account();
+        for (field, value) in [
+            (DIRECT_MARK_TICKS_FIELD, "777"),
+            (MAINTENANCE_FACTOR_FIELD, "12345"),
+        ] {
+            let values = HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (field.to_string(), serde_json::json!(value)),
+            ]);
+            account.data =
+                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
+        }
+
+        assert_eq!(
+            phoenix_markets(PHOENIX_PERP_ASSET_MAP, &account).unwrap(),
+            vec![PhoenixMarket {
+                symbol: "SOL".to_string(),
+                orderbook: Pubkey::from_str_const("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2"),
+                mark_ticks: 777,
+                maintenance_risk_factor_bps: 12_345,
+            }]
+        );
+
+        let foreign = Account {
+            owner: Pubkey::new_unique(),
+            ..perp_asset_map_account()
+        };
+        assert!(phoenix_markets(PHOENIX_PERP_ASSET_MAP, &foreign).is_err());
+    }
+
     #[test]
     fn the_codec_accepts_every_market_template_field_set() {
         let registry = TemplateRegistry::new();

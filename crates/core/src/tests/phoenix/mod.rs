@@ -23,7 +23,7 @@ use crate::{
             collateral::{index_trader_state_range, index_trader_state_ranges, trader_header},
             state_builder::{
                 PHOENIX_ETERNAL_PROGRAM_ID, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
-                build_phoenix_collateral_scenario, phoenix_market_symbols,
+                build_phoenix_collateral_scenario, phoenix_markets,
             },
         },
     },
@@ -120,12 +120,17 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
 
     let map_account = graph.account(&graph.perp_asset_map);
     assert_eq!(map_account.owner, PHOENIX_ETERNAL_PROGRAM_ID);
-    let symbols = phoenix_market_symbols(graph.perp_asset_map, map_account)
+    let markets = phoenix_markets(graph.perp_asset_map, map_account)
         .expect("live PerpAssetMap should decode");
     let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
         .expect("live PerpAssetMap should decode through phoenix-rise-accounts");
-    for (symbol, _, spline) in &graph.markets {
-        assert!(symbols.contains(symbol), "{symbol} is listed");
+    for (symbol, orderbook, spline) in &graph.markets {
+        assert!(
+            markets
+                .iter()
+                .any(|market| &market.symbol == symbol && market.orderbook == *orderbook),
+            "{symbol} is listed with the orderbook the BBO view reads"
+        );
         let entry = map
             .find_by_symbol(symbol)
             .expect("symbol lookup should decode")

@@ -24,7 +24,7 @@ use surfpool_core::{
                 collateral::trader_header,
                 state_builder::{
                     PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
-                    build_phoenix_collateral_scenario, phoenix_market_symbols,
+                    build_phoenix_collateral_scenario, phoenix_markets,
                 },
             },
             pump::v1::graduation_builder::{
@@ -1123,17 +1123,28 @@ impl Surfpool {
         let map_account = maps[0].as_ref().ok_or_else(|| {
             format!("Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet")
         })?;
-        let symbols = phoenix_market_symbols(perp_asset_map, map_account)
-            .map_err(|error| error.to_string())?;
+        let markets =
+            phoenix_markets(perp_asset_map, map_account).map_err(|error| error.to_string())?;
         Ok(serde_json::json!({
             "perpAssetMap": perp_asset_map.to_string(),
-            "count": symbols.len(),
-            "symbols": symbols,
+            "count": markets.len(),
+            "symbols": markets.iter().map(|market| &market.symbol).collect::<Vec<_>>(),
+            "markets": markets
+                .iter()
+                .map(|market| {
+                    serde_json::json!({
+                        "symbol": market.symbol,
+                        "orderbook": market.orderbook.to_string(),
+                        "markTicks": market.mark_ticks,
+                        "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
+                    })
+                })
+                .collect::<Vec<_>>(),
         }))
     }
 
     #[tool(
-        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Use it to discover valid market symbols before preparing a Phoenix scenario."
+        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Each market comes with its symbol, its orderbook account address, its current mark price in ticks (markTicks) and its maintenance risk factor (maintenanceRiskFactorBps). Use it to resolve a market given by symbol or by orderbook address to the symbol the Phoenix templates take, and compute relative changes (such as a 40% mark drop) from markTicks. Never read or decode the PerpAssetMap account yourself: it is 1.6 MB."
     )]
     async fn list_phoenix_markets(
         &self,

@@ -43,6 +43,8 @@ templates:
     llm_context: |
       This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot with the materialization slot. It does not simulate an oracle, orderbook, spline, or trade.
       Pass target_ticks as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes the symbol listed with
+      that address, and a relative move (such as a 40% drop) is computed from its markTicks there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
     address:
@@ -67,6 +69,8 @@ templates:
     llm_context: |
       This changes how much collateral positions in one market need to stay healthy. It does not change prices, collateral or positions, and does not execute liquidation.
       The maintenance margin scales linearly with the factor. Live markets use 5000, so 10000 doubles and 15000 triples the requirement.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes the symbol listed with
+      that address, and its current factor is maintenanceRiskFactorBps there.
       Pass the factor as a decimal string. The account is the singleton PerpAssetMap, so this template carries its address.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
