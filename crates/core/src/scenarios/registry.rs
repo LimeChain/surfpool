@@ -621,6 +621,19 @@ mod tests {
         assert!(registry.contains("bisonfi-depth"));
         assert!(registry.contains("bisonfi-spread"));
         assert!(registry.contains("bisonfi-freshness"));
+
+        for template_id in [
+            "bisonfi-fair-value",
+            "bisonfi-depth",
+            "bisonfi-spread",
+            "bisonfi-freshness",
+        ] {
+            assert_eq!(
+                registry.get(template_id).expect("BisonFi template").address,
+                AccountAddress::Pubkey(String::new()),
+                "BisonFi account addresses are supplied by the caller"
+            );
+        }
     }
 
     #[test]

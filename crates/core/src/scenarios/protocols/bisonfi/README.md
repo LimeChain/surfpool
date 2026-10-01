@@ -33,11 +33,11 @@ actions also repeat this requirement in their visible descriptions.
 
 ## Picking a market
 
-The templates default to the live WSOL/USDC market `8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo`.
-Other markets are found by reading `base_mint` and `quote_mint` on the accounts the program owns.
+The templates intentionally have no default account. Choose one of Studio's active-market shortcuts
+or enter a pool address directly. API callers must provide the pool account in the override.
 
-Only version-3 pool accounts are supported. Studio offers the supported accounts. Direct API callers
-are responsible for supplying an account that uses this layout.
+Only version-3 pool accounts are supported. Direct API callers are responsible for supplying an
+account that uses this layout.
 
 # Recipes
 
