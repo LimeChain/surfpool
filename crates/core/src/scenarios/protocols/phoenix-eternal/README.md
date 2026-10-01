@@ -42,9 +42,9 @@ The collateral builder and live market catalog are available through MCP:
 | `create_phoenix_collateral_scenario` | `trader`, `targetQuoteLots` |
 | `list_phoenix_markets` | None; optional `surfnetPort` |
 
-`list_phoenix_markets` returns every listed market with its symbol, orderbook address, current `markTicks` and
-`maintenanceRiskFactorBps`, so a market given by orderbook address resolves to its symbol, and relative changes start
-from live values. The collateral tool returns a Studio editor URL. The backend reads the live Trader account and refuses a target
+`list_phoenix_markets` returns every listed market with its symbol, orderbook address, current `markTicks`,
+`maintenanceRiskFactorBps` and `backstopRiskFactorBps`, so a market given by orderbook address resolves to its symbol,
+relative changes start from live values, and a maintenance factor can be kept above the backstop one. The collateral tool returns a Studio editor URL. The backend reads the live Trader account and refuses a target
 above the trader’s effective collateral.
 
 ## Troubleshooting

@@ -49,6 +49,7 @@ pub struct PhoenixMarket {
     pub orderbook: Pubkey,
     pub mark_ticks: u64,
     pub maintenance_risk_factor_bps: u16,
+    pub backstop_risk_factor_bps: u16,
 }
 
 pub fn phoenix_markets(
@@ -85,6 +86,7 @@ pub fn phoenix_markets(
                     .ticks
                     .as_inner(),
                 maintenance_risk_factor_bps: entry.metadata.risk_params().risk_factors[0],
+                backstop_risk_factor_bps: entry.metadata.risk_params().risk_factors[1],
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -664,6 +666,7 @@ mod tests {
                 orderbook: Pubkey::from_str_const("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2"),
                 mark_ticks: 777,
                 maintenance_risk_factor_bps: 9_000,
+                backstop_risk_factor_bps: 2_000,
             }]
         );
 

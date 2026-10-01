@@ -1137,6 +1137,7 @@ impl Surfpool {
                         "orderbook": market.orderbook.to_string(),
                         "markTicks": market.mark_ticks,
                         "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
+                        "backstopRiskFactorBps": market.backstop_risk_factor_bps,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1144,7 +1145,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Each market comes with its symbol, its orderbook account address, its current mark price in ticks (markTicks) and its maintenance risk factor (maintenanceRiskFactorBps). Use it to resolve a market given by symbol or by orderbook address to the symbol the Phoenix templates take, and compute relative changes (such as a 40% mark drop) from markTicks. Never read or decode the PerpAssetMap account yourself: it is 1.6 MB."
+        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Each market comes with its symbol, its orderbook account address, its current mark price in ticks (markTicks), its maintenance risk factor (maintenanceRiskFactorBps) and the backstop risk factor a maintenance factor must stay above (backstopRiskFactorBps). Use it to resolve a market given by symbol or by orderbook address to the symbol the Phoenix templates take, and compute relative changes (such as a 40% mark drop) from markTicks. Never read or decode the PerpAssetMap account yourself: it is 1.6 MB."
     )]
     async fn list_phoenix_markets(
         &self,

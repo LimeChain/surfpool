@@ -80,13 +80,15 @@ templates:
       This changes how much collateral positions in one market need to stay healthy.
       It does not change prices, collateral or positions, and does not execute liquidation.
       The maintenance margin scales linearly with the factor.
-      Live markets use 5000 with a backstop factor of 2000, so 10000 doubles the requirement, the
-      most it can be raised: Phoenix reads a factor above 10000 as 10000.
-      A factor at or below the backstop one is refused, since it would leave no Liquidatable tier.
+      Live markets use 5000, so 10000 doubles the requirement, the most it can be raised: Phoenix
+      reads a factor above 10000 as 10000.
+      A factor at or below the market's backstop factor is refused, since it would leave no
+      Liquidatable tier.
       Pass the factor as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
       Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
-      the symbol listed with that address, and its current factor is maintenanceRiskFactorBps there.
+      the symbol listed with that address, and its current and backstop factors are
+      maintenanceRiskFactorBps and backstopRiskFactorBps there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
     address:
