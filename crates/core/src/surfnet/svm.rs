@@ -63,7 +63,7 @@ use spl_token_2022_interface::extension::{
 use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
-    OverrideInstance, OverrideTemplate, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
+    OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
@@ -92,7 +92,7 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, account_data_values, template_registry},
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
@@ -286,34 +286,6 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
             "Expected a number or decimal string for {target}, found {other}"
         ))),
     }
-}
-
-/// The bundled template registry, parsed once and reused.
-fn template_registry() -> &'static crate::scenarios::TemplateRegistry {
-    static REGISTRY: std::sync::OnceLock<crate::scenarios::TemplateRegistry> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(crate::scenarios::TemplateRegistry::new)
-}
-
-/// Values that represent account fields rather than address/catalog selectors.
-fn account_data_values(
-    instance: &OverrideInstance,
-    template: Option<&OverrideTemplate>,
-) -> (HashMap<String, serde_json::Value>, usize, usize) {
-    let pda_refs = instance.account.get_pda_seed_references();
-    let constant_refs: HashSet<&str> = template
-        .into_iter()
-        .flat_map(|template| template.properties.iter())
-        .filter(|property| property.is_constant_ref())
-        .map(|property| property.path.as_str())
-        .collect();
-    let values = instance
-        .values
-        .iter()
-        .filter(|(key, _)| !pda_refs.contains(key) && !constant_refs.contains(key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    (values, pda_refs.len(), constant_refs.len())
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
@@ -4650,31 +4622,6 @@ mod tests {
 
     use super::*;
     use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
-
-    #[test]
-    fn account_data_values_exclude_constant_ref_selectors() {
-        let registry = TemplateRegistry::new();
-        let template = registry
-            .get("raydium-amm-custom")
-            .expect("template with a non-PDA constant_ref");
-        let instance = OverrideInstance::new(
-            template.id.clone(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(Pubkey::default().to_string()),
-        )
-        .with_values(HashMap::from([
-            ("market".to_string(), serde_json::json!("selected-market")),
-            ("status".to_string(), serde_json::json!(1)),
-        ]));
-
-        let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
-        assert_eq!(pda_refs, 0);
-        assert_eq!(constant_refs, 1);
-        assert_eq!(
-            values,
-            HashMap::from([("status".to_string(), serde_json::json!(1))])
-        );
-    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {

@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::OnceLock,
+};
 
-use surfpool_types::{OverrideTemplate, YamlOverrideTemplateCollection};
+use surfpool_types::{OverrideInstance, OverrideTemplate, YamlOverrideTemplateCollection};
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
@@ -65,6 +68,34 @@ pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
 pub struct TemplateRegistry {
     /// Map of template ID to template
     pub templates: BTreeMap<String, OverrideTemplate>,
+}
+
+/// The bundled template registry, parsed once and reused by scenario execution.
+pub(crate) fn template_registry() -> &'static TemplateRegistry {
+    static REGISTRY: OnceLock<TemplateRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(TemplateRegistry::new)
+}
+
+/// Returns only values that represent writable account fields, excluding address and catalog
+/// selectors used to resolve the target account.
+pub(crate) fn account_data_values(
+    instance: &OverrideInstance,
+    template: Option<&OverrideTemplate>,
+) -> (HashMap<String, serde_json::Value>, usize, usize) {
+    let pda_refs = instance.account.get_pda_seed_references();
+    let constant_refs: HashSet<&str> = template
+        .into_iter()
+        .flat_map(|template| template.properties.iter())
+        .filter(|property| property.is_constant_ref())
+        .map(|property| property.path.as_str())
+        .collect();
+    let values = instance
+        .values
+        .iter()
+        .filter(|(key, _)| !pda_refs.contains(key) && !constant_refs.contains(key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (values, pda_refs.len(), constant_refs.len())
 }
 
 impl TemplateRegistry {
@@ -311,6 +342,31 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn account_data_values_exclude_constant_ref_selectors() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("raydium-amm-custom")
+            .expect("template with a non-PDA constant_ref");
+        let instance = OverrideInstance::new(
+            template.id.clone(),
+            0,
+            AccountAddress::Pubkey(Pubkey::default().to_string()),
+        )
+        .with_values(HashMap::from([
+            ("market".to_string(), serde_json::json!("selected-market")),
+            ("status".to_string(), serde_json::json!(1)),
+        ]));
+
+        let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
+        assert_eq!(pda_refs, 0);
+        assert_eq!(constant_refs, 1);
+        assert_eq!(
+            values,
+            HashMap::from([("status".to_string(), serde_json::json!(1))])
+        );
+    }
 
     #[test]
     fn raydium_config_index_options_derive_their_documented_address() {
