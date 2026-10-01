@@ -24,6 +24,8 @@ templates:
       Only lower collateral; raising it needs a real deposit into the global vault.
       For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
       slot 1 in one create_scenario call.
+      Set fetchBeforeUse: true so the live Trader is forked first; an override on a Trader that is
+      not on the fork yet is skipped.
       Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
     address:
       type: pubkey
