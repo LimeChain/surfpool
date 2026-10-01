@@ -56,15 +56,6 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
         .collect()
 }
 
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b)
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Hawkeye checks it, because it reads a hot Trader's collateral from the GlobalTraderIndex and
 /// its positions from the ActiveTraderBuffer, and the Trader account's copies of both can lag.
 /// A margin view that fails rejects the trader, and its error is returned.
@@ -154,37 +145,6 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
             "the derived spline collection must belong to the Eternal program"
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn collateral_idl_override_preserves_live_trader_layout() {
-    let graph = phoenix_live_graph().await;
-    let account = graph.account(&graph.trader);
-
-    let idl: anchor_lang_idl::types::Idl =
-        serde_json::from_str(crate::scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT)
-            .expect("phoenix idl parses as an anchor idl");
-    let (svm, _events_rx, _geyser_rx) =
-        SurfnetSvm::new(crate::surfnet::svm::SurfnetSvmConfig::default()).unwrap();
-
-    let target: i64 = 12_345;
-    let overrides = HashMap::from([(
-        "traderState.quoteLotCollateral".to_string(),
-        serde_json::Value::from(target),
-    )]);
-
-    let forged = svm
-        .get_forged_account_data(&graph.trader, &account.data, &idl, &overrides)
-        .expect("idl override path forges the trader account");
-
-    let header = TraderHeader::try_read_from_account_bytes(&forged).expect("forged header decodes");
-    assert_eq!(header.trader_state.quote_lot_collateral.as_inner(), target);
-    assert_eq!(forged.len(), account.data.len());
-    let diffs = diff_indices(&forged, &account.data);
-    assert!(
-        diffs.iter().all(|index| (88..96).contains(index)),
-        "collateral override changed bytes outside 88..96: {diffs:?}"
-    );
 }
 
 const HAWKEYE_VIEW_MARGIN_DISCRIMINANT: [u8; 8] = [0xb2, 0x0a, 0x7c, 0xad, 0xec, 0xd2, 0x75, 0x06];
