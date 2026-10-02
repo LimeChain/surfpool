@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_patches_selected_hot_trader_and_index_record_only() {
+    async fn materialize_patches_selected_hot_trader_and_index_record_only() {
         use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_skips_invalid_or_missing_index_without_partial_trader_write() {
+    async fn materialize_skips_invalid_or_missing_index_without_partial_trader_write() {
         use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_patches_cold_trader_and_skips_mismatched_header_key() {
+    async fn materialize_patches_cold_trader_and_skips_mismatched_header_key() {
         use crate::surfnet::svm::SurfnetSvm;
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_indexes_a_stressed_trader_by_owner() {
+    async fn materialize_indexes_a_stressed_trader_by_owner() {
         use crate::surfnet::svm::SurfnetSvm;
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_refuses_cold_trader_writes_that_raise_collateral() {
+    async fn materialize_refuses_cold_trader_writes_that_raise_collateral() {
         use crate::surfnet::svm::SurfnetSvm;
 
         let trader = Pubkey::new_from_array(FIRST_KEY);
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn materialization_indexes_fetched_global_trader_index_by_owner() {
+    async fn materialize_indexes_fetched_global_trader_index_by_owner() {
         use base64::{Engine, prelude::BASE64_STANDARD};
         use solana_commitment_config::CommitmentConfig;
 
