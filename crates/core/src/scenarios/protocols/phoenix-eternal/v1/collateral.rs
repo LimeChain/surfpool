@@ -396,6 +396,7 @@ mod tests {
             "unsupported field",
             "raised collateral",
             "raised record of a cold-flagged Trader",
+            "capabilities of a cold-flagged Trader",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
@@ -425,6 +426,12 @@ mod tests {
                         "traderState.quoteLotCollateral".to_string(),
                         serde_json::json!("500"),
                     );
+                }
+                // What the capabilities template writes; Phoenix reads the bits from the record.
+                "capabilities of a cold-flagged Trader" => {
+                    write_u32(&mut before_trader.data, 96, 0);
+                    scenario.overrides[0].values =
+                        HashMap::from([("traderState.flags".to_string(), serde_json::json!(54))]);
                 }
                 "cycle" => write_u32(&mut before_index.data, 96, 2),
                 "missing key" => before_index.data[112..144].copy_from_slice(&[33; 32]),

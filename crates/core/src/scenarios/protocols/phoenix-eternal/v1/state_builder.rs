@@ -311,7 +311,12 @@ async fn prepare_trader_override(
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let header = trader_header(trader, account)?;
     let hot = header.trader_state.is_hot();
-    if hot {
+    let listed = !hot
+        && svm
+            .inner
+            .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
+            .is_some_and(|index| index_trader_state_range(&index, &header.key).is_ok());
+    if hot || listed {
         validate_hot_trader_fields(values)?;
     }
     let target = values
