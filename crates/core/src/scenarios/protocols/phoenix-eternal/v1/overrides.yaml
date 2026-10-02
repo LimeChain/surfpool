@@ -53,9 +53,10 @@ templates:
         description: Exact mark-price ticks, at least 1, encoded as a decimal string
     llm_context: |
       This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot
-      with the current slot. The market's spot and perp oracle readings are set to the same ticks
-      and slot, so the mark Phoenix rebuilds on the next trade keeps the shock. The orderbook and
-      spline are not moved: trades still fill at the book's real prices.
+      with the current slot. The market's spot and perp oracle readings get the same ticks and
+      slot. The orderbook and spline are not moved: trades still fill at the book's real prices,
+      and a mark Phoenix rebuilds after a trade can move back toward the book;
+      list_phoenix_markets shows the mark the fork holds.
       Pass target_ticks as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
       Resolve the market with list_phoenix_markets: a market named by its orderbook address takes

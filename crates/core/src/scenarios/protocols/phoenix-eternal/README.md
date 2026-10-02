@@ -69,10 +69,12 @@ whatever the HOT bit says. The templates follow the program:
   `[0, 0]` for the main account.
 - Collateral can only be lowered; raising it needs a real deposit into the global vault. With
   fetchBeforeUse the ceiling is the live amount on mainnet, otherwise the amount the fork reads.
-  A target above the ceiling is skipped at Play with a warning.
-- The target is the deposit only. Phoenix's effective collateral adds the discounted unrealized
-  PnL, unsettled funding and discounted spot collateral, so lowering collateral by N quote lots
-  lowers effective collateral by N. To reach a margin tier, take `collateral` and
+  The exception is a trader that left the hot set after the fork loaded the index: the fork's
+  index still lists it, so its record there is the ceiling either way. A target above the
+  ceiling is skipped at Play with a warning.
+- The target is the trader's quote-lot collateral, not just its deposits. Phoenix's effective
+  collateral adds the discounted unrealized PnL, unsettled funding and discounted spot
+  collateral, so lowering collateral by N quote lots lowers effective collateral by N. To reach a margin tier, take `collateral` and
   `effective_collateral` from Hawkeye's `view_margin` and set
   `target = collateral - effective_collateral + wanted_effective`.
 
@@ -95,9 +97,10 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 | `target_ticks` | Exact mark in ticks, as a decimal string, from 1 to 4294967295. |
 
 - It sets the market's mark ticks and stamps the mark with the current slot. It also sets the
-  five spot and five perp oracle samples and the spot component slot to the same ticks and slot,
-  so the mark Phoenix rebuilds on the next trade keeps the shock.
-- The orderbook and spline do not move, so trades still fill at the book's real prices.
+  five spot and five perp oracle samples and the spot component slot to the same ticks and slot.
+- The orderbook and spline do not move, so trades still fill at the book's real prices, and a
+  mark Phoenix rebuilds after a trade can move back toward the book. `list_phoenix_markets`
+  shows the mark the fork holds.
 - The target is exact ticks, not a percentage. Compute a relative move from `markTicks` just
   before Play: a target created as +10% from 86651 ticks was +9.76% once BTC had moved to 86840.
 
@@ -236,26 +239,27 @@ copy by itself. After every surfnet start:
 - `create_phoenix_collateral_scenario` reads the Trader from the surfnet Studio plays scenarios
   on and returns a Studio editor URL.
 - `create_scenario` refuses a market symbol `list_phoenix_markets` does not list, and suggests
-  the listed spelling when only the case differs, such as `kBONK` for `bonk`.
+  the listed spelling when only the case differs, such as `SOL` for `sol`. If the market list
+  cannot be read, the scenario is created without this check.
 
 ## Troubleshooting
 
-| Error or observation                                                                    | Meaning                                                                                                                                                                             |
-| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local fork nor its datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment.                                         |
-| `Phoenix market ... was not found`                                                      | The symbol is not in the live PerpAssetMap. Symbols are exact, such as `BTC`.                                                                                                       |
-| `Phoenix Trader account ... was not found`                                              | The MCP tool found no such Trader on the Studio surfnet. Check the address.                                                                                                         |
-| `Phoenix collateral stress can only lower collateral`                                   | The target is above the ceiling: the live collateral with fetchBeforeUse, otherwise the collateral the fork reads. Send a real deposit to raise collateral.                         |
-| `Phoenix collateral must be at least ...`                                               | Targets below `i64::MIN / 2` overflow Phoenix's margin math.                                                                                                                        |
-| `Phoenix TraderState field ... is unsupported`                                          | The fork's index lists the trader, and only collateral is mirrored into its record.                                                                                                 |
-| `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader turned hot after the fork loaded the index; Phoenix rejects its transactions too. Restart the fork.                                                                      |
-| `Expected a valid Phoenix Eternal Trader account`                                       | The supplied account is not a decodable Phoenix Eternal Trader owned by the deployed program.                                                                                       |
-| `price ticks ... are outside the Phoenix mark range`                                    | `target_ticks` must be from 1 to 4294967295.                                                                                                                                        |
-| `maintenance_risk_factor_bps ... must be above ...'s backstop factor`                   | Pick a factor above the market's `backstopRiskFactorBps` and at most 10000.                                                                                                         |
-| `Cannot get mark price, staleness or validity check failed`                             | The fork's PerpAssetMap aged since it was loaded. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart the fork. |
-| `Global configuration must be active` when a transaction is sent after Play             | The LastRestartSlot sysvar is still 0. See [Before sending transactions](#before-sending-transactions).                                                                             |
-| `sendTransaction` waits 30 s and fails with `Failed to fetch accounts from remote`      | The Phoenix log authority is missing. See [Before sending transactions](#before-sending-transactions).                                                                              |
-| A target set as a percentage lands a bit off                                            | Targets are exact values computed when the scenario is created; the market moved before Play.                                                                                       |
+| Error or observation                                                                    | Meaning                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local fork nor its datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment.                                                                                                 |
+| `Phoenix market ... was not found`                                                      | The symbol is not in the live PerpAssetMap. Symbols are exact, such as `BTC`.                                                                                                                                                               |
+| `Phoenix Trader account ... was not found`                                              | The MCP tool found no such Trader on the Studio surfnet. Check the address.                                                                                                                                                                 |
+| `Phoenix collateral stress can only lower collateral`                                   | The target is above the ceiling: the live collateral with fetchBeforeUse, otherwise the collateral the fork reads. See [Collateral stress](#collateral-stress) for a trader that left the hot set. Send a real deposit to raise collateral. |
+| `Phoenix collateral must be at least ...`                                               | Targets below `i64::MIN / 2` overflow Phoenix's margin math.                                                                                                                                                                                |
+| `Phoenix TraderState field ... is unsupported`                                          | The fork's index lists the trader, and only collateral is mirrored into its record.                                                                                                                                                         |
+| `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader turned hot after the fork loaded the index; Phoenix rejects its transactions too. Restart the fork.                                                                                                                              |
+| `Expected a valid Phoenix Eternal Trader account`                                       | The supplied account is not a decodable Phoenix Eternal Trader owned by the deployed program.                                                                                                                                               |
+| `price ticks ... are outside the Phoenix mark range`                                    | `target_ticks` must be from 1 to 4294967295.                                                                                                                                                                                                |
+| `maintenance_risk_factor_bps ... must be above ...'s backstop factor`                   | Pick a factor above the market's `backstopRiskFactorBps` and at most 10000.                                                                                                                                                                 |
+| `Cannot get mark price, staleness or validity check failed`                             | The fork's PerpAssetMap aged since it was loaded. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart the fork.                                                         |
+| `Global configuration must be active` when a transaction is sent after Play             | The LastRestartSlot sysvar is still 0. See [Before sending transactions](#before-sending-transactions).                                                                                                                                     |
+| `sendTransaction` waits 30 s and fails with `Failed to fetch accounts from remote`      | The Phoenix log authority is missing. See [Before sending transactions](#before-sending-transactions).                                                                                                                                      |
+| A target set as a percentage lands a bit off                                            | Targets are exact values computed when the scenario is created; the market moved before Play.                                                                                                                                               |
 
 ## Verification against mainnet
 
