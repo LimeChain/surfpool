@@ -2,8 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use phoenix_rise_accounts::{
-    global_config::GlobalConfig, pda::derive_spline_collection_address,
-    perp_asset_map::PerpAssetMap, trader::TraderHeader,
+    global_config::GlobalConfig,
+    pda::derive_spline_collection_address,
+    perp_asset_map::PerpAssetMap,
+    trader::{TRADER_CAPABILITY_HOT, TraderHeader},
 };
 use solana_account::Account;
 use solana_clock::Clock;
@@ -296,6 +298,59 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     assert_eq!(
         after_mark.mark_price_ticks, 1,
         "stage 1 shocks the mark the program itself reads"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn collateral_stress_follows_the_index_when_the_hot_flag_lags() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let set_trader = |trader: &Account| {
+        locker.with_svm_writer(|svm| svm.set_account(&graph.trader, trader.clone()).unwrap())
+    };
+    // A Trader refetched after it left the hot set has its HOT flag cleared while the fork's
+    // index still holds its record.
+    let mut lagging = locker
+        .with_svm_reader(|svm| svm.get_account(&graph.trader))
+        .unwrap()
+        .unwrap();
+    let flags = u32::from_le_bytes(lagging.data[96..100].try_into().unwrap());
+    lagging.data[96..100].copy_from_slice(&(flags & !TRADER_CAPABILITY_HOT).to_le_bytes());
+    set_trader(&lagging);
+    let before = hawkeye_margin(&locker, &graph);
+    let maintenance =
+        i64::try_from(before.maintenance_margin_quote_lots).expect("maintenance margin fits i64");
+    let target =
+        before.collateral_quote_lots - before.effective_collateral_quote_lots + maintenance / 2;
+
+    // The program keeps reading the index record, so the Trader account alone changes nothing.
+    let mut account_only = lagging.clone();
+    account_only.data[88..96].copy_from_slice(&target.to_le_bytes());
+    set_trader(&account_only);
+    assert_eq!(
+        hawkeye_margin(&locker, &graph).collateral_quote_lots,
+        before.collateral_quote_lots
+    );
+    set_trader(&lagging);
+
+    let scenario =
+        build_phoenix_collateral_scenario(graph.trader, &lagging, &target.to_string()).unwrap();
+    locker
+        .register_scenario(scenario, Some(graph.clock.slot))
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
+        .await
+        .unwrap();
+    let after = hawkeye_margin(&locker, &graph);
+    assert_eq!(
+        after.collateral_quote_lots, target,
+        "the stress lands in the index record the program reads"
+    );
+    assert_eq!(
+        after.is_liquidatable, 1,
+        "the stress must leave the trader liquidatable: effective collateral {} against \
+         maintenance margin {}",
+        after.effective_collateral_quote_lots, after.maintenance_margin_quote_lots
     );
 }
 
