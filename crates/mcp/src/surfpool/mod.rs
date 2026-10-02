@@ -1055,11 +1055,21 @@ impl Surfpool {
             (validation_error, phoenix_symbols)
         };
 
-        // Play only warns about an unknown market symbol, so check it while the caller can fix it.
-        // If the market list cannot be read, the scenario is staged unchecked.
+        // Play only warns about an unknown market symbol, so check it while the caller can fix it,
+        // on the surfnet Studio plays the scenario on. If the market list cannot be read, the
+        // scenario is staged unchecked.
         let validation_error = match validation_error {
             None if !phoenix_symbols.is_empty() => {
-                match self.list_phoenix_markets_from_surfnet(None).await {
+                let studio_url = format!(
+                    "http://127.0.0.1:{}",
+                    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+                );
+                let listing = async {
+                    let rpc_url = self.studio_rpc_url(&studio_url).await?;
+                    self.list_phoenix_markets_at(&rpc_url).await
+                }
+                .await;
+                match listing {
                     Ok(listing) => {
                         let errors = unlisted_phoenix_symbols(&listing, &phoenix_symbols);
                         (!errors.is_empty())
@@ -1163,14 +1173,9 @@ impl Surfpool {
         self.stage_scenario(scenario).await
     }
 
-    async fn list_phoenix_markets_from_surfnet(
-        &self,
-        surfnet_port: Option<u16>,
-    ) -> Result<serde_json::Value, String> {
+    async fn list_phoenix_markets_at(&self, rpc_url: &str) -> Result<serde_json::Value, String> {
         let perp_asset_map = PHOENIX_PERP_ASSET_MAP;
-        let maps = self
-            .fetch_surfnet_accounts(surfnet_port, &[perp_asset_map])
-            .await?;
+        let maps = self.fetch_accounts_at(rpc_url, &[perp_asset_map]).await?;
         let map_account = maps[0].as_ref().ok_or_else(|| {
             format!("Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet")
         })?;
@@ -1205,7 +1210,10 @@ impl Surfpool {
         Parameters(params): Parameters<ListPhoenixMarketsParams>,
     ) -> Result<CallToolResult, McpError> {
         match self
-            .list_phoenix_markets_from_surfnet(params.surfnet_port)
+            .list_phoenix_markets_at(&format!(
+                "http://127.0.0.1:{}",
+                params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+            ))
             .await
         {
             Ok(payload) => Ok(CallToolResult::success(vec![Content::text(

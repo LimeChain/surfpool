@@ -340,16 +340,25 @@ mod tests {
         use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
-        // A Trader the index lists is read from its record even when its own flag says cold.
-        for (key, other_key, collateral_offset, target, flagged_hot) in [
-            (FIRST_KEY, SECOND_KEY, 144, 1_i64, true),
-            (SECOND_KEY, FIRST_KEY, 208, -9_007_199_254_740_993, true),
-            (FIRST_KEY, SECOND_KEY, 144, 1_i64, false),
+        // A Trader the index lists is read from its record even when its own flag says cold, and
+        // its record caps the target even when its account copy holds less.
+        for (key, other_key, collateral_offset, target, flagged_hot, account_collateral) in [
+            (FIRST_KEY, SECOND_KEY, 144, 1_i64, true, 9_999),
+            (
+                SECOND_KEY,
+                FIRST_KEY,
+                208,
+                -9_007_199_254_740_993,
+                true,
+                9_999,
+            ),
+            (FIRST_KEY, SECOND_KEY, 144, 1_i64, false, 9_999),
+            (FIRST_KEY, SECOND_KEY, 144, 100_i64, false, 50),
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
             let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
-            let mut before_trader = trader_account(key, 9_999, flagged_hot);
+            let mut before_trader = trader_account(key, account_collateral, flagged_hot);
             before_trader.lamports = 1;
             let mut before_other = trader_account(other_key, 8_888, true);
             before_other.lamports = 1;
@@ -609,26 +618,30 @@ mod tests {
         let trader = Pubkey::new_from_array(FIRST_KEY);
         let matching = trader_account(FIRST_KEY, 9_999, false);
         // The whole TraderState is written too, so the collateral it ends with is checked.
-        for (case, collateral, patched) in [
-            ("raise through traderState", 20_000_i64, false),
-            ("lower through traderState", 1, true),
+        for (case, collateral, flags, patched) in [
+            ("raise through traderState", 20_000_i64, 0, false),
+            ("lower through traderState", 1, 0, true),
             (
                 "lower to the floor through traderState",
                 MIN_QUOTE_LOT_COLLATERAL,
+                0,
                 true,
             ),
             (
                 "lower past the floor through traderState",
                 MIN_QUOTE_LOT_COLLATERAL - 1,
+                0,
                 false,
             ),
+            // The index does not list this Trader, so Phoenix could not find it as hot.
+            ("set the HOT bit through traderState", 1, 63, false),
         ] {
             let mut scenario = build_phoenix_collateral_scenario(trader, &matching, "1").unwrap();
             scenario.overrides[0].values = HashMap::from([(
                 "traderState".to_string(),
                 serde_json::json!({
                     "quoteLotCollateral": collateral,
-                    "flags": 0,
+                    "flags": flags,
                     "padding": [0],
                     "globalPositionSequenceNumber": 0,
                     "makerFeeOverrideMultiplier": 0,

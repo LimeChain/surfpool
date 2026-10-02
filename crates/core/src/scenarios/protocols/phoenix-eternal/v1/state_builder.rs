@@ -359,7 +359,8 @@ async fn prepare_trader_override(
         .ok_or_else(|| SurfpoolError::internal("No IDL registered for Phoenix Eternal"))?
         .1;
     let data = svm.get_forged_account_data(trader, &account.data, idl, &values)?;
-    if !hot {
+    // A listed Trader is capped by its index record above, not by its account copy.
+    if !hot && !listed {
         let forged = TraderHeader::try_read_from_account_bytes(&data).map_err(|error| {
             SurfpoolError::invalid_account_data(
                 trader,
@@ -367,6 +368,14 @@ async fn prepare_trader_override(
                 Some(error),
             )
         })?;
+        // Phoenix looks a hot-flagged Trader up in the GlobalTraderIndex, which does not list
+        // this one, so every later transaction for it would fail.
+        if forged.trader_state.is_hot() {
+            return Err(SurfpoolError::internal(
+                "Phoenix traderState.flags must keep the HOT bit clear on a Trader the \
+                 GlobalTraderIndex does not list",
+            ));
+        }
         let collateral = forged.trader_state.quote_lot_collateral.as_inner();
         ensure_collateral_floor(collateral)?;
         ensure_collateral_is_lowered(
