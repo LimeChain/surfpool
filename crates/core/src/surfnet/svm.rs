@@ -3146,12 +3146,13 @@ impl SurfnetSvm {
                     &account,
                     &account_values,
                     remote_ctx,
+                    override_instance.fetch_before_use,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
                         for (pubkey, written) in writes {
-                            if let Err(e) = self.inner.set_account(pubkey, written) {
+                            if let Err(e) = self.set_account(&pubkey, written) {
                                 warn!(
                                     "Failed to set {} for override {}: {}",
                                     pubkey, override_instance.id, e

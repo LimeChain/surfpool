@@ -142,13 +142,23 @@ pub fn effective_collateral(header: &TraderHeader, index: Option<&Account>) -> S
     ))
 }
 
+/// A target near i64::MIN overflows Phoenix's checked margin math instead of making the trader
+/// liquidatable.
+pub const MIN_QUOTE_LOT_COLLATERAL: i64 = i64::MIN / 2;
+
 pub fn parse_quote_lot_collateral(value: &serde_json::Value) -> SurfpoolResult<i64> {
-    value
+    let collateral = value
         .as_i64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         .ok_or_else(|| {
             SurfpoolError::internal("Phoenix collateral must be a signed 64-bit integer")
-        })
+        })?;
+    if collateral < MIN_QUOTE_LOT_COLLATERAL {
+        return Err(SurfpoolError::internal(format!(
+            "Phoenix collateral must be at least {MIN_QUOTE_LOT_COLLATERAL} quote lots"
+        )));
+    }
+    Ok(collateral)
 }
 
 #[cfg(test)]
@@ -163,7 +173,12 @@ mod tests {
 
     #[test]
     fn collateral_values_preserve_signed_integer_precision() {
-        for value in [i64::MIN, -9_007_199_254_740_993, 0, i64::MAX] {
+        for value in [
+            MIN_QUOTE_LOT_COLLATERAL,
+            -9_007_199_254_740_993,
+            0,
+            i64::MAX,
+        ] {
             assert_eq!(
                 parse_quote_lot_collateral(&serde_json::json!(value.to_string())).unwrap(),
                 value
@@ -177,6 +192,8 @@ mod tests {
             serde_json::json!("9223372036854775808"),
             serde_json::json!(-1.5),
             serde_json::json!(null),
+            serde_json::json!(i64::MIN),
+            serde_json::json!((MIN_QUOTE_LOT_COLLATERAL - 1).to_string()),
         ] {
             assert!(parse_quote_lot_collateral(&value).is_err());
         }
@@ -326,13 +343,9 @@ mod tests {
             before_other.lamports = 1;
             let mut before_index = index_account();
             before_index.lamports = 1;
-            let scenario = build_phoenix_collateral_scenario(
-                trader,
-                &before_trader,
-                &target.to_string(),
-                Some(&before_index),
-            )
-            .unwrap();
+            let scenario =
+                build_phoenix_collateral_scenario(trader, &before_trader, &target.to_string())
+                    .unwrap();
             let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
             svm.set_account(&trader, before_trader.clone()).unwrap();
             svm.set_account(&other_trader, before_other.clone())
@@ -383,8 +396,7 @@ mod tests {
             let mut before_index = index_account();
             before_index.lamports = 1;
             let mut scenario =
-                build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&before_index))
-                    .unwrap();
+                build_phoenix_collateral_scenario(trader, &before_trader, "1").unwrap();
             match failure {
                 "mismatched key" => before_trader.data[24..56].copy_from_slice(&SECOND_KEY),
                 "unsupported field" => {
@@ -439,8 +451,7 @@ mod tests {
             (SECOND_KEY, "1", false),
             (FIRST_KEY, "10000", false),
         ] {
-            let mut scenario =
-                build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+            let mut scenario = build_phoenix_collateral_scenario(trader, &matching, "1").unwrap();
             scenario.overrides[0].values.insert(
                 "traderState.quoteLotCollateral".to_string(),
                 serde_json::json!(target),
@@ -463,6 +474,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn materialization_indexes_a_stressed_trader_by_owner() {
+        use crate::surfnet::svm::SurfnetSvm;
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut on_chain = trader_account(FIRST_KEY, 9_999, false);
+        on_chain.lamports = 1;
+        let scenario = build_phoenix_collateral_scenario(trader, &on_chain, "1").unwrap();
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        // A fetchBeforeUse refetch stores the Trader without indexing it by owner.
+        svm.inner.set_account(trader, on_chain.clone()).unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        // getProgramAccounts serves the local copy of an account only when it is indexed by owner.
+        let owned = svm
+            .get_account_owned_by(&PHOENIX_ETERNAL_PROGRAM_ID)
+            .unwrap();
+        let (_, stressed) = owned
+            .iter()
+            .find(|(pubkey, _)| *pubkey == trader)
+            .expect("the stressed Trader must be indexed by owner");
+        let mut expected = on_chain;
+        expected.data[88..96].copy_from_slice(&1_i64.to_le_bytes());
+        assert_eq!(stressed, &expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_before_use_refreshes_a_hot_traders_index_record() {
+        use std::collections::HashMap;
+
+        use base64::{Engine, prelude::BASE64_STANDARD};
+        use solana_commitment_config::CommitmentConfig;
+
+        use super::super::state_builder::{PHOENIX_GLOBAL_TRADER_INDEX, prepare_phoenix_override};
+        use crate::{
+            surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
+            tests::helpers::canned_rpc,
+        };
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut account = trader_account(FIRST_KEY, 9_999, true);
+        account.lamports = 1;
+        let mut live_index = index_account();
+        live_index.lamports = 1;
+        let range = index_trader_state_range(&live_index, &FIRST_KEY).unwrap();
+        let live = i64::from_le_bytes(
+            live_index.data[range.start..range.start + 8]
+                .try_into()
+                .unwrap(),
+        );
+        // The fork holds a stressed record, the datasource the live one.
+        let mut stressed_index = live_index.clone();
+        stressed_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
+        let url = canned_rpc(format!(
+            r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+            BASE64_STANDARD.encode(&live_index.data),
+            PHOENIX_ETERNAL_PROGRAM_ID,
+            live_index.data.len()
+        ))
+        .await;
+        let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
+        let values = HashMap::from([(
+            "traderState.quoteLotCollateral".to_string(),
+            serde_json::json!((live / 2).to_string()),
+        )]);
+
+        for fetch_before_use in [false, true] {
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, stressed_index.clone())
+                .unwrap();
+            let result = prepare_phoenix_override(
+                &mut svm,
+                &trader,
+                &account,
+                &values,
+                &remote,
+                fetch_before_use,
+            )
+            .await;
+            if !fetch_before_use {
+                assert!(
+                    result.is_err(),
+                    "without fetchBeforeUse the stressed record stays the ceiling"
+                );
+                continue;
+            }
+            let writes = result.unwrap().expect("a Trader override");
+            let (_, index) = writes
+                .iter()
+                .find(|(pubkey, _)| *pubkey == PHOENIX_GLOBAL_TRADER_INDEX)
+                .expect("the index record is written");
+            assert_eq!(
+                i64::from_le_bytes(index.data[range.start..range.start + 8].try_into().unwrap()),
+                live / 2
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn materialization_refuses_cold_trader_writes_that_raise_collateral() {
         use crate::surfnet::svm::SurfnetSvm;
 
@@ -473,8 +585,7 @@ mod tests {
             ("raise through traderState", 20_000_i64, false),
             ("lower through traderState", 1, true),
         ] {
-            let mut scenario =
-                build_phoenix_collateral_scenario(trader, &matching, "1", None).unwrap();
+            let mut scenario = build_phoenix_collateral_scenario(trader, &matching, "1").unwrap();
             scenario.overrides[0].values = HashMap::from([(
                 "traderState".to_string(),
                 serde_json::json!({
@@ -523,9 +634,9 @@ mod tests {
         before_trader.lamports = 1;
         let mut remote_index = index_account();
         remote_index.lamports = 1;
-        let scenario =
-            build_phoenix_collateral_scenario(trader, &before_trader, "1", Some(&remote_index))
-                .unwrap();
+        let mut scenario = build_phoenix_collateral_scenario(trader, &before_trader, "1").unwrap();
+        // The canned RPC answers every request with the index, so the Trader must not be refetched.
+        scenario.overrides[0].fetch_before_use = false;
         // The fork holds the Trader but has never read the index, so the override fetches it.
         let url = canned_rpc(format!(
             r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,

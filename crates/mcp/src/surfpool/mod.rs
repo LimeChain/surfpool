@@ -20,12 +20,8 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
-            phoenix_eternal::v1::{
-                collateral::trader_header,
-                state_builder::{
-                    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_PERP_ASSET_MAP,
-                    build_phoenix_collateral_scenario, phoenix_markets,
-                },
+            phoenix_eternal::v1::state_builder::{
+                PHOENIX_PERP_ASSET_MAP, build_phoenix_collateral_scenario, phoenix_markets,
             },
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
@@ -486,17 +482,11 @@ impl Surfpool {
             .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
         // Studio plays the scenario on its own surfnet, so the Trader is checked there.
         let rpc_url = self.studio_rpc_url(studio_url).await?;
-        let accounts = self
-            .fetch_accounts_at(&rpc_url, &[trader, PHOENIX_GLOBAL_TRADER_INDEX])
-            .await?;
+        let accounts = self.fetch_accounts_at(&rpc_url, &[trader]).await?;
         let trader_account = accounts[0]
             .as_ref()
             .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
-        let header = trader_header(&trader, trader_account).map_err(|error| error.to_string())?;
-        let index = accounts[1]
-            .as_ref()
-            .filter(|_| header.trader_state.is_hot());
-        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots, index)
+        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots)
             .map_err(|error| error.to_string())
     }
 
@@ -873,7 +863,7 @@ impl Surfpool {
         // Validate all templateIds exist in the registry
         // The registry lock must not be held across the HTTP await below, so the
         // validation runs in its own scope and only its outcome escapes
-        let validation_error: Option<String> = {
+        let (validation_error, phoenix_symbols) = {
             let registry = self.template_registry.read().map_err(|_| {
                 use std::borrow::Cow;
                 McpError {
@@ -885,6 +875,7 @@ impl Surfpool {
 
             let mut invalid_templates: Vec<String> = Vec::new();
             let mut validation_errors: Vec<String> = Vec::new();
+            let mut phoenix_symbols: Vec<(String, String)> = Vec::new();
 
             for override_instance in &mut scenario.overrides {
                 // Check if template exists
@@ -946,12 +937,23 @@ impl Surfpool {
                     // Validate constant_ref values against template constants
                     for prop in &template.properties {
                         if prop.is_dynamic_ref() {
-                            let present = override_instance
+                            let value = override_instance
                                 .values
                                 .get(&prop.path)
                                 .and_then(|value| value.as_str())
-                                .is_some_and(|value| !value.is_empty());
-                            if !present {
+                                .filter(|value| !value.is_empty());
+                            if let Some(symbol) = value
+                                && prop.source_name() == Some("list_phoenix_markets")
+                            {
+                                phoenix_symbols.push((
+                                    format!(
+                                        "Override '{}' (template '{}')",
+                                        override_instance.id, override_instance.template_id
+                                    ),
+                                    symbol.to_string(),
+                                ));
+                            }
+                            if value.is_none() {
                                 validation_errors.push(format!(
                                     "Override '{}' (template '{}'): Missing required value for '{}'. Resolve it with the `{}` tool and pass it as a non-empty string.",
                                     override_instance.id,
@@ -1035,7 +1037,7 @@ impl Surfpool {
                 }
             }
 
-            if !invalid_templates.is_empty() {
+            let validation_error = if !invalid_templates.is_empty() {
                 let valid_ids: Vec<String> = registry.list_ids();
                 Some(format!(
                     "Invalid templateId(s): {:?}. You MUST use templateIds from get_override_templates. Valid IDs are: {:?}",
@@ -1048,7 +1050,24 @@ impl Surfpool {
                 ))
             } else {
                 None
+            };
+            (validation_error, phoenix_symbols)
+        };
+
+        // Play only warns about an unknown market symbol, so check it while the caller can fix it.
+        // If the market list cannot be read, the scenario is staged unchecked.
+        let validation_error = match validation_error {
+            None if !phoenix_symbols.is_empty() => {
+                match self.list_phoenix_markets_from_surfnet(None).await {
+                    Ok(listing) => {
+                        let errors = unlisted_phoenix_symbols(&listing, &phoenix_symbols);
+                        (!errors.is_empty())
+                            .then(|| format!("Validation errors:\n{}", errors.join("\n")))
+                    }
+                    Err(_) => None,
+                }
             }
+            validation_error => validation_error,
         };
 
         if let Some(message) = validation_error {
@@ -1122,7 +1141,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: a target above the trader's effective collateral is refused, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's effective collateral with a warning, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
     )]
     async fn create_phoenix_collateral_scenario(
         &self,
@@ -1469,6 +1488,33 @@ impl ServerHandler for Surfpool {
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
     }
+}
+
+fn unlisted_phoenix_symbols(
+    listing: &serde_json::Value,
+    symbols: &[(String, String)],
+) -> Vec<String> {
+    let listed: Vec<&str> = listing["symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|symbol| symbol.as_str())
+        .collect();
+    symbols
+        .iter()
+        .filter(|(_, symbol)| !listed.contains(&symbol.as_str()))
+        .map(|(owner, symbol)| {
+            let hint = listed
+                .iter()
+                .find(|listed| listed.eq_ignore_ascii_case(symbol))
+                .map(|listed| format!(" Did you mean '{listed}'?"))
+                .unwrap_or_default();
+            format!(
+                "{owner}: '{symbol}' is not a listed Phoenix market (symbols are \
+                 case-sensitive).{hint} Resolve it with the `list_phoenix_markets` tool."
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1840,6 +1886,25 @@ mod tests {
                 "{mint} must not be offered for a bonding curve"
             );
         }
+    }
+
+    #[test]
+    fn unlisted_phoenix_symbols_names_each_miss_and_the_listed_spelling() {
+        let listing = serde_json::json!({ "symbols": ["SOL", "BNB", "kBONK"] });
+        let pairs = |symbols: &[&str]| -> Vec<(String, String)> {
+            symbols
+                .iter()
+                .map(|symbol| ("Override 'o'".to_string(), symbol.to_string()))
+                .collect()
+        };
+
+        assert!(unlisted_phoenix_symbols(&listing, &pairs(&["SOL", "kBONK"])).is_empty());
+
+        let errors = unlisted_phoenix_symbols(&listing, &pairs(&["sol", "SOL-PERP", "BONK"]));
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("'sol'") && errors[0].contains("Did you mean 'SOL'?"));
+        assert!(errors[1].contains("'SOL-PERP'") && !errors[1].contains("Did you mean"));
+        assert!(errors[2].contains("'BONK'") && errors[2].contains("list_phoenix_markets"));
     }
 
     #[tokio::test]

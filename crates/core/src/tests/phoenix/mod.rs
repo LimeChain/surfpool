@@ -206,13 +206,9 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     let target =
         before.collateral_quote_lots - before.effective_collateral_quote_lots + maintenance / 2;
 
-    let scenario = build_phoenix_collateral_scenario(
-        graph.trader,
-        &before_trader,
-        &target.to_string(),
-        Some(&before_index),
-    )
-    .unwrap();
+    let scenario =
+        build_phoenix_collateral_scenario(graph.trader, &before_trader, &target.to_string())
+            .unwrap();
     collateral_locker
         .register_scenario(scenario, Some(graph.clock.slot))
         .unwrap();
@@ -256,15 +252,10 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
         .unwrap()
         .unwrap();
     let prepared_collateral = hawkeye_margin(&mark_locker, &graph).collateral_quote_lots / 2;
-    let index_account = mark_locker
-        .with_svm_reader(|svm| svm.get_account(&graph.global_trader_index))
-        .unwrap()
-        .unwrap();
     let mut cascade = build_phoenix_collateral_scenario(
         graph.trader,
         &trader_account,
         &prepared_collateral.to_string(),
-        Some(&index_account),
     )
     .unwrap();
     let mut shock = phoenix_market_override(

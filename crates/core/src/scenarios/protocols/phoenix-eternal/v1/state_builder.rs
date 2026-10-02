@@ -131,6 +131,23 @@ fn patch_direct_mark(
         let mut price = bytemuck::pod_read_unaligned::<PriceComponent>(&bytes[..price_len]);
         price.mark_price.price.slot = mark_slot;
         price.mark_price.price.ticks = bytemuck::cast(target_ticks);
+        // Phoenix rebuilds the mark from its oracle inputs on every trade, so they carry the
+        // shock too; the book input is clamped around them and needs no write.
+        let mark = &mut price.mark_price;
+        for sample in mark
+            .spot_price_component
+            .last_exchange_spot_price
+            .iter_mut()
+            .chain(
+                mark.perp_price_component
+                    .last_exchange_perp_price
+                    .iter_mut(),
+            )
+        {
+            sample.ticks = mark.price.ticks;
+            sample.slot = mark_slot;
+        }
+        mark.spot_price_component.slot = mark_slot;
         bytes[..price_len].copy_from_slice(bytemuck::bytes_of(&price));
         Ok(())
     })
@@ -249,6 +266,7 @@ pub async fn prepare_phoenix_override(
     account: &Account,
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    fetch_before_use: bool,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Ok(None);
@@ -265,11 +283,16 @@ pub async fn prepare_phoenix_override(
                 },
             )]))
         }
-        Some(PhoenixAccount::Trader) => {
-            prepare_trader_override(svm, account_pubkey, account, values, remote_ctx)
-                .await
-                .map(Some)
-        }
+        Some(PhoenixAccount::Trader) => prepare_trader_override(
+            svm,
+            account_pubkey,
+            account,
+            values,
+            remote_ctx,
+            fetch_before_use,
+        )
+        .await
+        .map(Some),
         _ => Ok(None),
     }
 }
@@ -280,6 +303,7 @@ async fn prepare_trader_override(
     account: &Account,
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    fetch_before_use: bool,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let header = trader_header(trader, account)?;
     let hot = header.trader_state.is_hot();
@@ -294,7 +318,12 @@ async fn prepare_trader_override(
     // the target is checked against and patched in.
     let index = match target {
         Some(_) if hot => {
-            Some(phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?)
+            let mut index =
+                phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?;
+            if fetch_before_use {
+                refresh_index_record(&mut index, &header.key, remote_ctx).await;
+            }
+            Some(index)
         }
         _ => None,
     };
@@ -338,6 +367,13 @@ async fn prepare_trader_override(
             "TraderState",
             &HashMap::from([("quoteLotCollateral".to_string(), collateral.clone())]),
         )?;
+        if encoded.len() != range.len() {
+            return Err(SurfpoolError::internal(format!(
+                "the re-encoded TraderState is {} bytes, the GlobalTraderIndex record holds {}",
+                encoded.len(),
+                range.len()
+            )));
+        }
         index.data[range].copy_from_slice(&encoded);
         writes.push((PHOENIX_GLOBAL_TRADER_INDEX, index));
     }
@@ -349,6 +385,32 @@ async fn prepare_trader_override(
         },
     ));
     Ok(writes)
+}
+
+/// A hot Trader's live state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
+/// record too. If the fetch fails or lacks the trader, the local record stays.
+async fn refresh_index_record(
+    index: &mut Account,
+    trader_key: &[u8; 32],
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+) {
+    let Some((client, commitment)) = remote_ctx else {
+        return;
+    };
+    let Ok(Ok(remote)) = client
+        .get_account(&PHOENIX_GLOBAL_TRADER_INDEX, *commitment)
+        .await
+        .map(|fetched| fetched.map_account())
+    else {
+        return;
+    };
+    if let (Ok(local), Ok(live)) = (
+        index_trader_state_range(index, trader_key),
+        index_trader_state_range(&remote, trader_key),
+    ) && local.len() == live.len()
+    {
+        index.data[local].copy_from_slice(&remote.data[live]);
+    }
 }
 
 async fn phoenix_dependency(
@@ -400,15 +462,9 @@ pub fn build_phoenix_collateral_scenario(
     trader: Pubkey,
     trader_account: &Account,
     target_quote_lots: &str,
-    global_trader_index: Option<&Account>,
 ) -> SurfpoolResult<Scenario> {
     let target_quote_lots = parse_quote_lot_collateral(&serde_json::json!(target_quote_lots))?;
-    let header = trader_header(&trader, trader_account)?;
-    // Play checks this too; checking here tells an MCP caller before a scenario exists.
-    ensure_collateral_is_lowered(
-        effective_collateral(&header, global_trader_index)?,
-        target_quote_lots,
-    )?;
+    trader_header(&trader, trader_account)?;
 
     let template = TemplateRegistry::new()
         .get("phoenix-trader-collateral-stress")
@@ -418,13 +474,14 @@ pub fn build_phoenix_collateral_scenario(
         COLLATERAL_FIELD.to_string(),
         serde_json::json!(target_quote_lots.to_string()),
     )]);
-    let collateral_override = OverrideInstance::new(
+    let mut collateral_override = OverrideInstance::new(
         template.id,
         PREPARATION_SLOT,
         AccountAddress::Pubkey(trader.to_string()),
     )
     .with_values(values)
     .with_label("Phoenix Trader collateral stress".to_string());
+    collateral_override.fetch_before_use = true;
 
     let mut scenario = Scenario::new(
         "Phoenix Trader Collateral Stress".to_string(),
@@ -533,15 +590,12 @@ mod tests {
     }
 
     #[test]
-    fn builds_one_collateral_override_bounded_by_its_vault_backing() {
+    fn builds_one_collateral_override() {
         let trader = Pubkey::new_unique();
         let funded = trader_account_for(trader, 500);
-        let raised = build_phoenix_collateral_scenario(trader, &funded, "501", None).unwrap_err();
-        assert!(raised.to_string().contains("can only lower collateral"));
 
         for target in ["500", "-9007199254740993"] {
-            let preparation =
-                build_phoenix_collateral_scenario(trader, &funded, target, None).unwrap();
+            let preparation = build_phoenix_collateral_scenario(trader, &funded, target).unwrap();
             assert_eq!(preparation.overrides.len(), 1);
             let collateral_override = &preparation.overrides[0];
             assert_eq!(
@@ -557,7 +611,7 @@ mod tests {
                 serde_json::json!(target)
             );
             assert_eq!(collateral_override.scenario_relative_slot, PREPARATION_SLOT);
-            assert!(!collateral_override.fetch_before_use);
+            assert!(collateral_override.fetch_before_use);
         }
     }
 
@@ -576,8 +630,17 @@ mod tests {
             .find_by_symbol("SOL")
             .unwrap()
             .unwrap();
-        let price = after.metadata.oracle_price().mark_price.price;
-        assert_eq!((price.ticks.as_inner(), price.slot), (1, 123));
+        let mark = after.metadata.oracle_price().mark_price;
+        assert_eq!((mark.price.ticks.as_inner(), mark.price.slot), (1, 123));
+        for sample in mark
+            .spot_price_component
+            .last_exchange_spot_price
+            .iter()
+            .chain(mark.perp_price_component.last_exchange_perp_price.iter())
+        {
+            assert_eq!((sample.ticks.as_inner(), sample.slot), (1, 123));
+        }
+        assert_eq!(mark.spot_price_component.slot, 123);
         assert_eq!(patched.len(), account.data.len());
 
         for rejected in ["0", "4294967296"] {
