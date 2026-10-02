@@ -1,4 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use solana_clock::Slot;
@@ -280,6 +283,12 @@ pub struct Property {
     /// For constant_ref type: the name of the constant definition to use
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constant: Option<String>,
+    /// Raw-layout only: byte offset of this field within the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// Raw-layout only: how this field's bytes are produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<RawEncoding>,
     /// For dynamic_ref type: the MCP tool whose result supplies the dropdown options
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -296,6 +305,8 @@ impl Property {
             label: None,
             description: None,
             constant: None,
+            offset: None,
+            encoding: None,
             source: None,
             value_type: None,
         }
@@ -309,6 +320,8 @@ impl Property {
             label: None,
             description: None,
             constant: Some(constant.into()),
+            offset: None,
+            encoding: None,
             source: None,
             value_type: None,
         }
@@ -405,8 +418,11 @@ pub struct OverrideTemplate {
     pub description: String,
     /// Protocol this template is for (e.g., "Pyth", "Switchboard")
     pub protocol: String,
-    /// IDL for the account structure - defines all available fields and types
-    pub idl: Idl,
+    /// IDL for the account structure - defines all available fields and types.
+    ///
+    /// `None` for programs that publish no IDL and are written through `raw_layout` instead. Those
+    /// templates cannot use the IDL write path at all, so there is nothing to reconstruct here.
+    pub idl: Option<Idl>,
     /// How to determine the account address
     pub address: AccountAddress,
     /// Account type name from the IDL (e.g., "PriceAccount")
@@ -423,9 +439,27 @@ pub struct OverrideTemplate {
     /// This helps LLMs understand how to correctly use the template
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_context: Option<String>,
+    /// Whether the override engine writes bytes at each property's offset instead of decoding and
+    /// re-encoding through an IDL.
+    #[serde(default)]
+    pub raw_layout: bool,
 }
 
 impl OverrideTemplate {
+    /// The IDL this template was built from.
+    ///
+    /// Panics for templates that have none - those belong to programs that publish no IDL and are
+    /// written through `raw_layout`. Callers that may legitimately see either must match on the
+    /// field instead of calling this.
+    pub fn idl(&self) -> &Idl {
+        self.idl.as_ref().unwrap_or_else(|| {
+            panic!(
+                "template {} has no IDL; it is written through raw_layout",
+                self.id
+            )
+        })
+    }
+
     pub fn new(
         id: String,
         name: String,
@@ -441,13 +475,14 @@ impl OverrideTemplate {
             name,
             description,
             protocol,
-            idl,
+            idl: Some(idl),
             address,
             account_type,
             properties,
             constants: HashMap::new(),
             tags: Vec::new(),
             llm_context: None,
+            raw_layout: false,
         }
     }
 
@@ -651,7 +686,8 @@ pub struct YamlOverrideTemplateFile {
     pub properties: Vec<YamlProperty>,
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
-    pub idl_file_path: String,
+    #[serde(default)]
+    pub idl_file_path: Option<String>,
     pub address: YamlAccountAddress,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -668,7 +704,7 @@ impl YamlOverrideTemplateFile {
             name: self.name,
             description: self.description,
             protocol: self.protocol,
-            idl,
+            idl: Some(idl),
             address: self.address.into(),
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
@@ -679,6 +715,7 @@ impl YamlOverrideTemplateFile {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
+            raw_layout: false,
         }
     }
 }
@@ -859,6 +896,12 @@ pub enum YamlProperty {
         /// For constant_ref type: the name of the constant definition to use
         #[serde(default)]
         constant: Option<String>,
+        /// Raw-layout only: byte offset of this field within the account
+        #[serde(default)]
+        offset: Option<usize>,
+        /// Raw-layout only: how this field's bytes are produced
+        #[serde(default)]
+        encoding: Option<RawEncoding>,
         /// For dynamic_ref type: the MCP tool whose result supplies the options
         #[serde(default)]
         source: Option<String>,
@@ -877,6 +920,8 @@ impl From<YamlProperty> for Property {
                 label,
                 description,
                 constant,
+                offset,
+                encoding,
                 source,
                 value_type,
             } => {
@@ -891,6 +936,8 @@ impl From<YamlProperty> for Property {
                     label,
                     description,
                     constant,
+                    offset,
+                    encoding,
                     source,
                     value_type,
                 }
@@ -943,14 +990,18 @@ pub struct YamlOverrideTemplateCollection {
     /// Account type name from the IDL (optional, can be overridden per template)
     #[serde(default)]
     pub account_type: Option<String>,
-    /// Path to shared IDL file
-    pub idl_file_path: String,
+    /// Path to shared IDL file. Absent for programs that publish no IDL.
+    #[serde(default)]
+    pub idl_file_path: Option<String>,
     /// Common tags for all templates
     #[serde(default)]
     pub tags: Vec<String>,
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// Selects offset-and-encoding writes for programs with no usable IDL.
+    #[serde(default)]
+    pub raw_layout: bool,
     /// The templates
     pub templates: Vec<YamlOverrideTemplateEntry>,
 }
@@ -971,6 +1022,301 @@ pub struct YamlOverrideTemplateEntry {
     /// Optional context/instructions specifically for LLMs using this template
     #[serde(default)]
     pub llm_context: Option<String>,
+}
+
+// ========================================
+// Raw byte layouts (programs with no usable IDL)
+// ========================================
+
+/// How a raw-layout field's bytes are produced. Every variant is integer-exact: values arrive as
+/// JSON integers or decimal strings and are written little-endian, never routed through f64.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+pub enum RawEncoding {
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    I32,
+    I64,
+    I128,
+    /// A signed 32-bit value written to `count` slots, `stride` bytes apart.
+    ///
+    /// Exists because some layouts repeat one logical setting across a run of fixed-size records, and
+    /// exposing one property per record means exposing several that must agree - a worse footgun than
+    /// whatever it was meant to fix, such as a quote ladder repeated across fixed-size records.
+    I32Strided {
+        count: usize,
+        stride: usize,
+    },
+    /// A base58 pubkey, written as 32 bytes.
+    Bytes32,
+    /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
+    /// when the caller explicitly supplies JSON `null`; omitting the property performs no write.
+    /// A negative offset before slot zero saturates at zero, while positive overflow is rejected.
+    Slot {
+        lead: i64,
+    },
+}
+
+impl RawEncoding {
+    /// Byte width of this encoding.
+    pub fn width(&self) -> usize {
+        match self {
+            RawEncoding::U8 => 1,
+            RawEncoding::U16 => 2,
+            RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
+            RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
+            RawEncoding::U128 | RawEncoding::I128 => 16,
+            RawEncoding::Bytes32 => 32,
+        }
+    }
+
+    /// How many times the encoded value is written, and the byte step between writes.
+    ///
+    /// Every scalar writes once. Returning this uniformly lets `materialize` place strided and scalar
+    /// encodings with the same loop instead of special-casing one of them.
+    pub fn placements(&self) -> (usize, usize) {
+        match self {
+            RawEncoding::I32Strided { count, stride } => (*count, *stride),
+            other => (1, other.width()),
+        }
+    }
+
+    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
+    pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
+        // Read the digits as text so nothing passes through f64, which cannot hold a u128
+        // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
+        let digits = |what: &str| -> Result<String, String> {
+            match value {
+                serde_json::Value::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => {
+                    Err(format!(
+                        "{n} exceeds what a JSON number can hold exactly; pass this {what} as a \
+                         decimal string instead"
+                    ))
+                }
+                serde_json::Value::Number(n) => Ok(n.to_string()),
+                serde_json::Value::String(s) => Ok(s.trim().to_string()),
+                other => Err(format!(
+                    "expected a number or decimal string for {what}, found {other}"
+                )),
+            }
+        };
+        macro_rules! int {
+            ($ty:ty, $what:expr) => {{
+                let d = digits($what)?;
+                d.parse::<$ty>()
+                    .map_err(|e| format!("invalid {}: '{d}': {e}", $what))?
+                    .to_le_bytes()
+                    .to_vec()
+            }};
+        }
+        Ok(match self {
+            RawEncoding::U8 => int!(u8, "u8"),
+            RawEncoding::U16 => int!(u16, "u16"),
+            RawEncoding::U32 => int!(u32, "u32"),
+            RawEncoding::U64 => int!(u64, "u64"),
+            RawEncoding::U128 => int!(u128, "u128"),
+            RawEncoding::I32 | RawEncoding::I32Strided { .. } => int!(i32, "i32"),
+            RawEncoding::I64 => int!(i64, "i64"),
+            RawEncoding::I128 => int!(i128, "i128"),
+            RawEncoding::Bytes32 => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| "expected a base58 pubkey string".to_string())?;
+                Pubkey::from_str(text)
+                    .map_err(|e| format!("invalid pubkey '{text}': {e}"))?
+                    .to_bytes()
+                    .to_vec()
+            }
+            RawEncoding::Slot { lead } => {
+                let lead = match value {
+                    serde_json::Value::Null => *lead,
+                    _ => {
+                        let d = digits("slot lead")?;
+                        d.parse::<i64>()
+                            .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
+                    }
+                };
+                let slot = if lead >= 0 {
+                    target_slot.checked_add(lead as u64).ok_or_else(|| {
+                        format!("slot {target_slot} plus lead {lead} exceeds u64::MAX")
+                    })?
+                } else {
+                    target_slot.saturating_sub(lead.unsigned_abs())
+                };
+                slot.to_le_bytes().to_vec()
+            }
+        })
+    }
+}
+
+impl OverrideTemplate {
+    /// Validates every byte placement before a template enters the registry.
+    pub fn validate_raw_layout(&self) -> Result<(), String> {
+        if !self.raw_layout {
+            return Err(format!("template '{}' is not a raw layout", self.id));
+        }
+
+        let mut paths = HashSet::new();
+        let mut occupied = Vec::<(usize, usize, &str)>::new();
+        for property in &self.properties {
+            if property.path.trim().is_empty() {
+                return Err("raw-layout property path must not be empty".to_string());
+            }
+            if !paths.insert(property.path.as_str()) {
+                return Err(format!(
+                    "raw-layout property path '{}' is defined more than once",
+                    property.path
+                ));
+            }
+
+            // Constant references select PDA seeds or catalog values; they are not account writes.
+            if property.is_constant_ref() {
+                if property.offset.is_some() || property.encoding.is_some() {
+                    return Err(format!(
+                        "raw-layout selector '{}' must not define an offset or encoding",
+                        property.path
+                    ));
+                }
+                let constant = property.constant.as_deref().ok_or_else(|| {
+                    format!(
+                        "raw-layout selector '{}' is missing a constant name",
+                        property.path
+                    )
+                })?;
+                if !self.constants.contains_key(constant) {
+                    return Err(format!(
+                        "raw-layout selector '{}' references unknown constant '{}'",
+                        property.path, constant
+                    ));
+                }
+                continue;
+            }
+            if property.constant.is_some() {
+                return Err(format!(
+                    "writable raw-layout property '{}' must not define a selector constant",
+                    property.path
+                ));
+            }
+
+            let offset = property.offset.ok_or_else(|| {
+                format!(
+                    "writable raw-layout property '{}' is missing an offset",
+                    property.path
+                )
+            })?;
+            let encoding = property.encoding.as_ref().ok_or_else(|| {
+                format!(
+                    "writable raw-layout property '{}' is missing an encoding",
+                    property.path
+                )
+            })?;
+            let (count, stride) = encoding.placements();
+            if count == 0 {
+                return Err(format!(
+                    "writable raw-layout property '{}' has zero placements",
+                    property.path
+                ));
+            }
+            if count > 1 && stride < encoding.width() {
+                return Err(format!(
+                    "writable raw-layout property '{}' has stride {}, smaller than its {} byte width",
+                    property.path,
+                    stride,
+                    encoding.width()
+                ));
+            }
+
+            for index in 0..count {
+                let start = offset
+                    .checked_add(
+                        index
+                            .checked_mul(stride)
+                            .ok_or_else(|| format!("stride overflow for '{}'", property.path))?,
+                    )
+                    .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+                let end = start
+                    .checked_add(encoding.width())
+                    .ok_or_else(|| format!("offset overflow for '{}'", property.path))?;
+
+                occupied.push((start, end, property.path.as_str()));
+            }
+        }
+
+        // Sorting once avoids comparing every placement with every earlier placement. After the
+        // sort, any overlap must involve two neighboring ranges because each range is half-open.
+        occupied.sort_unstable_by_key(|(start, _, _)| *start);
+        for ranges in occupied.windows(2) {
+            let (start, end, path) = ranges[0];
+            let (other_start, other_end, other_path) = ranges[1];
+            if other_start < end {
+                return Err(format!(
+                    "raw-layout properties '{path}' at bytes {start}..{end} and '{other_path}' at \
+                     bytes {other_start}..{other_end} overlap"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes `values` into a copy of `data` using each property's offset and encoding.
+    pub fn materialize_raw_layout(
+        &self,
+        data: &[u8],
+        values: &HashMap<String, serde_json::Value>,
+        target_slot: Slot,
+    ) -> Result<Vec<u8>, String> {
+        self.validate_raw_layout()?;
+
+        let mut out = data.to_vec();
+        for (name, value) in values {
+            let property = self
+                .properties
+                .iter()
+                .find(|p| &p.path == name)
+                .ok_or_else(|| format!("'{name}' is not a property of this raw-layout template"))?;
+            let (Some(offset), Some(encoding)) = (property.offset, property.encoding.as_ref())
+            else {
+                return Err(format!("property '{name}' has no offset or encoding"));
+            };
+            let bytes = encoding.encode(value, target_slot)?;
+            let (count, stride) = encoding.placements();
+            for i in 0..count {
+                let at = offset
+                    .checked_add(
+                        i.checked_mul(stride)
+                            .ok_or_else(|| format!("stride overflow for '{name}'"))?,
+                    )
+                    .ok_or_else(|| format!("offset overflow for '{name}'"))?;
+                let end = at
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| format!("offset overflow for '{name}'"))?;
+                if end > out.len() {
+                    // Scalars keep the original wording; only a strided run needs to explain itself.
+                    return Err(if count == 1 {
+                        format!(
+                            "'{name}' at offset {offset} + {} bytes exceeds the {} byte account",
+                            bytes.len(),
+                            out.len()
+                        )
+                    } else {
+                        format!(
+                            "'{name}' writes {count} x {} bytes from offset {offset} every \
+                             {stride}, which exceeds the {} byte account",
+                            bytes.len(),
+                            out.len()
+                        )
+                    });
+                }
+                out[at..end].copy_from_slice(&bytes);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Walks a dot-notation path: struct fields by name, array elements by index.
@@ -1069,7 +1415,7 @@ fn idl_field_docs(idl: &Idl, account_type: &str, path: &str) -> Option<String> {
 /// supply one, so field guidance is not written twice.
 fn describe_properties_from_idl(
     properties: Vec<YamlProperty>,
-    idl: &Idl,
+    idl: Option<&Idl>,
     account_type: &str,
 ) -> Vec<Property> {
     properties
@@ -1077,7 +1423,10 @@ fn describe_properties_from_idl(
         .map(|yaml| {
             let mut property: Property = yaml.into();
             if property.description.is_none() {
-                property.description = idl_field_docs(idl, account_type, &property.path);
+                // Only a fallback. A raw_layout collection with no IDL must spell out every
+                // description in the YAML, since there is no schema to borrow docs from.
+                property.description =
+                    idl.and_then(|idl| idl_field_docs(idl, account_type, &property.path));
             }
             property
         })
@@ -1086,7 +1435,7 @@ fn describe_properties_from_idl(
 
 impl YamlOverrideTemplateCollection {
     /// Convert collection to runtime OverrideTemplates with loaded IDL
-    pub fn to_override_templates(self, idl: Idl) -> Vec<OverrideTemplate> {
+    pub fn to_override_templates(self, idl: Option<Idl>) -> Vec<OverrideTemplate> {
         // Convert constants once for sharing
         let constants: HashMap<String, ConstantDefinition> = self
             .constants
@@ -1109,11 +1458,16 @@ impl YamlOverrideTemplateCollection {
                     protocol: self.protocol.clone(),
                     idl: idl.clone(),
                     address: entry.address.into(),
-                    properties: describe_properties_from_idl(entry.properties, &idl, &account_type),
+                    properties: describe_properties_from_idl(
+                        entry.properties,
+                        idl.as_ref(),
+                        &account_type,
+                    ),
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
                     llm_context: entry.llm_context,
+                    raw_layout: self.raw_layout,
                 }
             })
             .collect()
@@ -1151,7 +1505,7 @@ impl YamlOverrideTemplate {
             name: self.name,
             description: self.description,
             protocol: self.protocol,
-            idl: self.idl,
+            idl: Some(self.idl),
             address: self.address.into(),
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
@@ -1162,6 +1516,7 @@ impl YamlOverrideTemplate {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
+            raw_layout: false,
         }
     }
 }
@@ -1258,7 +1613,314 @@ mod tests {
 
     use serde_json::json;
 
-    use super::PdaSeed;
+    use super::{AccountAddress, OverrideTemplate, PdaSeed, Property};
+
+    fn raw_template(properties: Vec<Property>) -> OverrideTemplate {
+        OverrideTemplate {
+            id: "example-raw".to_string(),
+            name: "Example raw layout".to_string(),
+            description: "Test template".to_string(),
+            protocol: "Example".to_string(),
+            idl: None,
+            address: AccountAddress::Pubkey(String::new()),
+            account_type: String::new(),
+            properties,
+            constants: HashMap::new(),
+            tags: Vec::new(),
+            llm_context: None,
+            raw_layout: true,
+        }
+    }
+
+    /// The encoding layer must never route a value through f64: a 2^88-scaled price is a 29-digit
+    /// integer and f64 carries about 16 significant digits.
+    #[test]
+    fn raw_encoding_writes_large_values_exactly() {
+        use super::RawEncoding;
+
+        let huge: u128 = 50u128 * (1u128 << 88);
+        let bytes = RawEncoding::U128
+            .encode(&json!(huge.to_string()), 0)
+            .expect("decimal string");
+        assert_eq!(u128::from_le_bytes(bytes.try_into().unwrap()), huge);
+
+        // A bare JSON number that big has already lost digits, so it must be refused rather than
+        // silently written wrong.
+        let err = RawEncoding::U128
+            .encode(&json!(1.152921504606847e21), 0)
+            .expect_err("an inexact JSON number must be refused");
+        assert!(err.contains("decimal string"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_encoding_handles_signed_and_slot_fields() {
+        use super::RawEncoding;
+
+        let bytes = RawEncoding::I64.encode(&json!(-25599i64 << 32), 0).unwrap();
+        assert_eq!(i64::from_le_bytes(bytes.try_into().unwrap()) >> 32, -25599);
+
+        // The supplied value is the lead, so one property covers live and stale.
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 500);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-5), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 495);
+
+        // The manifest lead is the default, used when no value is given.
+        let bytes = RawEncoding::Slot { lead: -1 }
+            .encode(&json!(null), 500)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 499);
+
+        // A lead that would go below zero clamps rather than wrapping.
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-10), 3)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 0);
+
+        // Slot is a u64. Values above i64::MAX must not wrap through a signed cast and become zero.
+        let large_slot = i64::MAX as u64 + 1;
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), large_slot)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), large_slot);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(-1), u64::MAX)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX - 1);
+
+        let bytes = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(0), u64::MAX)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), u64::MAX);
+
+        let err = RawEncoding::Slot { lead: 0 }
+            .encode(&json!(1), u64::MAX)
+            .expect_err("a positive lead must not wrap past u64::MAX");
+        assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_writes_past_the_end_of_the_account() {
+        use super::RawEncoding;
+
+        let mut property = Property::field("tail".to_string());
+        property.offset = Some(12);
+        property.encoding = Some(RawEncoding::U64);
+        let template = raw_template(vec![property]);
+
+        let err = template
+            .materialize_raw_layout(
+                &[0u8; 16],
+                &HashMap::from([("tail".to_string(), json!(1))]),
+                0,
+            )
+            .expect_err("a field crossing the end must be refused");
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_layout_serializes_as_a_boolean() {
+        let json = serde_json::to_value(raw_template(Vec::new())).expect("serialize raw template");
+        assert_eq!(json["rawLayout"], true);
+    }
+
+    #[test]
+    fn i32_strided_writes_every_slot_and_nothing_between() {
+        use super::RawEncoding;
+        let mut property = Property::field("ticks".to_string());
+        property.offset = Some(4);
+        property.encoding = Some(RawEncoding::I32Strided {
+            count: 3,
+            stride: 16,
+        });
+        let template = raw_template(vec![property]);
+
+        let out = template
+            .materialize_raw_layout(
+                &[0u8; 64],
+                &HashMap::from([("ticks".to_string(), json!(-25_600))]),
+                0,
+            )
+            .expect("strided write");
+
+        for i in 0..3usize {
+            let at = 4 + i * 16;
+            assert_eq!(
+                i32::from_le_bytes(out[at..at + 4].try_into().unwrap()),
+                -25_600,
+                "slot {i} at offset {at} should carry the value"
+            );
+        }
+        // Everything outside the three four-byte spans must be untouched.
+        let written: Vec<usize> = (0..3).flat_map(|i| (4 + i * 16)..(8 + i * 16)).collect();
+        for (i, b) in out.iter().enumerate() {
+            if !written.contains(&i) {
+                assert_eq!(
+                    *b, 0,
+                    "byte {i} lies between strided slots and must not change"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn i32_strided_rejects_a_run_that_leaves_the_account() {
+        use super::RawEncoding;
+        let mut property = Property::field("ticks".to_string());
+        property.offset = Some(4);
+        property.encoding = Some(RawEncoding::I32Strided {
+            count: 3,
+            stride: 16,
+        });
+        let template = raw_template(vec![property]);
+        let err = template
+            .materialize_raw_layout(
+                &[0u8; 32],
+                &HashMap::from([("ticks".to_string(), json!(1))]),
+                0,
+            )
+            .expect_err("a run crossing the end must be refused");
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_self_overlapping_strided_writes() {
+        use super::RawEncoding;
+
+        let mut property = Property::field("ticks".to_string());
+        property.offset = Some(4);
+        property.encoding = Some(RawEncoding::I32Strided {
+            count: 2,
+            stride: 2,
+        });
+        let template = raw_template(vec![property]);
+
+        let err = template
+            .validate_raw_layout()
+            .expect_err("a stride smaller than the encoded width must be rejected");
+        assert!(err.contains("smaller than its 4 byte width"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_rejects_overlaps_between_properties() {
+        use super::RawEncoding;
+
+        let mut amount = Property::field("amount".to_string());
+        amount.offset = Some(16);
+        amount.encoding = Some(RawEncoding::U64);
+
+        let mut ticks = Property::field("ticks".to_string());
+        ticks.offset = Some(4);
+        ticks.encoding = Some(RawEncoding::I32Strided {
+            count: 3,
+            stride: 8,
+        });
+
+        let template = raw_template(vec![amount, ticks]);
+        let err = template
+            .validate_raw_layout()
+            .expect_err("different properties must not target the same bytes");
+        assert!(err.contains("'ticks'"), "{err}");
+        assert!(err.contains("'amount'"), "{err}");
+        assert!(err.contains("overlap"), "{err}");
+
+        let err = template
+            .materialize_raw_layout(
+                &[0u8; 32],
+                &HashMap::from([
+                    ("amount".to_string(), json!(1)),
+                    ("ticks".to_string(), json!(2)),
+                ]),
+                0,
+            )
+            .expect_err("materialization must reject an unvalidated overlapping template");
+        assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_allows_adjacent_properties() {
+        use super::RawEncoding;
+
+        let mut first = Property::field("first".to_string());
+        first.offset = Some(0);
+        first.encoding = Some(RawEncoding::U64);
+
+        let mut second = Property::field("second".to_string());
+        second.offset = Some(8);
+        second.encoding = Some(RawEncoding::U64);
+
+        raw_template(vec![first, second])
+            .validate_raw_layout()
+            .expect("adjacent half-open byte ranges do not overlap");
+    }
+
+    #[test]
+    fn raw_layout_rejects_duplicate_and_empty_property_paths() {
+        use super::RawEncoding;
+
+        let property = |path: &str, offset| {
+            let mut property = Property::field(path.to_string());
+            property.offset = Some(offset);
+            property.encoding = Some(RawEncoding::U64);
+            property
+        };
+
+        let duplicate = raw_template(vec![property("value", 0), property("value", 8)]);
+        let err = duplicate
+            .validate_raw_layout()
+            .expect_err("duplicate paths make one property unreachable");
+        assert!(err.contains("defined more than once"), "{err}");
+
+        let empty = raw_template(vec![property(" ", 0)]);
+        let err = empty
+            .validate_raw_layout()
+            .expect_err("blank property paths must be rejected");
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn raw_layout_validates_selector_properties() {
+        use super::{ConstantDefinition, RawEncoding};
+
+        let selector = Property::constant_ref("market".to_string(), "markets".to_string());
+        let mut valid = raw_template(vec![selector.clone()]);
+        valid.constants.insert(
+            "markets".to_string(),
+            ConstantDefinition {
+                label: "Market".to_string(),
+                description: None,
+                options: Vec::new(),
+            },
+        );
+        valid
+            .validate_raw_layout()
+            .expect("a selector referencing a declared constant is valid");
+
+        let unknown = raw_template(vec![selector]);
+        let err = unknown
+            .validate_raw_layout()
+            .expect_err("a selector must reference a declared constant");
+        assert!(err.contains("unknown constant 'markets'"), "{err}");
+
+        let mut writable_selector = Property::constant_ref("market", "markets");
+        writable_selector.offset = Some(0);
+        writable_selector.encoding = Some(RawEncoding::Bytes32);
+        let mut invalid = raw_template(vec![writable_selector]);
+        invalid.constants = valid.constants;
+        let err = invalid
+            .validate_raw_layout()
+            .expect_err("a selector must not also write account bytes");
+        assert!(
+            err.contains("must not define an offset or encoding"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn u16_be_ref_rejects_out_of_range_values() {

@@ -93,7 +93,8 @@ use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
-        TemplateRegistry, protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override,
+        TemplateRegistry, account_data_values,
+        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
@@ -865,7 +866,11 @@ impl SurfnetSvm {
     fn register_builtin_template_idls(&mut self) {
         let registry = TemplateRegistry::new();
         for (_, template) in registry.templates.into_iter() {
-            let _ = self.register_idl(template.idl, None);
+            // Templates for programs with no IDL have nothing to register; they write through
+            // `raw_layout` instead.
+            if let Some(idl) = template.idl {
+                let _ = self.register_idl(idl, None);
+            }
         }
     }
 
@@ -3104,29 +3109,28 @@ impl SurfnetSvm {
 
             // Apply the override values to the account data
             if !override_instance.values.is_empty() {
-                // Filter out values that are only used for PDA derivation (not account data)
-                let pda_refs = override_instance.account.get_pda_seed_references();
-                let account_values: HashMap<String, serde_json::Value> = override_instance
-                    .values
-                    .iter()
-                    .filter(|(key, _)| !pda_refs.contains(key))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let override_template = template_registry().get(&override_instance.template_id);
+
+                // PDA references resolve the address above, while constant_ref properties drive
+                // UI/catalog choices; neither is an account field to serialize.
+                let (account_values, pda_ref_count, constant_ref_count) =
+                    account_data_values(override_instance, override_template);
 
                 if account_values.is_empty() {
                     debug!(
-                        "Override {} has no account data modifications (all values are PDA seeds)",
+                        "Override {} has no account data modifications (all values are selectors)",
                         override_instance.id
                     );
                     continue;
                 }
 
                 debug!(
-                    "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs)",
+                    "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs and {} constant refs)",
                     override_instance.id,
                     account_values.len(),
                     account_pubkey,
-                    pda_refs.len()
+                    pda_ref_count,
+                    constant_ref_count
                 );
 
                 // Get the account from the SVM
@@ -3137,6 +3141,44 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
+
+                // Programs with no usable IDL carry a byte layout instead, and this MUST come
+                // before the IDL lookup below: those programs have no registered IDL at all, so the
+                // lookup would `continue` and silently drop the override.
+                let raw_template = override_template.filter(|template| template.raw_layout);
+                if let Some(template) = raw_template {
+                    match template.materialize_raw_layout(
+                        account.data(),
+                        &account_values,
+                        target_slot,
+                    ) {
+                        Ok(new_data) => {
+                            let modified = Account {
+                                lamports: account.lamports(),
+                                data: new_data,
+                                owner: *account.owner(),
+                                executable: account.executable(),
+                                rent_epoch: account.rent_epoch(),
+                            };
+                            if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                                warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                            } else {
+                                debug!(
+                                    "Raw-layout override {} applied {} field(s) to {}",
+                                    override_instance.id,
+                                    account_values.len(),
+                                    account_pubkey
+                                );
+                                settled_this_slot.insert(account_pubkey);
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Raw-layout override {} failed on {}: {}",
+                            override_instance.id, account_pubkey, e
+                        ),
+                    }
+                    continue;
+                }
 
                 // A bad value in one override is that override's failure, never the batch's:
                 // an error returned from this loop aborts block production.
@@ -6019,10 +6061,18 @@ mod tests {
         assert!(!epoch_schedule.warmup);
 
         let registry = TemplateRegistry::new();
+        let mut checked = 0usize;
         for (_, template) in registry.templates {
-            let program_id = template.idl.address.clone();
+            // Templates for programs that publish no IDL have nothing to register.
+            let Some(idl) = template.idl else { continue };
+            let program_id = idl.address.clone();
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
+            checked += 1;
         }
+        assert!(
+            checked > 0,
+            "no template carried an IDL, so this proved nothing about registration"
+        );
         assert!(svm.skip_blockhash_check);
     }
 
