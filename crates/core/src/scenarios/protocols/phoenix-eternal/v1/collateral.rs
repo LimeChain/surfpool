@@ -158,12 +158,17 @@ pub fn parse_quote_lot_collateral(value: &serde_json::Value) -> SurfpoolResult<i
         .ok_or_else(|| {
             SurfpoolError::internal("Phoenix collateral must be a signed 64-bit integer")
         })?;
+    ensure_collateral_floor(collateral)?;
+    Ok(collateral)
+}
+
+pub fn ensure_collateral_floor(collateral: i64) -> SurfpoolResult<()> {
     if collateral < MIN_QUOTE_LOT_COLLATERAL {
         return Err(SurfpoolError::internal(format!(
             "Phoenix collateral must be at least {MIN_QUOTE_LOT_COLLATERAL} quote lots"
         )));
     }
-    Ok(collateral)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,6 +612,16 @@ mod tests {
         for (case, collateral, patched) in [
             ("raise through traderState", 20_000_i64, false),
             ("lower through traderState", 1, true),
+            (
+                "lower to the floor through traderState",
+                MIN_QUOTE_LOT_COLLATERAL,
+                true,
+            ),
+            (
+                "lower past the floor through traderState",
+                MIN_QUOTE_LOT_COLLATERAL - 1,
+                false,
+            ),
         ] {
             let mut scenario = build_phoenix_collateral_scenario(trader, &matching, "1").unwrap();
             scenario.overrides[0].values = HashMap::from([(

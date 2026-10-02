@@ -13,8 +13,8 @@ use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::collateral::{
-    index_trader_state_range, live_quote_lot_collateral, parse_quote_lot_collateral, trader_header,
-    validate_hot_trader_fields,
+    ensure_collateral_floor, index_trader_state_range, live_quote_lot_collateral,
+    parse_quote_lot_collateral, trader_header, validate_hot_trader_fields,
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -367,9 +367,11 @@ async fn prepare_trader_override(
                 Some(error),
             )
         })?;
+        let collateral = forged.trader_state.quote_lot_collateral.as_inner();
+        ensure_collateral_floor(collateral)?;
         ensure_collateral_is_lowered(
             header.trader_state.quote_lot_collateral.as_inner(),
-            forged.trader_state.quote_lot_collateral.as_inner(),
+            collateral,
         )?;
     }
 
