@@ -29,8 +29,9 @@ templates:
       Set fetchBeforeUse: true so the live Trader is forked first; an override on a Trader that is
       not on the fork yet is skipped.
       Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
-      Before sending Phoenix trades or liquidations, surfnet_setAccount the mainnet LastRestartSlot
-      sysvar and an empty system account at GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -62,8 +63,9 @@ templates:
       from its markTicks there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
-      Before sending Phoenix trades or liquidations, surfnet_setAccount the mainnet LastRestartSlot
-      sysvar and an empty system account at GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -101,8 +103,9 @@ templates:
       maintenanceRiskFactorBps and backstopRiskFactorBps there.
       Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
       override that builds on state an earlier one prepared in the same scenario.
-      Before sending Phoenix trades or liquidations, surfnet_setAccount the mainnet LastRestartSlot
-      sysvar and an empty system account at GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -131,32 +134,11 @@ templates:
       Pass both fees as JSON numbers in millionths of the notional: 350 is 0.035%, 1000 is 0.1%.
       defaultMakerFeeMicro may be negative (a rebate); keep it below the taker fee.
       Set fetchBeforeUse: true so the live orderbook is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
-
-  - id: phoenix-exchange-status
-    name: Phoenix Exchange Status
-    description: >-
-      Put the whole Phoenix Eternal exchange into maintenance or mark it inactive.
-    idl_account_name: GlobalConfiguration
-    properties:
-      - path: exchangeStatus
-        label: Exchange status bits
-        description: >-
-          Bit 7 initialized, bit 0 active, bit 2 maintenance. Live: 131. Maintenance: 135.
-          Example: 135
-    llm_context: |
-      This switches the exchange-wide status that Phoenix checks before trader actions such as
-      registering, depositing and trading. It does not cancel orders or move funds.
-      Phoenix treats the exchange as active only when bits 7 and 0 are set and bit 2 is clear.
-      The live value is 131 (bits 7, 1 and 0). Keep the bits you do not mean to change:
-      135 adds maintenance, 130 clears active, 131 restores the live state.
-      Pass exchangeStatus as a JSON number.
-      The account is the singleton GlobalConfiguration, so this template carries its address.
-      Set fetchBeforeUse: true so the live configuration is forked first.
-    address:
-      type: pubkey
-      value: 2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ
 
   - id: phoenix-withdraw-limits
     name: Phoenix Withdraw Limits
@@ -196,6 +178,9 @@ templates:
       keep the budget empty while you test.
       The account is the singleton WithdrawQueue, so this template carries its address.
       Set fetchBeforeUse: true so the live queue is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -227,6 +212,9 @@ templates:
       The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
       [0, 0] for the main account.
       Set fetchBeforeUse: true so the live trader is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -268,6 +256,9 @@ templates:
       asset id as u64 little-endian]. To find it, call getProgramAccounts on the Phoenix program
       with dataSize 328 and a memcmp of the trader account at offset 224; assetId is the u32 at 256.
       Set fetchBeforeUse: true so the live stop loss is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -295,5 +286,8 @@ templates:
       it, call getProgramAccounts on the Phoenix program with dataSize 168 and a memcmp of the
       authority at offset 8 or of the delegated key at offset 40.
       Set fetchBeforeUse: true so the live permission is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey

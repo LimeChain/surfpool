@@ -12,7 +12,6 @@ for submitting trades, arbitrage, and liquidation transactions.
 | Maintenance margin stress | `phoenix-maintenance-margin-stress` | Maintenance margin risk factor for one market in the current PerpAssetMap |
 | Liquidation cascade | Two validated overrides in one scenario | Trader collateral at slot 0, then a direct market mark shock at slot 1 |
 | Market fees | `phoenix-market-fees` | Default taker and maker fee on one market's orderbook |
-| Exchange status | `phoenix-exchange-status` | Exchange-wide status bits in GlobalConfiguration, such as maintenance |
 | Withdraw limits | `phoenix-withdraw-limits` | Withdrawal budget, its refill per slot and the withdrawal and queueing fees |
 | Trader capabilities | `phoenix-trader-capabilities` | Capability bits of one cold Trader: activate, reduce-only or frozen |
 | Stop-loss trigger | `phoenix-stop-loss-trigger` | Trigger and execution prices of a Trader's existing stop loss on one market |
@@ -21,9 +20,8 @@ for submitting trades, arbitrage, and liquidation transactions.
 Tick inputs are Phoenix protocol ticks, not human-readable USD prices. Pass the market templates'
 tick values and collateral as decimal strings so values outside JavaScript's safe integer range
 remain exact.
-The fee, exchange status, withdraw limit, capability, stop-loss and permission templates
-edit their account through the IDL like the Kamino templates, so their values are JSON
-numbers.
+The fee, withdraw limit, capability, stop-loss and permission templates edit their account
+through the IDL like the Kamino templates, so their values are JSON numbers.
 
 Market templates identify the real `PerpAssetMap` account. Their `symbol` and tick properties
 carry `value_type: string` so Studio can render scenario inputs without synthetic IDL accounts.
