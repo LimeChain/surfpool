@@ -133,7 +133,9 @@ pub fn live_quote_lot_collateral(
     header: &TraderHeader,
     index: Option<&Account>,
 ) -> SurfpoolResult<i64> {
-    if !header.trader_state.is_hot() {
+    // The index is passed whenever Phoenix reads this Trader from its record, even a cold-flagged
+    // Trader the fork's index still lists.
+    if index.is_none() && !header.trader_state.is_hot() {
         return Ok(header.trader_state.quote_lot_collateral.as_inner());
     }
     let index = index.ok_or_else(|| {
@@ -393,6 +395,7 @@ mod tests {
             "mismatched key",
             "unsupported field",
             "raised collateral",
+            "raised record of a cold-flagged Trader",
         ] {
             let trader = Pubkey::new_from_array(FIRST_KEY);
             let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
@@ -413,6 +416,14 @@ mod tests {
                     scenario.overrides[0].values.insert(
                         "traderState.quoteLotCollateral".to_string(),
                         serde_json::json!("112"),
+                    );
+                }
+                // Below the account's 9999 but above the 111 Phoenix reads from the record.
+                "raised record of a cold-flagged Trader" => {
+                    write_u32(&mut before_trader.data, 96, 0);
+                    scenario.overrides[0].values.insert(
+                        "traderState.quoteLotCollateral".to_string(),
+                        serde_json::json!("500"),
                     );
                 }
                 "cycle" => write_u32(&mut before_index.data, 96, 2),
