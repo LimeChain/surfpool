@@ -12,7 +12,7 @@ templates:
   - id: phoenix-trader-collateral-stress
     name: Phoenix Trader Collateral Stress
     description: >-
-      Set exact signed quote-lot collateral on a Phoenix Trader and its effective GlobalTraderIndex
+      Set exact signed quote-lot collateral on a Phoenix Trader and its live GlobalTraderIndex
       entry when hot.
     idl_account_name: Trader
     properties:
@@ -22,6 +22,8 @@ templates:
     llm_context: |
       This prepares collateral stress state. It does not execute liquidation.
       Only lower collateral; raising it needs a real deposit into the global vault.
+      The target is quoteLotCollateral, which excludes the unrealized PnL and funding Phoenix adds
+      for effective collateral: lowering it by N quote lots lowers effective collateral by N.
       For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
       slot 1 in one create_scenario call.
       Set fetchBeforeUse: true so the live Trader is forked first; an override on a Trader that is

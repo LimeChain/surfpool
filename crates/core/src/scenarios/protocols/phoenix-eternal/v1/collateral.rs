@@ -129,7 +129,10 @@ pub fn index_trader_state_range(
         })
 }
 
-pub fn effective_collateral(header: &TraderHeader, index: Option<&Account>) -> SurfpoolResult<i64> {
+pub fn live_quote_lot_collateral(
+    header: &TraderHeader,
+    index: Option<&Account>,
+) -> SurfpoolResult<i64> {
     if !header.trader_state.is_hot() {
         return Ok(header.trader_state.quote_lot_collateral.as_inner());
     }

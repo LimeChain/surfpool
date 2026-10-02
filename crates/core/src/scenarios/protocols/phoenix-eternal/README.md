@@ -56,7 +56,9 @@ The collateral builder and live market catalog are available through MCP:
 `baseLotDecimals`, `maintenanceRiskFactorBps` and `backstopRiskFactorBps`, so a market given by orderbook address resolves to its symbol,
 a mark converts to USD per base unit as `markTicks * tickSize * 10^(baseLotDecimals - 6)`,
 relative changes start from live values, and a maintenance factor can be kept above the backstop one. The collateral tool returns a Studio editor URL. The tool reads the live Trader account; Play skips a target above
-the trader’s effective collateral with a warning.
+the trader’s current `quoteLotCollateral` with a warning. That value excludes the unrealized PnL and
+funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective
+collateral by N.
 
 ## Troubleshooting
 

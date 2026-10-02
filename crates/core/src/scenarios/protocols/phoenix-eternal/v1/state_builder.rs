@@ -13,7 +13,7 @@ use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::collateral::{
-    effective_collateral, index_trader_state_range, parse_quote_lot_collateral, trader_header,
+    index_trader_state_range, live_quote_lot_collateral, parse_quote_lot_collateral, trader_header,
     validate_hot_trader_fields,
 };
 use crate::{
@@ -333,7 +333,7 @@ async fn prepare_trader_override(
     };
     let mut values = values.clone();
     if let Some(target) = target {
-        ensure_collateral_is_lowered(effective_collateral(&header, index.as_ref())?, target)?;
+        ensure_collateral_is_lowered(live_quote_lot_collateral(&header, index.as_ref())?, target)?;
         values.insert(
             COLLATERAL_FIELD.to_string(),
             serde_json::Value::from(target),
@@ -489,7 +489,7 @@ pub fn build_phoenix_collateral_scenario(
 
     let mut scenario = Scenario::new(
         "Phoenix Trader Collateral Stress".to_string(),
-        "Set exact signed quote-lot collateral on a Phoenix Trader and its effective index entry."
+        "Set exact signed quote-lot collateral on a Phoenix Trader and its live index entry."
             .to_string(),
     );
     scenario.tags = vec![

@@ -1141,7 +1141,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's effective collateral with a warning, since raising it needs a real deposit. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's current quoteLotCollateral with a warning, since raising it needs a real deposit. quoteLotCollateral excludes the unrealized PnL and funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective collateral by N. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
     )]
     async fn create_phoenix_collateral_scenario(
         &self,
