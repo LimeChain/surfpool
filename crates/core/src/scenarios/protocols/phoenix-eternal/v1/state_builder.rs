@@ -18,7 +18,6 @@ use super::collateral::{
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    scenarios::TemplateRegistry,
     surfnet::{
         remote::SurfnetRemoteClient,
         svm::{AccountUpdatePolicy, SurfnetSvm},
@@ -37,6 +36,7 @@ fn phoenix_account_kind(data: &[u8]) -> Option<PhoenixAccount> {
     PhoenixAccount::from_discriminant(data.get(..8)?.try_into().unwrap())
 }
 
+const COLLATERAL_TEMPLATE_ID: &str = "phoenix-trader-collateral-stress";
 const COLLATERAL_FIELD: &str = "traderState.quoteLotCollateral";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
@@ -483,16 +483,12 @@ pub fn build_phoenix_collateral_scenario(
     let target_quote_lots = parse_quote_lot_collateral(&serde_json::json!(target_quote_lots))?;
     trader_header(&trader, trader_account)?;
 
-    let template = TemplateRegistry::new()
-        .get("phoenix-trader-collateral-stress")
-        .cloned()
-        .ok_or_else(|| SurfpoolError::internal("Phoenix collateral template is unavailable"))?;
     let values = HashMap::from([(
         COLLATERAL_FIELD.to_string(),
         serde_json::json!(target_quote_lots.to_string()),
     )]);
     let mut collateral_override = OverrideInstance::new(
-        template.id,
+        COLLATERAL_TEMPLATE_ID.to_string(),
         PREPARATION_SLOT,
         AccountAddress::Pubkey(trader.to_string()),
     )
@@ -539,6 +535,7 @@ mod tests {
     use solana_account::Account;
 
     use super::*;
+    use crate::scenarios::TemplateRegistry;
 
     const TRADER_HEADER_LEN: usize = size_of::<TraderHeader>();
     const COLLATERAL_BYTE_RANGE: core::ops::Range<usize> = 88..96;
@@ -610,14 +607,15 @@ mod tests {
     fn builds_one_collateral_override() {
         let trader = Pubkey::new_unique();
         let funded = trader_account_for(trader, 500);
+        let registry = TemplateRegistry::new();
 
         for target in ["500", "-9007199254740993"] {
             let preparation = build_phoenix_collateral_scenario(trader, &funded, target).unwrap();
             assert_eq!(preparation.overrides.len(), 1);
             let collateral_override = &preparation.overrides[0];
-            assert_eq!(
-                collateral_override.template_id,
-                "phoenix-trader-collateral-stress"
+            assert!(
+                registry.contains(&collateral_override.template_id),
+                "the override must name a bundled template"
             );
             assert_eq!(
                 collateral_override.account,
