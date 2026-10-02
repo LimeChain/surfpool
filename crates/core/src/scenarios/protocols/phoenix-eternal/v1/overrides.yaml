@@ -228,29 +228,6 @@ templates:
     address:
       type: pubkey
 
-  - id: phoenix-trader-limits
-    name: Phoenix Trader Position Limit
-    description: >-
-      Set how many markets a Phoenix Trader may hold positions in.
-    idl_account_name: Trader
-    properties:
-      - path: maxPositions
-        label: Max positions
-        description: >-
-          Most markets the trader can hold a position in. New cross-margin traders get 128.
-          Example: 1
-    llm_context: |
-      This caps the number of markets a trader can hold positions in, for example to test a bot
-      that hits the limit when it opens one more market. It does not close positions.
-      Keep maxPositions at or above the trader's open position count; at that count, opening a
-      position in another market is refused.
-      Pass maxPositions as a JSON number.
-      The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
-      [0, 0] for the main account.
-      Set fetchBeforeUse: true so the live trader is forked first.
-    address:
-      type: pubkey
-
   - id: phoenix-stop-loss-trigger
     name: Phoenix Stop-Loss Trigger
     description: >-

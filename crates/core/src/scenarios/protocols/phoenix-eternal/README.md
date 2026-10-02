@@ -15,15 +15,14 @@ for submitting trades, arbitrage, and liquidation transactions.
 | Exchange status | `phoenix-exchange-status` | Exchange-wide status bits in GlobalConfiguration, such as maintenance |
 | Withdraw limits | `phoenix-withdraw-limits` | Withdrawal budget, its refill per slot and the withdrawal and queueing fees |
 | Trader capabilities | `phoenix-trader-capabilities` | Capability bits of one cold Trader: activate, reduce-only or frozen |
-| Position limit | `phoenix-trader-limits` | How many markets one Trader may hold positions in |
 | Stop-loss trigger | `phoenix-stop-loss-trigger` | Trigger and execution prices of a Trader's existing stop loss on one market |
 | Delegated permission | `phoenix-permission-limits` | Expiry and remaining signer actions of one delegated permission |
 
 Tick inputs are Phoenix protocol ticks, not human-readable USD prices. Pass the market templates'
 tick values and collateral as decimal strings so values outside JavaScript's safe integer range
 remain exact.
-The fee, exchange status, withdraw limit, capability, position limit, stop-loss and permission
-templates edit their account through the IDL like the Kamino templates, so their values are JSON
+The fee, exchange status, withdraw limit, capability, stop-loss and permission templates
+edit their account through the IDL like the Kamino templates, so their values are JSON
 numbers.
 
 Market templates identify the real `PerpAssetMap` account. Their `symbol` and tick properties
