@@ -50,6 +50,8 @@ pub struct PhoenixMarket {
     pub symbol: String,
     pub orderbook: Pubkey,
     pub mark_ticks: u64,
+    pub tick_size: u64,
+    pub base_lot_decimals: i8,
     pub maintenance_risk_factor_bps: u16,
     pub backstop_risk_factor_bps: u16,
 }
@@ -87,6 +89,8 @@ pub fn phoenix_markets(
                     .price
                     .ticks
                     .as_inner(),
+                tick_size: entry.metadata.static_market_params().tick_size.as_inner(),
+                base_lot_decimals: entry.metadata.static_market_params().base_lot_decimals,
                 maintenance_risk_factor_bps: entry.metadata.risk_params().risk_factors[0],
                 backstop_risk_factor_bps: entry.metadata.risk_params().risk_factors[1],
             })
@@ -783,6 +787,8 @@ mod tests {
                 symbol: "SOL".to_string(),
                 orderbook: Pubkey::from_str_const("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2"),
                 mark_ticks: 777,
+                tick_size: 100,
+                base_lot_decimals: 2,
                 maintenance_risk_factor_bps: 9_000,
                 backstop_risk_factor_bps: 2_000,
             }]
