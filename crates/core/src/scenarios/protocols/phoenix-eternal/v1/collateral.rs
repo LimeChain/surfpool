@@ -333,14 +333,16 @@ mod tests {
         use super::super::state_builder::PHOENIX_GLOBAL_TRADER_INDEX;
         use crate::surfnet::svm::SurfnetSvm;
 
-        for (key, other_key, collateral_offset, target) in [
-            (FIRST_KEY, SECOND_KEY, 144, 1_i64),
-            (SECOND_KEY, FIRST_KEY, 208, -9_007_199_254_740_993),
+        // A Trader the index lists is read from its record even when its own flag says cold.
+        for (key, other_key, collateral_offset, target, flagged_hot) in [
+            (FIRST_KEY, SECOND_KEY, 144, 1_i64, true),
+            (SECOND_KEY, FIRST_KEY, 208, -9_007_199_254_740_993, true),
+            (FIRST_KEY, SECOND_KEY, 144, 1_i64, false),
         ] {
             let trader = Pubkey::new_from_array(key);
             let other_trader = Pubkey::new_from_array(other_key);
             let index_key = PHOENIX_GLOBAL_TRADER_INDEX;
-            let mut before_trader = trader_account(key, 9_999, true);
+            let mut before_trader = trader_account(key, 9_999, flagged_hot);
             before_trader.lamports = 1;
             let mut before_other = trader_account(other_key, 8_888, true);
             before_other.lamports = 1;

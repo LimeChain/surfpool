@@ -329,6 +329,12 @@ async fn prepare_trader_override(
             }
             Some(index)
         }
+        // A fork's index can predate the Trader leaving the hot set, and Phoenix keeps reading a
+        // Trader the index lists from its record.
+        Some(_) => svm
+            .inner
+            .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
+            .filter(|index| index_trader_state_range(index, &header.key).is_ok()),
         _ => None,
     };
     let mut values = values.clone();
