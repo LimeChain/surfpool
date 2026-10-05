@@ -46,6 +46,9 @@ sell output = floor(base_in  × quote_atoms_per_base_atom_x1e15 × sell_level_0_
 buy output  = floor(quote_in × base_atoms_per_quote_atom_x1e15 × buy_level_0_factor  / 10^21)
 ```
 
+As a fork ages, the program can switch to a later one of the five quote-start configs at offset 1136.
+The last one pays 75 ppm less on SOL / USDC, so a fill can land up to that much below these formulas.
+
 ### Layout
 
 The market account is 1264 bytes. Offsets not listed are not written by any template.
@@ -72,9 +75,10 @@ quote skip leading levels, and two consumed-depth words at 0 and 8 are not expos
 ## Picking a market
 
 Every template starts with a market picker. Its options are read from the program when Studio or
-MCP loads the templates: every 1264-byte account with market tag `5` at offset 96 whose quote was
-updated within the last 5000 slots, through the surfnet (local state first, then mainnet) and cached
-for 60 seconds. Markets the maker stopped quoting drop out. On 2026-09-25 that included:
+MCP loads the templates: every 1264-byte account with market tag `5` at offset 96 whose quote the
+maker updated within the last 5000 slots on mainnet, cached for 60 seconds. Freshness is read from
+the surfnet's datasource because a fork never re-quotes the copies it loaded; without a datasource
+every market is listed. Markets the maker stopped quoting drop out. On 2026-09-25 that included:
 
 | Choice                         | Best suited for                                       |
 | ------------------------------ | ----------------------------------------------------- |
@@ -146,6 +150,23 @@ Use this to test fallback routing when Tessera stops updating.
 1. Apply `tessera-halt` with both fields `0`.
 2. Confirm both directions fail with custom error 65535 and that an alternative venue still fills.
 
+### Price moves between quote and fill
+
+Use this to test a router's slippage limit when Tessera reprices after the router quoted it.
+
+1. Add `tessera-freshness` with `last_update_slot: 0` at the first slot, so the live price quotes.
+2. Two slots later, add `tessera-price` 1% lower in both directions and `tessera-freshness` again.
+3. Quote a swap in the first slot and fill it after the move. The fill pays 1% less, and a tight
+   slippage limit must reject it.
+
+### Arbitrage against an AMM
+
+Use this to test an arbitrage bot across Tessera and an AMM pool.
+
+1. Read the SOL / USDC price of an AMM pool, for example Orca Whirlpool.
+2. Set Tessera's SOL / USDC price 2% above it with `tessera-price` and keep the quote fresh.
+3. Buying SOL on the AMM and selling it into Tessera should clear both venues' fees.
+
 # Recipes
 
 ## Set the price
@@ -176,7 +197,8 @@ template: tessera-freshness
 last_update_slot: -20      # SOL/USDC freshness_limit_slots is 20
 ```
 
-The boundary is exclusive: `-19` still fills, `-20` rejects. Do not schedule a fresh override after it.
+The boundary is exclusive: `-19` still fills in the slot it lands, `-20` rejects, and every later
+slot ages the quote by one more. Do not schedule a fresh override after it.
 
 ## Reduce depth
 
@@ -207,6 +229,24 @@ buy_levels_enabled:  0
 
 Only `0` is supported. Clearing only the first level does not halt a quote that starts at a later
 level.
+
+# Checking a scenario with a real swap
+
+Tessera fills swaps only through a router. A direct call must carry the DFlow sentinel
+`8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d` as a signer. To send one on a local surfnet:
+
+1. Start surfpool with `--skip-signature-verification`, so the sentinel needs no key.
+2. Play the scenario. Studio pauses the clock, so the quote stays fresh until Complete.
+3. Simulate the swap before sending it. On a fresh fork the send otherwise fails with
+   "Failed to fetch accounts from remote".
+
+The instruction data is tag `0x11`, the direction (`1` sells base), the input amount and the
+minimum output as u64, then `0`. The accounts are the global state
+`8ekCy2jHHUbW2yeNGFWYJT9Hm9FW7SvZcZK66dSZCDiF`, the market, the taker, the base and quote vaults,
+the taker's base and quote token accounts, both mints, both token programs, the sentinel, the config
+`BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK` and the market record
+`4cG31VNF9TzFinNc7BmnjhFvGjxkY3sCETVMtMgbrhPs`. The vaults are token accounts of the global state,
+one per mint, and the USDC vault is shared by every USDC market.
 
 # Troubleshooting
 

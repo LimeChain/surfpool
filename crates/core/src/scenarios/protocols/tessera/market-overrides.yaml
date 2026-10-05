@@ -72,7 +72,8 @@ templates:
       For a fill that starts and ends in the first ladder level:
         sell output = floor(base_in * quote_atoms_per_base_atom_x1e15 * sell_level_0_factor / 10^21)
         buy output  = floor(quote_in * base_atoms_per_quote_atom_x1e15 * buy_level_0_factor / 10^21)
-      A factor of 1000000 is neutral.
+      A factor of 1000000 is neutral. As a fork ages the program can switch to a later quote-start
+      config; the last one pays 75 ppm less on SOL / USDC, so a fill can land up to that much below.
 
       EXAMPLE - "SOL is worth $100" on SOL / USDC (9/6 decimals):
         quote_atoms_per_base_atom_x1e15: "100000000000000"
@@ -108,8 +109,9 @@ templates:
 
       Tessera rejects a quote whose age is at least the market's own limit, read from the selected
       market's freshness_limit_slots metadata. The boundary is exclusive:
-      last_update_slot -(freshness_limit_slots - 1) still fills, -freshness_limit_slots rejects
-      both swap directions with custom error 65535 (0xffff).
+      last_update_slot -(freshness_limit_slots - 1) still fills in the slot it materializes,
+      -freshness_limit_slots rejects both swap directions with custom error 65535 (0xffff), and
+      every later slot ages the quote by one more.
 
       HOW TO USE:
       1. For a fresh quote set last_update_slot to 0
