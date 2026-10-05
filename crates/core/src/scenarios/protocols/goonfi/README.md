@@ -8,7 +8,8 @@ companion publisher program, checks that quote against a reference band stored i
 settles from its two token vaults.
 
 Deployment: market program `goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE`, oracle publisher
-`dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu`; layout verified at slot 450333923 (2026-09-25).
+`dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu`; layout re-verified on 2026-10-05 against the
+redeployment at slot 451334772.
 
 ## Template index
 
