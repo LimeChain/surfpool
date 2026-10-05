@@ -512,6 +512,7 @@ async fn tessera_resolver_returns_every_live_market() {
     let rpc_url = std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
     let served = resolve_live_constants(
         &rpc_url,
+        Some(&rpc_url),
         all_templates.iter().map(|t| (*t).clone()).collect(),
     )
     .await;

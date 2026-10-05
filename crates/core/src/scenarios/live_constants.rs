@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     str::FromStr,
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
@@ -29,13 +29,16 @@ type CachedOptions = (Instant, Vec<ConstantOption>);
 static CACHE: LazyLock<Mutex<HashMap<String, CachedOptions>>> = LazyLock::new(Default::default);
 
 /// Fills every live constant of `templates` through the surfnet RPC at `rpc_url`, which serves
-/// local state first and falls back to its datasource. A template whose address is an empty
+/// local state first and falls back to its datasource. A `fresh` window is judged on
+/// `datasource_url`, and without one every account is kept. A template whose address is an empty
 /// pubkey targets the first option. A source that fails to resolve is served with no options.
 pub async fn resolve_live_constants(
     rpc_url: &str,
+    datasource_url: Option<&str>,
     mut templates: Vec<OverrideTemplate>,
 ) -> Vec<OverrideTemplate> {
     let client = SurfnetRemoteClient::new(rpc_url);
+    let datasource = datasource_url.map(SurfnetRemoteClient::new);
     let mut resolved: HashMap<String, Vec<ConstantOption>> = HashMap::new();
     for template in &mut templates {
         let mut names: Vec<String> = template
@@ -50,9 +53,9 @@ pub async fn resolve_live_constants(
             let Some(LiveConstantSource::ProgramAccounts(source)) = &constant.source else {
                 continue;
             };
-            let key = format!("{rpc_url} {source:?}");
+            let key = format!("{rpc_url} {datasource_url:?} {source:?}");
             if !resolved.contains_key(&key) {
-                let options = cached_options(&client, &key, source)
+                let options = cached_options(&client, datasource.as_ref(), &key, source)
                     .await
                     .unwrap_or_else(|error| {
                         warn!(
@@ -78,6 +81,7 @@ pub async fn resolve_live_constants(
 
 async fn cached_options(
     client: &SurfnetRemoteClient,
+    datasource: Option<&SurfnetRemoteClient>,
     key: &str,
     source: &ProgramAccountsSource,
 ) -> Result<Vec<ConstantOption>, String> {
@@ -90,7 +94,7 @@ async fn cached_options(
     if let Some(options) = hit {
         return Ok(options);
     }
-    let options = fetch_program_account_options(client, source).await?;
+    let options = fetch_program_account_options(client, datasource, source).await?;
     if let Ok(mut cache) = CACHE.lock() {
         cache.insert(key.to_string(), (Instant::now(), options.clone()));
     }
@@ -100,6 +104,7 @@ async fn cached_options(
 /// Reads the source's accounts and their pair's mints, then builds the options.
 pub async fn fetch_program_account_options(
     client: &SurfnetRemoteClient,
+    datasource: Option<&SurfnetRemoteClient>,
     source: &ProgramAccountsSource,
 ) -> Result<Vec<ConstantOption>, String> {
     let program = Pubkey::from_str(&source.program).map_err(|e| e.to_string())?;
@@ -113,7 +118,7 @@ pub async fn fetch_program_account_options(
         ..Default::default()
     };
     let matched: Vec<Pubkey> = client
-        .get_program_accounts(&program, config, Some(filters))
+        .get_program_accounts(&program, config.clone(), Some(filters.clone()))
         .await
         .and_then(|result| result.into_result())
         .map_err(|e| e.to_string())?
@@ -136,6 +141,26 @@ pub async fn fetch_program_account_options(
                 accounts.push((*pubkey, account.data));
             }
         }
+    }
+    // A fork never re-quotes the copies it loaded, so their own slots age out of any window.
+    if source.fresh.is_some()
+        && let Some(datasource) = datasource
+    {
+        let remote: Vec<(Pubkey, Vec<u8>)> = datasource
+            .get_program_accounts(&program, config, Some(filters))
+            .await
+            .and_then(|result| result.into_result())
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|(pubkey, account)| Some((pubkey, account.data.decode()?)))
+            .collect();
+        let slot = datasource
+            .get_epoch_info()
+            .await
+            .map_err(|e| e.to_string())?
+            .absolute_slot;
+        let live = fresh_accounts(source, &remote, slot);
+        accounts.retain(|(pubkey, _)| live.contains(pubkey));
     }
 
     let mut mints: Vec<Pubkey> = accounts
@@ -160,37 +185,40 @@ pub async fn fetch_program_account_options(
             }
         }
     }
-    let current_slot = match source.fresh {
-        Some(_) => {
-            client
-                .get_epoch_info()
-                .await
-                .map_err(|e| e.to_string())?
-                .absolute_slot
-        }
-        None => 0,
+    Ok(program_account_options(source, &accounts, &mint_data))
+}
+
+/// The accounts whose `fresh` field is within its window at `current_slot`.
+pub fn fresh_accounts(
+    source: &ProgramAccountsSource,
+    accounts: &[(Pubkey, Vec<u8>)],
+    current_slot: u64,
+) -> HashSet<Pubkey> {
+    let Some(fresh) = &source.fresh else {
+        return accounts.iter().map(|(pubkey, _)| *pubkey).collect();
     };
-    Ok(program_account_options(
-        source,
-        &accounts,
-        &mint_data,
-        current_slot,
-    ))
+    accounts
+        .iter()
+        .filter(|(_, data)| {
+            read_field(&source.fields[&fresh.field], data)
+                .and_then(|slot| slot.as_u64())
+                .is_some_and(|slot| slot.saturating_add(fresh.within_slots) >= current_slot)
+        })
+        .map(|(pubkey, _)| *pubkey)
+        .collect()
 }
 
 /// Builds the options for `accounts`, sorted by label with the `default` pair first. An account
-/// whose pair mints are missing is skipped, since its decimals are unknown, and so is one that
-/// `fresh` finds older than its window at `current_slot`.
+/// whose pair mints are missing is skipped, since its decimals are unknown.
 pub fn program_account_options(
     source: &ProgramAccountsSource,
     accounts: &[(Pubkey, Vec<u8>)],
     mints: &HashMap<Pubkey, Vec<u8>>,
-    current_slot: u64,
 ) -> Vec<ConstantOption> {
     let mut options: Vec<ConstantOption> = accounts
         .iter()
         .filter(|(_, data)| matches_source(source, data))
-        .filter_map(|(address, data)| account_options(source, address, data, mints, current_slot))
+        .filter_map(|(address, data)| account_options(source, address, data, mints))
         .flatten()
         .collect();
 
@@ -222,16 +250,9 @@ fn account_options(
     address: &Pubkey,
     data: &[u8],
     mints: &HashMap<Pubkey, Vec<u8>>,
-    current_slot: u64,
 ) -> Option<Vec<ConstantOption>> {
     if data.len() != source.size {
         return None;
-    }
-    if let Some(fresh) = &source.fresh {
-        let slot = read_field(&source.fields[&fresh.field], data)?.as_u64()?;
-        if slot.saturating_add(fresh.within_slots) < current_slot {
-            return None;
-        }
     }
     let pubkey_field = |name: &str| read_pubkey(&source.fields[name], data);
     let base = pubkey_field(&source.pair.base)?;
@@ -332,7 +353,7 @@ mod tests {
     use solana_pubkey::Pubkey;
     use surfpool_types::ProgramAccountsSource;
 
-    use super::program_account_options;
+    use super::{fresh_accounts, program_account_options};
 
     const WSOL: &str = "So11111111111111111111111111111111111111112";
     const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -383,7 +404,7 @@ pair: { base: base_mint, quote: quote_mint }
         ];
         let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6))]);
 
-        let options = program_account_options(&source, &accounts, &mints, 0);
+        let options = program_account_options(&source, &accounts, &mints);
 
         assert_eq!(
             options.len(),
@@ -441,7 +462,7 @@ expand:
         .concat();
         let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6))]);
 
-        let options = program_account_options(&source, &[(Pubkey::new_unique(), data)], &mints, 0);
+        let options = program_account_options(&source, &[(Pubkey::new_unique(), data)], &mints);
 
         let summary: Vec<_> = options
             .iter()
@@ -507,7 +528,7 @@ pair: { base: base_mint, quote: quote_mint }
         ];
         let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6)), (usdt, mint(6))]);
 
-        let labels: Vec<_> = program_account_options(&source, &accounts, &mints, 0)
+        let labels: Vec<_> = program_account_options(&source, &accounts, &mints)
             .into_iter()
             .map(|option| option.label)
             .collect();
@@ -531,11 +552,13 @@ pair: { base: base_mint, quote: quote_mint }
                 )
             })
             .collect();
-        let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6))]);
 
-        let mut kept: Vec<_> = program_account_options(&source, &accounts, &mints, 1_000)
-            .into_iter()
-            .map(|option| option.metadata["last_update_slot"].as_u64().unwrap())
+        let live = fresh_accounts(&source, &accounts, 1_000);
+
+        let mut kept: Vec<_> = accounts
+            .iter()
+            .filter(|(pubkey, _)| live.contains(pubkey))
+            .map(|(_, data)| u64::from_le_bytes(data[64..].try_into().unwrap()))
             .collect();
         kept.sort_unstable();
 
@@ -564,7 +587,7 @@ pair: { base: base_mint, quote: quote_mint }
         ];
         let mints = HashMap::from([(wsol, mint(9)), (usdc, mint(6))]);
 
-        let kept = program_account_options(&source, &accounts, &mints, 1_000);
+        let kept = program_account_options(&source, &accounts, &mints);
 
         assert_eq!(
             kept.len(),
