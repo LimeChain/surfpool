@@ -19,6 +19,8 @@ pub(super) struct ResolvedEndpoints {
     pub rpc_url: String,
     pub ws_url: String,
     pub studio_url: String,
+    /// The RPC as Surfpool's own server reaches it, whatever URL is advertised.
+    pub local_rpc_url: String,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +112,11 @@ impl EndpointOverrides {
             rpc_url,
             ws_url,
             studio_url,
+            local_rpc_url: format!(
+                "http://{}:{}",
+                url_host(default_public_host(&config.rpc.bind_host)),
+                config.rpc.bind_port
+            ),
         })
     }
 }
@@ -435,6 +442,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.rpc_url, "https://rpc.example.com");
+        assert_eq!(resolved.local_rpc_url, "http://127.0.0.1:8899");
         assert_eq!(resolved.studio_url, "https://studio.example.com");
         assert_eq!(resolved.ws_url, "ws://staging.example.com:8900");
     }
