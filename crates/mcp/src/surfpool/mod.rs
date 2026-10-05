@@ -19,9 +19,11 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
-        live_constants::resolve_live_constants,
-        protocols::pump::v1::graduation_builder::{
-            build_pump_graduation_scenario, pump_graduation_addresses,
+        protocols::{
+            pump::v1::graduation_builder::{
+                build_pump_graduation_scenario, pump_graduation_addresses,
+            },
+            tessera::fill_market_options,
         },
     },
     solana_account::Account,
@@ -190,7 +192,6 @@ pub struct CallSurfnetRpcParams {
 pub struct Surfpool {
     pub surfnets: Arc<RwLock<HashMap<u16, u16>>>,
     pub template_registry: Arc<RwLock<TemplateRegistry>>,
-    pub datasource_url: Option<String>,
     tool_router: ToolRouter<Surfpool>,
 }
 
@@ -199,7 +200,6 @@ impl Surfpool {
         Self {
             surfnets: Arc::new(RwLock::new(HashMap::new())),
             template_registry: Arc::new(RwLock::new(TemplateRegistry::new())),
-            datasource_url: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -440,11 +440,9 @@ impl Surfpool {
             "http://127.0.0.1:{}",
             surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
         );
-        Ok(
-            resolve_live_constants(&rpc_url, self.datasource_url.as_deref(), vec![template])
-                .await
-                .remove(0),
-        )
+        let mut templates = vec![template];
+        fill_market_options(&rpc_url, &mut templates).await;
+        Ok(templates.remove(0))
     }
 
     /// Reads through the surfnet's own RPC: local state wins, only missing

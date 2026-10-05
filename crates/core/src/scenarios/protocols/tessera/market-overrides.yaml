@@ -12,24 +12,8 @@ tags:
 constants:
   market:
     label: Tessera market
-    description: Choose one of the Tessera markets its maker quoted recently, read from the program's own accounts.
-    source:
-      program_accounts:
-        program: TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH
-        size: 1264
-        filters:
-          - offset: 96
-            bytes: [5, 0, 0, 0, 0, 0, 0, 0]
-        fields:
-          base_mint: { offset: 24, encoding: pubkey }
-          quote_mint: { offset: 56, encoding: pubkey }
-          freshness_limit_slots: { offset: 88, encoding: u64 }
-          last_update_slot: { offset: 120, encoding: u64 }
-        pair: { base: base_mint, quote: quote_mint }
-        default:
-          base: So11111111111111111111111111111111111111112
-          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-        fresh: { field: last_update_slot, within_slots: 5000 }
+    description: Choose a Tessera market. The list is every priced market the program has on the surfnet, SOL / USDC first, then the most recently quoted; markets idle for a day are marked (idle).
+    options: []
 
 templates:
   - id: tessera-price

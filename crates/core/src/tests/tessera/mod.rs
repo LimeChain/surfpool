@@ -19,9 +19,8 @@ use solana_signer::Signer;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use crate::{
-    scenarios::{TemplateRegistry, resolve_live_constants},
+    scenarios::{TemplateRegistry, protocols::tessera::fill_market_options},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
-    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -397,6 +396,15 @@ fn clock_slot(market: &MarketFork) -> u64 {
     read_u64(&market.market.data, 120) + 1
 }
 
+fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
+    left.iter()
+        .zip(right)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn write_u64(data: &mut [u8], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
@@ -505,21 +513,17 @@ fn price_values(quote_per_base: u64) -> Vec<(String, serde_json::Value)> {
 }
 
 #[tokio::test]
-async fn tessera_resolver_returns_every_live_market() {
+async fn tessera_market_options_list_every_market() {
     let registry = TemplateRegistry::new();
     let all_templates = registry.by_protocol("Tessera");
     assert_eq!(all_templates.len(), 5);
     let rpc_url = std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
-    let served = resolve_live_constants(
-        &rpc_url,
-        Some(&rpc_url),
-        all_templates.iter().map(|t| (*t).clone()).collect(),
-    )
-    .await;
+    let mut served: Vec<_> = all_templates.iter().map(|t| (*t).clone()).collect();
+    fill_market_options(&rpc_url, &mut served).await;
     let catalog = served[0].constants["market"].options.clone();
     assert!(
         !catalog.is_empty(),
-        "no live markets resolved; a 429 or timeout from {rpc_url} is unverified, not a failure"
+        "no markets listed; a 429 or timeout from {rpc_url} is unverified, not a failure"
     );
     assert_eq!(
         catalog[0].value,
@@ -625,7 +629,7 @@ async fn tessera_resolver_returns_every_live_market() {
     assert_eq!(
         checked,
         catalog.len(),
-        "every live market must be exercised"
+        "every listed market must be exercised"
     );
 }
 

@@ -25,7 +25,7 @@ use rmcp_actix_web::transport::StreamableHttpService;
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use surfpool_core::scenarios::{TemplateRegistry, resolve_live_constants};
+use surfpool_core::scenarios::{TemplateRegistry, protocols::tessera::fill_market_options};
 use surfpool_mcp::Surfpool;
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
@@ -68,13 +68,8 @@ pub async fn start_studio_and_scenario_server(
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
     // Initialize MCP service
-    let datasource_url = config.rpc_datasource_url.clone();
     let mcp_service = StreamableHttpService::builder()
-        .service_factory(Arc::new(move || {
-            let mut surfpool = Surfpool::new();
-            surfpool.datasource_url = datasource_url.clone();
-            Ok(surfpool)
-        }))
+        .service_factory(Arc::new(|| Ok(Surfpool::new())))
         .session_manager(Arc::new(LocalSessionManager::default()))
         .stateful_mode(true)
         .sse_keep_alive(Duration::from_secs(30))
@@ -154,7 +149,7 @@ async fn get_scenario_templates(
     template_registry: Data<RwLock<TemplateRegistry>>,
     config: Data<RwLock<SanitizedConfig>>,
 ) -> Result<HttpResponse, Error> {
-    let templates: Vec<OverrideTemplate> = template_registry
+    let mut templates: Vec<OverrideTemplate> = template_registry
         .read()
         .map_err(|_| {
             actix_web::error::ErrorInternalServerError("Failed to read template registry")
@@ -163,14 +158,13 @@ async fn get_scenario_templates(
         .into_iter()
         .cloned()
         .collect();
-    let (rpc_url, datasource_url) = {
-        let config = config
-            .read()
-            .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to read context"))?;
-        (config.rpc_url.clone(), config.rpc_datasource_url.clone())
-    };
+    let rpc_url = config
+        .read()
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to read context"))?
+        .rpc_url
+        .clone();
 
-    let templates = resolve_live_constants(&rpc_url, datasource_url.as_deref(), templates).await;
+    fill_market_options(&rpc_url, &mut templates).await;
     let response = serde_json::to_string(&templates)
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to serialize templates"))?;
 

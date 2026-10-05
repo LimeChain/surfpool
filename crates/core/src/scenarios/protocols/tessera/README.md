@@ -74,11 +74,12 @@ quote skip leading levels, and two consumed-depth words at 0 and 8 are not expos
 
 ## Picking a market
 
-Every template starts with a market picker. Its options are read from the program when Studio or
-MCP loads the templates: every 1264-byte account with market tag `5` at offset 96 whose quote the
-maker updated within the last 5000 slots on mainnet, cached for 60 seconds. Freshness is read from
-the surfnet's datasource because a fork never re-quotes the copies it loaded; without a datasource
-every market is listed. Markets the maker stopped quoting drop out. On 2026-09-25 that included:
+Every template starts with a market picker. When Studio or MCP loads the templates, its options are
+read from the surfnet: every 1264-byte Tessera account with market tag `5` at offset 96 and a price
+in both directions, SOL / USDC first and then the most recently quoted. A market without a price
+has every level disabled and cannot fill. Nothing is hidden by age, because a fork never re-quotes
+the markets it loaded; a market whose quote trails the newest by about a day is marked `(idle)`. On
+2026-10-05 the program had 27 markets: 20 priced, 11 of them quoted live:
 
 | Choice                         | Best suited for                                       |
 | ------------------------------ | ----------------------------------------------------- |
