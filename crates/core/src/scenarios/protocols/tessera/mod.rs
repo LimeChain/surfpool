@@ -20,13 +20,11 @@ const MARKET_SIZE: usize = 1264;
 const MARKET_TAG: [u8; 8] = [5, 0, 0, 0, 0, 0, 0, 0];
 const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
 const USDC: Pubkey = Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-/// A quote this many slots (about a day) behind the newest one is labelled idle.
-const IDLE_SLOTS: u64 = 216_000;
 const MAX_MULTIPLE_ACCOUNTS: usize = 100;
 
-/// Lists every Tessera market on the surfnet at `rpc_url` as the `market` options of the Tessera
-/// templates and points a template without an address at the first one. Nothing is filtered by
-/// age, because a fork never re-quotes the markets it loaded; an unreachable surfnet lists none.
+/// Lists every priced Tessera market on the surfnet at `rpc_url` as the `market` options of the
+/// Tessera templates and points a template without an address at the first one. An unreachable
+/// surfnet lists none.
 pub async fn fill_market_options(rpc_url: &str, templates: &mut [OverrideTemplate]) {
     if !templates
         .iter()
@@ -105,6 +103,8 @@ async fn fetch_markets(
 /// One option per market with a price in both directions and known mint decimals: SOL / USDC
 /// first, then the most recently quoted. A market without a price has every level disabled and
 /// cannot fill; halts and freshness overrides leave the price alone, so they never hide a market.
+/// Nothing is filtered by age, so no market drops out as a fork ages or time travels; the ones a
+/// maker stopped quoting sink to the end.
 pub fn market_options(
     markets: &[(Pubkey, Vec<u8>)],
     decimals: &HashMap<Pubkey, u8>,
@@ -112,18 +112,12 @@ pub fn market_options(
     let markets = markets.iter().filter(|(_, data)| {
         data.len() == MARKET_SIZE && u64_at(data, 128) > 0 && u64_at(data, 144) > 0
     });
-    let newest = markets
-        .clone()
-        .map(|(_, data)| u64_at(data, 120))
-        .max()
-        .unwrap_or(0);
     let mut options: Vec<(bool, u64, ConstantOption)> = markets
         .filter_map(|(address, data)| {
             let (base, quote) = (pubkey_at(data, 24), pubkey_at(data, 56));
             let (base_decimals, quote_decimals) = (*decimals.get(&base)?, *decimals.get(&quote)?);
             let last_update = u64_at(data, 120);
             let (base_symbol, quote_symbol) = (symbol(&base), symbol(&quote));
-            let idle = newest.saturating_sub(last_update) > IDLE_SLOTS;
             let metadata = HashMap::from([
                 ("account".to_string(), Value::from(address.to_string())),
                 (
@@ -142,10 +136,7 @@ pub fn market_options(
             ]);
             let option = ConstantOption {
                 id: address.to_string(),
-                label: format!(
-                    "{base_symbol} / {quote_symbol}{}",
-                    if idle { " (idle)" } else { "" }
-                ),
+                label: format!("{base_symbol} / {quote_symbol}"),
                 description: None,
                 value: address.to_string(),
                 metadata,
@@ -229,8 +220,8 @@ mod tests {
         let labels: Vec<_> = options.iter().map(|option| option.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["SOL / USDC", "USDT / USDC", "US51 / USDC (idle)"],
-            "an unpriced or unknown-mint market is skipped, an old one is labelled, not dropped"
+            ["SOL / USDC", "USDT / USDC", "US51 / USDC"],
+            "an unpriced or unknown-mint market is skipped, an old one stays at the end"
         );
         let sol = &options[0];
         assert_eq!(sol.value, Pubkey::new_from_array([3; 32]).to_string());

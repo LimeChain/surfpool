@@ -12,7 +12,7 @@ tags:
 constants:
   market:
     label: Tessera market
-    description: Choose a Tessera market. The list is every priced market the program has on the surfnet, SOL / USDC first, then the most recently quoted; markets idle for a day are marked (idle).
+    description: Choose a Tessera market. The list is every priced market the program has on the surfnet, SOL / USDC first, then the most recently quoted. A market whose last_update_slot trails the others by millions of slots is no longer quoted by its maker, so its swaps may not fill.
     options: []
 
 templates:
