@@ -44,7 +44,7 @@ const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
 const MAX_RISK_FACTOR_BPS: u16 = 10_000;
 const PREPARATION_SLOT: u64 = 0;
 
-/// What a caller can name a market by, and the live values a relative change starts from.
+/// What a caller can name a market by, and the current values a relative change starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhoenixMarket {
     pub symbol: String,
@@ -413,7 +413,7 @@ async fn prepare_trader_override(
     Ok(writes)
 }
 
-/// A hot Trader's live state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
+/// A hot Trader's current state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
 /// record too. If the fetch fails or lacks the trader, the local record stays.
 async fn refresh_index_record(
     index: &mut Account,
@@ -430,12 +430,12 @@ async fn refresh_index_record(
     else {
         return;
     };
-    if let (Ok(local), Ok(live)) = (
+    if let (Ok(local), Ok(upstream)) = (
         index_trader_state_range(index, trader_key),
         index_trader_state_range(&remote, trader_key),
-    ) && local.len() == live.len()
+    ) && local.len() == upstream.len()
     {
-        index.data[local].copy_from_slice(&remote.data[live]);
+        index.data[local].copy_from_slice(&remote.data[upstream]);
     }
 }
 
@@ -507,7 +507,7 @@ pub fn build_phoenix_collateral_scenario(
 
     let mut scenario = Scenario::new(
         "Phoenix Trader Collateral Stress".to_string(),
-        "Set exact signed quote-lot collateral on a Phoenix Trader and its live index entry."
+        "Set exact signed quote-lot collateral on a Phoenix Trader, and on its record in the local GlobalTraderIndex when the index lists it."
             .to_string(),
     );
     scenario.tags = vec![

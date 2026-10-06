@@ -45,10 +45,10 @@ GlobalTraderIndex, and its positions in the ActiveTraderBuffer. A cold trader's 
 own Trader account. On mainnet the HOT bit (value 1) of the Trader's `traderState.flags` and the
 index agree, and traders join and leave the hot set all the time.
 
-The GlobalTraderIndex is pulled from the upstream datasource once, so it can disagree with a
-Trader that is fetched later. Hawkeye and the program read a trader from its index record
-whenever the local GlobalTraderIndex lists it, whatever the HOT bit says. The templates follow the
-program:
+The `GlobalTraderIndex` will be pulled from the upstream datasource once, so it can potentially
+disagree with a Trader that is fetched later. Hawkeye and the program read a trader from its index
+record whenever the local GlobalTraderIndex lists it, whatever the HOT bit says. The templates
+follow the program:
 
 - If the local GlobalTraderIndex lists the Trader, its collateral is written to both its record
   there and its Trader account. Other TraderState fields are refused for it, since only
@@ -129,13 +129,13 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 
 ### Withdraw limits
 
-| Field                                           | Meaning                                                                                                         |
-| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `withdrawThrottle.maxBudget.inner`              | Most quote lots withdrawable before requests queue. Live: `2000000000000` (2,000,000 PhUSD).                    |
-| `withdrawThrottle.remainingBudget.inner`        | Quote lots still withdrawable now; keep it at or below the maximum. `0` sends every withdrawal to the queue.    |
-| `withdrawThrottle.replenishAmountPerSlot.inner` | Quote lots added back each slot. Live: `450000000` (450 PhUSD). Set `0` to keep the budget empty while testing. |
-| `withdrawalFee.inner`                           | Quote lots charged per withdrawal. Live: `500000` (0.5 PhUSD).                                                  |
-| `enqueueingFee.inner`                           | Quote lots charged when a withdrawal is queued. Live: `500000` (0.5 PhUSD).                                     |
+| Field                                           | Meaning                                                                                                            |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `withdrawThrottle.maxBudget.inner`              | Most quote lots withdrawable before requests queue. Mainnet: `2000000000000` (2,000,000 PhUSD).                    |
+| `withdrawThrottle.remainingBudget.inner`        | Quote lots still withdrawable now; keep it at or below the maximum. `0` sends every withdrawal to the queue.       |
+| `withdrawThrottle.replenishAmountPerSlot.inner` | Quote lots added back each slot. Mainnet: `450000000` (450 PhUSD). Set `0` to keep the budget empty while testing. |
+| `withdrawalFee.inner`                           | Quote lots charged per withdrawal. Mainnet: `500000` (0.5 PhUSD).                                                  |
+| `enqueueingFee.inner`                           | Quote lots charged when a withdrawal is queued. Mainnet: `500000` (0.5 PhUSD).                                     |
 
 - The account is the singleton WithdrawQueue `3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K`, which
   the template carries.
@@ -169,7 +169,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 - Each slot has a flags byte (account byte 49 for slot 0, 129 for slot 1): bit 0 active, bit 2
   buy, otherwise sell. Only an active slot fires, so edit only active slots.
 - A sell's execution price is at or below its trigger, a buy's at or above it.
-- Do not touch `positionSequenceNumber`: it must keep matching the live position.
+- Do not touch `positionSequenceNumber`: it must keep matching the current position.
 - The account is the PDA `["stoploss", trader account, asset id as u64 little-endian]`. To find
   one, call `getProgramAccounts` on the Phoenix program with `dataSize: 328` and a memcmp of the
   trader account at offset 224. The asset id is the u32 at offset 256.
@@ -206,7 +206,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
    - Collateral takes the Trader account and a target in USD or quote lots.
    - The mark takes a market and a target as a percent change, a USD price or ticks.
    - The maintenance factor takes a market and a target as a percent or bps.
-   - The market field searches the live list by symbol or orderbook address.
+   - The market field searches the markets in the local VM by symbol or orderbook address.
 3. For the other templates, open the scenario editor, pick **Phoenix Eternal** and the template,
    and set the account and fields described above.
 4. Inspect the generated override, then press **Play** to activate it.

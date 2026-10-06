@@ -563,7 +563,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        // The local VM holds a stressed record, the datasource the live one.
+        // The local VM holds a stressed record, the datasource the unstressed one.
         let mut stressed_index = live_index.clone();
         stressed_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
         let url = canned_rpc(format!(

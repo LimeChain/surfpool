@@ -88,7 +88,7 @@ templates:
       This changes how much collateral positions in one market need to stay healthy.
       It does not change prices, collateral or positions, and does not execute liquidation.
       The maintenance margin scales linearly with the factor.
-      Live markets use 5000, so 10000 doubles the requirement, the most it can be raised: Phoenix
+      Mainnet markets use 5000, so 10000 doubles the requirement, the most it can be raised: Phoenix
       reads a factor above 10000 as 10000.
       A factor at or below the market's backstop factor is refused, since it would leave no
       Liquidatable tier.
@@ -113,12 +113,12 @@ templates:
       - path: defaultTakerFeeMicro
         label: Taker fee (micro)
         description: >-
-          Taker fee in millionths of the filled notional. Live markets use 350 (0.035%).
+          Taker fee in millionths of the filled notional. Mainnet markets use 350 (0.035%).
           Example: 1000
       - path: defaultMakerFeeMicro
         label: Maker fee (micro)
         description: >-
-          Maker fee in millionths of the filled notional; negative is a rebate. Live markets use 50.
+          Maker fee in millionths of the filled notional; negative is a rebate. Mainnet markets use 50.
           Example: -50
     llm_context: |
       This changes the fees a market charges on every fill, for example a fee hike or a maker
@@ -141,7 +141,7 @@ templates:
         label: Max withdraw budget
         description: >-
           Most quote lots withdrawable before requests queue (1000000 = 1 PhUSD).
-          Live: 2000000000000. Example: 1000000000
+          Mainnet: 2000000000000. Example: 1000000000
       - path: withdrawThrottle.remainingBudget.inner
         label: Remaining withdraw budget
         description: >-
@@ -150,15 +150,15 @@ templates:
       - path: withdrawThrottle.replenishAmountPerSlot.inner
         label: Budget refill per slot
         description: >-
-          Quote lots added back to the budget each slot. Live: 450000000 (450 PhUSD). Example: 0
+          Quote lots added back to the budget each slot. Mainnet: 450000000 (450 PhUSD). Example: 0
       - path: withdrawalFee.inner
         label: Withdrawal fee
         description: >-
-          Quote lots charged per withdrawal. Live: 500000 (0.5 PhUSD). Example: 2000000
+          Quote lots charged per withdrawal. Mainnet: 500000 (0.5 PhUSD). Example: 2000000
       - path: enqueueingFee.inner
         label: Queueing fee
         description: >-
-          Quote lots charged when a withdrawal is queued. Live: 500000 (0.5 PhUSD). Example: 2000000
+          Quote lots charged when a withdrawal is queued. Mainnet: 500000 (0.5 PhUSD). Example: 2000000
     llm_context: |
       This throttles withdrawals for every trader, for example a bank run where withdrawals queue
       instead of paying out. It does not move collateral or cancel queued requests.
@@ -232,11 +232,11 @@ templates:
       Slot 0 is the greater-than trigger and slot 1 the less-than trigger. Each slot has a flags
       byte, at account byte 49 for slot 0 and 129 for slot 1: bit 0 active, bit 2 buy, otherwise
       sell. Only an active slot fires, so edit only active slots.
-      A sell's execution price is at or below its trigger and a buy's at or above it; most live
+      A sell's execution price is at or below its trigger and a buy's at or above it; most mainnet
       orders use either the trigger itself or a gap of about 10%.
       Prices are mark ticks: read the market's markTicks from list_phoenix_markets.
       Pass prices as JSON numbers. Do not touch positionSequenceNumber: it must keep matching the
-      live position or the stop loss no longer applies.
+      current position or the stop loss no longer applies.
       The account is the trader's StopLosses PDA for the market: ["stoploss", trader account,
       asset id as u64 little-endian]. To find it, call getProgramAccounts on the Phoenix program
       with dataSize 328 and a memcmp of the trader account at offset 224; assetId is the u32 at 256.
