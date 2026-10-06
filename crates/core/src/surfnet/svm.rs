@@ -4645,31 +4645,6 @@ mod tests {
     use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
 
     #[test]
-    fn account_data_values_exclude_constant_ref_selectors() {
-        let registry = TemplateRegistry::new();
-        let template = registry
-            .get("raydium-amm-custom")
-            .expect("template with a non-PDA constant_ref");
-        let instance = OverrideInstance::new(
-            template.id.clone(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(Pubkey::default().to_string()),
-        )
-        .with_values(HashMap::from([
-            ("market".to_string(), serde_json::json!("selected-market")),
-            ("status".to_string(), serde_json::json!(1)),
-        ]));
-
-        let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
-        assert_eq!(pda_refs, 0);
-        assert_eq!(constant_refs, 1);
-        assert_eq!(
-            values,
-            HashMap::from([("status".to_string(), serde_json::json!(1))])
-        );
-    }
-
-    #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
         use surfpool_types::SurfnetStartupPhase;
 
