@@ -1,5 +1,5 @@
 use core::mem::size_of;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError,
@@ -264,6 +264,8 @@ fn forge_phoenix_override(
 }
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
+/// `written_this_slot` holds the accounts an earlier Phoenix override already wrote in the same
+/// slot; a later override of such a Trader builds on its index record instead of refreshing it.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     account_pubkey: &Pubkey,
@@ -271,6 +273,7 @@ pub async fn prepare_phoenix_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
+    written_this_slot: &HashSet<Pubkey>,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Ok(None);
@@ -294,6 +297,7 @@ pub async fn prepare_phoenix_override(
             values,
             remote_ctx,
             fetch_before_use,
+            written_this_slot,
         )
         .await
         .map(Some),
@@ -308,6 +312,7 @@ async fn prepare_trader_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
+    written_this_slot: &HashSet<Pubkey>,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let header = trader_header(trader, account)?;
     let hot = header.trader_state.is_hot();
@@ -329,7 +334,7 @@ async fn prepare_trader_override(
         Some(_) if hot => {
             let mut index =
                 phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?;
-            if fetch_before_use {
+            if fetch_before_use && !written_this_slot.contains(trader) {
                 refresh_index_record(&mut index, &header.key, remote_ctx).await;
             }
             Some(index)

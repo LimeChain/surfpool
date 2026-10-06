@@ -592,6 +592,7 @@ mod tests {
                 &values,
                 &remote,
                 fetch_before_use,
+                &std::collections::HashSet::new(),
             )
             .await;
             if !fetch_before_use {
@@ -615,6 +616,70 @@ mod tests {
                 stressed_index.data[range.start + 8..range.end],
                 "the rest of the record stays local"
             );
+        }
+    }
+
+    /// A refused override writes nothing, so a later one in the same slot is still capped by the
+    /// upstream collateral, while an applied one is what a later one builds on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_slot_override_builds_only_on_an_applied_one() {
+        use std::collections::{HashMap, HashSet};
+
+        use base64::{Engine, prelude::BASE64_STANDARD};
+        use solana_commitment_config::CommitmentConfig;
+
+        use super::super::state_builder::{PHOENIX_GLOBAL_TRADER_INDEX, prepare_phoenix_override};
+        use crate::{
+            surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
+            tests::helpers::canned_rpc,
+        };
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut account = trader_account(FIRST_KEY, 9_999, true);
+        account.lamports = 1;
+        let mut upstream_index = index_account();
+        upstream_index.lamports = 1;
+        let range = index_trader_state_range(&upstream_index, &FIRST_KEY).unwrap();
+        upstream_index.data[range.start..range.start + 8].copy_from_slice(&100_i64.to_le_bytes());
+        // The local record predates a drop of the trader's collateral upstream.
+        let mut local_index = upstream_index.clone();
+        local_index.data[range.start..range.start + 8].copy_from_slice(&1_000_i64.to_le_bytes());
+        let url = canned_rpc(format!(
+            r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+            BASE64_STANDARD.encode(&upstream_index.data),
+            PHOENIX_ETERNAL_PROGRAM_ID,
+            upstream_index.data.len()
+        ))
+        .await;
+        let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, local_index)
+            .unwrap();
+        let mut written_this_slot = HashSet::new();
+
+        for (target, applied) in [("200", false), ("500", false), ("50", true), ("80", false)] {
+            let values = HashMap::from([(
+                "traderState.quoteLotCollateral".to_string(),
+                serde_json::json!(target),
+            )]);
+            let result = prepare_phoenix_override(
+                &mut svm,
+                &trader,
+                &account,
+                &values,
+                &remote,
+                true,
+                &written_this_slot,
+            )
+            .await;
+            assert_eq!(result.is_ok(), applied, "target {target}");
+            // As the materialize loop does once an override's writes are applied.
+            if let Ok(Some(writes)) = result {
+                for (pubkey, written) in writes {
+                    svm.set_account(&pubkey, written).unwrap();
+                }
+                written_this_slot.insert(trader);
+            }
         }
     }
 
