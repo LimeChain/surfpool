@@ -2161,7 +2161,12 @@ impl SurfnetSvm {
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
     ) -> SurfpoolResult<()> {
+        // A fresh LiteSVM starts LastRestartSlot at 0; keep the one loaded from the datasource.
+        let last_restart_slot = self
+            .inner
+            .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>();
         self.inner.reset(self.feature_set.clone())?;
+        self.inner.set_sysvar(&last_restart_slot);
 
         let native_mint_account = self
             .inner
@@ -6433,6 +6438,37 @@ mod tests {
     }
 
     // Garbage collection tests
+
+    /// LiteSVM starts LastRestartSlot at 0, so a rebuild must not drop the datasource's value.
+    #[test]
+    fn the_last_restart_slot_survives_garbage_collection_and_network_resets() {
+        use solana_sysvar::last_restart_slot::LastRestartSlot;
+
+        let last_restart_slot = LastRestartSlot {
+            last_restart_slot: 246_464_040,
+        };
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        svm.inner.set_sysvar(&last_restart_slot);
+
+        svm.inner.garbage_collect(svm.feature_set.clone());
+        assert_eq!(
+            svm.inner.get_sysvar::<LastRestartSlot>(),
+            last_restart_slot,
+            "after garbage collection"
+        );
+
+        let epoch_schedule = SurfnetSvm::default_epoch_schedule();
+        svm.reset_network(
+            SurfnetSvm::default_epoch_info(&epoch_schedule),
+            epoch_schedule,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.inner.get_sysvar::<LastRestartSlot>(),
+            last_restart_slot,
+            "after a network reset"
+        );
+    }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]

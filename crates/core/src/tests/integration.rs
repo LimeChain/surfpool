@@ -7546,6 +7546,9 @@ async fn test_ws_signature_subscribe_does_not_miss_local_commit_during_remote_lo
                     }),
                     "getTransaction" => serde_json::Value::Null,
                     "getGenesisHash" => serde_json::Value::String(Hash::default().to_string()),
+                    "getAccountInfo" => {
+                        serde_json::json!({ "context": { "slot": 0 }, "value": null })
+                    }
                     unexpected => panic!("unexpected datasource method: {unexpected}"),
                 };
                 let response = serde_json::json!({
