@@ -29,9 +29,6 @@ templates:
       Set fetchBeforeUse: true so the Trader is fetched from the upstream datasource first; an
       override on a Trader that is not in the local VM yet is skipped.
       Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -65,9 +62,6 @@ templates:
       Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
       false only for a later override that builds on state an earlier one prepared in the same
       scenario.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -106,9 +100,6 @@ templates:
       Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
       false only for a later override that builds on state an earlier one prepared in the same
       scenario.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -137,9 +128,6 @@ templates:
       Pass both fees as JSON numbers in millionths of the notional: 350 is 0.035%, 1000 is 0.1%.
       defaultMakerFeeMicro may be negative (a rebate); keep it below the taker fee.
       Set fetchBeforeUse: true so the orderbook is fetched from the upstream datasource first.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -181,9 +169,6 @@ templates:
       keep the budget empty while you test.
       The account is the singleton WithdrawQueue, so this template carries its address.
       Set fetchBeforeUse: true so the queue is fetched from the upstream datasource first.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -215,9 +200,6 @@ templates:
       The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
       [0, 0] for the main account.
       Set fetchBeforeUse: true so the trader is fetched from the upstream datasource first.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -259,9 +241,6 @@ templates:
       asset id as u64 little-endian]. To find it, call getProgramAccounts on the Phoenix program
       with dataSize 328 and a memcmp of the trader account at offset 224; assetId is the u32 at 256.
       Set fetchBeforeUse: true so the stop loss is fetched from the upstream datasource first.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey
 
@@ -289,8 +268,5 @@ templates:
       it, call getProgramAccounts on the Phoenix program with dataSize 168 and a memcmp of the
       authority at offset 8 or of the delegated key at offset 40.
       Set fetchBeforeUse: true so the permission is fetched from the upstream datasource first.
-      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
-      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
-      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
     address:
       type: pubkey

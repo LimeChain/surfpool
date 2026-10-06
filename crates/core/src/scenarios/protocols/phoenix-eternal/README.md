@@ -195,19 +195,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
    then sits at half the maintenance margin, so the trader is Liquidatable.
 3. At slot 1, use `phoenix-direct-mark-risk-shock` on the trader's market, moving the mark
    against the position.
-4. Prepare the fork for transactions (next section), then send the liquidation.
-
-## Before sending transactions
-
-Views such as Hawkeye work on any fork. Phoenix transactions need two accounts the fork does not
-copy by itself. After every surfnet start:
-
-1. Copy the mainnet `SysvarLastRestartS1ot1111111111111111111111` account with
-   `surfnet_setAccount`. Surfnet starts this sysvar at 0, and Phoenix only trades while it equals
-   the restart slot its GlobalConfig acknowledged (246464040 on mainnet).
-2. Create `GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS`, the Phoenix log authority, as an empty
-   system account with `surfnet_setAccount`. It does not exist on mainnet, and without it
-   `sendTransaction` waits 30 s for it.
+4. Send the liquidation.
 
 ## Use from Studio
 
@@ -250,8 +238,6 @@ copy by itself. After every surfnet start:
 | `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local VM nor the upstream datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment.                                |
 | `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader turned hot after the GlobalTraderIndex was pulled; Phoenix rejects its transactions too. Restart surfnet.                                                              |
 | `Cannot get mark price, staleness or validity check failed`                             | The local PerpAssetMap aged since it was pulled. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart surfnet. |
-| `Global configuration must be active` when a transaction is sent after Play             | The LastRestartSlot sysvar is still 0. See [Before sending transactions](#before-sending-transactions).                                                                           |
-| `sendTransaction` waits 30 s and fails with `Failed to fetch accounts from remote`      | The Phoenix log authority is missing. See [Before sending transactions](#before-sending-transactions).                                                                            |
 
 ## Verification against mainnet
 
