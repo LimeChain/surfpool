@@ -2,9 +2,10 @@
 //! against.
 //!
 //! The account-fetch and byte-diff helpers below are deliberately DUPLICATED from the Kamino suite
-//! rather than shared. These suites fork live mainnet state and are the most likely place to need a
-//! one-off change to retry behaviour or account synthesis; a shared helper would couple two
-//! unrelated protocols' tests together and make such a change risky for both.
+//! rather than shared. These suites load state from the upstream datasource into a local VM and are
+//! the most likely place to need a one-off change to retry behaviour or account synthesis; a shared
+//! helper would couple two unrelated protocols' tests together and make such a change risky for
+//! both.
 
 //!
 //! Like the Kamino suite these fetch real mainnet accounts rather than embedding captured copies,
@@ -109,9 +110,9 @@ async fn fetch_optional(addresses: &[&str]) -> Vec<Option<Vec<u8>>> {
 
 /// Like [`fetch`] but keeps each account's owner instead of its data.
 ///
-/// Needed to tell a classic SPL mint from a Token-2022 one. Two of BisonFi's live markets quote a
-/// Token-2022 base asset and refuse a swap with `Custom(60)` if handed classic token accounts, so a
-/// replay harness that assumes one token program silently cannot exercise them.
+/// Needed to tell a classic SPL mint from a Token-2022 one. Pools quoting a Token-2022 asset refuse
+/// a swap with `Custom(60)` if handed classic token accounts, so a replay harness that assumes one
+/// token program silently cannot exercise them.
 async fn fetch_owners(addresses: &[Pubkey]) -> Vec<Pubkey> {
     let client = SurfnetRemoteClient::new(
         std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
@@ -1219,9 +1220,9 @@ const WHIRLPOOL_SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
 
 /// SCENARIO: arbitrage between BisonFi and an AMM on the same pair.
 ///
-/// Surfpool forks mainnet, so dislocating BisonFi alone creates a real arbitrage against every other
-/// venue's live state - no second override needed. This measures that against Orca's actual on-chain
-/// price rather than a hardcoded number.
+/// Surfpool loads mainnet state into the local VM, so dislocating BisonFi alone creates a real
+/// arbitrage against every other venue's upstream state with no second override. This measures that
+/// against Orca's actual on-chain price rather than a hardcoded number.
 ///
 /// The Whirlpool's price comes from its `sqrt_price` (Q64.64 at offset 65), squared. Nothing is
 /// executed on the AMM side: pricing an Orca swap needs its tick arrays, which is a much larger piece
@@ -1938,9 +1939,9 @@ const BISONFI_PROGRAMDATA: &str = "42snJ7ip4zKKsip3EtaMoBo8wzoRsQJSzgUSFXAVJFfG"
 
 const BISONFI_NINTH: &str = "8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d";
 
-/// The control the whole exercise needed: the deployed program, entered against a forked pool,
-/// prices a swap. It returned zero for a long time because LiteSVM reports LastRestartSlot as 0 and
-/// the program refuses to quote below 246_464_040 - it logs "LRS0", Last Restart Slot, and gives up.
+/// The control the whole exercise needed: the deployed program, entered against pool state loaded
+/// from the upstream datasource, prices a swap. BisonFi also requires LastRestartSlot to describe
+/// the local VM's start slot; Surfpool initializes the same sysvar during startup.
 ///
 /// Asserts the fill lands just below the pool's own published mid, which is the end-to-end check
 /// that `fair_value` is the price this venue actually quotes on.
@@ -1951,8 +1952,8 @@ async fn bisonfi_swap_replay_prices_near_the_published_mid() {
     let fork = bisonfi_fork(BISONFI_POOL).await;
     let mid = u128::from_le_bytes(fork.pool[832..848].try_into().unwrap()) as f64 / 2f64.powi(88);
     let out = bisonfi_run(&fork, ONE_SOL, 0, |_| {})
-        .expect("the forked pool should price a one SOL sell");
-    assert!(out > 0, "a live pool should quote a non-zero amount");
+        .expect("the loaded pool should price a one SOL sell");
+    assert!(out > 0, "a usable pool should quote a non-zero amount");
 
     // USDC has six decimals, so `out` is the quote in micro-units for one whole SOL.
     let realized = out as f64 / 1e6;
@@ -2103,17 +2104,10 @@ fn bisonfi_replay_min_out(
     clock.slot = pool_slot;
     clock.unix_timestamp = 1_787_041_969;
     svm.set_sysvar(&clock);
-    svm.set_account(
-        Pubkey::from_str_const("SysvarLastRestartS1ot1111111111111111111111"),
-        Account {
-            lamports: 1_000_000,
-            data: 246_464_040u64.to_le_bytes().to_vec(),
-            owner: Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111"),
-            executable: false,
-            rent_epoch: 0,
-        },
-    )
-    .map_err(|e| format!("set last_restart_slot: {e:?}"))?;
+    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+        // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
+        last_restart_slot: 246_464_040,
+    });
 
     let owned = |data: Vec<u8>, owner: Pubkey| Account {
         lamports: 10_000_000_000,
@@ -2242,7 +2236,7 @@ const BISONFI_LADDER_MIRROR: usize = 288;
 /// A rung is 16 bytes: share-if-ask, share-if-bid, level, tick offset.
 const BISONFI_RUNG: usize = 16;
 
-/// A forked pool plus the deployed program, ready to run swaps against.
+/// Pool state loaded from the upstream datasource plus the deployed program, ready for local swaps.
 #[derive(Clone)]
 struct BisonfiFork {
     elf: Vec<u8>,
@@ -2252,7 +2246,7 @@ struct BisonfiFork {
     quote_vault: (Pubkey, Vec<u8>, u64),
 }
 
-/// Cached per process, keyed by pool. Several tests fork the same market, and refetching it for each
+/// Cached per process, keyed by pool. Several tests load the same market, and refetching it for each
 /// one is what exhausts the public endpoint. One snapshot per suite run is also more consistent:
 /// tests then compare against identical state rather than a market that moved between them.
 fn bisonfi_fork_cache() -> &'static std::sync::Mutex<HashMap<String, BisonfiFork>> {
@@ -2308,7 +2302,8 @@ async fn bisonfi_fork_uncached(pool_addr: &str) -> BisonfiFork {
     }
 }
 
-/// Runs one swap against a mutated copy of the fork. `direction` 0 sells the base token, 1 buys it.
+/// Runs one swap against a mutated copy of the loaded state. `direction` 0 sells the base token and
+/// 1 buys it.
 fn bisonfi_run(
     fork: &BisonfiFork,
     amount_in: u64,
@@ -2340,18 +2335,11 @@ fn bisonfi_run(
     clock.slot = pool_slot;
     clock.unix_timestamp = 1_787_041_969;
     svm.set_sysvar(&clock);
-    // The program refuses to quote unless LastRestartSlot is at least this, logging "LRS0".
-    svm.set_account(
-        Pubkey::from_str_const("SysvarLastRestartS1ot1111111111111111111111"),
-        Account {
-            lamports: 1_000_000,
-            data: 246_464_040u64.to_le_bytes().to_vec(),
-            owner: Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111"),
-            executable: false,
-            rent_epoch: 0,
-        },
-    )
-    .map_err(|e| format!("{e:?}"))?;
+    // Match Surfpool startup: this local VM begins at the account snapshot's slot.
+    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+        // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
+        last_restart_slot: 246_464_040,
+    });
 
     let owned = |data: Vec<u8>, owner: Pubkey| Account {
         lamports: 10_000_000_000,
@@ -3110,7 +3098,7 @@ async fn whirlpool_fork(pool: &str) -> WhirlpoolFork {
     }
 }
 
-/// Executes a Whirlpool swap in LiteSVM against forked mainnet state.
+/// Executes a Whirlpool swap in LiteSVM against state loaded from the upstream datasource.
 ///
 /// Returns `(amount_in_spent, amount_out_received)` measured from the taker's own token accounts.
 fn whirlpool_replay(
@@ -3137,7 +3125,7 @@ fn whirlpool_replay(
 
     // The pool accrues rewards against wall-clock time and refuses to run if the clock is behind its
     // own `reward_last_updated_timestamp` (error 6022, InvalidTimestamp). LiteSVM starts near zero,
-    // which is millions of seconds behind any forked mainnet account, so the clock has to be advanced
+    // which is millions of seconds behind an account loaded from upstream, so the clock is advanced
     // to the pool's own notion of now.
     let pool_ts = u64::from_le_bytes(fork.data[261..269].try_into().unwrap());
     let mut clock: solana_clock::Clock = svm.get_sysvar();
@@ -3241,13 +3229,13 @@ fn whirlpool_replay(
     }
 }
 
-/// A real Orca Whirlpool swap executes against forked mainnet state, in both directions.
+/// A real Orca Whirlpool swap executes against state loaded from upstream, in both directions.
 ///
 /// This is the AMM leg the cross-venue arbitrage scenario needs, and it is also what validates the
 /// instruction layout transcribed in `whirlpool_swap`: the assertions below pin all four balances that
 /// move, so a wrong account order or argument encoding cannot pass by coincidence.
 #[tokio::test]
-async fn whirlpool_swap_executes_against_forked_state() {
+async fn whirlpool_swap_executes_against_loaded_upstream_state() {
     let fork = whirlpool_fork(WHIRLPOOL_SOL_USDC).await;
     // 1 SOL. Small enough to stay inside the current tick array on a pool this deep, which keeps the
     // test about the instruction rather than about tick-crossing.
@@ -3366,17 +3354,10 @@ async fn bisonfi_orca_atomic_arb(
     clock.slot = bf_slot;
     clock.unix_timestamp = orca_ts as i64;
     svm.set_sysvar(&clock);
-    svm.set_account(
-        Pubkey::from_str_const("SysvarLastRestartS1ot1111111111111111111111"),
-        Account {
-            lamports: 1_000_000,
-            data: 246_464_040u64.to_le_bytes().to_vec(),
-            owner: Pubkey::from_str_const("Sysvar1111111111111111111111111111111111111"),
-            executable: false,
-            rent_epoch: 0,
-        },
-    )
-    .map_err(|e| format!("set last_restart_slot: {e:?}"))?;
+    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+        // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
+        last_restart_slot: 246_464_040,
+    });
 
     let owned = |data: Vec<u8>, owner: Pubkey| Account {
         lamports: 10_000_000_000,
@@ -3520,7 +3501,7 @@ async fn bisonfi_orca_atomic_arb(
 /// SCENARIO: arbitrage between BisonFi and an AMM on the same pair, executed atomically.
 ///
 /// The upgrade over `bisonfi_scenario_arbitrage_against_an_amm`, which compares the two venues' quotes
-/// without trading: here both legs run in a single transaction against forked mainnet state for both
+/// without trading: here both legs run in a single transaction against upstream state loaded for both
 /// programs, and the profit is a real balance change in the arbitrageur's own account.
 ///
 /// Self-validating in both directions. At the market's true mid the round trip must LOSE money, since
@@ -3546,6 +3527,7 @@ async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
 
     // Mark BisonFi up so it becomes the richer bid, and the same transaction becomes an arbitrage.
     let mut last = fair;
+    let mut two_percent_profit = None;
     for pct in [2.0f64, 5.0, 10.0] {
         let profit = bisonfi_orca_atomic_arb(SOL_USDC, ONE_SOL, 1.0 + pct / 100.0)
             .await
@@ -3557,8 +3539,17 @@ async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
             "marking BisonFi up {pct}% must pay better than the {last} the previous step returned, \
              got {profit}"
         );
+        if pct == 2.0 {
+            two_percent_profit = Some(profit);
+        }
         last = profit;
     }
+    let two_percent_profit = two_percent_profit.expect("the 2% leg must run");
+    assert!(
+        two_percent_profit > 0,
+        "the hardcoded Studio scenario claims a 2% premium clears both venues' fees, got \
+         {two_percent_profit}"
+    );
     assert!(
         last > 0,
         "a 10% dislocation must produce an outright profit, got {last}. The fair-value template's \

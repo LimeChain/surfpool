@@ -2162,6 +2162,9 @@ impl SurfnetSvm {
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
     ) -> SurfpoolResult<()> {
+        let last_restart_slot = self
+            .inner
+            .get_sysvar::<solana_last_restart_slot::LastRestartSlot>();
         self.inner.reset(self.feature_set.clone())?;
 
         let native_mint_account = self
@@ -2224,6 +2227,7 @@ impl SurfnetSvm {
         self.inner.set_sysvar(&epoch_schedule);
         // Rebuild sysvars so getLatestBlockhash / sendTransaction stay aligned after reset.
         self.reconstruct_sysvars();
+        self.inner.set_sysvar(&last_restart_slot);
         // Reset checkpoint state to avoid recovering stale chain tips after a reset.
         self.slot_checkpoint.clear()?;
         self.last_checkpoint_slot = self.genesis_slot;
@@ -6065,6 +6069,25 @@ mod tests {
     }
 
     #[test]
+    fn reset_network_preserves_last_restart_slot() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let expected = solana_last_restart_slot::LastRestartSlot {
+            last_restart_slot: 246_464_040,
+        };
+        svm.inner.set_sysvar(&expected);
+        let epoch_schedule = EpochSchedule::without_warmup();
+        let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+
+        svm.reset_network(epoch_info, epoch_schedule).unwrap();
+
+        assert_eq!(
+            svm.inner
+                .get_sysvar::<solana_last_restart_slot::LastRestartSlot>(),
+            expected
+        );
+    }
+
+    #[test]
     fn test_clone_for_profiling_preserves_skip_blockhash_check() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         svm.skip_blockhash_check = true;
@@ -8140,6 +8163,10 @@ mod tests {
     fn garbage_collection_keeps_the_epoch_schedule(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
         let gc_slot = *GARBAGE_COLLECTION_INTERVAL_SLOTS;
+        let last_restart_slot = solana_last_restart_slot::LastRestartSlot {
+            last_restart_slot: 123,
+        };
+        svm.inner.set_sysvar(&last_restart_slot);
         svm.latest_epoch_info.absolute_slot = gc_slot;
         svm.latest_epoch_info.slot_index = gc_slot;
 
@@ -8149,11 +8176,19 @@ mod tests {
         assert_eq!(
             (
                 svm.inner.get_sysvar::<EpochSchedule>(),
+                svm.inner
+                    .get_sysvar::<solana_last_restart_slot::LastRestartSlot>(),
                 info.absolute_slot,
                 info.epoch,
                 info.slot_index
             ),
-            (EpochSchedule::without_warmup(), gc_slot + 1, 0, gc_slot + 1)
+            (
+                EpochSchedule::without_warmup(),
+                last_restart_slot,
+                gc_slot + 1,
+                0,
+                gc_slot + 1
+            )
         );
     }
 }

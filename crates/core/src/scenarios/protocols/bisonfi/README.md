@@ -48,7 +48,7 @@ template: bisonfi-fair-value
 fair_value: "15474250491067253436239052800"    # $50 x 2^88, as a STRING
 ```
 
-Set `fetchBeforeUse: true` so the live pool is forked first.
+Set `fetchBeforeUse: true` so the pool is loaded from the upstream datasource first.
 
 ## Make large trades slip
 
@@ -76,10 +76,10 @@ that cannot fill at all.
 
 ## Keep the venue quoting
 
-**A forked pool eventually goes stale by itself** - nothing in a fork republishes the mid. The exact
-allowed age is maker policy and can vary between markets or deployments. Once stale, the price,
-depth and spread templates are silently ignored. Refresh the timestamp to keep the venue alive for
-as long as your scenario needs.
+**A pool loaded into the local VM eventually goes stale by itself.** The local VM does not republish
+the mid. The exact allowed age is maker policy and can vary between markets or deployments. Once
+stale, the price, depth and spread templates are silently ignored. Refresh the timestamp to keep the
+venue alive for as long as your scenario needs.
 
 **Studio:** add **Keep Quote Live** to every later slot containing a BisonFi swap, then set
 **Slots behind the chain** to `0`. It does not need to be added to intermediate slots with no swap.
@@ -146,6 +146,6 @@ executable margin - both legs fit in one transaction. Two things to get right:
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
 | The quote becomes stale again later in the scenario | Schedule another freshness override in each slot where the quote must be usable |
-| `Custom(60)` | A Token-2022 mint whose token accounts need matching extension data. Two live markets quote such an asset |
-| A swap in a simulated slot returns 0 for no reason | The `LastRestartSlot` sysvar must be at least `246464040`, and the default 200k compute budget cannot finish a large trade - ask for ~1.4M |
+| `Custom(60)` | A Token-2022 mint whose token accounts need extension data matching that mint |
+| A large swap exhausts its compute budget | The default 200k compute budget may be too small; request about 1.4M units |
 | A freshness override does not seem to age the pool | If your harness derives its clock from the pool's own `last_update_slot`, aging the account moves the clock with it. Apply the override after the clock is taken |

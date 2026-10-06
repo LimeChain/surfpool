@@ -33,7 +33,7 @@ templates:
       PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
-      between markets or deployments. Because nothing in a fork republishes the mid, refresh
+      between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
       usable quote.
 
@@ -52,7 +52,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching live v3 pool exists, say so instead of guessing.
+         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
+         vaults, say so instead of guessing.
 
       This is the only price lever. The reserves control depth, not price: BisonFi quotes around a mid
       the operator publishes, so changing vault balances will not move the quote.
@@ -60,7 +61,7 @@ templates:
       HOW TO USE:
       1. Multiply the price by 2^88 (309485009821345068724781056)
       2. Pass the result as a decimal STRING, since it exceeds what a JSON number holds exactly
-      3. Set fetchBeforeUse: true so the live pool is forked first
+      3. Set fetchBeforeUse: true so the pool is loaded from the upstream datasource first
 
       MID-FLIGHT VARIANT: schedule two steps on this field a couple of slots apart, and a caller
       prices on one mid and executes against another. A reprice is caught by the caller's own
@@ -102,7 +103,7 @@ templates:
       PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
-      between markets or deployments. Because nothing in a fork republishes the mid, refresh
+      between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
       usable quote.
 
@@ -121,7 +122,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching live v3 pool exists, say so instead of guessing.
+         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
+         vaults, say so instead of guessing.
 
       The depth lever: how far a trade moves the price. For how wide the venue quotes around its mid,
       use bisonfi-spread instead.
@@ -229,7 +231,7 @@ templates:
       PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
-      between markets or deployments. Because nothing in a fork republishes the mid, refresh
+      between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
       usable quote.
 
@@ -248,7 +250,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching live v3 pool exists, say so instead of guessing.
+         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
+         vaults, say so instead of guessing.
 
       The spread lever: how wide the venue quotes around its mid, independently of how much inventory
       it holds. Use bisonfi-depth to make a venue THIN and this one to make it EXPENSIVE.
@@ -310,15 +313,16 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching live v3 pool exists, say so instead of guessing.
+         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
+         vaults, say so instead of guessing.
 
-      A FORKED POOL GOES STALE BY ITSELF. Surfpool takes its starting slot from mainnet and never
-      re-fetches an account it has already pulled, so nothing republishes the mid. Once the maker's
-      allowed publication age is exceeded, the venue stops quoting and stays that way. The exact
-      tolerance is maker policy and can vary between markets or deployments. From then on the price,
-      depth and spread overrides are silently ignored - the swap returns zero and the transaction
-      still SUCCEEDS. That makes this template the precondition for the other three in any scenario
-      that spans multiple slots.
+      A POOL LOADED INTO THE LOCAL VM GOES STALE BY ITSELF. Surfpool loads the account from the
+      upstream datasource once, and the local VM does not republish the mid. Once the maker's allowed
+      publication age is exceeded, the venue stops quoting and stays that way. The exact tolerance
+      is maker policy and can vary between markets or deployments. From then on the price, depth and
+      spread overrides are silently ignored: the swap returns zero and the transaction still
+      SUCCEEDS. That makes this template the precondition for the other three in any scenario that
+      spans multiple slots.
 
       THE VALUE IS AN OFFSET, NOT A SLOT NUMBER. It is resolved against the slot the override
       materializes at, so 0 means "published this slot". Do not pass the chain's absolute slot: the
@@ -330,8 +334,9 @@ templates:
       2. If the scenario spans enough slots for the quote to become stale again, schedule another
          freshness override in every slot where the quote must be usable
 
-      A scenario that executes immediately after forking may not need this. A multi-slot scenario
-      should keep the publication fresh explicitly rather than depending on the current tolerance.
+      A scenario that executes immediately after the account is loaded may not need this. A
+      multi-slot scenario should keep the publication fresh explicitly rather than depending on the
+      current tolerance.
 
       EXAMPLE - "keep the maker quoting for the whole run":
       Add last_update_slot: 0 at each slot where a transaction needs a live quote.

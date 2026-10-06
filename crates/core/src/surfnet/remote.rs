@@ -24,6 +24,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
+use solana_last_restart_slot::{LastRestartSlot, sysvar as last_restart_slot_sysvar};
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::{
@@ -220,6 +221,20 @@ impl SurfnetRemoteClient {
 
     pub async fn get_epoch_schedule(&self) -> SurfpoolResult<EpochSchedule> {
         self.client.get_epoch_schedule().await.map_err(Into::into)
+    }
+
+    /// Fetches the upstream cluster's most recent hard-fork slot.
+    pub async fn get_last_restart_slot(&self) -> SurfpoolResult<LastRestartSlot> {
+        let account = self.client.get_account(&last_restart_slot_sysvar::id()).await?;
+        let bytes: [u8; 8] = account.data.as_slice().try_into().map_err(|_| {
+            SurfpoolError::internal(format!(
+                "LastRestartSlot sysvar has {} bytes, expected 8",
+                account.data.len()
+            ))
+        })?;
+        Ok(LastRestartSlot {
+            last_restart_slot: u64::from_le_bytes(bytes),
+        })
     }
 
     pub async fn get_account(

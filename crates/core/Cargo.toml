@@ -65,6 +65,7 @@ solana-hash = { workspace = true }
 solana-inflation = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
+solana-last-restart-slot = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true }

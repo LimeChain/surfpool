@@ -265,17 +265,24 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule, some_genesis_hash) = {
+        let (mut epoch_info, epoch_schedule, last_restart_slot, some_genesis_hash) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
+            let last_restart_slot = remote_client.get_last_restart_slot().await?;
             let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
-            (epoch_info, epoch_schedule, some_genesis_hash)
+            (
+                epoch_info,
+                epoch_schedule,
+                last_restart_slot,
+                some_genesis_hash,
+            )
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
+            svm_writer.inner.set_sysvar(&last_restart_slot);
         });
         Ok(())
     }
@@ -4640,6 +4647,17 @@ mod tests {
                 RpcRequest::GetEpochSchedule => {
                     serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
                 }
+                RpcRequest::GetAccountInfo => serde_json::json!({
+                    "context": { "slot": 2 },
+                    "value": {
+                        "data": ["KL6wDgAAAAA=", "base64"],
+                        "executable": false,
+                        "lamports": 946560,
+                        "owner": "Sysvar1111111111111111111111111111111111111",
+                        "rentEpoch": u64::MAX,
+                        "space": 8
+                    }
+                }),
                 RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
                 _ => panic!("unexpected startup RPC request: {request:?}"),
             })
@@ -4693,7 +4711,14 @@ mod tests {
                 .inner,
             expected_hash
         );
-        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            svm_locker.with_svm_reader(|svm| svm
+                .inner
+                .get_sysvar::<solana_last_restart_slot::LastRestartSlot>()
+                .last_restart_slot),
+            246_464_040
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 
     #[cfg(feature = "sqlite")]

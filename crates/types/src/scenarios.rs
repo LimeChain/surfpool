@@ -1774,6 +1774,7 @@ mod tests {
             .expect_err("a stride smaller than the encoded width must be rejected");
         assert!(err.contains("smaller than its 4 byte width"), "{err}");
     }
+
     #[test]
     fn raw_layout_rejects_overlaps_between_properties() {
         use super::RawEncoding;
@@ -1857,13 +1858,14 @@ mod tests {
 
         let selector = Property::constant_ref("market".to_string(), "markets".to_string());
         let mut valid = raw_template(vec![selector.clone()]);
-        valid
-            .constants
-            .insert("markets".to_string(), ConstantDefinition {
+        valid.constants.insert(
+            "markets".to_string(),
+            ConstantDefinition {
                 label: "Market".to_string(),
                 description: None,
                 options: Vec::new(),
-            });
+            },
+        );
         valid
             .validate_raw_layout()
             .expect("a selector referencing a declared constant is valid");
