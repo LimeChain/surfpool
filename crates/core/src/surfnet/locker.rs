@@ -4635,7 +4635,7 @@ mod tests {
         async fn send(
             &self,
             request: RpcRequest,
-            _params: serde_json::Value,
+            params: serde_json::Value,
         ) -> ClientResult<serde_json::Value> {
             self.requests.fetch_add(1, Ordering::Relaxed);
 
@@ -4653,17 +4653,21 @@ mod tests {
                 }
                 RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
                 // The LastRestartSlot sysvar; the data is 246_464_040 as a little-endian u64.
-                RpcRequest::GetAccountInfo => serde_json::json!({
-                    "context": { "slot": 2 },
-                    "value": {
-                        "lamports": 946_560,
-                        "data": ["KL6wDgAAAAA=", "base64"],
-                        "owner": "Sysvar1111111111111111111111111111111111111",
-                        "executable": false,
-                        "rentEpoch": 0,
-                        "space": 8,
-                    },
-                }),
+                RpcRequest::GetAccountInfo
+                    if params[0] == solana_sysvar::last_restart_slot::ID.to_string() =>
+                {
+                    serde_json::json!({
+                        "context": { "slot": 2 },
+                        "value": {
+                            "lamports": 946_560,
+                            "data": ["KL6wDgAAAAA=", "base64"],
+                            "owner": "Sysvar1111111111111111111111111111111111111",
+                            "executable": false,
+                            "rentEpoch": 0,
+                            "space": 8,
+                        },
+                    })
+                }
                 _ => panic!("unexpected startup RPC request: {request:?}"),
             })
         }
