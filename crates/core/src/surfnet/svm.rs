@@ -3207,8 +3207,6 @@ impl SurfnetSvm {
                     continue;
                 }
 
-                // A bad value in one override is that override's failure, never the batch's:
-                // an error returned from this loop aborts block production.
                 match prepare_phoenix_override(
                     self,
                     &account_pubkey,
@@ -3238,6 +3236,8 @@ impl SurfnetSvm {
                             "Skipping override {} for {}: {}",
                             override_instance.id, account_pubkey, e
                         );
+                        // A bad value in one override is that override's failure, never the
+                        // batch's: an error returned from this loop aborts block production.
                         continue;
                     }
                 }
