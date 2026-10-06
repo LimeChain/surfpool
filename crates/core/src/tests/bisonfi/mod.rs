@@ -21,7 +21,10 @@
 //! check a synthetic account against. The only way to know an offset is right is to run the real
 //! deployed program over real account state and watch the fill change.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
@@ -30,6 +33,7 @@ use solana_sysvar::last_restart_slot::LastRestartSlot;
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    tests::helpers::diff_indices,
 };
 
 // ---------------------------------------------------------------- fetch/diff helpers
@@ -142,16 +146,6 @@ async fn fetch_owners(addresses: &[Pubkey]) -> Vec<Pubkey> {
             | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.owner,
             GetAccountResult::None(_) => panic!("{address} no longer exists on mainnet"),
         })
-        .collect()
-}
-
-/// Byte indices at which two buffers differ.
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b.iter())
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
         .collect()
 }
 
@@ -1050,8 +1044,29 @@ async fn bisonfi_scenario_set_spread() {
     let mut checked = 0usize;
     for (pool, data, tp) in &rig.quoting {
         let base_reserve = u64::from_le_bytes(data[48..56].try_into().unwrap());
-        // 5% of the reserve: comfortably above the size below which the ladder is not consulted.
-        let size = base_reserve / 20;
+        // Pick the first size this market can fill where the quote ladder is actually engaged.
+        let size = [20u64, 50, 100, 200, 1000].into_iter().find_map(|div| {
+            let size = base_reserve / div;
+            let control = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {}).ok()?;
+            if control == 0 {
+                return None;
+            }
+            let wide = rig
+                .try_scenario(
+                    pool,
+                    data,
+                    *tp,
+                    "bisonfi-spread",
+                    &bisonfi_spread_values(WIDE),
+                    size,
+                    0,
+                )
+                .ok()?;
+            (wide < control).then_some(size)
+        });
+        let Some(size) = size else {
+            continue;
+        };
         let at = |magnitude: i32| {
             rig.try_scenario(
                 pool,
@@ -2214,17 +2229,36 @@ fn bisonfi_replay_min_out(
     }
 }
 
-/// The program ELF, fetched once per machine and reused. Delete the file to pick up a redeploy.
-async fn bisonfi_elf() -> Vec<u8> {
-    let cache = std::env::temp_dir().join("surfpool-bisonfi-program.so");
-    match std::fs::read(&cache) {
-        Ok(bytes) if bytes.len() > 200_000 => bytes,
-        _ => {
-            let bytes = fetch(&[BISONFI_PROGRAMDATA]).await.remove(0)[45..].to_vec();
-            let _ = std::fs::write(&cache, &bytes);
-            bytes
+/// Publishes an ELF cache only after the complete file has been written. A unique temporary path
+/// prevents parallel test processes from observing or overwriting one another's partial writes.
+fn publish_elf_cache(cache: &std::path::Path, bytes: &[u8]) {
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let temporary = cache.with_extension(format!("so.{}.{}.tmp", std::process::id(), sequence));
+    if std::fs::write(&temporary, bytes).is_ok() {
+        let _ = std::fs::rename(&temporary, cache);
+    }
+    let _ = std::fs::remove_file(temporary);
+}
+
+async fn load_program_elf(cache_name: &str, programdata: &str) -> Vec<u8> {
+    let cache = std::env::temp_dir().join(cache_name);
+    if let Ok(bytes) = std::fs::read(&cache) {
+        if bytes.len() > 200_000 {
+            return bytes;
         }
     }
+    let bytes = fetch(&[programdata]).await.remove(0)[45..].to_vec();
+    publish_elf_cache(&cache, &bytes);
+    bytes
+}
+
+/// The program ELF, fetched once per process and reused. Delete the file to pick up a redeploy.
+async fn bisonfi_elf() -> Vec<u8> {
+    static ELF: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+    ELF.get_or_init(|| load_program_elf("surfpool-bisonfi-program.so", BISONFI_PROGRAMDATA))
+        .await
+        .clone()
 }
 
 /// Offsets of the live quote ladder. `LADDER` is the table the program actually prices from;
@@ -2273,17 +2307,7 @@ async fn bisonfi_fork(pool_addr: &str) -> BisonfiFork {
 }
 
 async fn bisonfi_fork_uncached(pool_addr: &str) -> BisonfiFork {
-    // The ELF is ~250 KB and the same for every pool, so it is fetched once per machine and cached.
-    // Delete the file to pick up a redeploy.
-    let cache = std::env::temp_dir().join("surfpool-bisonfi-program.so");
-    let elf = match std::fs::read(&cache) {
-        Ok(bytes) if bytes.len() > 200_000 => bytes,
-        _ => {
-            let bytes = fetch(&[BISONFI_PROGRAMDATA]).await.remove(0)[45..].to_vec();
-            let _ = std::fs::write(&cache, &bytes);
-            bytes
-        }
-    };
+    let elf = bisonfi_elf().await;
     // The vault addresses live in the pool, so learning them takes one read - but the pool's cached
     // reserves and the vault balances must come from the SAME slot or they disagree. This market
     // turns over tens of thousands of dollars between two requests, which is enough to make the pool
@@ -2988,19 +3012,16 @@ mod whirlpool_swap {
 
 /// The Whirlpool program's executable, cached in the temp dir like [`bisonfi_elf`].
 async fn whirlpool_elf() -> Vec<u8> {
-    let cache = std::env::temp_dir().join("surfpool-whirlpool-program.so");
-    if let Ok(bytes) = std::fs::read(&cache) {
-        if bytes.len() > 200_000 {
-            return bytes;
-        }
-    }
-    let prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
-    let loader = Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111");
-    let (programdata, _) = Pubkey::find_program_address(&[prog.as_ref()], &loader);
-    // 45 bytes of UpgradeableLoaderState::ProgramData precede the ELF.
-    let bytes = fetch(&[&programdata.to_string()]).await.remove(0)[45..].to_vec();
-    let _ = std::fs::write(&cache, &bytes);
-    bytes
+    static ELF: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+    ELF.get_or_init(|| async {
+        let prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
+        let loader = Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111");
+        let (programdata, _) = Pubkey::find_program_address(&[prog.as_ref()], &loader);
+        // 45 bytes of UpgradeableLoaderState::ProgramData precede the ELF.
+        load_program_elf("surfpool-whirlpool-program.so", &programdata.to_string()).await
+    })
+    .await
+    .clone()
 }
 
 /// Everything needed to replay a swap against one Whirlpool's live state.
