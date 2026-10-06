@@ -253,7 +253,7 @@ impl AccountAddress {
 
 /// The type of a property - determines how it's rendered in the UI
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PropertyKind {
     /// A regular field from the IDL (default behavior)
     #[default]
@@ -262,7 +262,23 @@ pub enum PropertyKind {
     ConstantRef,
     /// Options fetched live from an MCP tool (renders as a dropdown whose entries are
     /// pulled from a running surfnet, so the catalog is never hardcoded)
-    DynamicRef,
+    DynamicRef {
+        /// The MCP tool whose result supplies the dropdown options
+        source: String,
+    },
+}
+
+impl PropertyKind {
+    /// Maps a YAML `type` string, defaulting to a field. A dynamic_ref needs its `source`.
+    pub fn from_yaml(kind: Option<&str>, source: Option<String>) -> Result<Self, String> {
+        match kind {
+            Some("constant_ref") => Ok(Self::ConstantRef),
+            Some("dynamic_ref") => source
+                .map(|source| Self::DynamicRef { source })
+                .ok_or_else(|| "a dynamic_ref needs a source".to_string()),
+            _ => Ok(Self::Field),
+        }
+    }
 }
 
 /// Defines a property in a template with full metadata
@@ -272,7 +288,7 @@ pub struct Property {
     /// The path to the field in the IDL (e.g., "liquidity", "fees.swap_fee_numerator")
     pub path: String,
     /// The type of property - determines rendering behavior
-    #[serde(default, rename = "type")]
+    #[serde(flatten)]
     pub kind: PropertyKind,
     /// Human-readable label for the UI (optional, defaults to path)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,9 +305,8 @@ pub struct Property {
     /// Raw-layout only: how this field's bytes are produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<RawEncoding>,
-    /// For dynamic_ref type: the MCP tool whose result supplies the dropdown options
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    /// The value's IDL type when `path` is not a field of the account's IDL type, such as a
+    /// market symbol picked from a dynamic_ref. UIs render the input from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_type: Option<anchor_lang_idl::types::IdlType>,
 }
@@ -307,7 +322,6 @@ impl Property {
             constant: None,
             offset: None,
             encoding: None,
-            source: None,
             value_type: None,
         }
     }
@@ -322,7 +336,6 @@ impl Property {
             constant: Some(constant.into()),
             offset: None,
             encoding: None,
-            source: None,
             value_type: None,
         }
     }
@@ -334,7 +347,7 @@ impl Property {
 
     /// Check if this is a dynamic reference
     pub fn is_dynamic_ref(&self) -> bool {
-        matches!(self.kind, PropertyKind::DynamicRef)
+        matches!(self.kind, PropertyKind::DynamicRef { .. })
     }
 
     /// Get the constant name if this is a constant reference
@@ -344,7 +357,10 @@ impl Property {
 
     /// Get the source tool name if this is a dynamic reference
     pub fn source_name(&self) -> Option<&str> {
-        self.source.as_deref()
+        match &self.kind {
+            PropertyKind::DynamicRef { source } => Some(source),
+            _ => None,
+        }
     }
 
     /// Get the display label (falls back to path if no label set)
@@ -699,8 +715,8 @@ pub struct YamlOverrideTemplateFile {
 
 impl YamlOverrideTemplateFile {
     /// Convert file-based template to runtime OverrideTemplate with loaded IDL
-    pub fn to_override_template(self, idl: Idl) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self, idl: Idl) -> Result<OverrideTemplate, String> {
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
@@ -708,7 +724,11 @@ impl YamlOverrideTemplateFile {
             idl: Some(idl),
             address: self.address.into(),
             account_type: self.account_type,
-            properties: self.properties.into_iter().map(Into::into).collect(),
+            properties: self
+                .properties
+                .into_iter()
+                .map(Property::try_from)
+                .collect::<Result<_, _>>()?,
             constants: self
                 .constants
                 .into_iter()
@@ -717,7 +737,7 @@ impl YamlOverrideTemplateFile {
             tags: self.tags,
             llm_context: self.llm_context,
             raw_layout: false,
-        }
+        })
     }
 }
 
@@ -885,7 +905,7 @@ pub enum YamlProperty {
     Full {
         /// The path to the field in the IDL
         path: String,
-        /// The type of property: "field" (default), "constant_ref" or "dynamic_ref"
+        /// The serialized [`PropertyKind`]; defaults to a field
         #[serde(default, rename = "type")]
         kind: Option<String>,
         /// Human-readable label for the UI (optional)
@@ -906,15 +926,18 @@ pub enum YamlProperty {
         /// For dynamic_ref type: the MCP tool whose result supplies the options
         #[serde(default)]
         source: Option<String>,
+        /// The value's IDL type when `path` is not a field of the account's IDL type
         #[serde(default)]
         value_type: Option<anchor_lang_idl::types::IdlType>,
     },
 }
 
-impl From<YamlProperty> for Property {
-    fn from(yaml: YamlProperty) -> Self {
+impl TryFrom<YamlProperty> for Property {
+    type Error = String;
+
+    fn try_from(yaml: YamlProperty) -> Result<Self, Self::Error> {
         match yaml {
-            YamlProperty::Simple(path) => Property::field(path),
+            YamlProperty::Simple(path) => Ok(Property::field(path)),
             YamlProperty::Full {
                 path,
                 kind,
@@ -926,12 +949,9 @@ impl From<YamlProperty> for Property {
                 source,
                 value_type,
             } => {
-                let kind = match kind.as_deref() {
-                    Some("constant_ref") => PropertyKind::ConstantRef,
-                    Some("dynamic_ref") => PropertyKind::DynamicRef,
-                    _ => PropertyKind::Field,
-                };
-                Property {
+                let kind = PropertyKind::from_yaml(kind.as_deref(), source)
+                    .map_err(|e| format!("property '{path}': {e}"))?;
+                Ok(Property {
                     path,
                     kind,
                     label,
@@ -939,9 +959,8 @@ impl From<YamlProperty> for Property {
                     constant,
                     offset,
                     encoding,
-                    source,
                     value_type,
-                }
+                })
             }
         }
     }
@@ -1418,25 +1437,25 @@ fn describe_properties_from_idl(
     properties: Vec<YamlProperty>,
     idl: Option<&Idl>,
     account_type: &str,
-) -> Vec<Property> {
+) -> Result<Vec<Property>, String> {
     properties
         .into_iter()
         .map(|yaml| {
-            let mut property: Property = yaml.into();
+            let mut property = Property::try_from(yaml)?;
             if property.description.is_none() {
                 // Only a fallback. A raw_layout collection with no IDL must spell out every
                 // description in the YAML, since there is no schema to borrow docs from.
                 property.description =
                     idl.and_then(|idl| idl_field_docs(idl, account_type, &property.path));
             }
-            property
+            Ok(property)
         })
         .collect()
 }
 
 impl YamlOverrideTemplateCollection {
     /// Convert collection to runtime OverrideTemplates with loaded IDL
-    pub fn to_override_templates(self, idl: Option<Idl>) -> Vec<OverrideTemplate> {
+    pub fn to_override_templates(self, idl: Option<Idl>) -> Result<Vec<OverrideTemplate>, String> {
         // Convert constants once for sharing
         let constants: HashMap<String, ConstantDefinition> = self
             .constants
@@ -1452,24 +1471,23 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
-                OverrideTemplate {
+                let properties =
+                    describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type)
+                        .map_err(|e| format!("template '{}': {e}", entry.id))?;
+                Ok(OverrideTemplate {
                     id: entry.id,
                     name: entry.name,
                     description: entry.description,
                     protocol: self.protocol.clone(),
                     idl: idl.clone(),
                     address: entry.address.into(),
-                    properties: describe_properties_from_idl(
-                        entry.properties,
-                        idl.as_ref(),
-                        &account_type,
-                    ),
+                    properties,
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
                     llm_context: entry.llm_context,
                     raw_layout: self.raw_layout,
-                }
+                })
             })
             .collect()
     }
@@ -1500,8 +1518,8 @@ pub struct YamlOverrideTemplate {
 
 impl YamlOverrideTemplate {
     /// Convert to runtime OverrideTemplate
-    pub fn to_override_template(self) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self) -> Result<OverrideTemplate, String> {
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
@@ -1509,7 +1527,11 @@ impl YamlOverrideTemplate {
             idl: Some(self.idl),
             address: self.address.into(),
             account_type: self.account_type,
-            properties: self.properties.into_iter().map(Into::into).collect(),
+            properties: self
+                .properties
+                .into_iter()
+                .map(Property::try_from)
+                .collect::<Result<_, _>>()?,
             constants: self
                 .constants
                 .into_iter()
@@ -1518,7 +1540,7 @@ impl YamlOverrideTemplate {
             tags: self.tags,
             llm_context: self.llm_context,
             raw_layout: false,
-        }
+        })
     }
 }
 
@@ -1965,5 +1987,62 @@ mod tests {
             let values = HashMap::from([("index".to_string(), value.clone())]);
             assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
         }
+    }
+
+    /// Studio and MCP clients read `type` and `source` as flat keys of a property.
+    #[test]
+    fn property_kind_keeps_its_json_shape() {
+        use super::PropertyKind;
+
+        let dynamic_ref = Property {
+            kind: PropertyKind::DynamicRef {
+                source: "list_phoenix_markets".to_string(),
+            },
+            ..Property::field("symbol")
+        };
+        let cases = [
+            (
+                Property::field("liquidity"),
+                json!({"path": "liquidity", "type": "field"}),
+            ),
+            (
+                Property::constant_ref("mint", "token_mint"),
+                json!({"path": "mint", "type": "constant_ref", "constant": "token_mint"}),
+            ),
+            (
+                dynamic_ref,
+                json!({"path": "symbol", "type": "dynamic_ref", "source": "list_phoenix_markets"}),
+            ),
+        ];
+
+        for (property, expected) in cases {
+            assert_eq!(serde_json::to_value(&property).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<Property>(expected).unwrap(),
+                property
+            );
+        }
+    }
+
+    #[test]
+    fn a_dynamic_ref_without_a_source_is_rejected() {
+        use super::YamlProperty;
+
+        let yaml = YamlProperty::Full {
+            path: "symbol".to_string(),
+            kind: Some("dynamic_ref".to_string()),
+            label: None,
+            description: None,
+            constant: None,
+            offset: None,
+            encoding: None,
+            source: None,
+            value_type: None,
+        };
+
+        assert_eq!(
+            Property::try_from(yaml),
+            Err("property 'symbol': a dynamic_ref needs a source".to_string())
+        );
     }
 }

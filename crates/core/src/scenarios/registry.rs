@@ -267,7 +267,9 @@ impl TemplateRegistry {
         let requires_raw_layout = idl.is_none();
 
         // Convert all templates in the collection
-        let templates = collection.to_override_templates(idl);
+        let templates = collection
+            .to_override_templates(idl)
+            .unwrap_or_else(|e| panic!("unable to load {} overrides: {}", protocol_name, e));
 
         // Validate the entire collection before mutating the registry, so one malformed entry
         // cannot leave its valid siblings partially registered.
