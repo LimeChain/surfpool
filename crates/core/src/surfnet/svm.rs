@@ -2986,7 +2986,6 @@ impl SurfnetSvm {
         );
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
-        let mut phoenix_written_this_slot: HashSet<Pubkey> = HashSet::new();
 
         // `take` already emptied the slot, so bailing out mid-loop would drop every override that
         // has not been reached yet. Put the unprocessed tail back before returning the error.
@@ -3042,7 +3041,9 @@ impl SurfnetSvm {
             );
 
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
+            let fetch_from_upstream =
+                override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey);
+            if fetch_from_upstream {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -3219,26 +3220,20 @@ impl SurfnetSvm {
                     &account,
                     &account_values,
                     remote_ctx,
-                    override_instance.fetch_before_use,
-                    &phoenix_written_this_slot,
+                    fetch_from_upstream,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
-                        let mut applied = true;
                         for (pubkey, written) in writes {
                             if let Err(e) = self.set_account(&pubkey, written) {
                                 warn!(
                                     "Failed to set {} for override {}: {}",
                                     pubkey, override_instance.id, e
                                 );
-                                applied = false;
                                 break;
                             }
                             settled_this_slot.insert(pubkey);
-                        }
-                        if applied {
-                            phoenix_written_this_slot.insert(account_pubkey);
                         }
                         continue;
                     }

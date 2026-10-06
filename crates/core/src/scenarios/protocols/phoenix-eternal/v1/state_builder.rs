@@ -1,5 +1,5 @@
 use core::mem::size_of;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use phoenix_rise_accounts::{
     PhoenixAccount, PhoenixAccountDecodeError,
@@ -264,8 +264,6 @@ fn forge_phoenix_override(
 }
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
-/// `written_this_slot` holds the accounts an earlier Phoenix override already wrote in the same
-/// slot; a later override of such a Trader builds on its index record instead of refreshing it.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     account_pubkey: &Pubkey,
@@ -273,7 +271,6 @@ pub async fn prepare_phoenix_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
-    written_this_slot: &HashSet<Pubkey>,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Ok(None);
@@ -297,7 +294,6 @@ pub async fn prepare_phoenix_override(
             values,
             remote_ctx,
             fetch_before_use,
-            written_this_slot,
         )
         .await
         .map(Some),
@@ -312,10 +308,13 @@ async fn prepare_trader_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
-    written_this_slot: &HashSet<Pubkey>,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let header = trader_header(trader, account)?;
     let hot = header.trader_state.is_hot();
+    // Ahead of every check, so a refused override still leaves the fresh record behind.
+    if hot && fetch_before_use {
+        refresh_index_record(svm, &header.key, remote_ctx).await?;
+    }
     let listed = !hot
         && svm
             .inner
@@ -332,12 +331,7 @@ async fn prepare_trader_override(
     // the target is checked against and patched in.
     let index = match target {
         Some(_) if hot => {
-            let mut index =
-                phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?;
-            if fetch_before_use && !written_this_slot.contains(trader) {
-                refresh_index_record(&mut index, &header.key, remote_ctx).await;
-            }
-            Some(index)
+            Some(phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?)
         }
         // The local GlobalTraderIndex can predate the Trader leaving the hot set, and Phoenix
         // keeps reading a Trader the index lists from its record.
@@ -423,30 +417,37 @@ async fn prepare_trader_override(
 
 /// A hot Trader's collateral is read from its GlobalTraderIndex record, so fetchBeforeUse refreshes
 /// the collateral there too. The rest of the record stays as the local VM has it, and so does the
-/// whole record if the fetch fails or lacks the trader.
+/// whole record if the fetch fails or lacks the trader. The refreshed record is stored at once, as
+/// core stores the refetched Trader, so later overrides in the same slot are checked against it.
 async fn refresh_index_record(
-    index: &mut Account,
+    svm: &mut SurfnetSvm,
     trader_key: &[u8; 32],
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-) {
+) -> SurfpoolResult<()> {
     let Some((client, commitment)) = remote_ctx else {
-        return;
+        return Ok(());
+    };
+    // An index not held locally yet is fetched whole, and so fresh, when the override needs it.
+    let Some(mut index) = svm.inner.get_account(&PHOENIX_GLOBAL_TRADER_INDEX)? else {
+        return Ok(());
     };
     let Ok(Ok(remote)) = client
         .get_account(&PHOENIX_GLOBAL_TRADER_INDEX, *commitment)
         .await
         .map(|fetched| fetched.map_account())
     else {
-        return;
+        return Ok(());
     };
     if let (Ok(local), Ok(upstream)) = (
-        index_trader_state_range(index, trader_key),
+        index_trader_state_range(&index, trader_key),
         index_trader_state_range(&remote, trader_key),
     ) && local.len() == upstream.len()
     {
         index.data[local.start..local.start + 8]
             .copy_from_slice(&remote.data[upstream.start..upstream.start + 8]);
+        svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, index)?;
     }
+    Ok(())
 }
 
 async fn phoenix_dependency(
