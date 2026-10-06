@@ -74,13 +74,13 @@ quote skip leading levels, and two consumed-depth words at 0 and 8 are not expos
 
 ## Picking a market
 
-Every template starts with a market picker. When Studio or MCP loads the templates, its options are
-read from the surfnet: every 1264-byte Tessera account with market tag `5` at offset 96 and a price
-in both directions, SOL / USDC first and then the most recently quoted. A market without a price
-has every level disabled and cannot fill. Nothing is hidden by age, so no market drops out as a
-fork ages or time travels. Markets the maker no longer quotes sink to the end; their
-`last_update_slot` trails the live ones by tens of millions of slots. On 2026-10-05 the program had
-27 markets: 20 priced, 11 of them quoted live:
+Every template starts with a market picker. When Studio or an MCP client opens a Tessera template,
+its options are read from the surfnet: every 1264-byte Tessera account with market tag `5` at
+offset 96 and a price in both directions, SOL / USDC first and then the most recently quoted. A
+market without a price has every level disabled and cannot fill. Nothing is hidden by age, so no
+market drops out as a fork ages or time travels. Markets the maker no longer quotes sink to the
+end; their `last_update_slot` trails the live ones by tens of millions of slots. On 2026-10-05 the
+program had 27 markets: 20 priced, 11 of them quoted live:
 
 | Choice                         | Best suited for                                       |
 | ------------------------------ | ----------------------------------------------------- |
@@ -93,6 +93,9 @@ The picker supplies the market account to the template. SOL / USDC is listed fir
 default when no market is chosen. Each option's metadata carries the pair, both mints, both decimals and the
 market's `freshness_limit_slots`, which the price and freshness formulas need. A BONK / USDC market
 cannot be priced through `tessera-price`: its base-per-quote price exceeds the u64 field.
+
+`/v1/scenarios/templates` lists the templates without these options, so it never waits on the
+network. API callers must provide the market account in the override.
 
 Use `fetchBeforeUse: true` so the selected market is forked before its bytes are changed.
 

@@ -25,7 +25,7 @@ use rmcp_actix_web::transport::StreamableHttpService;
 #[cfg(feature = "explorer")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use surfpool_core::scenarios::{TemplateRegistry, protocols::tessera::fill_market_options};
+use surfpool_core::scenarios::TemplateRegistry;
 use surfpool_mcp::Surfpool;
 use surfpool_studio_ui::serve_studio_static_files;
 use surfpool_types::{
@@ -54,18 +54,14 @@ fn configure_api(cfg: &mut web::ServiceConfig) {
         .service(web::scope("/v1").default_service(web::route().to(api_not_found)));
 }
 
-struct LocalRpcUrl(String);
-
 pub async fn start_studio_and_scenario_server(
     studio_bind_addr: String,
     config: SanitizedConfig,
-    local_rpc_url: String,
     subgraph_events_tx: Sender<SubgraphEvent>,
     ctx: &Context,
     enable_studio: bool,
 ) -> Result<ServerHandle, Box<dyn StdError>> {
     let config_wrapped = Data::new(RwLock::new(config.clone()));
-    let local_rpc_url = Data::new(LocalRpcUrl(local_rpc_url));
 
     // Initialize template registry and load templates
     let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
@@ -83,7 +79,6 @@ pub async fn start_studio_and_scenario_server(
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
-            .app_data(local_rpc_url.clone())
             .app_data(template_registry_wrapped.clone())
             .app_data(loaded_scenarios.clone())
             .wrap(
@@ -152,18 +147,12 @@ async fn get_config(
 #[actix_web::get("/v1/scenarios/templates")]
 async fn get_scenario_templates(
     template_registry: Data<RwLock<TemplateRegistry>>,
-    local_rpc_url: Data<LocalRpcUrl>,
 ) -> Result<HttpResponse, Error> {
-    let mut templates: Vec<OverrideTemplate> = template_registry
-        .read()
-        .map_err(|_| {
-            actix_web::error::ErrorInternalServerError("Failed to read template registry")
-        })?
-        .all()
-        .into_iter()
-        .cloned()
-        .collect();
-    fill_market_options(&local_rpc_url.0, &mut templates).await;
+    let registry = template_registry.read().map_err(|_| {
+        actix_web::error::ErrorInternalServerError("Failed to read template registry")
+    })?;
+
+    let templates: Vec<&OverrideTemplate> = registry.all();
     let response = serde_json::to_string(&templates)
         .map_err(|_| actix_web::error::ErrorInternalServerError("Failed to serialize templates"))?;
 
