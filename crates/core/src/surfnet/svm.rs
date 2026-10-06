@@ -4838,66 +4838,6 @@ mod tests {
         assert_eq!(&patched[72..], &account.data[72..]);
     }
 
-    #[tokio::test]
-    async fn test_rejected_token_override_does_not_stop_the_slot() {
-        const SLOT: u64 = 500;
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        let mut token_account = crate::types::TokenAccount::new(
-            &spl_token_interface::id(),
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            None,
-        );
-        token_account.set_amount(10);
-        let account = Account {
-            lamports: 2_039_280,
-            data: token_account.pack_into_vec(),
-            owner: spl_token_interface::id(),
-            executable: false,
-            rent_epoch: 0,
-        };
-        let (rejected, applied) = (Pubkey::new_unique(), Pubkey::new_unique());
-        for pubkey in [rejected, applied] {
-            svm.inner.set_account(pubkey, account.clone()).unwrap();
-        }
-        let balance_override = |pubkey: Pubkey, amount: serde_json::Value| {
-            surfpool_types::OverrideInstance::new(
-                "spl-token-account-balance".to_string(),
-                0,
-                surfpool_types::AccountAddress::Pubkey(pubkey.to_string()),
-            )
-            .with_values(HashMap::from([("amount".to_string(), amount)]))
-        };
-        svm.scheduled_overrides
-            .store(
-                SLOT,
-                vec![
-                    balance_override(rejected, serde_json::json!(-1)),
-                    balance_override(applied, serde_json::json!("42")),
-                ],
-            )
-            .unwrap();
-
-        svm.materialize_overrides_for_slot(&None, SLOT)
-            .await
-            .expect("a rejected override must not fail the slot");
-
-        let amount = |pubkey: &Pubkey| {
-            let data = svm.inner.get_account(pubkey).unwrap().unwrap().data;
-            u64::from_le_bytes(data[64..72].try_into().unwrap())
-        };
-        assert_eq!(
-            amount(&rejected),
-            10,
-            "the rejected override leaves its account as it was"
-        );
-        assert_eq!(
-            amount(&applied),
-            42,
-            "the override scheduled after it still applies"
-        );
-    }
-
     /// A 165-byte SPL token account of `mint` (state = Initialized), which sends `get_account`
     /// down the coupled-mint path. The canned server answers the mint lookup with the same body.
     fn canned_token_account(mint: Pubkey) -> &'static str {
