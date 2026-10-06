@@ -13,6 +13,7 @@ use solana_loader_v3_interface::get_program_data_address;
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_slot_hashes::SlotHashes;
+use solana_sysvar::last_restart_slot::LastRestartSlot;
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::RecentBlockhashes;
 use solana_transaction::versioned::VersionedTransaction;
@@ -110,10 +111,12 @@ impl SurfnetLiteSvm {
         // - SlotHashes: for ALT resolution
         // - Clock: for time-dependent programs
         // - EpochSchedule: the surfnet's own (or the datasource's), not LiteSVM's default
+        // - LastRestartSlot: the datasource's, not LiteSVM's 0
         let recent_blockhashes = self.svm.get_sysvar::<RecentBlockhashes>();
         let slot_hashes = self.svm.get_sysvar::<SlotHashes>();
         let clock = self.svm.get_sysvar::<Clock>();
         let epoch_schedule = self.svm.get_sysvar::<EpochSchedule>();
+        let last_restart_slot = self.svm.get_sysvar::<LastRestartSlot>();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::litesvm_settings(feature_set);
@@ -125,6 +128,7 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&slot_hashes);
         self.svm.set_sysvar(&clock);
         self.svm.set_sysvar(&epoch_schedule);
+        self.svm.set_sysvar(&last_restart_slot);
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {

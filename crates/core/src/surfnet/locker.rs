@@ -271,11 +271,15 @@ impl SurfnetSvmLocker {
             let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
             (epoch_info, epoch_schedule, some_genesis_hash)
         };
+        let last_restart_slot = remote_client.get_last_restart_slot().await;
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
+            svm_writer
+                .inner
+                .set_sysvar(&last_restart_slot.unwrap_or_default());
         });
         Ok(())
     }
@@ -4648,6 +4652,18 @@ mod tests {
                     serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
                 }
                 RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
+                // The LastRestartSlot sysvar; the data is 246_464_040 as a little-endian u64.
+                RpcRequest::GetAccountInfo => serde_json::json!({
+                    "context": { "slot": 2 },
+                    "value": {
+                        "lamports": 946_560,
+                        "data": ["KL6wDgAAAAA=", "base64"],
+                        "owner": "Sysvar1111111111111111111111111111111111111",
+                        "executable": false,
+                        "rentEpoch": 0,
+                        "space": 8,
+                    },
+                }),
                 _ => panic!("unexpected startup RPC request: {request:?}"),
             })
         }
@@ -4700,7 +4716,15 @@ mod tests {
                 .inner,
             expected_hash
         );
-        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            svm_locker.with_svm_reader(|svm| {
+                svm.inner
+                    .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>()
+                    .last_restart_slot
+            }),
+            246_464_040
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 
     #[cfg(feature = "sqlite")]
