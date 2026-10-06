@@ -139,6 +139,8 @@ jobs:
           cp surfpool-sdk/surfpool-sdk.*.node "npm/${{ matrix.platform_dir }}/"
           # Build TS so the root tarball ships dist/.
           npm run build:ts
+          # Platform optionalDependencies are only added at publish time (see script).
+          npm run inject-platform-deps
           PACK_DIR="$(mktemp -d)"
           ROOT_TARBALL="$(npm pack --silent --pack-destination "$PACK_DIR")"
           ROOT_TARBALL_PATH="$PACK_DIR/$ROOT_TARBALL"
@@ -251,6 +253,10 @@ jobs:
       - name: Build TypeScript wrapper
         working-directory: crates/sdk-node
         run: npm run build:ts
+
+      - name: Inject platform optionalDependencies
+        working-directory: crates/sdk-node
+        run: npm run inject-platform-deps
 
       - name: Pack root npm tarball
         working-directory: crates/sdk-node

@@ -24,7 +24,6 @@ use solana_commitment_config::CommitmentConfig;
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
-use solana_last_restart_slot::{LastRestartSlot, sysvar as last_restart_slot_sysvar};
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::{
@@ -35,6 +34,7 @@ use solana_rpc_client_api::client_error::{
     Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
 };
 use solana_signature::Signature;
+use solana_sysvar::last_restart_slot::{self, LastRestartSlot};
 use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock};
 use surfpool_types::sanitized_datasource_url;
 
@@ -103,16 +103,34 @@ fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
     }
 }
 
-/// The datasource's answer for a `Mint` filter it cannot resolve: JSON-RPC `-32602` with
-/// `could not find mint`. Any other `-32602` (bad encoding, bad program filter) is a request
-/// error the caller must see.
+/// The datasource's answer for a mint it cannot resolve: JSON-RPC `-32602` with
+/// `could not find mint`. Any other `-32602` (bad encoding, bad program filter, `not a Token
+/// mint`) is a request error the caller must see.
+fn is_unknown_mint_error(error: &ClientError) -> bool {
+    matches!(
+        error.kind(),
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
+            if message.contains("could not find mint")
+    )
+}
+
+/// [`is_unknown_mint_error`] for a token-accounts request: only a `Mint` filter can be answered
+/// by an unknown mint.
 fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
-    matches!(filter, TokenAccountsFilter::Mint(_))
-        && matches!(
-            error.kind(),
-            ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
-                if message.contains("could not find mint")
-        )
+    matches!(filter, TokenAccountsFilter::Mint(_)) && is_unknown_mint_error(error)
+}
+
+/// Drops the URL a transport error carries.
+fn without_datasource_url(error: ClientError) -> ClientError {
+    let ClientError { request, kind } = error;
+    let kind = match *kind {
+        ClientErrorKind::Reqwest(error) => ClientErrorKind::Reqwest(error.without_url()),
+        kind => kind,
+    };
+    ClientError {
+        request,
+        kind: Box::new(kind),
+    }
 }
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
@@ -136,7 +154,7 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
         params: serde_json::Value,
     ) -> ClientResult<serde_json::Value> {
         match tokio::time::timeout(self.deadline, self.inner.send(request, params)).await {
-            Ok(response) => response,
+            Ok(response) => response.map_err(without_datasource_url),
             // Scheme and host only. This message reaches a client through
             // JSON-RPC error data, and a datasource URL carries credentials in
             // its query, its path, and its userinfo. A URL that will not parse
@@ -223,18 +241,14 @@ impl SurfnetRemoteClient {
         self.client.get_epoch_schedule().await.map_err(Into::into)
     }
 
-    /// Fetches the upstream cluster's most recent hard-fork slot.
     pub async fn get_last_restart_slot(&self) -> SurfpoolResult<LastRestartSlot> {
-        let account = self.client.get_account(&last_restart_slot_sysvar::id()).await?;
-        let bytes: [u8; 8] = account.data.as_slice().try_into().map_err(|_| {
-            SurfpoolError::internal(format!(
-                "LastRestartSlot sysvar has {} bytes, expected 8",
-                account.data.len()
-            ))
-        })?;
-        Ok(LastRestartSlot {
-            last_restart_slot: u64::from_le_bytes(bytes),
-        })
+        let account = self
+            .client
+            .get_account(&last_restart_slot::ID)
+            .await
+            .map_err(|e| SurfpoolError::get_account(last_restart_slot::ID, e))?;
+        wincode::deserialize(&account.data)
+            .map_err(|e| SurfpoolError::internal(format!("Invalid LastRestartSlot sysvar: {e}")))
     }
 
     pub async fn get_account(
@@ -547,11 +561,24 @@ impl SurfnetRemoteClient {
         mint: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolResult<Vec<RpcTokenAccountBalance>> {
-        self.client
+        let res = self
+            .client
             .get_token_largest_accounts_with_commitment(mint, commitment_config)
-            .await
-            .map(|response| response.value)
-            .map_err(|e| SurfpoolError::get_token_largest_accounts(*mint, e))
+            .await;
+        match res {
+            Ok(res) => Ok(res.value),
+            // A mint that exists only on this surfnet is `could not find mint` upstream. That is
+            // a definite "no remote holders", not a failed lookup, and must not discard the
+            // local accounts the caller merges with.
+            Err(e) if is_unknown_mint_error(&e) => {
+                log::debug!(
+                    "datasource does not know mint {mint} in getTokenLargestAccounts; answering \
+                     from local accounts only"
+                );
+                Ok(vec![])
+            }
+            Err(e) => Err(SurfpoolError::get_token_largest_accounts(*mint, e)),
+        }
     }
 
     pub async fn get_token_accounts_by_delegate(
@@ -1117,6 +1144,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transport_failure_does_not_disclose_the_datasource_credentials() {
+        // Bind an OS-assigned port and release it, so nothing listens there and
+        // every request fails to connect.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a local port should be free")
+            .local_addr()
+            .expect("the listener should have a local address")
+            .port();
+        let secrets = [
+            format!("http://127.0.0.1:{port}/?api-key=SUPERSECRET"),
+            format!("http://127.0.0.1:{port}/SUPERSECRET"),
+            format!("http://user:SUPERSECRET@127.0.0.1:{port}"),
+        ];
+
+        for url in secrets {
+            let sender = DeadlineSender::new(HttpSender::new(url), Duration::from_secs(5));
+
+            let error = sender
+                .send(RpcRequest::GetSlot, serde_json::Value::Null)
+                .await
+                .expect_err("a datasource with no listener should not succeed");
+
+            assert!(
+                matches!(error.kind(), ClientErrorKind::Reqwest(error) if error.is_connect()),
+                "the failure should come from the transport, not the deadline: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                !message.contains("SUPERSECRET"),
+                "the failure disclosed the datasource credential: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_datasource_that_never_answers_is_an_error_rather_than_a_wait() {
         let sender = DeadlineSender::new(
             NeverAnswers("http://never.example".to_string()),
@@ -1328,5 +1390,98 @@ mod tests {
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].pubkey, token_account_pubkey.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let accounts = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect("a mint the datasource has never seen has no remote holders, not a failure");
+
+        assert!(accounts.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_largest_accounts_provider_failure_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect_err("a provider failure must not be reported as an empty answer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to get largest token accounts")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn any_other_invalid_params_rejection_on_largest_accounts_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect_err("a rejected parameter is a request error, not an empty answer");
+
+        assert!(error.to_string().contains("unsupported encoding"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_born_mint_keeps_its_local_largest_accounts() {
+        use solana_account::Account;
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState};
+
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let mint = Pubkey::new_unique();
+        let holder = Pubkey::new_unique();
+        let mut data = vec![0u8; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount: 42,
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        locker.with_svm_writer(|svm| {
+            svm.set_account(
+                &holder,
+                Account {
+                    lamports: 2_039_280,
+                    data,
+                    owner: spl_token_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        });
+        let remote = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let accounts = locker
+            .get_token_largest_accounts(&Some((remote, CommitmentConfig::default())), &mint)
+            .await
+            .expect("local holders survive a datasource that has never seen the mint")
+            .inner;
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].address, holder.to_string());
+        assert_eq!(accounts[0].amount.amount, "42");
     }
 }

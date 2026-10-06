@@ -22,7 +22,7 @@ use solana_client::{
 use solana_clock::{Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
+use solana_message::{AccountKeys, VersionedMessage, compiled_instruction::CompiledInstruction};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_sdk_ids::compute_budget;
@@ -31,7 +31,7 @@ use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
-    UiTransactionEncoding,
+    UiTransactionEncoding, map_inner_instructions, parse_ui_inner_instructions,
 };
 use surfpool_types::{
     SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
@@ -41,8 +41,7 @@ use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
         decode_and_deserialize, decode_rpc_versioned_transaction,
-        transform_tx_metadata_to_ui_accounts, verify_and_parse_signatures_for_address_params,
-        verify_pubkey,
+        verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
 use crate::{
@@ -192,6 +191,26 @@ pub struct RpcTransactionsForAddressResult {
     pub data: Vec<RpcTransactionForAddressEntry>,
     pub pagination_token: Option<String>,
 }
+
+/// The programdata account a loader-v3 program points at, which SIMD-0186 counts with it.
+fn programdata_address(account: &solana_account::Account) -> Option<Pubkey> {
+    if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() {
+        return None;
+    }
+    match bincode::deserialize(&account.data) {
+        Ok(solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
+            programdata_address,
+        }) => Some(programdata_address),
+        _ => None,
+    }
+}
+
+/// SIMD-0186: the size every loaded account adds on top of its data
+/// (`TRANSACTION_ACCOUNT_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
+const TRANSACTION_ACCOUNT_BASE_SIZE: u64 = 64;
+/// SIMD-0186: the size every address lookup table adds, the largest table plus its metadata
+/// (`ADDRESS_LOOKUP_TABLE_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
+const ADDRESS_LOOKUP_TABLE_BASE_SIZE: u64 = 8248;
 
 #[rpc]
 pub trait Full {
@@ -1229,7 +1248,7 @@ pub trait Full {
     /// # See Also
     /// - `getBlock`, `getBlockTime`, `minimumLedgerSlot`
     #[rpc(meta, name = "getFirstAvailableBlock")]
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot>;
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>>;
 
     /// Returns the latest blockhash and associated metadata needed to sign and send a transaction.
     ///
@@ -1962,6 +1981,10 @@ impl Full for SurfpoolFullRpc {
                 .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
                 .await?;
 
+            let lookup_tables = unsanitized_tx
+                .message
+                .address_table_lookups()
+                .map_or(0, <[_]>::len);
             let mut seen_accounts = std::collections::HashSet::new();
             let mut loaded_accounts_data_size: u64 = 0;
 
@@ -1970,6 +1993,14 @@ impl Full for SurfpoolFullRpc {
                     GetAccountResult::FoundAccount(pubkey, account, _) => {
                         if seen_accounts.insert(*pubkey) {
                             loaded_accounts_data_size += account.data.len() as u64;
+                        }
+                        // A program already on the surfnet is not coupled with its programdata.
+                        if let Some(pd_pubkey) = programdata_address(account)
+                            && let Ok(Some(pd)) =
+                                svm_locker.with_svm_reader(|svm| svm.get_account(&pd_pubkey))
+                            && seen_accounts.insert(pd_pubkey)
+                        {
+                            loaded_accounts_data_size += pd.data.len() as u64;
                         }
                     }
                     // According to SIMD 0186, program data is tracked as well as program accounts
@@ -2011,18 +2042,18 @@ impl Full for SurfpoolFullRpc {
                 track_accounts_data_size(res);
             }
 
+            // SIMD-0186: every account counted above also costs a base size, and every address
+            // lookup table a flat size, whatever it holds.
+            //
+            // Delete this count once LiteSVM reports the size it metered, as
+            // `TransactionMetadata::loaded_accounts_data_size`
+            // (https://github.com/LiteSVM/litesvm/pull/428), and report that instead.
+            let loaded_accounts_data_size = loaded_accounts_data_size
+                + TRANSACTION_ACCOUNT_BASE_SIZE * seen_accounts.len() as u64
+                + ADDRESS_LOOKUP_TABLE_BASE_SIZE * lookup_tables as u64;
+
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
-
-            if let Some(alt_pubkeys) = loaded_addresses.map(|l| l.alt_addresses()) {
-                let alt_updates = svm_locker
-                    .get_multiple_accounts(&remote_ctx, &alt_pubkeys, None)
-                    .await?
-                    .inner;
-                for res in alt_updates.iter() {
-                    track_accounts_data_size(res);
-                }
-            }
 
             let replacement_blockhash = if config.replace_recent_blockhash {
                 unsanitized_tx
@@ -2179,13 +2210,8 @@ impl Full for SurfpoolFullRpc {
         wrapper: Option<RpcBlocksConfigWrapper>,
         config: Option<RpcContextConfig>,
     ) -> BoxFuture<Result<Vec<Slot>>> {
-        let end_slot = match wrapper {
-            Some(RpcBlocksConfigWrapper::EndSlotOnly(end_slot)) => end_slot,
-            Some(RpcBlocksConfigWrapper::ConfigOnly(_)) => None,
-            None => None,
-        };
-
-        let config = config.unwrap_or_default();
+        let (end_slot, wrapper_config) = wrapper.map(|wrapper| wrapper.unzip()).unwrap_or_default();
+        let config = config.or(wrapper_config).unwrap_or_default();
         // get blocks should default to processed rather than finalized to default to the most recent
         let commitment = config.commitment.unwrap_or(CommitmentConfig {
             commitment: CommitmentLevel::Processed,
@@ -2491,18 +2517,31 @@ impl Full for SurfpoolFullRpc {
         })
     }
 
-    fn get_first_available_block(&self, meta: Self::Metadata) -> Result<Slot> {
-        meta.with_svm_reader(|svm_reader| {
-            Ok::<_, jsonrpc_core::Error>(
-                svm_reader
-                    .blocks
-                    .keys()?
-                    .into_iter()
-                    .min()
-                    .unwrap_or_default(),
-            )
-        })?
-        .map_err(Into::into)
+    fn get_first_available_block(&self, meta: Self::Metadata) -> BoxFuture<Result<Slot>> {
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            // `getBlock` serves every slot from the first local slot on, and forwards the ones
+            // before it to the datasource, so on a fork the datasource's floor counts too, unless it
+            // has since pruned past the fork.
+            let first_local_slot = svm_locker.get_first_local_slot().unwrap_or_default();
+            if let Some((remote_client, _)) = remote_ctx {
+                remote_client
+                    .client
+                    .get_first_available_block()
+                    .await
+                    .map(|first| first.min(first_local_slot))
+                    .map_err(|e| SurfpoolError::client_error(e).into())
+            } else {
+                Ok(first_local_slot)
+            }
+        })
     }
 
     fn get_latest_blockhash(
@@ -2790,11 +2829,12 @@ fn get_simulate_transaction_result(
         accounts,
         err: error.map(|e| e.into()),
         inner_instructions: if include_inner_instructions {
-            Some(transform_tx_metadata_to_ui_accounts(
-                metadata.clone(),
-                message,
-                loaded_addresses,
-            ))
+            let account_keys = AccountKeys::new(message.static_account_keys(), loaded_addresses);
+            Some(
+                map_inner_instructions(metadata.inner_instructions.clone())
+                    .map(|ix| parse_ui_inner_instructions(ix, &account_keys))
+                    .collect(),
+            )
         } else {
             None
         },
@@ -2820,17 +2860,31 @@ fn get_simulate_transaction_result(
 mod tests {
     pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
-    use std::thread::JoinHandle;
+    use std::{
+        sync::{Arc, Mutex},
+        thread::JoinHandle,
+    };
 
+    use async_trait::async_trait;
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
     use crossbeam_channel::{Receiver, Sender};
+    use solana_account::Account;
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
-    use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
+    use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
+    use solana_client::{
+        client_error::Result as ClientResult,
+        nonblocking::rpc_client::RpcClient,
+        rpc_client::RpcClientConfig,
+        rpc_config::RpcSimulateTransactionAccountsConfig,
+        rpc_request::RpcRequest,
+        rpc_sender::{RpcSender, RpcTransportStats},
+    };
     use solana_commitment_config::CommitmentConfig;
     use solana_hash::Hash;
-    use solana_instruction::Instruction;
+    use solana_instruction::{AccountMeta, Instruction};
     use solana_keypair::Keypair;
+    use solana_loader_v3_interface::state::UpgradeableLoaderState;
     use solana_message::{
         AddressLookupTableAccount, MessageHeader,
         legacy::Message as LegacyMessage,
@@ -2838,6 +2892,7 @@ mod tests {
         v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
     };
     use solana_pubkey::Pubkey;
+    use solana_sdk_ids::bpf_loader_upgradeable;
     use solana_signer::Signer;
     use solana_system_interface::{
         instruction::{self as system_instruction, transfer},
@@ -2849,8 +2904,9 @@ mod tests {
     };
     use solana_transaction_error::TransactionError;
     use solana_transaction_status::{
-        EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
-        UiRawMessage, UiTransaction, UiTransactionEncoding,
+        EncodedTransaction, EncodedTransactionWithStatusMeta, TransactionDetails,
+        UiCompiledInstruction, UiMessage, UiRawMessage, UiTransaction, UiTransactionEncoding,
+        option_serializer::OptionSerializer,
     };
     use solana_transaction_status_client_types::UiTransactionConfig;
     use surfpool_types::{
@@ -4056,6 +4112,110 @@ mod tests {
         );
     }
 
+    /// SIMD-0186, as Agave's `load_transaction_accounts` counts it: each loaded account costs 64
+    /// bytes plus its data (nothing if it does not exist), a loader-v3 program also costs its
+    /// programdata, and each address lookup table costs a flat 8248 bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_transaction_loaded_accounts_data_size() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (program, programdata, table) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let program_data = bincode::serialize(&UpgradeableLoaderState::Program {
+            programdata_address: programdata,
+        })
+        .unwrap();
+        let programdata_len = 1_000;
+        let system_program_len = setup.context.svm_locker.with_svm_writer(|svm| {
+            let account = |owner, data| Account {
+                lamports: LAMPORTS_PER_SOL,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&payer.pubkey(), account(system_program::id(), vec![]))
+                .unwrap();
+            // Not executable, so the surfnet does not load it as a program; SIMD-0186 counts
+            // its programdata all the same.
+            svm.set_account(
+                &program,
+                account(bpf_loader_upgradeable::id(), program_data.clone()),
+            )
+            .unwrap();
+            svm.set_account(
+                &programdata,
+                account(bpf_loader_upgradeable::id(), vec![0; programdata_len]),
+            )
+            .unwrap();
+            let lookup_table = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: vec![recipient].into(),
+            };
+            svm.set_account(
+                &table,
+                account(
+                    solana_address_lookup_table_interface::program::id(),
+                    lookup_table.serialize_for_tests().unwrap(),
+                ),
+            )
+            .unwrap();
+            svm.get_account(&system_program::id())
+                .unwrap()
+                .unwrap()
+                .data
+                .len()
+        });
+
+        let mut transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000_000);
+        transfer
+            .accounts
+            .push(AccountMeta::new_readonly(program, false));
+        let blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let message = V0Message::try_compile(
+            &payer.pubkey(),
+            &[transfer],
+            &[AddressLookupTableAccount {
+                key: table,
+                addresses: vec![recipient],
+            }],
+            blockhash,
+        )
+        .unwrap();
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer]).unwrap();
+
+        let simulation = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The recipient does not exist, so it costs nothing.
+        let expected = 64 // payer, which holds no data
+            + (64 + system_program_len) // invoked program
+            + (64 + program_data.len()) // loader-v3 program ...
+            + (64 + programdata_len) // ... and its programdata
+            + 8248; // the lookup table
+        assert_eq!(
+            simulation.value.loaded_accounts_data_size,
+            Some(expected as u32)
+        );
+    }
+
     #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
     #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
     #[test_case(TransactionVersion::Number(1) ; "V1 transactions")]
@@ -4383,53 +4543,84 @@ mod tests {
         );
     }
 
+    /// The first available block is the lowest slot `getBlock` serves. A block stored at a later
+    /// slot must not move it: the slots before that block are empty, not purged.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(deprecated)]
     async fn test_get_first_available_block() {
         let setup = TestSetup::new(SurfpoolFullRpc);
+        insert_test_blocks(&setup, vec![100]);
 
-        {
-            let mut svm_writer = setup.context.svm_locker.0.write().await;
+        let first = setup
+            .rpc
+            .get_first_available_block(Some(setup.context.clone()))
+            .await
+            .unwrap();
+        let block_at = |slot| setup.rpc.get_block(Some(setup.context.clone()), slot, None);
 
-            let previous_chain_tip = svm_writer.chain_tip.clone();
+        assert_eq!(
+            (
+                block_at(first).await.map(|block| block.is_some()),
+                block_at(first - 1).await.map(|block| block.is_some()),
+            ),
+            (Ok(true), Err(SurfpoolError::slot_too_old(first - 1).into()))
+        );
+    }
 
-            let latest_entries = svm_writer
-                .inner
-                .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>(
-            );
-            let latest_entry = latest_entries.first().unwrap();
+    /// Answers every request with its slot, recording which method was asked.
+    struct FirstAvailableBlockIs(Slot, Arc<Mutex<Vec<RpcRequest>>>);
 
-            svm_writer.chain_tip = BlockIdentifier::new(
-                svm_writer.chain_tip.index + 1,
-                latest_entry.blockhash.to_string().as_str(),
-            );
-
-            let hash = svm_writer.chain_tip.hash.clone();
-            let block_height = svm_writer.chain_tip.index;
-            let parent_slot = svm_writer.get_latest_absolute_slot();
-
-            svm_writer
-                .blocks
-                .store(
-                    parent_slot,
-                    BlockHeader {
-                        hash,
-                        previous_blockhash: previous_chain_tip.hash.clone(),
-                        block_time: chrono::Utc::now().timestamp_millis(),
-                        block_height,
-                        parent_slot,
-                        signatures: Vec::new(),
-                    },
-                )
-                .unwrap();
+    #[async_trait]
+    impl RpcSender for FirstAvailableBlockIs {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.1.lock().unwrap().push(request);
+            Ok(serde_json::json!(self.0))
         }
 
-        let res = setup
-            .rpc
-            .get_first_available_block(Some(setup.context))
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://first-available-block.example".to_string()
+        }
+    }
+
+    /// `getBlock` forwards the slots before the fork to the datasource and serves the rest itself,
+    /// so the first available block is the lower of the datasource's and the first local slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_first_available_block_from_the_datasource() {
+        let first_local_slot = TestSetup::new(SurfpoolFullRpc)
+            .context
+            .svm_locker
+            .get_first_local_slot()
             .unwrap();
 
-        assert_eq!(res, 123);
+        // Before the fork, and pruned past it.
+        for (datasource_first, expected) in [(7, 7), (1_000, first_local_slot)] {
+            let requests = Arc::new(Mutex::new(vec![]));
+            let mut setup = TestSetup::new(SurfpoolFullRpc);
+            setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                client: RpcClient::new_sender(
+                    FirstAvailableBlockIs(datasource_first, Arc::clone(&requests)),
+                    RpcClientConfig::default(),
+                )
+                .into(),
+            });
+
+            let first = setup
+                .rpc
+                .get_first_available_block(Some(setup.context))
+                .await;
+
+            assert_eq!(
+                (first, requests.lock().unwrap().clone()),
+                (Ok(expected), vec![RpcRequest::GetFirstAvailableBlock])
+            );
+        }
     }
 
     #[test]
@@ -4791,6 +4982,245 @@ mod tests {
         );
     }
 
+    /// Airdrops to a payer, then lands one successful and one failed transfer in a
+    /// confirmed block. Returns the airdrop, success and failure signatures and the slot.
+    async fn confirmed_transfers(
+        setup: &mut TestSetup<SurfpoolFullRpc>,
+    ) -> (Signature, Signature, Signature, Slot) {
+        let payer = Keypair::new();
+        let airdrop = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                2 * LAMPORTS_PER_SOL,
+                None,
+            )
+            .unwrap();
+        let blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let transfer = |lamports| {
+            build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    lamports,
+                )],
+                &blockhash,
+            )
+        };
+        let ok = transfer(LAMPORTS_PER_SOL);
+        let failed = transfer(10 * LAMPORTS_PER_SOL);
+        setup.process_txs(vec![ok.clone(), failed.clone()]).await;
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+        let slot = setup.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .transactions
+                .get(&ok.signatures[0].to_string())
+                .unwrap()
+                .unwrap()
+                .expect_processed()
+                .0
+                .slot
+        });
+        (
+            Signature::from_str(&airdrop).unwrap(),
+            ok.signatures[0],
+            failed.signatures[0],
+            slot,
+        )
+    }
+
+    fn is_json_raw(tx: &EncodedTransactionWithStatusMeta) -> bool {
+        matches!(
+            &tx.transaction,
+            EncodedTransaction::Json(UiTransaction {
+                message: UiMessage::Raw(_),
+                ..
+            })
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (_, _, _, slot) = confirmed_transfers(&mut setup).await;
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context),
+                slot,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let txs = block.transactions.unwrap();
+        assert!(!txs.is_empty());
+        assert!(txs.iter().all(is_json_raw), "{txs:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_transaction_local_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (_, ok, _, _) = confirmed_transfers(&mut setup).await;
+
+        let result = setup
+            .context
+            .svm_locker
+            .get_transaction_local(&ok, &RpcTransactionConfig::default())
+            .unwrap();
+
+        let GetTransactionResult::FoundTransaction(_, tx, _) = result else {
+            panic!("transaction not found");
+        };
+        assert!(is_json_raw(&tx.transaction), "{tx:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stored_transactions_omit_empty_return_data() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (airdrop, ok, failed, _) = confirmed_transfers(&mut setup).await;
+
+        for signature in [airdrop, ok, failed] {
+            let tx = setup
+                .rpc
+                .get_transaction(
+                    Some(setup.context.clone()),
+                    signature.to_string(),
+                    Some(RpcEncodingConfigWrapper::Current(Some(
+                        get_default_transaction_config(),
+                    ))),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let meta = tx.transaction.meta.unwrap();
+            assert_eq!(meta.return_data, OptionSerializer::Skip, "{signature}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_transaction_details_and_rewards() {
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let (_, ok, failed, slot) = confirmed_transfers(&mut setup).await;
+
+        let get_block = |transaction_details, rewards| {
+            setup.rpc.get_block(
+                Some(setup.context.clone()),
+                slot,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    transaction_details: Some(transaction_details),
+                    rewards,
+                    max_supported_transaction_version: Some(0),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+        };
+
+        let full = get_block(TransactionDetails::Full, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.rewards, Some(vec![]));
+        assert_eq!(full.signatures, None);
+        let full_signatures: Vec<String> = full
+            .transactions
+            .unwrap()
+            .into_iter()
+            .map(|tx| match tx.transaction {
+                EncodedTransaction::Json(tx) => tx.signatures[0].clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(full_signatures.contains(&ok.to_string()));
+        assert!(full_signatures.contains(&failed.to_string()));
+
+        let signatures = get_block(TransactionDetails::Signatures, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(signatures.transactions, None);
+        assert_eq!(signatures.signatures, Some(full_signatures.clone()));
+
+        let accounts = get_block(TransactionDetails::Accounts, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let accounts = accounts.transactions.unwrap();
+        assert_eq!(accounts.len(), full_signatures.len());
+        assert!(
+            accounts
+                .iter()
+                .all(|tx| matches!(tx.transaction, EncodedTransaction::Accounts(_)))
+        );
+
+        let none = get_block(TransactionDetails::None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((none.transactions, none.signatures), (None, None));
+
+        let no_rewards = get_block(TransactionDetails::Full, Some(false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_rewards.rewards, None);
+        assert!(
+            no_rewards
+                .transactions
+                .unwrap()
+                .iter()
+                .all(|tx| { tx.meta.as_ref().unwrap().rewards == OptionSerializer::None })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_signatures_come_from_block_header() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        insert_test_blocks(&setup, 100..=110);
+        // A header signature with no stored transaction record.
+        let signature = Signature::new_unique();
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            let mut header = svm_writer.blocks.get(&100).unwrap().unwrap();
+            header.signatures = vec![signature];
+            svm_writer.blocks.store(100, header).unwrap();
+        });
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context.clone()),
+                100,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    transaction_details: Some(TransactionDetails::Signatures),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.transactions, None);
+        assert_eq!(block.signatures, Some(vec![signature.to_string()]));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_with_limit() {
         let setup = TestSetup::new(SurfpoolFullRpc);
@@ -5066,6 +5496,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finalized_result, vec![65, 66, 67, 68, 69]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_config_in_place_of_end_slot() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+
+        insert_test_blocks(&setup, 50..=100);
+
+        // `[start_slot, config]`, as clients send it when there is no end slot
+        let result = setup
+            .rpc
+            .get_blocks(
+                Some(setup.context.clone()),
+                65,
+                Some(RpcBlocksConfigWrapper::ConfigOnly(Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    min_context_slot: None,
+                }))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, vec![65, 66, 67, 68, 69]);
+
+        let result = setup
+            .rpc
+            .get_blocks(
+                Some(setup.context.clone()),
+                65,
+                Some(RpcBlocksConfigWrapper::ConfigOnly(Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot: Some(101),
+                }))),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

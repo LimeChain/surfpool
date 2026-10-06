@@ -129,7 +129,6 @@ solana-hash = { version = "~4.5", default-features = false }
 solana-inflation = { version = "3.0", default-features = false }
 solana-instruction = { version = "~3.4", default-features = false }
 solana-keypair = { version = "3.1", default-features = false }
-solana-last-restart-slot = { version = "3.1", default-features = false, features = ["sysvar", "wincode"] }
 solana-loader-v3-interface = { version = "6.1", default-features = false }
 solana-message = { version = "4.3", default-features = false }
 solana-nonce = { version = "~3.2", default-features = false }
