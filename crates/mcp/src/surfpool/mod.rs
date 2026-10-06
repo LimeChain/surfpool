@@ -813,7 +813,7 @@ impl Surfpool {
 
     #[tool(description = r#"
         Creates a Scenario - a list of account state overrides applied at specific slots.
-        Returns a URL to Surfpool Studio for testing. 1 slot = 400ms.
+        Returns a URL to Surfpool Studio for testing. 1 slot = the surfnet's slot time (250ms by default, set with `--slot-time`).
 
         ⚠️ CRITICAL JSON FORMAT RULES:
         - The `overrides` field MUST be a JSON array [], NOT a JSON string
