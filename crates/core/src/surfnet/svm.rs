@@ -3041,7 +3041,9 @@ impl SurfnetSvm {
             );
 
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
+            let fetch_from_upstream =
+                override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey);
+            if fetch_from_upstream {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -3218,7 +3220,7 @@ impl SurfnetSvm {
                     &account,
                     &account_values,
                     remote_ctx,
-                    override_instance.fetch_before_use,
+                    fetch_from_upstream,
                 )
                 .await
                 {
