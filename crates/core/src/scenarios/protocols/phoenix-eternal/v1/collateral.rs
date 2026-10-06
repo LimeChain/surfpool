@@ -129,7 +129,7 @@ pub fn index_trader_state_range(
         })
 }
 
-pub fn live_quote_lot_collateral(
+pub fn current_quote_lot_collateral(
     header: &TraderHeader,
     index: Option<&Account>,
 ) -> SurfpoolResult<i64> {
@@ -555,28 +555,28 @@ mod tests {
         let trader = Pubkey::new_from_array(FIRST_KEY);
         let mut account = trader_account(FIRST_KEY, 9_999, true);
         account.lamports = 1;
-        let mut live_index = index_account();
-        live_index.lamports = 1;
-        let range = index_trader_state_range(&live_index, &FIRST_KEY).unwrap();
-        let live = i64::from_le_bytes(
-            live_index.data[range.start..range.start + 8]
+        let mut upstream_index = index_account();
+        upstream_index.lamports = 1;
+        let range = index_trader_state_range(&upstream_index, &FIRST_KEY).unwrap();
+        let upstream = i64::from_le_bytes(
+            upstream_index.data[range.start..range.start + 8]
                 .try_into()
                 .unwrap(),
         );
         // The local VM holds a stressed record, the datasource the unstressed one.
-        let mut stressed_index = live_index.clone();
+        let mut stressed_index = upstream_index.clone();
         stressed_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
         let url = canned_rpc(format!(
             r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
-            BASE64_STANDARD.encode(&live_index.data),
+            BASE64_STANDARD.encode(&upstream_index.data),
             PHOENIX_ETERNAL_PROGRAM_ID,
-            live_index.data.len()
+            upstream_index.data.len()
         ))
         .await;
         let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
         let values = HashMap::from([(
             "traderState.quoteLotCollateral".to_string(),
-            serde_json::json!((live / 2).to_string()),
+            serde_json::json!((upstream / 2).to_string()),
         )]);
 
         for fetch_before_use in [false, true] {
@@ -606,7 +606,7 @@ mod tests {
                 .expect("the index record is written");
             assert_eq!(
                 i64::from_le_bytes(index.data[range.start..range.start + 8].try_into().unwrap()),
-                live / 2
+                upstream / 2
             );
         }
     }

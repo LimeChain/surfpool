@@ -13,7 +13,7 @@ use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::collateral::{
-    ensure_collateral_floor, index_trader_state_range, live_quote_lot_collateral,
+    current_quote_lot_collateral, ensure_collateral_floor, index_trader_state_range,
     parse_quote_lot_collateral, trader_header, validate_hot_trader_fields,
 };
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
 
 pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih");
-// Singletons that GlobalConfig points at; the live suite checks them against GlobalConfig.
+// Singletons that GlobalConfig points at; the mainnet tests check them against GlobalConfig.
 pub const PHOENIX_PERP_ASSET_MAP: Pubkey =
     Pubkey::from_str_const("2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC");
 pub const PHOENIX_GLOBAL_TRADER_INDEX: Pubkey =
@@ -344,7 +344,10 @@ async fn prepare_trader_override(
     };
     let mut values = values.clone();
     if let Some(target) = target {
-        ensure_collateral_is_lowered(live_quote_lot_collateral(&header, index.as_ref())?, target)?;
+        ensure_collateral_is_lowered(
+            current_quote_lot_collateral(&header, index.as_ref())?,
+            target,
+        )?;
         values.insert(
             COLLATERAL_FIELD.to_string(),
             serde_json::Value::from(target),
