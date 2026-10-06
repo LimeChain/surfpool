@@ -334,8 +334,8 @@ async fn prepare_trader_override(
             }
             Some(index)
         }
-        // A fork's index can predate the Trader leaving the hot set, and Phoenix keeps reading a
-        // Trader the index lists from its record.
+        // The local GlobalTraderIndex can predate the Trader leaving the hot set, and Phoenix
+        // keeps reading a Trader the index lists from its record.
         Some(_) => svm
             .inner
             .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
@@ -462,8 +462,8 @@ async fn phoenix_dependency(
     })?;
     let fetched = client.get_account(address, *commitment).await?;
     let account = fetched.clone().map_account()?;
-    // Fill the fork gap once instead of refetching the same dependency per override, the way a
-    // fork read does: the account is also indexed by owner, so getProgramAccounts serves the
+    // Fetch the dependency once instead of per override, the way any read from the upstream
+    // datasource does: the account is also indexed by owner, so getProgramAccounts serves the
     // local copy the override then patches.
     svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
     Ok(account)

@@ -12,8 +12,8 @@ templates:
   - id: phoenix-trader-collateral-stress
     name: Phoenix Trader Collateral Stress
     description: >-
-      Set exact signed quote-lot collateral on a Phoenix Trader and its live GlobalTraderIndex
-      entry when hot.
+      Set exact signed quote-lot collateral on a Phoenix Trader, and on its record in the local
+      GlobalTraderIndex when the index lists it.
     idl_account_name: Trader
     properties:
       - path: traderState.quoteLotCollateral
@@ -26,8 +26,8 @@ templates:
       for effective collateral: lowering it by N quote lots lowers effective collateral by N.
       For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
       slot 1 in one create_scenario call.
-      Set fetchBeforeUse: true so the live Trader is forked first; an override on a Trader that is
-      not on the fork yet is skipped.
+      Set fetchBeforeUse: true so the Trader is fetched from the upstream datasource first; an
+      override on a Trader that is not in the local VM yet is skipped.
       Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
@@ -56,14 +56,15 @@ templates:
       with the current slot. The market's spot and perp oracle readings get the same ticks and
       slot. The orderbook and spline are not moved: trades still fill at the book's real prices,
       and a mark Phoenix rebuilds after a trade can move back toward the book;
-      list_phoenix_markets shows the mark the fork holds.
+      list_phoenix_markets shows the mark in the local VM.
       Pass target_ticks as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
       Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
       the symbol listed with that address, and a relative move (such as a 40% drop) is computed
       from its markTicks there.
-      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
-      override that builds on state an earlier one prepared in the same scenario.
+      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
+      false only for a later override that builds on state an earlier one prepared in the same
+      scenario.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -102,8 +103,9 @@ templates:
       Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
       the symbol listed with that address, and its current and backstop factors are
       maintenanceRiskFactorBps and backstopRiskFactorBps there.
-      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
-      override that builds on state an earlier one prepared in the same scenario.
+      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
+      false only for a later override that builds on state an earlier one prepared in the same
+      scenario.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -134,7 +136,7 @@ templates:
       its orderbook address in account.pubkey.
       Pass both fees as JSON numbers in millionths of the notional: 350 is 0.035%, 1000 is 0.1%.
       defaultMakerFeeMicro may be negative (a rebate); keep it below the taker fee.
-      Set fetchBeforeUse: true so the live orderbook is forked first.
+      Set fetchBeforeUse: true so the orderbook is fetched from the upstream datasource first.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -178,7 +180,7 @@ templates:
       numbers. Keep remainingBudget at or below maxBudget, and set replenishAmountPerSlot to 0 to
       keep the budget empty while you test.
       The account is the singleton WithdrawQueue, so this template carries its address.
-      Set fetchBeforeUse: true so the live queue is forked first.
+      Set fetchBeforeUse: true so the queue is fetched from the upstream datasource first.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -200,7 +202,7 @@ templates:
           62. Example: 62
     llm_context: |
       This changes a trader's capability bits, for example to activate a freshly registered trader
-      on the fork so a bot can deposit and trade, or to make a trader reduce-only or frozen.
+      in the local VM so a bot can deposit and trade, or to make a trader reduce-only or frozen.
       It does not change collateral or positions.
       Bits: 1 hot, 2 place limit, 4 place market, 8 increase risk, 16 deposit, 32 withdraw.
       A freshly registered trader is frozen with 6 until Phoenix activates it; 62 activates it as
@@ -212,7 +214,7 @@ templates:
       Pass traderState.flags as a JSON number.
       The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
       [0, 0] for the main account.
-      Set fetchBeforeUse: true so the live trader is forked first.
+      Set fetchBeforeUse: true so the trader is fetched from the upstream datasource first.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -256,7 +258,7 @@ templates:
       The account is the trader's StopLosses PDA for the market: ["stoploss", trader account,
       asset id as u64 little-endian]. To find it, call getProgramAccounts on the Phoenix program
       with dataSize 328 and a memcmp of the trader account at offset 224; assetId is the u32 at 256.
-      Set fetchBeforeUse: true so the live stop loss is forked first.
+      Set fetchBeforeUse: true so the stop loss is fetched from the upstream datasource first.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
@@ -286,7 +288,7 @@ templates:
       The account is the PermissionAccount PDA ["permission", authority, delegated key]. To find
       it, call getProgramAccounts on the Phoenix program with dataSize 168 and a memcmp of the
       authority at offset 8 or of the delegated key at offset 40.
-      Set fetchBeforeUse: true so the live permission is forked first.
+      Set fetchBeforeUse: true so the permission is fetched from the upstream datasource first.
       Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
       (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
       GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.

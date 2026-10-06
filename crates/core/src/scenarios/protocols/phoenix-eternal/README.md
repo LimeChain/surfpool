@@ -5,34 +5,34 @@ for submitting trades, arbitrage, and liquidation transactions.
 
 ## Templates
 
-| Template                            | Account it writes                                                          | Fields                                            | Studio                       |
-| ----------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------- |
-| `phoenix-trader-collateral-stress`  | A Trader, and its GlobalTraderIndex record while the fork's index lists it | `traderState.quoteLotCollateral`                  | Phoenix state dialog, editor |
-| `phoenix-direct-mark-risk-shock`    | The PerpAssetMap (fixed address)                                           | `symbol`, `target_ticks`                          | Phoenix state dialog, editor |
-| `phoenix-maintenance-margin-stress` | The PerpAssetMap (fixed address)                                           | `symbol`, `maintenance_risk_factor_bps`           | Phoenix state dialog, editor |
-| `phoenix-market-fees`               | One market's orderbook                                                     | `defaultTakerFeeMicro`, `defaultMakerFeeMicro`    | Editor                       |
-| `phoenix-withdraw-limits`           | The WithdrawQueue (fixed address)                                          | Budget, refill and fee fields                     | Editor                       |
-| `phoenix-trader-capabilities`       | One cold Trader                                                            | `traderState.flags`                               | Editor                       |
-| `phoenix-stop-loss-trigger`         | One StopLosses account                                                     | Trigger and execution prices of both slots        | Editor                       |
-| `phoenix-permission-limits`         | One PermissionAccount                                                      | `expiresAtTimestamp`, `numSignerActionsRemaining` | Editor                       |
+| Template                            | Account it writes                                                         | Fields                                            | Studio                       |
+| ----------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------- |
+| `phoenix-trader-collateral-stress`  | A Trader, and its GlobalTraderIndex record while the local index lists it | `traderState.quoteLotCollateral`                  | Phoenix state dialog, editor |
+| `phoenix-direct-mark-risk-shock`    | The PerpAssetMap (fixed address)                                          | `symbol`, `target_ticks`                          | Phoenix state dialog, editor |
+| `phoenix-maintenance-margin-stress` | The PerpAssetMap (fixed address)                                          | `symbol`, `maintenance_risk_factor_bps`           | Phoenix state dialog, editor |
+| `phoenix-market-fees`               | One market's orderbook                                                    | `defaultTakerFeeMicro`, `defaultMakerFeeMicro`    | Editor                       |
+| `phoenix-withdraw-limits`           | The WithdrawQueue (fixed address)                                         | Budget, refill and fee fields                     | Editor                       |
+| `phoenix-trader-capabilities`       | One cold Trader                                                           | `traderState.flags`                               | Editor                       |
+| `phoenix-stop-loss-trigger`         | One StopLosses account                                                    | Trigger and execution prices of both slots        | Editor                       |
+| `phoenix-permission-limits`         | One PermissionAccount                                                     | `expiresAtTimestamp`, `numSignerActionsRemaining` | Editor                       |
 
 A liquidation cascade is two overrides in one scenario: collateral stress at slot 0, then a mark
 shock at slot 1. See [Recipe: liquidation cascade](#recipe-liquidation-cascade).
 
-Set `fetchBeforeUse: true` on every override, so the live account is forked before its bytes are
-changed. Use `false` only for a later override that builds on state an earlier override of the
-same scenario prepared.
+Set `fetchBeforeUse: true` on every override, so the account is fetched from the upstream
+datasource before its bytes are changed. Use `false` only for a later override that builds on
+state an earlier override of the same scenario prepared.
 
 ## Number formats
 
-| Value                                          | Unit                                                                                                                             | Example                           |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| Mark and stop-loss prices                      | Phoenix ticks. USD per base unit = `markTicks * tickSize * 10^(baseLotDecimals - 6)`, with all three from `list_phoenix_markets` | BTC was 86883 ticks on 2026-10-02 |
-| Collateral, withdraw budgets and withdraw fees | Quote lots of PhUSD, which has 6 decimals                                                                                        | `1000000` = 1 PhUSD               |
-| Risk factors                                   | Basis points of the initial margin                                                                                               | `5000` = 50%                      |
-| Trading fees                                   | Millionths of the filled notional                                                                                                | `350` = 0.035%                    |
-| Capability bits                                | Bit flags                                                                                                                        | `62` = active cold trader         |
-| Permission expiry                              | Unix seconds                                                                                                                     | `0` = never expires               |
+| Value                                          | Unit                                                                                                                             | Example                     |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| Mark and stop-loss prices                      | Phoenix ticks. USD per base unit = `markTicks * tickSize * 10^(baseLotDecimals - 6)`, with all three from `list_phoenix_markets` | From `list_phoenix_markets` |
+| Collateral, withdraw budgets and withdraw fees | Quote lots of PhUSD, which has 6 decimals                                                                                        | `1000000` = 1 PhUSD         |
+| Risk factors                                   | Basis points of the initial margin                                                                                               | `5000` = 50%                |
+| Trading fees                                   | Millionths of the filled notional                                                                                                | `350` = 0.035%              |
+| Capability bits                                | Bit flags                                                                                                                        | `62` = active cold trader   |
+| Permission expiry                              | Unix seconds                                                                                                                     | `0` = never expires         |
 
 The collateral, mark and maintenance templates take their numbers as decimal strings, so values
 outside JavaScript's safe integer range stay exact. The other five templates edit their account
@@ -43,19 +43,20 @@ through the IDL like the Kamino templates, so their values are JSON numbers.
 Phoenix keeps an active ("hot") trader's TraderState in a 16-byte record in the
 GlobalTraderIndex, and its positions in the ActiveTraderBuffer. A cold trader's state lives in its
 own Trader account. On mainnet the HOT bit (value 1) of the Trader's `traderState.flags` and the
-index agree, and traders join and leave the hot set all the time: 17 of 208 hot traders left it
-within a day when we measured on 2026-10-02.
+index agree, and traders join and leave the hot set all the time.
 
-A fork loads the GlobalTraderIndex once, so it can disagree with a freshly fetched Trader. Hawkeye
-and the program read a trader from its index record whenever the fork's index lists it,
-whatever the HOT bit says. The templates follow the program:
+The GlobalTraderIndex is pulled from the upstream datasource once, so it can disagree with a
+Trader that is fetched later. Hawkeye and the program read a trader from its index record
+whenever the local GlobalTraderIndex lists it, whatever the HOT bit says. The templates follow the
+program:
 
-- A trader the fork's index lists gets its collateral written to its record and to its account.
-  Other TraderState fields are refused for it, since only collateral is mirrored into the record.
-- A trader flagged hot that the fork's index does not list turned hot after the fork loaded the
-  index. Phoenix rejects every transaction for it on that fork with
-  `TradersViewError::TraderNotFound`, so the collateral override is refused. Restart the fork to
-  load the current index.
+- If the local GlobalTraderIndex lists the Trader, its collateral is written to both its record
+  there and its Trader account. Other TraderState fields are refused for it, since only
+  collateral is mirrored into the record.
+- If the Trader's HOT bit is set but the local GlobalTraderIndex does not list it, the Trader
+  became hot after the index was pulled. Phoenix rejects every transaction for that Trader with
+  `TradersViewError::TraderNotFound`, so the collateral override is refused. Restart surfnet to
+  pull the current GlobalTraderIndex.
 
 ## Template guides
 
@@ -68,9 +69,9 @@ whatever the HOT bit says. The templates follow the program:
 - The account is the Trader PDA `["trader", authority, [pda index, subaccount index]]`, usually
   `[0, 0]` for the main account.
 - Collateral can only be lowered; raising it needs a real deposit into the global vault. With
-  fetchBeforeUse the ceiling is the live amount on mainnet, otherwise the amount the fork reads.
-  The exception is a trader that left the hot set after the fork loaded the index: the fork's
-  index still lists it, so its record there is the ceiling either way. A target above the
+  fetchBeforeUse the ceiling is the amount on mainnet, otherwise the amount in the local VM.
+  The exception is a trader that left the hot set after the GlobalTraderIndex was pulled: the
+  local index still lists it, so its record there is the ceiling either way. A target above the
   ceiling is skipped at Play with a warning.
 - The target is the trader's quote-lot collateral, not just its deposits. Phoenix's effective
   collateral adds the discounted unrealized PnL, unsettled funding and discounted spot
@@ -100,9 +101,9 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
   five spot and five perp oracle samples and the spot component slot to the same ticks and slot.
 - The orderbook and spline do not move, so trades still fill at the book's real prices, and a
   mark Phoenix rebuilds after a trade can move back toward the book. `list_phoenix_markets`
-  shows the mark the fork holds.
+  shows the mark in the local VM.
 - The target is exact ticks, not a percentage. Compute a relative move from `markTicks` just
-  before Play: a target created as +10% from 86651 ticks was +9.76% once BTC had moved to 86840.
+  before Play, since the market keeps moving after the scenario is created.
 
 ### Maintenance margin stress
 
@@ -123,7 +124,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 | `defaultMakerFeeMicro` | Maker fee in millionths; negative is a rebate. Keep it below the taker fee. |
 
 - The account is the market's orderbook: resolve the market with `list_phoenix_markets` and use
-  its `orderbook`. The markets we checked charged 350 (taker) and 50 (maker) on 2026-10-02.
+  its `orderbook`.
 - Per-trader fee overrides, prices and orders do not change.
 
 ### Withdraw limits
@@ -151,8 +152,8 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
   `54` is reduce-only and `6` freezes a trader.
 - Never change the hot bit (1): the index would not list the trader, and Phoenix would reject
   its transactions. Limit orders need a hot trader, so a cold trader places market orders only.
-- Only cold traders are supported. A trader the fork's index lists keeps these bits in its
-  index record, so Play skips the override with a warning.
+- Only cold traders are supported. A trader the local GlobalTraderIndex lists keeps these bits
+  in its index record, so Play skips the override with a warning.
 
 ### Stop-loss trigger
 
@@ -210,7 +211,7 @@ copy by itself. After every surfnet start:
 
 ## Use from Studio
 
-1. Start an online Surfpool fork and open Studio.
+1. Start surfnet with a mainnet datasource and open Studio.
 2. For collateral, mark or maintenance stress, open **Scenario presets**, choose
    **Phoenix state** and pick the **State goal**: Liquidation-risk collateral, Direct mark-price
    adjustment or Maintenance margin stress.
@@ -234,8 +235,8 @@ copy by itself. After every surfnet start:
 
 - `list_phoenix_markets` returns every listed market with its `symbol`, `orderbook`,
   `markTicks`, `tickSize`, `baseLotDecimals`, `maintenanceRiskFactorBps` and
-  `backstopRiskFactorBps`. It reads the fork's PerpAssetMap, so `markTicks` is the fork's value,
-  which a market template refreshes when it plays with fetchBeforeUse.
+  `backstopRiskFactorBps`. It reads the PerpAssetMap in the local VM, so `markTicks` is the
+  local value, which a market template refreshes when it plays with fetchBeforeUse.
 - `create_phoenix_collateral_scenario` reads the Trader from the surfnet Studio plays scenarios
   on and returns a Studio editor URL.
 - `create_scenario` refuses a market symbol `list_phoenix_markets` does not list, and suggests
@@ -244,13 +245,13 @@ copy by itself. After every surfnet start:
 
 ## Troubleshooting
 
-| Error or observation                                                                    | Meaning                                                                                                                                                                             |
-| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local fork nor its datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment.                                         |
-| `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader turned hot after the fork loaded the index; Phoenix rejects its transactions too. Restart the fork.                                                                      |
-| `Cannot get mark price, staleness or validity check failed`                             | The fork's PerpAssetMap aged since it was loaded. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart the fork. |
-| `Global configuration must be active` when a transaction is sent after Play             | The LastRestartSlot sysvar is still 0. See [Before sending transactions](#before-sending-transactions).                                                                             |
-| `sendTransaction` waits 30 s and fails with `Failed to fetch accounts from remote`      | The Phoenix log authority is missing. See [Before sending transactions](#before-sending-transactions).                                                                              |
+| Error or observation                                                                    | Meaning                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local VM nor the upstream datasource holds the Phoenix account graph. Start Surfpool against a datasource that carries the deployment.                                |
+| `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader turned hot after the GlobalTraderIndex was pulled; Phoenix rejects its transactions too. Restart surfnet.                                                              |
+| `Cannot get mark price, staleness or validity check failed`                             | The local PerpAssetMap aged since it was pulled. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart surfnet. |
+| `Global configuration must be active` when a transaction is sent after Play             | The LastRestartSlot sysvar is still 0. See [Before sending transactions](#before-sending-transactions).                                                                           |
+| `sendTransaction` waits 30 s and fails with `Failed to fetch accounts from remote`      | The Phoenix log authority is missing. See [Before sending transactions](#before-sending-transactions).                                                                            |
 
 ## Verification against mainnet
 

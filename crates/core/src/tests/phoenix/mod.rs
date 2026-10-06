@@ -307,7 +307,7 @@ async fn collateral_stress_follows_the_index_when_the_hot_flag_lags() {
     let set_trader = |trader: &Account| {
         locker.with_svm_writer(|svm| svm.set_account(&graph.trader, trader.clone()).unwrap())
     };
-    // A Trader refetched after it left the hot set has its HOT flag cleared while the fork's
+    // A Trader refetched after it left the hot set has its HOT flag cleared while the local
     // index still holds its record.
     let mut lagging = locker
         .with_svm_reader(|svm| svm.get_account(&graph.trader))
@@ -430,12 +430,12 @@ async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
     let graph = phoenix_live_graph().await;
-    let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+    let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
     (locker, graph)
 }
 
-/// A fork holding the deployed programs and every graph account, at the graph's clock.
-fn phoenix_fork(
+/// A local VM holding the deployed programs and every graph account, at the graph's clock.
+fn phoenix_surfnet(
     graph: &PhoenixLiveGraph,
     eternal_program: &[u8],
     hawkeye_program: &[u8],
@@ -569,7 +569,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
                 .into_iter()
                 .map(|(trader, _)| trader)
                 .collect();
-        let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+        let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
         for (trader, account) in traders
             .iter()
             .filter(|(trader, _)| indexed.contains(trader))

@@ -134,7 +134,7 @@ pub fn live_quote_lot_collateral(
     index: Option<&Account>,
 ) -> SurfpoolResult<i64> {
     // The index is passed whenever Phoenix reads this Trader from its record, even a cold-flagged
-    // Trader the fork's index still lists.
+    // Trader the local index still lists.
     if index.is_none() && !header.trader_state.is_hot() {
         return Ok(header.trader_state.quote_lot_collateral.as_inner());
     }
@@ -563,7 +563,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        // The fork holds a stressed record, the datasource the live one.
+        // The local VM holds a stressed record, the datasource the live one.
         let mut stressed_index = live_index.clone();
         stressed_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
         let url = canned_rpc(format!(
@@ -688,7 +688,7 @@ mod tests {
         let mut scenario = build_phoenix_collateral_scenario(trader, &before_trader, "1").unwrap();
         // The canned RPC answers every request with the index, so the Trader must not be refetched.
         scenario.overrides[0].fetch_before_use = false;
-        // The fork holds the Trader but has never read the index, so the override fetches it.
+        // The local VM holds the Trader but has never read the index, so the override fetches it.
         let url = canned_rpc(format!(
             r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
             BASE64_STANDARD.encode(&remote_index.data),
