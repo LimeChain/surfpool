@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
+use solana_sysvar::last_restart_slot::LastRestartSlot;
 
 use crate::{
     scenarios::TemplateRegistry,
@@ -2104,7 +2105,7 @@ fn bisonfi_replay_min_out(
     clock.slot = pool_slot;
     clock.unix_timestamp = 1_787_041_969;
     svm.set_sysvar(&clock);
-    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+    svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
     });
@@ -2336,7 +2337,7 @@ fn bisonfi_run(
     clock.unix_timestamp = 1_787_041_969;
     svm.set_sysvar(&clock);
     // Match Surfpool startup: this local VM begins at the account snapshot's slot.
-    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+    svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
     });
@@ -2640,13 +2641,17 @@ async fn bisonfi_staleness_threshold_exists() {
     // Smallest age that stops the quote, by binary search over a generous range.
     let (mut lo, mut hi) = (0u64, 4096u64);
     assert_eq!(
-        bisonfi_run(&fork, ONE_SOL, 0, age_by(hi)).unwrap_or(0),
+        bisonfi_run(&fork, ONE_SOL, 0, age_by(hi))
+            .expect("the stale quote check must execute successfully"),
         0,
         "aging by {hi} slots should stop the venue quoting"
     );
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
-        if bisonfi_run(&fork, ONE_SOL, 0, age_by(mid)).unwrap_or(0) > 0 {
+        if bisonfi_run(&fork, ONE_SOL, 0, age_by(mid)).unwrap_or_else(|error| {
+            panic!("the staleness search must execute successfully: {error}")
+        }) > 0
+        {
             lo = mid;
         } else {
             hi = mid;
@@ -3290,10 +3295,14 @@ async fn whirlpool_swap_executes_against_loaded_upstream_state() {
 /// when the transaction is built, so a leg that bought "whatever N USDC gets" could not be followed by
 /// a leg that sells exactly that. Asking Orca for exactly N base tokens and paying whatever it costs
 /// makes the second leg's size known in advance, which is what lets both legs sit in one transaction.
-async fn bisonfi_orca_atomic_arb(
+fn bisonfi_orca_atomic_arb(
+    orca: &WhirlpoolFork,
+    bf_elf: &[u8],
     bisonfi_pool: &str,
+    bisonfi_snapshot: &[u8],
+    bf_programs: (Pubkey, Pubkey),
     base_out: u64,
-    dislocation: f64,
+    fair_value: u128,
 ) -> Result<i64, String> {
     use litesvm::LiteSVM;
     use solana_account::Account;
@@ -3302,10 +3311,7 @@ async fn bisonfi_orca_atomic_arb(
     use solana_signer::Signer;
     use solana_transaction::Transaction;
 
-    let orca = whirlpool_fork(WHIRLPOOL_SOL_USDC).await;
-    let bf_elf = bisonfi_elf().await;
-    let mut bf = fetch(&[bisonfi_pool]).await.remove(0);
-    let bf_programs = bisonfi_token_programs(&[bf.clone()]).await.remove(0);
+    let mut bf = bisonfi_snapshot.to_vec();
 
     let g64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let base_reserve = g64(&bf, 48);
@@ -3324,15 +3330,12 @@ async fn bisonfi_orca_atomic_arb(
         "the Orca pool and the BisonFi market must quote the same base/quote pair"
     );
 
-    // Dislocate BisonFi's mid through the shipped template.
-    if dislocation != 1.0 {
-        let mid = u128::from_le_bytes(bf[832..848].try_into().unwrap());
-        let moved = (mid as f64 * dislocation) as u128;
-        bisonfi_apply_template(
-            "bisonfi-fair-value",
-            &[("fair_value", serde_json::json!(moved.to_string()))],
-        )(&mut bf);
-    }
+    // Every run starts from the same external reference, not BisonFi's independently moving live
+    // price. This makes fair and dislocated runs differ only by the template value under test.
+    bisonfi_apply_template(
+        "bisonfi-fair-value",
+        &[("fair_value", serde_json::json!(fair_value.to_string()))],
+    )(&mut bf);
 
     let bf_prog = Pubkey::from_str_const(BISONFI_PROGRAM);
     let orca_prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
@@ -3342,7 +3345,7 @@ async fn bisonfi_orca_atomic_arb(
     let mut svm = LiteSVM::new()
         .with_sigverify(false)
         .with_blockhash_check(false);
-    svm.add_program(bf_prog, &bf_elf)
+    svm.add_program(bf_prog, bf_elf)
         .map_err(|e| format!("add bisonfi: {e:?}"))?;
     svm.add_program(orca_prog, &orca.elf)
         .map_err(|e| format!("add orca: {e:?}"))?;
@@ -3354,7 +3357,7 @@ async fn bisonfi_orca_atomic_arb(
     clock.slot = bf_slot;
     clock.unix_timestamp = orca_ts as i64;
     svm.set_sysvar(&clock);
-    svm.set_sysvar(&solana_last_restart_slot::LastRestartSlot {
+    svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
     });
@@ -3514,10 +3517,33 @@ async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
     const SOL_USDC: &str = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo";
     const ONE_SOL: u64 = 1_000_000_000;
 
-    // No dislocation: buying on Orca and selling on BisonFi at the true mid must not pay.
-    let fair = bisonfi_orca_atomic_arb(SOL_USDC, ONE_SOL, 1.0)
-        .await
-        .expect("the round trip must execute at the true mid");
+    // Load both venues once so every point in the sweep executes against exactly the same state.
+    let orca = whirlpool_fork(WHIRLPOOL_SOL_USDC).await;
+    let bf_elf = bisonfi_elf().await;
+    let bf = fetch(&[SOL_USDC]).await.remove(0);
+    let bf_programs = bisonfi_token_programs(&[bf.clone()]).await.remove(0);
+
+    // Orca stores sqrt(raw quote/base) in Q64.64. SOL has 9 decimals and USDC has 6, while
+    // BisonFi stores the human quote/base price in Q40.88, hence the 1000 raw-unit adjustment.
+    let sqrt_price = u128::from_le_bytes(orca.data[65..81].try_into().unwrap());
+    let reference_fair_value = (sqrt_price
+        .checked_mul(sqrt_price)
+        .expect("the Orca square-root price must fit in u128")
+        >> 40)
+        .checked_mul(1_000)
+        .expect("the converted Orca price must fit in u128");
+
+    // No dislocation: both legs use Orca's snapshot price, so fees make the round trip a loss.
+    let fair = bisonfi_orca_atomic_arb(
+        &orca,
+        &bf_elf,
+        SOL_USDC,
+        &bf,
+        bf_programs,
+        ONE_SOL,
+        reference_fair_value,
+    )
+    .expect("the round trip must execute at the shared reference price");
     assert!(
         fair < 0,
         "buying on Orca and selling on BisonFi at the true mid returned a profit of {fair}. Two \
@@ -3528,18 +3554,27 @@ async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
     // Mark BisonFi up so it becomes the richer bid, and the same transaction becomes an arbitrage.
     let mut last = fair;
     let mut two_percent_profit = None;
-    for pct in [2.0f64, 5.0, 10.0] {
-        let profit = bisonfi_orca_atomic_arb(SOL_USDC, ONE_SOL, 1.0 + pct / 100.0)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("the round trip must execute with BisonFi {pct}% rich: {e}")
-            });
+    for pct in [2u128, 5, 10] {
+        let dislocated = reference_fair_value
+            .checked_mul(100 + pct)
+            .expect("the dislocated price must fit in u128")
+            / 100;
+        let profit = bisonfi_orca_atomic_arb(
+            &orca,
+            &bf_elf,
+            SOL_USDC,
+            &bf,
+            bf_programs,
+            ONE_SOL,
+            dislocated,
+        )
+        .unwrap_or_else(|e| panic!("the round trip must execute with BisonFi {pct}% rich: {e}"));
         assert!(
             profit > last,
             "marking BisonFi up {pct}% must pay better than the {last} the previous step returned, \
              got {profit}"
         );
-        if pct == 2.0 {
+        if pct == 2 {
             two_percent_profit = Some(profit);
         }
         last = profit;
@@ -3617,7 +3652,7 @@ async fn bisonfi_staleness_suppresses_the_price_and_spread_levers() {
                 apply(d);
             }
         })
-        .unwrap_or(0);
+        .unwrap_or_else(|error| panic!("{pool}: stale price check must execute: {error}"));
         assert_eq!(
             stale_doubled, 0,
             "{pool}: a market {STALE_BY} slots stale must ignore a doubled mid, but it paid \
@@ -3633,7 +3668,7 @@ async fn bisonfi_staleness_suppresses_the_price_and_spread_levers() {
                 apply(d);
             }
         })
-        .unwrap_or(0);
+        .unwrap_or_else(|error| panic!("{pool}: stale spread check must execute: {error}"));
         assert_eq!(
             stale_spread, 0,
             "{pool}: a market {STALE_BY} slots stale must ignore a spread override, but it paid \
