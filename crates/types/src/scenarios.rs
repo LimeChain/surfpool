@@ -266,16 +266,30 @@ pub enum PropertyKind {
         /// The MCP tool whose result supplies the dropdown options
         source: String,
     },
+    /// A value the protocol's own writer reads that is not a field of the account's IDL type,
+    /// such as a Phoenix market's target mark ticks
+    Input {
+        /// The value's IDL type, which UIs render the input from
+        value_type: anchor_lang_idl::types::IdlType,
+    },
 }
 
 impl PropertyKind {
-    /// Maps a YAML `type` string, defaulting to a field. A dynamic_ref needs its `source`.
-    pub fn from_yaml(kind: Option<&str>, source: Option<String>) -> Result<Self, String> {
+    /// Maps a YAML `type` string, defaulting to a field. A dynamic_ref needs its `source` and an
+    /// input its `value_type`.
+    pub fn from_yaml(
+        kind: Option<&str>,
+        source: Option<String>,
+        value_type: Option<anchor_lang_idl::types::IdlType>,
+    ) -> Result<Self, String> {
         match kind {
             Some("constant_ref") => Ok(Self::ConstantRef),
             Some("dynamic_ref") => source
                 .map(|source| Self::DynamicRef { source })
                 .ok_or_else(|| "a dynamic_ref needs a source".to_string()),
+            Some("input") => value_type
+                .map(|value_type| Self::Input { value_type })
+                .ok_or_else(|| "an input needs a value_type".to_string()),
             _ => Ok(Self::Field),
         }
     }
@@ -305,10 +319,6 @@ pub struct Property {
     /// Raw-layout only: how this field's bytes are produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<RawEncoding>,
-    /// The value's IDL type when `path` is not a field of the account's IDL type, such as a
-    /// market symbol picked from a dynamic_ref. UIs render the input from it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_type: Option<anchor_lang_idl::types::IdlType>,
 }
 
 impl Property {
@@ -322,7 +332,6 @@ impl Property {
             constant: None,
             offset: None,
             encoding: None,
-            value_type: None,
         }
     }
 
@@ -336,8 +345,12 @@ impl Property {
             constant: Some(constant.into()),
             offset: None,
             encoding: None,
-            value_type: None,
         }
+    }
+
+    /// Check if this is a field of the account's IDL type
+    pub fn is_field(&self) -> bool {
+        matches!(self.kind, PropertyKind::Field)
     }
 
     /// Check if this is a constant reference
@@ -926,7 +939,7 @@ pub enum YamlProperty {
         /// For dynamic_ref type: the MCP tool whose result supplies the options
         #[serde(default)]
         source: Option<String>,
-        /// The value's IDL type when `path` is not a field of the account's IDL type
+        /// For input type: the value's IDL type
         #[serde(default)]
         value_type: Option<anchor_lang_idl::types::IdlType>,
     },
@@ -949,7 +962,7 @@ impl TryFrom<YamlProperty> for Property {
                 source,
                 value_type,
             } => {
-                let kind = PropertyKind::from_yaml(kind.as_deref(), source)
+                let kind = PropertyKind::from_yaml(kind.as_deref(), source, value_type)
                     .map_err(|e| format!("property '{path}': {e}"))?;
                 Ok(Property {
                     path,
@@ -959,7 +972,6 @@ impl TryFrom<YamlProperty> for Property {
                     constant,
                     offset,
                     encoding,
-                    value_type,
                 })
             }
         }
@@ -1989,7 +2001,7 @@ mod tests {
         }
     }
 
-    /// Studio and MCP clients read `type` and `source` as flat keys of a property.
+    /// Studio and MCP clients read `type`, `source` and `value_type` as flat keys of a property.
     #[test]
     fn property_kind_keeps_its_json_shape() {
         use super::PropertyKind;
@@ -1999,6 +2011,12 @@ mod tests {
                 source: "list_phoenix_markets".to_string(),
             },
             ..Property::field("symbol")
+        };
+        let input = Property {
+            kind: PropertyKind::Input {
+                value_type: anchor_lang_idl::types::IdlType::String,
+            },
+            ..Property::field("target_ticks")
         };
         let cases = [
             (
@@ -2013,6 +2031,10 @@ mod tests {
                 dynamic_ref,
                 json!({"path": "symbol", "type": "dynamic_ref", "source": "list_phoenix_markets"}),
             ),
+            (
+                input,
+                json!({"path": "target_ticks", "type": "input", "value_type": "string"}),
+            ),
         ];
 
         for (property, expected) in cases {
@@ -2025,24 +2047,29 @@ mod tests {
     }
 
     #[test]
-    fn a_dynamic_ref_without_a_source_is_rejected() {
+    fn a_dynamic_ref_without_a_source_or_an_input_without_a_type_is_rejected() {
         use super::YamlProperty;
 
-        let yaml = YamlProperty::Full {
-            path: "symbol".to_string(),
-            kind: Some("dynamic_ref".to_string()),
-            label: None,
-            description: None,
-            constant: None,
-            offset: None,
-            encoding: None,
-            source: None,
-            value_type: None,
-        };
+        for (kind, error) in [
+            ("dynamic_ref", "a dynamic_ref needs a source"),
+            ("input", "an input needs a value_type"),
+        ] {
+            let yaml = YamlProperty::Full {
+                path: "value".to_string(),
+                kind: Some(kind.to_string()),
+                label: None,
+                description: None,
+                constant: None,
+                offset: None,
+                encoding: None,
+                source: None,
+                value_type: None,
+            };
 
-        assert_eq!(
-            Property::try_from(yaml),
-            Err("property 'symbol': a dynamic_ref needs a source".to_string())
-        );
+            assert_eq!(
+                Property::try_from(yaml),
+                Err(format!("property 'value': {error}"))
+            );
+        }
     }
 }

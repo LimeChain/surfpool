@@ -39,12 +39,12 @@ templates:
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
-        value_type: string
         type: dynamic_ref
         label: Market Symbol
         source: list_phoenix_markets
         description: Exact Phoenix market symbol
       - path: target_ticks
+        type: input
         value_type: string
         label: Target Mark Ticks
         description: Exact mark-price ticks, at least 1, encoded as a decimal string
@@ -73,12 +73,12 @@ templates:
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
-        value_type: string
         type: dynamic_ref
         label: Market Symbol
         source: list_phoenix_markets
         description: Exact Phoenix market symbol
       - path: maintenance_risk_factor_bps
+        type: input
         value_type: string
         label: Maintenance Risk Factor (bps)
         description: >-

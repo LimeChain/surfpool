@@ -1505,7 +1505,7 @@ templates: []
                 continue;
             };
             for property in &template.properties {
-                if property.is_constant_ref() || property.value_type.is_some() {
+                if !property.is_field() {
                     continue;
                 }
                 checked += 1;
