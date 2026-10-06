@@ -44,8 +44,9 @@ templates:
       3. Put that oracle in the override as {"account":{"pubkey":"<oracle>"}} and set
          fetchBeforeUse: true. Do not target the market account with this template.
 
-      PRECONDITION - SET BOTH PRICE FIELDS. The exponent is live operator state and changed during
-      validation, so changing only the coefficient can produce a different human price later.
+      PRECONDITION - SET BOTH PRICE FIELDS. The exponent is stored independently from the
+      coefficient, so changing only the coefficient makes the resulting human price depend on the
+      exponent already stored in the selected oracle account.
 
       This is SolFi's authoritative price input. The 1728-byte market account contains a cached,
       XOR-looking word at offset 712, but changing that word alone does not move a fill. The program
@@ -54,8 +55,8 @@ templates:
       CONVERSION:
         human_price = coefficient * 10^exponent * 10^(base_decimals - quote_decimals)
 
-      Set price_exponent and price_coefficient together so a live exponent change cannot alter the
-      meaning of the scenario. For example, at exponent -10, WSOL/USDC (9/6 decimals) at $50 has
+      Set price_exponent and price_coefficient together so the scenario defines the complete price.
+      For example, at exponent -10, WSOL/USDC (9/6 decimals) at $50 has
       coefficient 500000000, while USDT/USDC (6/6) at $1 has coefficient 10000000000.
 
       Set fetchBeforeUse: true. The oracle address is embedded in the market account at bytes 24..56;

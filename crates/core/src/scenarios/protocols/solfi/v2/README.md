@@ -33,16 +33,17 @@ Price conversion is:
 human_price = coefficient × 10^exponent × 10^(base_decimals - quote_decimals)
 ```
 
-The exponent is live state and changed during validation. Set exponent and coefficient together.
+The exponent is stored independently from the coefficient. Set both fields together so the intended
+human price does not depend on the exponent already stored in the selected oracle account.
 
 ## Picking a market
 
-Studio offers a short list of useful markets and also accepts a market, oracle or vault address
+Studio offers a short list of featured markets and also accepts a market, oracle or vault address
 directly. Market templates target the market account, price and freshness templates target its
 embedded oracle, and the vault template targets one of its SPL-token vaults. The backend templates
 do not embed a market catalog.
 
-Studio currently highlights four useful markets:
+Studio includes four featured markets:
 
 | Choice      | Best suited for                                      |
 | ----------- | ---------------------------------------------------- |
@@ -57,7 +58,8 @@ pair through both vault mints, and select the corresponding target account. Empt
 SolFi state, but their presence on chain is not a promise that a swap can currently settle.
 
 Do not reuse an oracle or vault merely because the token pair looks similar. Use
-`fetchBeforeUse: true` so the selected account is forked before its bytes are changed.
+`fetchBeforeUse: true` so the selected account is loaded into the local VM from the upstream
+datasource before its bytes are changed.
 
 ## Two rules that prevent misleading scenarios
 
@@ -216,9 +218,9 @@ to be deterministic. Set `max_widening` at or above the intended result or the c
 
 ## Make large trades progressively worse
 
-Use `solfi-size-impact`. Each direction has eight `y` properties, one for each existing live `x`
-breakpoint. Set all eight values for the side being modeled and use non-decreasing values for ordinary
-liquidity deterioration.
+Use `solfi-size-impact`. Each direction has eight `y` properties, one for each `x` breakpoint stored
+in the selected market account. Set all eight values for the side being modeled and use
+non-decreasing values for ordinary liquidity deterioration.
 
 ```text
 template: solfi-size-impact
@@ -235,8 +237,8 @@ additional_widening_curve_y: 0
 max_widening:                100000
 ```
 
-The template intentionally preserves the market's `x` positions because the operator can change
-them live. The `x` axis is raw quote-token notional:
+The template intentionally preserves the `x` positions stored in the selected market account. The
+`x` axis is raw quote-token notional:
 
 - quote-to-base uses the raw quote input
 - base-to-quote converts the base input to quote notional at the oracle price before lookup.

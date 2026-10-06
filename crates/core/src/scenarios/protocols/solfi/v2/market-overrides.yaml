@@ -99,8 +99,8 @@ templates:
         additional_widening_curve_y: 0
         max_widening: 100000
 
-      This controls configured widening, not inventory. Vault balances are separate live inputs and
-      may still introduce bounded inventory effects or an insufficient-liquidity refusal.
+      This controls configured widening, not inventory. Vault balances independently determine
+      settlement capacity and may still cause an insufficient-liquidity refusal.
 
       DIRECTIONAL RISK-OFF: raise quote_to_base_curve_y when the maker does not want to sell more
       base; raise base_to_quote_curve_y when it does not want to buy more base. Set both for a
@@ -108,7 +108,7 @@ templates:
 
   - id: solfi-size-impact
     name: Override Size Impact
-    description: Shape SolFi widening across the market's eight live trade-size breakpoints
+    description: Shape SolFi widening across the market's eight configured trade-size breakpoints
     idl_account_name: Market
     address:
       type: pubkey
@@ -118,112 +118,112 @@ templates:
           offset: 792,
           encoding: u64,
           label: 'Buy-base knot 1',
-          description: 'Widening at the first live quote-notional breakpoint; set all eight buy-base knots together.',
+          description: 'Widening at the first configured quote-notional breakpoint; set all eight buy-base knots together.',
         }
       - {
           path: quote_to_base_y_1,
           offset: 800,
           encoding: u64,
           label: 'Buy-base knot 2',
-          description: 'Widening at the second live quote-notional breakpoint; interpolation begins from adjacent values.',
+          description: 'Widening at the second configured quote-notional breakpoint; interpolation begins from adjacent values.',
         }
       - {
           path: quote_to_base_y_2,
           offset: 808,
           encoding: u64,
           label: 'Buy-base knot 3',
-          description: 'Widening at the third live quote-notional breakpoint.',
+          description: 'Widening at the third configured quote-notional breakpoint.',
         }
       - {
           path: quote_to_base_y_3,
           offset: 816,
           encoding: u64,
           label: 'Buy-base knot 4',
-          description: 'Widening at the fourth live quote-notional breakpoint.',
+          description: 'Widening at the fourth configured quote-notional breakpoint.',
         }
       - {
           path: quote_to_base_y_4,
           offset: 824,
           encoding: u64,
           label: 'Buy-base knot 5',
-          description: 'Widening at the fifth live quote-notional breakpoint.',
+          description: 'Widening at the fifth configured quote-notional breakpoint.',
         }
       - {
           path: quote_to_base_y_5,
           offset: 832,
           encoding: u64,
           label: 'Buy-base knot 6',
-          description: 'Widening at the sixth live quote-notional breakpoint.',
+          description: 'Widening at the sixth configured quote-notional breakpoint.',
         }
       - {
           path: quote_to_base_y_6,
           offset: 840,
           encoding: u64,
           label: 'Buy-base knot 7',
-          description: 'Widening at the seventh live quote-notional breakpoint.',
+          description: 'Widening at the seventh configured quote-notional breakpoint.',
         }
       - {
           path: quote_to_base_y_7,
           offset: 848,
           encoding: u64,
           label: 'Buy-base knot 8',
-          description: 'Widening at and above the final live quote-notional breakpoint.',
+          description: 'Widening at and above the final configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_0,
           offset: 928,
           encoding: u64,
           label: 'Sell-base knot 1',
-          description: 'Widening at the first live quote-notional breakpoint; set all eight sell-base knots together.',
+          description: 'Widening at the first configured quote-notional breakpoint; set all eight sell-base knots together.',
         }
       - {
           path: base_to_quote_y_1,
           offset: 936,
           encoding: u64,
           label: 'Sell-base knot 2',
-          description: 'Widening at the second live quote-notional breakpoint; interpolation begins from adjacent values.',
+          description: 'Widening at the second configured quote-notional breakpoint; interpolation begins from adjacent values.',
         }
       - {
           path: base_to_quote_y_2,
           offset: 944,
           encoding: u64,
           label: 'Sell-base knot 3',
-          description: 'Widening at the third live quote-notional breakpoint.',
+          description: 'Widening at the third configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_3,
           offset: 952,
           encoding: u64,
           label: 'Sell-base knot 4',
-          description: 'Widening at the fourth live quote-notional breakpoint.',
+          description: 'Widening at the fourth configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_4,
           offset: 960,
           encoding: u64,
           label: 'Sell-base knot 5',
-          description: 'Widening at the fifth live quote-notional breakpoint.',
+          description: 'Widening at the fifth configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_5,
           offset: 968,
           encoding: u64,
           label: 'Sell-base knot 6',
-          description: 'Widening at the sixth live quote-notional breakpoint.',
+          description: 'Widening at the sixth configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_6,
           offset: 976,
           encoding: u64,
           label: 'Sell-base knot 7',
-          description: 'Widening at the seventh live quote-notional breakpoint.',
+          description: 'Widening at the seventh configured quote-notional breakpoint.',
         }
       - {
           path: base_to_quote_y_7,
           offset: 984,
           encoding: u64,
           label: 'Sell-base knot 8',
-          description: 'Widening at and above the final live quote-notional breakpoint.',
+          description: 'Widening at and above the final configured quote-notional breakpoint.',
         }
       - path: age_multiplier_curve_y
         offset: 1064
@@ -260,7 +260,7 @@ templates:
       where a quote is needed.
 
       This is the advanced form of SolFi spread control. It preserves the eight x breakpoints that
-      are already configured on the live market and replaces their y values. The deployed program
+      are stored in the selected market account and replaces their y values. The deployed program
       linearly interpolates between adjacent points and clamps to the endpoint outside the populated
       range. The x axis is raw quote-token notional: quote-to-base uses the quote input directly,
       while base-to-quote converts the base input at the oracle price before lookup. Do not assume
@@ -276,4 +276,5 @@ templates:
 
       HOW TO USE: set all eight y values for each direction you care about. A conventional
       large-trade deterioration uses non-decreasing values. Do not copy x assumptions between
-      markets: this template deliberately leaves the operator's live x breakpoints untouched.
+      markets: this template deliberately leaves the selected market's configured x breakpoints
+      untouched.
