@@ -7,9 +7,8 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 
 use crate::{
-    scenarios::{TemplateRegistry, resolve_live_constants},
+    scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient},
-    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -64,16 +63,90 @@ async fn fetch(addresses: &[&str]) -> Vec<Account> {
         .collect()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct MarketDef {
-    pair: String,
-    market: String,
-    oracle: String,
-    base_vault: String,
-    quote_vault: String,
+    pair: &'static str,
+    market: &'static str,
+    oracle: &'static str,
+    base_vault: &'static str,
+    quote_vault: &'static str,
 }
 
-/// How many resolved markets the behavioural tests replay.
+/// The markets Studio offers as shortcuts, in its order. The behavioural tests replay the first
+/// ones whose classic SPL-token vaults are funded.
+const FEATURED_MARKETS: [MarketDef; 4] = [
+    MarketDef {
+        pair: "SOL / USDC",
+        market: "GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC",
+        oracle: "7yecFG22heommABQ5svcbQLK1Ua4ZrJsHPiktZ17jfm3",
+        base_vault: "8ncU5YW1CQwvr4gs7buH57bW58e86TDau4STrCJBuz8z",
+        quote_vault: "EunHLeqeJKvxnCPQSytnBP63HJVk2fbHceiKKpngyAo8",
+    },
+    MarketDef {
+        pair: "HYPE / USDC",
+        market: "8TDBxPXyGvxcaoHZoY5D4X2vePuhMYekKpTEhEhaQX5b",
+        oracle: "GHjEJbxWcT55xWCucjSRUJAxxVXD8wXsLUAToBWTUPBa",
+        base_vault: "FDNiPEBtf5gTzX91wc3H2riudcFdXzz1k8kJJaZP4MyJ",
+        quote_vault: "G4zxFHdZ8nqeHeX9bvhRLfFYGEeZLSVQhRdK5BTGaEwh",
+    },
+    MarketDef {
+        pair: "JUP / USDC",
+        market: "AkxuRa1soguFpVRjnDrRsXAcfTkZjRv1XyNXySzVivmC",
+        oracle: "APkXGniPLaXoUeRYrdBwgZE7ky9n1xkiMyrYQH9xsMzS",
+        base_vault: "G39Mthg4bixLGYRzHqjfRdpyAWSJGH5CiUC4grTMpwyd",
+        quote_vault: "GFcj7sRkYqoNCiEkXWxapY7D28UCmAqBjiqGNQGydha4",
+    },
+    MarketDef {
+        pair: "PUMP / USDC",
+        market: "FkGgvNwKBMkDAWStXx7C9CbYiwTCHq2pFrkWHkvS9eJg",
+        oracle: "14kCeUADn4r4sJKFX78b9qibo9JfgZQdWGED3tqJqe4t",
+        base_vault: "BUiRksN6oyCNeDqjPHvtWedVKWFQeiBo5Ft5HeucmTgw",
+        quote_vault: "8iR3pQ7MSZidfu2mP2NtYmSq9prdz3u6mhbRmRbJcx6h",
+    },
+];
+
+/// Every market account the program owns, live and stopped, as of the deployment at slot
+/// 451334772. Each template must write only its own bytes on every one of them.
+const ALL_MARKETS: [&str; 36] = [
+    "2GwiLfAEH1LCNPZtF5JzZUS2KvZ9dEhAyoQ8WLxeYNDY",
+    "2U5S52n2L9Rr8vjDiEFRmHo5iQjJQg9zAgJ5nY1aWXK1",
+    "2hv45fLgAjhBw4w3zmjMyca8AA1HMfxBPDUXFZtPXVVA",
+    "41D2v9b7XJYremti4iGZ36U9fR3ZhmeJpvjarLP62XqG",
+    "4rJggoVMajEUtipev1XhSMjESYk8Zibz6CDHPtUe1mem",
+    "4sewpY37mKe5b2SRbhYNehQvme1uow2pNnSQqBqSjqX2",
+    "5Jw5Lkb3RVaes1h2CTnwvLWQBDQF4qYKwGUHvpuPzciF",
+    "5mHTXRU1bgBDo9vUoHKkCidbFRc2mLHSgTTdQyZBjMfg",
+    "75nkLnRC6oAqwDjLEwyBRabz6gWkE8EBd5ohNuTMpWyS",
+    "8TDBxPXyGvxcaoHZoY5D4X2vePuhMYekKpTEhEhaQX5b",
+    "8TxrtAxqA5PA2Y1d2pxzCz9SoDhjrBcYqNAQKVv6p443",
+    "8hotzuT21Lj9ekjHV7GBBxp8NaaCDk5MVx7d7GmKdc17",
+    "9Nk161kPxkZb1VLwKYXrWbZgr35JN7mHy3EgxxgaXuVH",
+    "9yE49sMheNg9Jia9eokPiEgG7suBgD1crLJoN4tn2Y8u",
+    "A2fTLPdDC3UJcNPC6TFQnELEFXgJ6FadXT3DRiq8VNbG",
+    "AeanNmmxpMEcSv3a3rKaRcrPjXDwpEiG37syPRyu3VJ2",
+    "AkxuRa1soguFpVRjnDrRsXAcfTkZjRv1XyNXySzVivmC",
+    "Ba4nvPmb4KDAYanxaR5uABigxnUqRTcFmEZaeds4ntVv",
+    "CmUBg6HtQDP67Zkt2rhi3oT8rz5cvtysLpw92yxpPMdX",
+    "Cvwhi9ryMNjUUKgjjrzzocVFtDLZCBX9NpAgVCXjiqiM",
+    "D7sZfY6mrfjdauaXhaRzhL7QNzWVjXtkLScQNMXJqc2p",
+    "Daopjqyt5qZZ111x7MDbWbxtf72cdNEUnCECzZ7hVpbp",
+    "DnYTE1Yin8uErtQEyjcdvPoF8sW3cM4brnQEsP1uT6Cg",
+    "DvNVHqG3FanuNLG8N3P1hw4BdFFgvwDN1n1TPe9rr31f",
+    "EEUNhHsRoUVgJUFpkupmdF4v7uLUw1zhYLp7u9s8zFqG",
+    "En8TnhTxJ525KawkZxC2rweSPrYmE1VUB3Ny4p9TMikF",
+    "F6mM8qrRizECPHLUDK7M3rcLQ6AyCJyENRhFdQ9MWbko",
+    "FkGgvNwKBMkDAWStXx7C9CbYiwTCHq2pFrkWHkvS9eJg",
+    "FmiBEriWps99eg63dC66UZfS5Mypa8W5s9J5SFpNGQMX",
+    "FrQuDkgAc1WQ9Vswxq3LWjB5BgnFxaKareWK4YGh1ZMM",
+    "GMCJvYGf5Ex2ARiMquaBDqU6iKM8uiEQkB8jCnoNfHpC",
+    "HBDaV4ndLuVe6qK1vGCXReon4B1DJKa9UrbqP8cVqywx",
+    "HdQjyoXdhXjWT6ut4WUy2d6767rG9hMSZdBvsbqUeKJV",
+    "HzDvPKffZCzRXRQQW4MNaHjrrctiZeqfkyD927JUYv8q",
+    "TcMgpxh6SLph4DZNchtSp63KXK115g5Xo9vQ76kwbAZ",
+    "kGfQmgrNaU6xq3jVr19oNBP5DmNpivohDf6k77CocpM",
+];
+
+/// How many featured markets the behavioural tests replay.
 const FIXTURES: usize = 3;
 /// A fixture's vaults each hold at least this many times the test trade.
 const VAULT_COVER: u64 = 10;
@@ -153,36 +226,12 @@ async fn forks() -> Arc<Vec<GoonfiFork>> {
             let global = fetch(&[GLOBAL]).await.remove(0);
             assert_eq!(global.owner, Pubkey::from_str_const(PROGRAM));
 
-            let rpc_url =
-                std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
-            let registry = TemplateRegistry::new();
-            let band = registry.get("goonfi-reference-band").expect("band template").clone();
-            let served = resolve_live_constants(&rpc_url, vec![band]).await;
-            let options = served[0].constants["market"].options.clone();
-            assert!(
-                !options.is_empty(),
-                "no live markets resolved; a 429 or timeout from {rpc_url} is unverified, not a failure"
-            );
-
             let mut out = Vec::new();
-            for option in &options {
+            for def in FEATURED_MARKETS {
                 if out.len() == FIXTURES {
                     break;
                 }
-                let meta = |key: &str| {
-                    option.metadata[key]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{} has no {key}", option.id))
-                        .to_string()
-                };
-                let def = MarketDef {
-                    pair: meta("pair"),
-                    market: option.value.clone(),
-                    oracle: meta("oracle"),
-                    base_vault: meta("base_vault"),
-                    quote_vault: meta("quote_vault"),
-                };
-                let a = fetch(&[&def.market, &def.oracle, &def.base_vault, &def.quote_vault]).await;
+                let a = fetch(&[def.market, def.oracle, def.base_vault, def.quote_vault]).await;
                 let (market, oracle) = (&a[0], &a[1]);
                 assert_eq!(
                     market.owner,
@@ -206,27 +255,22 @@ async fn forks() -> Arc<Vec<GoonfiFork>> {
                     assert_eq!(pubkey_at(&vault.data, 0), mint, "{} vault mint", def.pair);
                     assert_eq!(
                         pubkey_at(&vault.data, 32),
-                        Pubkey::from_str_const(&def.market),
+                        Pubkey::from_str_const(def.market),
                         "{} vault authority",
                         def.pair
                     );
                 }
-                let decimals = |key: &str| {
-                    option.metadata[key]
-                        .as_u64()
-                        .unwrap_or_else(|| panic!("{} has no {key}", option.id))
-                        as u32
-                };
+                let mints = fetch(&[&base_mint.to_string(), &quote_mint.to_string()]).await;
+                let decimals = |mint: &Account| u32::from(mint.data[44]);
                 // About 100 quote tokens each way, so no live price or balance is pinned.
-                let quote_trade = 100 * 10u64.pow(decimals("quote_decimals"));
-                let base_trade = (100u128 * 10u128.pow(decimals("base_decimals")) * 1_000_000
+                let quote_trade = 100 * 10u64.pow(decimals(&mints[1]));
+                let base_trade = (100u128 * 10u128.pow(decimals(&mints[0])) * 1_000_000
                     / u128::from(bid)) as u64;
                 if u64_at(&a[2].data, 64) < base_trade.saturating_mul(VAULT_COVER)
                     || u64_at(&a[3].data, 64) < quote_trade.saturating_mul(VAULT_COVER)
                 {
                     continue;
                 }
-                let mints = fetch(&[&base_mint.to_string(), &quote_mint.to_string()]).await;
                 out.push(GoonfiFork {
                     slot: u64::from(u32_at(&oracle.data, 16)),
                     unix_timestamp: (u64_at(&oracle.data, 24) / 1_000) as i64,
@@ -243,7 +287,9 @@ async fn forks() -> Arc<Vec<GoonfiFork>> {
                     quote_trade,
                 });
             }
-            let first = out.first().expect("no resolved GoonFi market has funded vaults");
+            let first = out
+                .first()
+                .expect("no featured GoonFi market has funded classic vaults");
             assert_eq!(
                 (first.base_mint.0, first.quote_mint.0),
                 (
@@ -269,6 +315,15 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
     assert!(t.raw_layout, "{id} must use raw-layout writes");
     t.materialize_raw_layout(data, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
+}
+
+fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
+    left.iter()
+        .zip(right)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn assert_writes_within(before: &[u8], after: &[u8], allowed: std::ops::Range<usize>, what: &str) {
@@ -358,10 +413,10 @@ fn run(
     clock.unix_timestamp = fork.unix_timestamp + 1;
     svm.set_sysvar(&clock);
 
-    let market = Pubkey::from_str_const(&fork.def.market);
-    let oracle = Pubkey::from_str_const(&fork.def.oracle);
-    let base_vault = Pubkey::from_str_const(&fork.def.base_vault);
-    let quote_vault = Pubkey::from_str_const(&fork.def.quote_vault);
+    let market = Pubkey::from_str_const(fork.def.market);
+    let oracle = Pubkey::from_str_const(fork.def.oracle);
+    let base_vault = Pubkey::from_str_const(fork.def.base_vault);
+    let quote_vault = Pubkey::from_str_const(fork.def.quote_vault);
     let global = Pubkey::from_str_const(GLOBAL);
     let (base_mint, quote_mint) = (fork.base_mint.0, fork.quote_mint.0);
     for (key, account, data) in [
@@ -455,12 +510,39 @@ fn assert_rejects(result: Result<u64, String>, code: &str, context: &str) {
     }
 }
 
+/// Every template writes only its own bytes on every market the program owns, live or stopped.
 #[tokio::test]
-async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
-    let forks = forks().await;
-    for fork in forks.iter() {
-        let def = &fork.def;
-        let live = fork.live();
+async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
+    let mut markets = Vec::new();
+    for chunk in ALL_MARKETS.chunks(20) {
+        markets.extend(chunk.iter().copied().zip(fetch(chunk).await));
+    }
+    let linked: Vec<String> = markets
+        .iter()
+        .flat_map(|(_, market)| {
+            [208, 144, 176].map(|offset| pubkey_at(&market.data, offset).to_string())
+        })
+        .collect();
+    let mut accounts = HashMap::new();
+    for chunk in linked.chunks(20) {
+        let keys: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        accounts.extend(chunk.iter().cloned().zip(fetch(&keys).await));
+    }
+    for (address, market) in &markets {
+        assert_eq!(market.owner, Pubkey::from_str_const(PROGRAM), "{address}");
+        assert_eq!(market.data[..8], MARKET_TAG, "{address}");
+        let linked = |offset| {
+            accounts[&pubkey_at(&market.data, offset).to_string()]
+                .data
+                .clone()
+        };
+        let live = State {
+            market: market.data.clone(),
+            oracle: linked(208),
+            base_vault: linked(144),
+            quote_vault: linked(176),
+        };
+        let slot = u64::from(u32_at(&live.oracle, 16));
         for (id, data) in [
             ("goonfi-price", &live.oracle),
             ("goonfi-freshness", &live.oracle),
@@ -469,10 +551,9 @@ async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
             ("goonfi-vault-balance", &live.quote_vault),
         ] {
             assert_eq!(
-                &apply_raw(id, data, &[], fork.slot),
+                &apply_raw(id, data, &[], slot),
                 data,
-                "{id} must round-trip {}",
-                def.pair
+                "{id} must round-trip {address}"
             );
         }
 
@@ -483,7 +564,7 @@ async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
                 ("bid_price_x1e6", serde_json::json!(99_740_000u64)),
                 ("ask_price_x1e6", serde_json::json!(99_750_000u64)),
             ],
-            fork.slot,
+            slot,
         );
         assert_writes_within(&live.oracle, &price, 0..16, "goonfi-price");
         assert_eq!(
@@ -495,10 +576,10 @@ async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
             "goonfi-freshness",
             &live.oracle,
             &[("last_update_slot", serde_json::json!(-7))],
-            fork.slot + 100,
+            slot + 100,
         );
         assert_writes_within(&live.oracle, &fresh, 16..20, "goonfi-freshness");
-        assert_eq!(u64::from(u32_at(&fresh, 16)), fork.slot + 93);
+        assert_eq!(u64::from(u32_at(&fresh, 16)), slot + 93);
 
         let band = apply_raw(
             "goonfi-reference-band",
@@ -507,7 +588,7 @@ async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
                 ("reference_price_a_x1e6", serde_json::json!(1u64)),
                 ("reference_price_b_x1e6", serde_json::json!(2u64)),
             ],
-            fork.slot,
+            slot,
         );
         assert_writes_within(&live.market, &band, 1712..1728, "goonfi-reference-band");
         assert_eq!((u64_at(&band, 1712), u64_at(&band, 1720)), (1, 2));
@@ -516,109 +597,53 @@ async fn goonfi_templates_write_only_proven_bytes_on_the_fixture_markets() {
             "goonfi-vault-balance",
             &live.quote_vault,
             &[("amount", serde_json::json!(123u64))],
-            fork.slot,
+            slot,
         );
         assert_writes_within(&live.quote_vault, &vault, 64..72, "goonfi-vault-balance");
         assert_eq!(u64_at(&vault, 64), 123);
     }
 }
 
+/// The featured addresses Studio and the README name are the market's own fields, so a replaced
+/// market fails here instead of silently targeting the wrong account.
 #[tokio::test]
-async fn goonfi_resolver_returns_the_live_markets_with_their_oracles_and_vaults() {
-    let registry = TemplateRegistry::new();
-    let templates = registry.by_protocol("GoonFi");
-    assert_eq!(templates.len(), 4);
-    let rpc_url = std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
-    let served =
-        resolve_live_constants(&rpc_url, templates.iter().map(|t| (*t).clone()).collect()).await;
-    let options = |id: &str| {
-        served
-            .iter()
-            .find(|t| t.id == id)
-            .unwrap_or_else(|| panic!("missing {id}"))
-            .constants["market"]
-            .options
-            .clone()
-    };
-    let markets = options("goonfi-reference-band");
-    let oracles = options("goonfi-price");
-    let vaults = options("goonfi-vault-balance");
-    assert!(
-        !markets.is_empty(),
-        "no live markets resolved; a 429 or timeout from {rpc_url} is unverified, not a failure"
-    );
-    assert_eq!(options("goonfi-freshness"), oracles);
-    assert_eq!(oracles.len(), markets.len());
-    assert_eq!(vaults.len(), 2 * markets.len());
-    for template in &served {
-        let first = &template.constants["market"].options[0];
-        assert_eq!(
-            template.address,
-            surfpool_types::AccountAddress::Pubkey(first.value.clone()),
-            "{} defaults to its first option",
-            template.id
-        );
-        assert_eq!(first.metadata["base_mint"], NATIVE_MINT, "{}", template.id);
-        assert_eq!(first.metadata["quote_mint"], USDC_MINT, "{}", template.id);
-    }
-
-    let addresses = markets
-        .iter()
-        .map(|option| option.value.as_str())
-        .collect::<Vec<_>>();
-    let mut accounts = HashMap::new();
-    for chunk in addresses.chunks(20) {
-        accounts.extend(chunk.iter().copied().zip(fetch(chunk).await));
-    }
-    let text = |option: &surfpool_types::ConstantOption, key: &str| {
-        option.metadata[key]
-            .as_str()
-            .unwrap_or_else(|| panic!("{} has no {key}", option.id))
-            .to_string()
-    };
-    let bytes_of = |option: &surfpool_types::ConstantOption| {
-        let market = &accounts[text(option, "account").as_str()];
+async fn goonfi_featured_markets_match_their_market_accounts() {
+    for def in FEATURED_MARKETS {
+        let a = fetch(&[def.market, def.oracle, def.base_vault, def.quote_vault]).await;
+        let (market, oracle) = (&a[0], &a[1]);
         assert_eq!(
             market.owner,
             Pubkey::from_str_const(PROGRAM),
             "{}",
-            option.id
+            def.pair
         );
-        assert_eq!(market.data[..8], MARKET_TAG, "{}", option.id);
-        market.data.clone()
-    };
-    let at = |data: &[u8], offset: usize| pubkey_at(data, offset).to_string();
-
-    for option in &markets {
-        let data = bytes_of(option);
-        assert_eq!(text(option, "account"), option.value, "{}", option.id);
-        for (key, offset) in [
-            ("base_mint", 80),
-            ("quote_mint", 112),
-            ("base_vault", 144),
-            ("quote_vault", 176),
-            ("oracle", 208),
+        assert_eq!(market.data[..8], MARKET_TAG, "{}", def.pair);
+        for (offset, expected, what) in [
+            (208, def.oracle, "oracle"),
+            (144, def.base_vault, "base vault"),
+            (176, def.quote_vault, "quote vault"),
         ] {
-            assert_eq!(text(option, key), at(&data, offset), "{} {key}", option.id);
+            assert_eq!(
+                pubkey_at(&market.data, offset).to_string(),
+                expected,
+                "{} {what}",
+                def.pair
+            );
         }
-    }
-    for option in &oracles {
-        let data = bytes_of(option);
-        assert_eq!(option.value, at(&data, 208), "{} oracle pointer", option.id);
-    }
-    for option in &vaults {
-        let data = bytes_of(option);
-        let offset = match option.metadata["side"].as_str() {
-            Some("base") => 144,
-            Some("quote") => 176,
-            other => panic!("{} has side {other:?}", option.id),
-        };
         assert_eq!(
-            option.value,
-            at(&data, offset),
-            "{} vault pointer",
-            option.id
+            oracle.owner,
+            Pubkey::from_str_const(ORACLE_PROGRAM),
+            "{} oracle owner",
+            def.pair
         );
+        for (vault, mint_offset) in [(&a[2], 80), (&a[3], 112)] {
+            assert_eq!(
+                pubkey_at(&vault.data, 0),
+                pubkey_at(&market.data, mint_offset),
+                "{} vault mint",
+                def.pair
+            );
+        }
     }
 }
 
@@ -684,7 +709,7 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
             OverrideInstance::new(
                 template_id.to_string(),
                 0,
-                AccountAddress::Pubkey(target_account.clone()),
+                AccountAddress::Pubkey(target_account.to_string()),
             )
             .with_values(
                 values
@@ -708,12 +733,12 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
             .data
     };
     let prepared = State {
-        market: materialized(&fork.def.market),
-        oracle: materialized(&fork.def.oracle),
+        market: materialized(fork.def.market),
+        oracle: materialized(fork.def.oracle),
         base_vault: live.base_vault.clone(),
         quote_vault: live.quote_vault.clone(),
     };
-    let limited_quote_vault = materialized(&fork.def.quote_vault);
+    let limited_quote_vault = materialized(fork.def.quote_vault);
     assert_writes_within(&live.oracle, &prepared.oracle, 0..20, "oracle overrides");
     assert_writes_within(&live.market, &prepared.market, 1712..1728, "band override");
     assert_writes_within(&live.quote_vault, &limited_quote_vault, 64..72, "vault");

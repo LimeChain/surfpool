@@ -9,31 +9,6 @@ tags:
   - prop-amm
   - oracle
 
-constants:
-  market:
-    label: GoonFi market
-    description: Choose a GoonFi market that has traded within the last day; the value is its oracle.
-    source:
-      program_accounts:
-        program: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
-        size: 2048
-        filters:
-          - offset: 0
-            bytes: [48, 188, 47, 53, 52, 88, 50, 154]
-        fields:
-          base_mint: { offset: 80, encoding: pubkey }
-          quote_mint: { offset: 112, encoding: pubkey }
-          base_vault: { offset: 144, encoding: pubkey }
-          quote_vault: { offset: 176, encoding: pubkey }
-          oracle: { offset: 208, encoding: pubkey }
-          activity_slot: { offset: 40, encoding: u64 }
-        pair: { base: base_mint, quote: quote_mint }
-        value: oracle
-        default:
-          base: So11111111111111111111111111111111111111112
-          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-        fresh: { field: activity_slot, within_slots: 216000 }
-
 templates:
   - id: goonfi-price
     name: Override Price
@@ -53,7 +28,27 @@ templates:
         label: Ask price
         description: Price GoonFi sells base at, quote per base times 10^6; keep it at or above the bid.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once.
+      2. Make two getProgramAccounts calls at once, each with two positional params: the program id
+         string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+         {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+         {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+         The second call uses dataSlice {"offset":144,"length":32}. Offset 0 is the market tag.
+         Each result's pubkey is a market for the pair; its data is the market's oracle in the
+         first call and its base vault in the second.
+      3. No result usually means a mistyped mint. Copy both mints again exactly from
+         get_token_address and repeat once before saying GoonFi has no market for the pair.
+      4. A single result is the market. Several results mean the pair also has stopped markets:
+         call getMultipleAccounts with encoding "jsonParsed" on their base vaults and keep the
+         market whose vault holds the most tokens. If every vault is empty, say so instead of
+         guessing.
+      5. For a market address the user gives, read its oracle with getAccountInfo, encoding
+         "base58" and dataSlice {"offset":208,"length":32}.
+      6. Put the oracle in the override's account as {"pubkey":"<oracle>"} and set
+         fetchBeforeUse: true. The oracle address is never an override value.
+
       PRECONDITION - MOVE THE REFERENCE BAND TOO. The market account holds a reference band that
       guards this quote. A sell whose bid sits above the band, or a buy whose ask sits below it,
       rejects with custom error 0x24 (36). Apply goonfi-reference-band to the paired market, scaled
@@ -67,7 +62,7 @@ templates:
       The scale is independent of mint decimals: SOL at 99.74 USDC is 99740000 on a 9/6 market,
       and USDT at 1.0001 USDC is 1000100 on a 6/6 market. Set both fields with ask >= bid.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
       Price and freshness are independent. A quote older than its per-market window rejects with
@@ -96,7 +91,27 @@ templates:
         label: Update-slot offset
         description: Relative to the slot where the override materializes; 0 is current, -2000 is stale.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once.
+      2. Make two getProgramAccounts calls at once, each with two positional params: the program id
+         string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+         {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+         {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+         The second call uses dataSlice {"offset":144,"length":32}. Offset 0 is the market tag.
+         Each result's pubkey is a market for the pair; its data is the market's oracle in the
+         first call and its base vault in the second.
+      3. No result usually means a mistyped mint. Copy both mints again exactly from
+         get_token_address and repeat once before saying GoonFi has no market for the pair.
+      4. A single result is the market. Several results mean the pair also has stopped markets:
+         call getMultipleAccounts with encoding "jsonParsed" on their base vaults and keep the
+         market whose vault holds the most tokens. If every vault is empty, say so instead of
+         guessing.
+      5. For a market address the user gives, read its oracle with getAccountInfo, encoding
+         "base58" and dataSlice {"offset":208,"length":32}.
+      6. Put the oracle in the override's account as {"pubkey":"<oracle>"} and set
+         fetchBeforeUse: true. The oracle address is never an override value.
+
       The oracle's 4-byte update slot is GoonFi's only staleness input. The value is a relative slot
       offset: Surfpool writes the materialization slot plus the offset. The publish timestamp at
       oracle bytes 24..32 is not consulted, and the decay multiplier at 20..24 is left untouched.
@@ -115,7 +130,7 @@ templates:
 
       Do not schedule a fresh override over an interval that is meant to stay stale.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared, such as a goonfi-price
       move applied to the same oracle.
 

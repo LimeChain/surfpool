@@ -8,8 +8,8 @@ companion publisher program, checks that quote against a reference band stored i
 settles from its two token vaults.
 
 Deployment: market program `goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE`, oracle publisher
-`dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu`; layout re-verified on 2026-10-05 against the
-redeployment at slot 451334772.
+`dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu`; layout verified against the deployment at slot
+451334772.
 
 ## Template index
 
@@ -56,33 +56,33 @@ price_x1e6 = human_price × 10^6
 
 ## Picking a market
 
-Every template starts with a market picker. Surfpool reads it from the program when the templates
-are served: every 2048-byte account of the market program that starts with the market tag and
-whose activity slot at byte 40 is within 216,000 slots (about a day) of the current slot. On
-2026-09-25 that was 19 of the program's 33 markets; the other 14 had stopped trading, most with
-empty vaults and an oracle millions of slots old. Each option is labelled with its token pair, and
-SOL / USDC comes first, so a template without a chosen account targets it.
+The templates have no default account, and the backend embeds no market catalog. Studio offers a
+short list of useful markets and also accepts a market, oracle or vault address directly; API and
+MCP callers put the account in the override. The band template targets the market account, the
+price and freshness templates target the oracle the market points at (bytes 208..240), and the
+vault template targets one of the market's SPL-token vaults (base at 144..176, quote at 176..208).
 
-| Template                | Option value                              | Metadata beyond the market's fields |
-| ----------------------- | ----------------------------------------- | ----------------------------------- |
-| `goonfi-reference-band` | the market                                | none                                |
-| `goonfi-price`, `goonfi-freshness` | the market's oracle (bytes 208..240) | none                          |
-| `goonfi-vault-balance`  | one option per vault (bytes 144..176, 176..208) | `side`: `base` or `quote`     |
+Studio highlights four markets:
 
-Every option also carries the market as `account`, both mints, both vaults, the oracle, `pair`
-and both mint decimals. A pair with more than one live market gets the market's first six
-characters in its label.
+| Choice      | Best suited for                                                       |
+| ----------- | --------------------------------------------------------------------- |
+| SOL / USDC  | SOL price shocks, band moves and liquidity tests                      |
+| HYPE / USDC | Altcoin price and inventory stress tests                              |
+| JUP / USDC  | A second altcoin market with deep classic SPL-token vaults            |
+| PUMP / USDC | Volatile-token price tests; its base vault is a Token-2022 account    |
 
-The byte-40 slot matched the market's latest successful transaction when it was checked. It is
-used only to hide abandoned markets; it is not a freshness input of the program, which reads the
-oracle's own update slot.
+For any other pair, each template's LLM guidance finds the market on the program: two calls filter
+its accounts by the two mints and return each market with its oracle and base vault. A pair can
+have several markets; the guidance then keeps the one whose base vault holds the most tokens. One
+that stopped trading usually has near-empty vaults, a zero reference band and an oracle millions of
+slots old.
 
-The deployed-program tests replay the first three served markets whose classic SPL-token vaults
-each hold at least ten times the tests' 100-quote-token trade. SOL / USDC must be the first of
-them, or the tests fail.
+The deployed-program tests replay the first three featured markets whose classic SPL-token vaults
+each hold at least ten times the tests' 100-quote-token trade, with SOL / USDC first, and check
+every template's writes on every market the program owns.
 
 Do not reuse an oracle or vault merely because the token pair looks similar. Use
-`fetchBeforeUse: true` so the selected account is forked before its bytes are changed.
+`fetchBeforeUse: true` so the selected account is pulled from upstream before its bytes are changed.
 
 ## Two rules that prevent misleading scenarios
 
@@ -196,5 +196,5 @@ base vault moves a buy's output slightly before it blocks it.
 | `Custom(38)` (`0x26`) on an ageing quote                   | Observed when a decayed fill falls about 5% below fresh; refresh it  |
 | `Custom(1)` (`0x1`) after lowering a vault                 | The payout vault cannot settle the requested output                  |
 | `Custom(15)` (`0xf`)                                       | The swap's minimum output is above the fill                          |
-| A price override writes correctly but the fill is unchanged | The override targets a different market's oracle; use the picker    |
+| A price override writes correctly but the fill is unchanged | The override targets another market's oracle; read it from 208..240 |
 | A vault balance returns after a swap                       | Remove the later vault reset; it is undoing transaction-owned state  |

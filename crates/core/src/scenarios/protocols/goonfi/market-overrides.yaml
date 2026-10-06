@@ -9,30 +9,6 @@ tags:
   - prop-amm
   - swap
 
-constants:
-  market:
-    label: GoonFi market
-    description: Choose a GoonFi market that has traded within the last day.
-    source:
-      program_accounts:
-        program: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
-        size: 2048
-        filters:
-          - offset: 0
-            bytes: [48, 188, 47, 53, 52, 88, 50, 154]
-        fields:
-          base_mint: { offset: 80, encoding: pubkey }
-          quote_mint: { offset: 112, encoding: pubkey }
-          base_vault: { offset: 144, encoding: pubkey }
-          quote_vault: { offset: 176, encoding: pubkey }
-          oracle: { offset: 208, encoding: pubkey }
-          activity_slot: { offset: 40, encoding: u64 }
-        pair: { base: base_mint, quote: quote_mint }
-        default:
-          base: So11111111111111111111111111111111111111112
-          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-        fresh: { field: activity_slot, within_slots: 216000 }
-
 templates:
   - id: goonfi-reference-band
     name: Override Reference Band
@@ -52,7 +28,26 @@ templates:
         label: Reference price B
         description: Second reference anchor, quote per base times 10^6; their order is not fixed.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once.
+      2. Make two getProgramAccounts calls at once, each with two positional params: the program id
+         string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+         {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+         {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+         The second call uses dataSlice {"offset":144,"length":32}. Offset 0 is the market tag.
+         Each result's pubkey is a market for the pair; its data is the market's oracle in the
+         first call and its base vault in the second.
+      3. No result usually means a mistyped mint. Copy both mints again exactly from
+         get_token_address and repeat once before saying GoonFi has no market for the pair.
+      4. A single result is the market. Several results mean the pair also has stopped markets:
+         call getMultipleAccounts with encoding "jsonParsed" on their base vaults and keep the
+         market whose vault holds the most tokens. If every vault is empty, say so instead of
+         guessing.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set
+         fetchBeforeUse: true. A market address the user gives is used as is. The market address
+         is never an override value.
+
       PRECONDITION - MOVE THE BAND WITH THE PRICE. GoonFi checks the oracle quote against these two
       reference prices before it fills. A sell whose oracle bid sits above the band, or a buy whose
       oracle ask sits below it, rejects with custom error 0x24 (36). Every goonfi-price move needs
@@ -67,7 +62,7 @@ templates:
       Set both anchors. Their order on the live market is not fixed, so set both to the target price
       or scale both by the same factor as the oracle.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared. The market's oracle is
       at market bytes 208..240; its vaults are at 144..176 (base) and 176..208 (quote).
 
