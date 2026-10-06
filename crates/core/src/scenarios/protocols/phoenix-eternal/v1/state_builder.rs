@@ -416,8 +416,9 @@ async fn prepare_trader_override(
     Ok(writes)
 }
 
-/// A hot Trader's current state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
-/// record too. If the fetch fails or lacks the trader, the local record stays.
+/// A hot Trader's collateral is read from its GlobalTraderIndex record, so fetchBeforeUse refreshes
+/// the collateral there too. The rest of the record stays as the local VM has it, and so does the
+/// whole record if the fetch fails or lacks the trader.
 async fn refresh_index_record(
     index: &mut Account,
     trader_key: &[u8; 32],
@@ -438,7 +439,8 @@ async fn refresh_index_record(
         index_trader_state_range(&remote, trader_key),
     ) && local.len() == upstream.len()
     {
-        index.data[local].copy_from_slice(&remote.data[upstream]);
+        index.data[local.start..local.start + 8]
+            .copy_from_slice(&remote.data[upstream.start..upstream.start + 8]);
     }
 }
 

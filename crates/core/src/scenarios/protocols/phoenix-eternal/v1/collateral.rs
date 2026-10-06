@@ -563,9 +563,11 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        // The local VM holds a stressed record, the datasource the unstressed one.
+        // The local VM holds a stressed record, the datasource the unstressed one. The local
+        // record's flags and fee multipliers differ too, and only its collateral is refreshed.
         let mut stressed_index = upstream_index.clone();
         stressed_index.data[range.start..range.start + 8].copy_from_slice(&1_i64.to_le_bytes());
+        stressed_index.data[range.start + 14..range.end].copy_from_slice(&[5, 6]);
         let url = canned_rpc(format!(
             r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
             BASE64_STANDARD.encode(&upstream_index.data),
@@ -607,6 +609,11 @@ mod tests {
             assert_eq!(
                 i64::from_le_bytes(index.data[range.start..range.start + 8].try_into().unwrap()),
                 upstream / 2
+            );
+            assert_eq!(
+                index.data[range.start + 8..range.end],
+                stressed_index.data[range.start + 8..range.end],
+                "the rest of the record stays local"
             );
         }
     }
