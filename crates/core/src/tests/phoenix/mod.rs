@@ -58,7 +58,10 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
 /// Hawkeye checks it, because it reads a hot Trader's collateral from the GlobalTraderIndex and
 /// its positions from the ActiveTraderBuffer, and the Trader account's copies of both can lag.
 /// A margin view that fails rejects the trader, and its error is returned.
-fn trader_is_eligible(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> Result<bool, String> {
+fn trader_is_eligible(
+    locker: &SurfnetSvmLocker,
+    graph: &PhoenixMainnetGraph,
+) -> Result<bool, String> {
     let header = trader_header(&graph.trader, graph.account(&graph.trader)).unwrap_or_else(|e| {
         panic!(
             "{} is in the GlobalTraderIndex but is not a valid Trader: {e}",
@@ -77,13 +80,13 @@ fn trader_is_eligible(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> Re
 }
 
 /// A zero-copy layout cannot be round-tripped against itself, so drift shows up as an
-/// invariant that stops holding on live bytes.
+/// invariant that stops holding on mainnet bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn live_accounts_satisfy_the_typed_layout_invariants() {
-    let graph = phoenix_live_graph().await;
+async fn mainnet_accounts_satisfy_the_typed_layout_invariants() {
+    let graph = phoenix_mainnet_graph().await;
 
     let global = GlobalConfig::try_from_account_bytes(&graph.account(&PHOENIX_GLOBAL_CONFIG).data)
-        .expect("live GlobalConfig should decode through phoenix-rise-accounts");
+        .expect("mainnet GlobalConfig should decode through phoenix-rise-accounts");
     assert_eq!(
         Pubkey::new_from_array(global.account_key()),
         PHOENIX_GLOBAL_CONFIG,
@@ -101,9 +104,9 @@ async fn live_accounts_satisfy_the_typed_layout_invariants() {
     let map_account = graph.account(&graph.perp_asset_map);
     assert_eq!(map_account.owner, PHOENIX_ETERNAL_PROGRAM_ID);
     let markets = phoenix_markets(graph.perp_asset_map, map_account)
-        .expect("live PerpAssetMap should decode");
+        .expect("mainnet PerpAssetMap should decode");
     let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
-        .expect("live PerpAssetMap should decode through phoenix-rise-accounts");
+        .expect("mainnet PerpAssetMap should decode through phoenix-rise-accounts");
     for (symbol, orderbook, spline) in &graph.markets {
         assert!(
             markets
@@ -157,9 +160,10 @@ async fn deployed_program(programdata: Pubkey) -> Vec<u8> {
     bytes
 }
 
-fn live_graph_cache() -> &'static tokio::sync::Mutex<Option<Result<PhoenixLiveGraph, String>>> {
+fn mainnet_graph_cache() -> &'static tokio::sync::Mutex<Option<Result<PhoenixMainnetGraph, String>>>
+{
     static CACHE: std::sync::OnceLock<
-        tokio::sync::Mutex<Option<Result<PhoenixLiveGraph, String>>>,
+        tokio::sync::Mutex<Option<Result<PhoenixMainnetGraph, String>>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
@@ -185,24 +189,24 @@ async fn phoenix_state_preparation_changes_hawkeye_risk_outcomes() {
     let before = hawkeye_margin(&collateral_locker, &graph);
     assert!(
         before.collateral_quote_lots > 0,
-        "no eligible live candidate: the discovered trader has no collateral to stress"
+        "no eligible mainnet candidate: the discovered trader has no collateral to stress"
     );
     assert!(
         before.position_count > 0,
-        "no eligible live candidate: the program sees no position for the discovered trader"
+        "no eligible mainnet candidate: the program sees no position for the discovered trader"
     );
     assert!(
         before.maintenance_margin_quote_lots > 0,
-        "no eligible live candidate: the discovered trader's positions require no margin"
+        "no eligible mainnet candidate: the discovered trader's positions require no margin"
     );
     assert_eq!(
         before.is_liquidatable, 0,
-        "no eligible live candidate: the discovered trader is already liquidatable"
+        "no eligible mainnet candidate: the discovered trader is already liquidatable"
     );
 
     // Effective collateral moves one-for-one with collateral, whatever else it counts (uPnL,
     // funding, ...), so this target puts it at half the maintenance margin. A fixed target of 1
-    // left about one live trader in four healthy.
+    // left about one mainnet trader in four healthy.
     let maintenance =
         i64::try_from(before.maintenance_margin_quote_lots).expect("maintenance margin fits i64");
     let target =
@@ -307,7 +311,7 @@ async fn collateral_stress_follows_the_index_when_the_hot_flag_lags() {
     let set_trader = |trader: &Account| {
         locker.with_svm_writer(|svm| svm.set_account(&graph.trader, trader.clone()).unwrap())
     };
-    // A Trader refetched after it left the hot set has its HOT flag cleared while the fork's
+    // A Trader refetched after it left the hot set has its HOT flag cleared while the local
     // index still holds its record.
     let mut lagging = locker
         .with_svm_reader(|svm| svm.get_account(&graph.trader))
@@ -355,10 +359,10 @@ async fn collateral_stress_follows_the_index_when_the_hot_flag_lags() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn maintenance_margin_stress_raises_the_live_requirement() {
+async fn maintenance_margin_stress_raises_the_mainnet_requirement() {
     let (locker, graph) = phoenix_behavior_locker().await;
     let map = PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
-        .expect("live PerpAssetMap decodes");
+        .expect("mainnet PerpAssetMap decodes");
 
     // For a hot Trader the program reads positions from the ActiveTraderBuffer, which the Trader
     // account's copy can lag behind, so every market's factor is doubled rather than the one
@@ -369,7 +373,7 @@ async fn maintenance_margin_stress_raises_the_live_requirement() {
     );
     let mut doubled = Vec::new();
     for entry in map.iter() {
-        let entry = entry.expect("live map entry decodes");
+        let entry = entry.expect("mainnet map entry decodes");
         // Doubled up to 100%, the most a factor can be.
         let factor = entry.metadata.risk_params().risk_factors[0]
             .saturating_mul(2)
@@ -388,7 +392,7 @@ async fn maintenance_margin_stress_raises_the_live_requirement() {
     let before = hawkeye_margin(&locker, &graph);
     assert!(
         before.maintenance_margin_quote_lots > 0,
-        "no eligible live candidate: the discovered trader's positions require no margin"
+        "no eligible mainnet candidate: the discovered trader's positions require no margin"
     );
     locker
         .register_scenario(scenario, Some(graph.clock.slot))
@@ -426,17 +430,17 @@ async fn maintenance_margin_stress_raises_the_live_requirement() {
     );
 }
 
-async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixLiveGraph) {
+async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixMainnetGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
-    let graph = phoenix_live_graph().await;
-    let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+    let graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
     (locker, graph)
 }
 
-/// A fork holding the deployed programs and every graph account, at the graph's clock.
-fn phoenix_fork(
-    graph: &PhoenixLiveGraph,
+/// A local VM holding the deployed programs and every graph account, at the graph's clock.
+fn phoenix_surfnet(
+    graph: &PhoenixMainnetGraph,
     eternal_program: &[u8],
     hawkeye_program: &[u8],
 ) -> SurfnetSvmLocker {
@@ -461,8 +465,8 @@ fn phoenix_fork(
     locker
 }
 
-async fn phoenix_live_graph() -> PhoenixLiveGraph {
-    let mut cache = live_graph_cache().lock().await;
+async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
+    let mut cache = mainnet_graph_cache().lock().await;
     match cache.as_ref() {
         Some(Ok(graph)) => return graph.clone(),
         Some(Err(reason)) => panic!("{reason}"),
@@ -471,7 +475,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
 
     let global_account = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
     let global = GlobalConfig::try_from_account_bytes(&global_account.data)
-        .expect("live GlobalConfig decodes");
+        .expect("mainnet GlobalConfig decodes");
     let perp_asset_map = Pubkey::new_from_array(global.perp_asset_map_key());
     let global_trader_index = Pubkey::new_from_array(global.global_trader_index_header_key());
     let active_trader_buffer = Pubkey::new_from_array(global.active_trader_buffer_header_key());
@@ -480,8 +484,8 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     let mut discovery = fetch(&[perp_asset_map, global_trader_index]).await;
     let map_account = discovery.remove(0);
     let index_account = discovery.remove(0);
-    let map =
-        PerpAssetMap::try_from_account_bytes(&map_account.data).expect("live PerpAssetMap decodes");
+    let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
+        .expect("mainnet PerpAssetMap decodes");
     let mut markets = Vec::new();
     let mut addresses = vec![
         PHOENIX_GLOBAL_CONFIG,
@@ -493,7 +497,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         let entry = map
             .find_by_symbol(symbol)
             .expect("symbol lookup")
-            .expect("live SOL/BTC market");
+            .expect("mainnet SOL/BTC market");
         let orderbook =
             Pubkey::new_from_array(entry.metadata.static_market_params().market_account);
         let spline = derive_spline_collection_address(&PHOENIX_ETERNAL_PROGRAM_ID, &orderbook);
@@ -507,7 +511,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     // Every hot Trader is a candidate, in address order, so the pick moves only when it or a
     // trader ahead of it changes.
     let mut candidates: Vec<Pubkey> = index_trader_state_ranges(&index_account)
-        .expect("live GlobalTraderIndex should walk")
+        .expect("mainnet GlobalTraderIndex should walk")
         .into_iter()
         .map(|(trader, _)| trader)
         .collect();
@@ -553,7 +557,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         let clock: Clock = bincode::deserialize(&clock_account.data).unwrap();
         assert!(clock.slot > 0);
 
-        let mut graph = PhoenixLiveGraph {
+        let mut graph = PhoenixMainnetGraph {
             clock,
             accounts: dependencies.iter().chain(&traders).cloned().collect(),
             global_trader_index,
@@ -565,11 +569,11 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
         // A trader that left the index since it was listed is no longer hot.
         let indexed: HashSet<Pubkey> =
             index_trader_state_ranges(graph.account(&global_trader_index))
-                .expect("live GlobalTraderIndex should walk")
+                .expect("mainnet GlobalTraderIndex should walk")
                 .into_iter()
                 .map(|(trader, _)| trader)
                 .collect();
-        let locker = phoenix_fork(&graph, &eternal_program, &hawkeye_program);
+        let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
         for (trader, account) in traders
             .iter()
             .filter(|(trader, _)| indexed.contains(trader))
@@ -592,7 +596,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
     }
 
     let reason = format!(
-        "no eligible live candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
+        "no eligible mainnet candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
          collateral, a position Hawkeye margins and a healthy account{}",
         last_error
             .map(|error| format!("; the last margin view that failed was {error}"))
@@ -603,7 +607,7 @@ async fn phoenix_live_graph() -> PhoenixLiveGraph {
 }
 
 #[derive(Clone)]
-struct PhoenixLiveGraph {
+struct PhoenixMainnetGraph {
     clock: Clock,
     accounts: Vec<(Pubkey, Account)>,
     global_trader_index: Pubkey,
@@ -614,18 +618,18 @@ struct PhoenixLiveGraph {
     markets: Vec<(String, Pubkey, Pubkey)>,
 }
 
-impl PhoenixLiveGraph {
+impl PhoenixMainnetGraph {
     fn account(&self, address: &Pubkey) -> &Account {
         self.accounts
             .iter()
             .find_map(|(key, account)| (key == address).then_some(account))
-            .unwrap_or_else(|| panic!("{address} is not in the live graph"))
+            .unwrap_or_else(|| panic!("{address} is not in the mainnet graph"))
     }
 }
 
 fn hawkeye_view(
     locker: &SurfnetSvmLocker,
-    graph: &PhoenixLiveGraph,
+    graph: &PhoenixMainnetGraph,
     discriminant: [u8; 8],
     extra_accounts: &[Pubkey],
 ) -> Vec<u8> {
@@ -636,7 +640,7 @@ fn hawkeye_view(
 /// The view's return data, or the transaction error and logs when the view fails.
 fn try_hawkeye_view(
     locker: &SurfnetSvmLocker,
-    graph: &PhoenixLiveGraph,
+    graph: &PhoenixMainnetGraph,
     discriminant: [u8; 8],
     extra_accounts: &[Pubkey],
 ) -> Result<Vec<u8>, String> {
@@ -674,14 +678,14 @@ fn try_hawkeye_view(
     })
 }
 
-fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixLiveGraph) -> HawkeyeMarginView {
+fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph) -> HawkeyeMarginView {
     try_hawkeye_margin(locker, graph)
         .unwrap_or_else(|e| panic!("Hawkeye margin view failed for {}: {e}", graph.trader))
 }
 
 fn try_hawkeye_margin(
     locker: &SurfnetSvmLocker,
-    graph: &PhoenixLiveGraph,
+    graph: &PhoenixMainnetGraph,
 ) -> Result<HawkeyeMarginView, String> {
     let data = try_hawkeye_view(
         locker,
@@ -701,7 +705,7 @@ fn try_hawkeye_margin(
 }
 
 fn hawkeye_bbo_for_market(
-    graph: &PhoenixLiveGraph,
+    graph: &PhoenixMainnetGraph,
     locker: &SurfnetSvmLocker,
     orderbook: Pubkey,
     spline: Pubkey,

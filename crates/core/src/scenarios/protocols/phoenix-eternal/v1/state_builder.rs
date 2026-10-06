@@ -13,7 +13,7 @@ use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::collateral::{
-    ensure_collateral_floor, index_trader_state_range, live_quote_lot_collateral,
+    current_quote_lot_collateral, ensure_collateral_floor, index_trader_state_range,
     parse_quote_lot_collateral, trader_header, validate_hot_trader_fields,
 };
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
 
 pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih");
-// Singletons that GlobalConfig points at; the live suite checks them against GlobalConfig.
+// Singletons that GlobalConfig points at; the mainnet tests check them against GlobalConfig.
 pub const PHOENIX_PERP_ASSET_MAP: Pubkey =
     Pubkey::from_str_const("2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC");
 pub const PHOENIX_GLOBAL_TRADER_INDEX: Pubkey =
@@ -44,7 +44,7 @@ const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
 const MAX_RISK_FACTOR_BPS: u16 = 10_000;
 const PREPARATION_SLOT: u64 = 0;
 
-/// What a caller can name a market by, and the live values a relative change starts from.
+/// What a caller can name a market by, and the current values a relative change starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhoenixMarket {
     pub symbol: String,
@@ -334,8 +334,8 @@ async fn prepare_trader_override(
             }
             Some(index)
         }
-        // A fork's index can predate the Trader leaving the hot set, and Phoenix keeps reading a
-        // Trader the index lists from its record.
+        // The local GlobalTraderIndex can predate the Trader leaving the hot set, and Phoenix
+        // keeps reading a Trader the index lists from its record.
         Some(_) => svm
             .inner
             .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
@@ -344,7 +344,10 @@ async fn prepare_trader_override(
     };
     let mut values = values.clone();
     if let Some(target) = target {
-        ensure_collateral_is_lowered(live_quote_lot_collateral(&header, index.as_ref())?, target)?;
+        ensure_collateral_is_lowered(
+            current_quote_lot_collateral(&header, index.as_ref())?,
+            target,
+        )?;
         values.insert(
             COLLATERAL_FIELD.to_string(),
             serde_json::Value::from(target),
@@ -413,7 +416,7 @@ async fn prepare_trader_override(
     Ok(writes)
 }
 
-/// A hot Trader's live state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
+/// A hot Trader's current state is its GlobalTraderIndex record, so fetchBeforeUse refreshes that
 /// record too. If the fetch fails or lacks the trader, the local record stays.
 async fn refresh_index_record(
     index: &mut Account,
@@ -430,12 +433,12 @@ async fn refresh_index_record(
     else {
         return;
     };
-    if let (Ok(local), Ok(live)) = (
+    if let (Ok(local), Ok(upstream)) = (
         index_trader_state_range(index, trader_key),
         index_trader_state_range(&remote, trader_key),
-    ) && local.len() == live.len()
+    ) && local.len() == upstream.len()
     {
-        index.data[local].copy_from_slice(&remote.data[live]);
+        index.data[local].copy_from_slice(&remote.data[upstream]);
     }
 }
 
@@ -462,8 +465,8 @@ async fn phoenix_dependency(
     })?;
     let fetched = client.get_account(address, *commitment).await?;
     let account = fetched.clone().map_account()?;
-    // Fill the fork gap once instead of refetching the same dependency per override, the way a
-    // fork read does: the account is also indexed by owner, so getProgramAccounts serves the
+    // Fetch the dependency once instead of per override, the way any read from the upstream
+    // datasource does: the account is also indexed by owner, so getProgramAccounts serves the
     // local copy the override then patches.
     svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
     Ok(account)
@@ -507,7 +510,7 @@ pub fn build_phoenix_collateral_scenario(
 
     let mut scenario = Scenario::new(
         "Phoenix Trader Collateral Stress".to_string(),
-        "Set exact signed quote-lot collateral on a Phoenix Trader and its live index entry."
+        "Set exact signed quote-lot collateral on a Phoenix Trader, and on its record in the local GlobalTraderIndex when the index lists it."
             .to_string(),
     );
     scenario.tags = vec![
