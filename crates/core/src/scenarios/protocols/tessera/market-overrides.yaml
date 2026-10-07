@@ -216,13 +216,19 @@ templates:
       (capacity in base atoms); the buy ladder starts at 640 and fills quote-to-base buys (capacity
       in quote atoms). Capacities are directional quoting limits, not vault balances.
 
-      Only enabled levels quote, and how many are enabled differs per market, so read the selected
-      market account first. For a percentage cut, multiply every enabled level's capacity on the
-      chosen side by one ratio; leave disabled levels alone and never round a stored nonzero capacity
-      to zero. A fill smaller than the first level is unchanged, so only a large swap shows the change.
+      Only enabled levels quote, and how many are enabled differs per market. For a percentage cut,
+      read the chosen side's twenty capacities and multiply every nonzero one by one ratio; a
+      disabled level does not quote, so scaling it changes nothing. Never round a stored nonzero
+      capacity to zero. A fill smaller than the first level is unchanged, so only a large swap shows
+      the change.
+
+      READING THE STORED VALUES: make all twenty reads in one round, twenty getAccountInfo calls on
+      the market at once, each with encoding "base64" and dataSlice {"offset":<the property's
+      offset>,"length":8}. Each result is an 8-byte little-endian u64; an unused level reads 0. The
+      whole account is too large for base58.
 
       EXAMPLE - keep 10% of sell depth: sell_level_N_amount = floor(stored sell_level_N_amount * 1000 / 10000)
-      for every enabled sell level; leave the buy side unset.
+      for every nonzero sell level; leave the buy side unset.
 
   - id: tessera-curve
     name: Override Curve
@@ -307,6 +313,11 @@ templates:
       neighbours equal, so check that each result stays strictly below the one before it and lower
       an equal one by 1. A ratio that rounds a nonzero factor to zero disables that level.
 
+      READING THE STORED VALUES: make all twenty reads in one round, twenty getAccountInfo calls on
+      the market at once, each with encoding "base64" and dataSlice {"offset":<the property's
+      offset>,"length":8}. Each result is an 8-byte little-endian u64; an unused level reads 0. The
+      whole account is too large for base58.
+
       EXAMPLE - make selling base 50% worse: sell_level_N_factor = floor(stored * 5000 / 10000) for
       all twenty sell levels.
 
@@ -324,7 +335,7 @@ templates:
             count: 20
             stride: 24
         label: Sell liquidity enabled
-        description: Enabled flag of all twenty sell levels; only 0 is supported.
+        description: Enabled flag of all twenty sell levels, which fill base-to-quote sells; only 0 is supported.
       - path: buy_levels_enabled
         offset: 656
         encoding:
@@ -332,7 +343,7 @@ templates:
             count: 20
             stride: 24
         label: Buy liquidity enabled
-        description: Enabled flag of all twenty buy levels; only 0 is supported.
+        description: Enabled flag of all twenty buy levels, which fill quote-to-base buys; only 0 is supported.
     llm_context: |
       FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Resolve both token symbols with get_token_address, both calls at once; each result also
@@ -356,8 +367,11 @@ templates:
       Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
-      Each field halts one direction; set one to 0 for a one-sided halt, both for a full halt. Each writes the enabled flag of all twenty levels on its side,
-      after which the program rejects either swap direction with custom error 65535 (0xffff), the
-      same code as a stale quote. Clearing only the first level does not halt a quote that the
+      The ladders are named after the user's swap, not the maker's side: sell_levels_enabled halts
+      users selling the base token (base-to-quote), buy_levels_enabled halts users buying it
+      (quote-to-base). To stop buyers, set buy_levels_enabled. Set one to 0 for a one-sided halt,
+      both for a full halt. Each writes the enabled flag of all twenty levels on its side, after
+      which the program rejects that swap direction with custom error 65535 (0xffff), the same
+      code as a stale quote. Clearing only the first level does not halt a quote that the
       market starts at a later level. Writing 1 would enable levels whose capacity and factor were
       never configured, so only 0 is supported.
