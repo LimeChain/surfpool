@@ -39,6 +39,13 @@ Set `fetchBeforeUse: true` on every override, so the account is fetched from the
 datasource before its bytes are changed. Use `false` only for a later override that builds on
 state an earlier override of the same scenario prepared.
 
+Every Phoenix override also keeps the markets usable for the rest of the session. Oracle updates
+keep each market's readings fresh, and Phoenix refuses a market once its readings are older than
+its stale threshold times its hard-stale multiplier, or than the threshold alone when the
+multiplier is 0. Nothing refreshes them locally, so the override raises every market's
+threshold in the local PerpAssetMap instead, fetching the map first when it is not local yet.
+Prices and reading slots stay as they were.
+
 ## Traders in the GlobalTraderIndex
 
 Traders join and leave the GlobalTraderIndex all the time. The `GlobalTraderIndex` will be pulled
@@ -137,7 +144,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local VM nor the upstream datasource holds the Phoenix accounts. Start surfnet with a datasource that has the Phoenix deployment.                                     |
 | `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader joined the GlobalTraderIndex after it was pulled; Phoenix rejects its transactions too. Restart surfnet.                                                               |
-| `Cannot get mark price, staleness or validity check failed`                             | The local PerpAssetMap aged since it was pulled. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart surfnet. |
+| `Cannot get mark price, staleness or validity check failed`                             | No Phoenix scenario was played on this surfnet, so the PerpAssetMap kept its fetched stale thresholds and its oracle readings aged past them. Play any Phoenix scenario.          |
 
 ## Tests against mainnet
 

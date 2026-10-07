@@ -44,6 +44,10 @@ const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
 const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
 const MAX_RISK_FACTOR_BPS: u16 = 10_000;
 const PREPARATION_SLOT: u64 = 0;
+/// Phoenix refuses a market once its readings are older than its stale threshold times its `u8`
+/// `oracle_hard_stale_multiplier`, or than the threshold alone when that is 0. `u32::MAX` puts the
+/// limit beyond any session and keeps within a `u64`.
+const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 
 /// What a caller can name a market by, and the current values a relative change starts from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +187,54 @@ fn patch_maintenance_factor(
     })
 }
 
+/// The map with every market's spot and perp oracle stale threshold raised to
+/// [`RAISED_STALE_THRESHOLD_SLOTS`], or `None` when they already are. A higher threshold is kept.
+fn raise_stale_thresholds(account_pubkey: &Pubkey, data: &[u8]) -> SurfpoolResult<Option<Vec<u8>>> {
+    let decode_error = |error: PhoenixAccountDecodeError| {
+        price_patch_error(
+            account_pubkey,
+            format!("invalid Phoenix PerpAssetMap account: {error}"),
+        )
+    };
+    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
+    let price_len = size_of::<PriceComponent>();
+    let mut patched: Option<Vec<u8>> = None;
+    // The decoder walks the entries in storage order, and each market's metadata holds its own
+    // market account, so it occurs once in the map
+    let mut cursor = 0;
+    for entry in map.iter() {
+        let metadata = entry.map_err(decode_error)?.metadata;
+        let metadata_bytes = metadata.as_bytes();
+        let offset = data[cursor..]
+            .windows(metadata_bytes.len())
+            .position(|window| window == metadata_bytes)
+            .map(|position| cursor + position)
+            .ok_or_else(|| {
+                price_patch_error(account_pubkey, "Phoenix market metadata was not found")
+            })?;
+        cursor = offset + metadata_bytes.len();
+
+        // The PriceComponent is the metadata's first field.
+        let mut price = *metadata.oracle_price();
+        let mark = &mut price.mark_price;
+        let mut raised = false;
+        for threshold in [
+            &mut mark.spot_price_component.stale_threshold,
+            &mut mark.perp_price_component.stale_threshold,
+        ] {
+            if *threshold < RAISED_STALE_THRESHOLD_SLOTS {
+                *threshold = RAISED_STALE_THRESHOLD_SLOTS;
+                raised = true;
+            }
+        }
+        if raised {
+            patched.get_or_insert_with(|| data.to_vec())[offset..offset + price_len]
+                .copy_from_slice(bytemuck::bytes_of(&price));
+        }
+    }
+    Ok(patched)
+}
+
 fn patch_market_metadata(
     account_pubkey: &Pubkey,
     data: &[u8],
@@ -265,6 +317,8 @@ fn forge_phoenix_override(
 }
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
+/// Every Phoenix override also leaves the local PerpAssetMap's markets usable for the rest of the
+/// session; see `keep_oracle_readings_usable`.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     account_pubkey: &Pubkey,
@@ -280,6 +334,16 @@ pub async fn prepare_phoenix_override(
         Some(PhoenixAccount::PerpAssetMap) => {
             let mark_slot = svm.inner.get_sysvar::<Clock>().slot;
             let data = forge_phoenix_override(account_pubkey, account, values, mark_slot)?;
+            // This override writes the map Phoenix reads, so the thresholds go in the same write.
+            let data = match raise_stale_thresholds(account_pubkey, &data) {
+                Ok(raised) => raised.unwrap_or(data),
+                Err(e) => {
+                    warn!(
+                        "Could not raise the Phoenix PerpAssetMap's oracle stale thresholds: {e}"
+                    );
+                    data
+                }
+            };
             Ok(Some(vec![(
                 *account_pubkey,
                 Account {
@@ -288,17 +352,46 @@ pub async fn prepare_phoenix_override(
                 },
             )]))
         }
-        Some(PhoenixAccount::Trader) => prepare_trader_override(
-            svm,
-            account_pubkey,
-            account,
-            values,
-            remote_ctx,
-            fetch_before_use,
-        )
-        .await
-        .map(Some),
-        _ => Ok(None),
+        kind => {
+            keep_oracle_readings_usable(svm, remote_ctx).await;
+            match kind {
+                Some(PhoenixAccount::Trader) => prepare_trader_override(
+                    svm,
+                    account_pubkey,
+                    account,
+                    values,
+                    remote_ctx,
+                    fetch_before_use,
+                )
+                .await
+                .map(Some),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// Oracle updates keep every market's readings fresh, and Phoenix refuses a market whose readings
+/// are too old (see [`RAISED_STALE_THRESHOLD_SLOTS`]). Nothing refreshes them locally, so
+/// this raises the thresholds of the local PerpAssetMap, fetching it first when it is not local
+/// yet. Prices and reading slots stay as they were, and the markets stay usable however far the
+/// local Clock moves. A failure leaves the map as it was and never fails the override. It runs on
+/// every Phoenix override, before that override's own checks, since the map is needed whether or
+/// not the override applies; each run reads the whole map.
+async fn keep_oracle_readings_usable(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+) {
+    let kept = async {
+        let map = phoenix_dependency(svm, &PHOENIX_PERP_ASSET_MAP, remote_ctx).await?;
+        let Some(data) = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)? else {
+            return Ok(());
+        };
+        svm.set_account(&PHOENIX_PERP_ASSET_MAP, Account { data, ..map })
+    }
+    .await;
+    if let Err(e) = kept {
+        warn!("Could not raise the Phoenix PerpAssetMap's oracle stale thresholds: {e}");
     }
 }
 
@@ -965,5 +1058,267 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Where the fixture markets' PriceComponents start: after the 48-byte map header, each
+    /// 1584-byte entry holds a 16-byte symbol and then the metadata, which starts with them.
+    const PRICE_COMPONENT_STARTS: [usize; 2] = [48 + 16, 48 + 1_584 + 16];
+
+    /// The SOL fixture followed by a second market, a copy of SOL with its own symbol, mark and
+    /// thresholds, so a walk over the entries has a later market to find.
+    fn two_market_map_account() -> Account {
+        let mut account = perp_asset_map_account();
+        let [first, second] = PRICE_COMPONENT_STARTS.map(|start| start - 16);
+        account.data.copy_within(first..second, second);
+        let mut symbol = [0_u8; 16];
+        symbol[..3].copy_from_slice(b"BTC");
+        account.data[second..second + 16].copy_from_slice(&symbol);
+        let price_range =
+            PRICE_COMPONENT_STARTS[1]..PRICE_COMPONENT_STARTS[1] + size_of::<PriceComponent>();
+        let mut price: PriceComponent =
+            bytemuck::pod_read_unaligned(&account.data[price_range.clone()]);
+        price.mark_price.price.ticks = bytemuck::cast(12_345_u64);
+        price.mark_price.spot_price_component.stale_threshold = 25;
+        price.mark_price.perp_price_component.stale_threshold = 25;
+        account.data[price_range].copy_from_slice(bytemuck::bytes_of(&price));
+        // Two assets in two used slots.
+        account.data[24..26].copy_from_slice(&2_u16.to_le_bytes());
+        account.data[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        account
+    }
+
+    fn market(data: &[u8], symbol: &str) -> PerpAssetMetadata {
+        PerpAssetMap::try_from_account_bytes(data)
+            .unwrap()
+            .find_by_symbol(symbol)
+            .unwrap()
+            .unwrap()
+            .metadata
+    }
+
+    fn oracle_thresholds(data: &[u8], symbol: &str) -> (u64, u64) {
+        let mark = market(data, symbol).oracle_price().mark_price;
+        (
+            mark.spot_price_component.stale_threshold,
+            mark.perp_price_component.stale_threshold,
+        )
+    }
+
+    const RAISED_THRESHOLDS: (u64, u64) =
+        (RAISED_STALE_THRESHOLD_SLOTS, RAISED_STALE_THRESHOLD_SLOTS);
+
+    #[test]
+    fn raising_the_stale_thresholds_keeps_the_readings_of_every_market() {
+        let account = two_market_map_account();
+        assert_ne!(
+            market(&account.data, "SOL").oracle_price(),
+            market(&account.data, "BTC").oracle_price(),
+            "the markets differ, so a write to the wrong one shows"
+        );
+
+        let raised = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &account.data)
+            .unwrap()
+            .expect("upstream's thresholds are raised");
+
+        for symbol in ["SOL", "BTC"] {
+            let before = market(&account.data, symbol);
+            assert!(
+                oracle_thresholds(&account.data, symbol).0 < RAISED_STALE_THRESHOLD_SLOTS,
+                "{symbol}: the fixture carries upstream's thresholds"
+            );
+            let after = market(&raised, symbol);
+            let mut expected = before.oracle_price().mark_price;
+            expected.spot_price_component.stale_threshold = RAISED_STALE_THRESHOLD_SLOTS;
+            expected.perp_price_component.stale_threshold = RAISED_STALE_THRESHOLD_SLOTS;
+            assert_eq!(
+                after.oracle_price().mark_price,
+                expected,
+                "{symbol}: prices, reading slots and the book component stay as they were"
+            );
+            assert_eq!(after.risk_params(), before.risk_params(), "{symbol}");
+        }
+        let in_price_component = |index: usize| {
+            PRICE_COMPONENT_STARTS
+                .iter()
+                .any(|start| (*start..*start + size_of::<PriceComponent>()).contains(&index))
+        };
+        assert_eq!(raised.len(), account.data.len());
+        assert_eq!(
+            raised
+                .iter()
+                .zip(&account.data)
+                .enumerate()
+                .position(|(index, (after, before))| after != before && !in_price_component(index)),
+            None,
+            "nothing outside the markets' PriceComponents is written"
+        );
+        assert_eq!(
+            raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &raised).unwrap(),
+            None,
+            "a raised map is written once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_map_override_leaves_every_market_usable() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.inner
+            .set_account(PHOENIX_PERP_ASSET_MAP, two_market_map_account())
+            .unwrap();
+        let template = TemplateRegistry::new()
+            .get("phoenix-maintenance-margin-stress")
+            .expect("template")
+            .clone();
+        let mut scenario = Scenario::new("maintenance".to_string(), "maintenance".to_string());
+        scenario.add_override(
+            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (
+                    MAINTENANCE_FACTOR_FIELD.to_string(),
+                    serde_json::json!("9000"),
+                ),
+            ])),
+        );
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
+        let metadata = PerpAssetMap::try_from_account_bytes(&map.data)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata.risk_params().risk_factors[0], 9_000);
+        for symbol in ["SOL", "BTC"] {
+            assert_eq!(
+                oracle_thresholds(&map.data, symbol),
+                RAISED_THRESHOLDS,
+                "{symbol}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_map_override_still_applies_when_the_thresholds_cannot_be_raised() {
+        // A second entry with a non-ASCII symbol: finding SOL stops before it, raising every
+        // market's threshold does not.
+        let mut map = perp_asset_map_account();
+        map.data[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        map.data[1_632] = 0xFF;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.inner.set_account(PHOENIX_PERP_ASSET_MAP, map).unwrap();
+        let template = TemplateRegistry::new()
+            .get("phoenix-maintenance-margin-stress")
+            .expect("template")
+            .clone();
+        let mut scenario = Scenario::new("maintenance".to_string(), "maintenance".to_string());
+        scenario.add_override(
+            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
+                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+                (
+                    MAINTENANCE_FACTOR_FIELD.to_string(),
+                    serde_json::json!("9000"),
+                ),
+            ])),
+        );
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
+        let metadata = PerpAssetMap::try_from_account_bytes(&map.data)
+            .unwrap()
+            .find_by_symbol("SOL")
+            .unwrap()
+            .unwrap()
+            .metadata;
+        assert_eq!(metadata.risk_params().risk_factors[0], 9_000);
+    }
+
+    #[tokio::test]
+    async fn any_phoenix_override_leaves_the_local_map_usable() {
+        let trader = Pubkey::new_unique();
+        let funded = trader_account_for(trader, 500);
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
+            .unwrap();
+        svm.set_account(&trader, funded.clone()).unwrap();
+        let scenario = build_phoenix_collateral_scenario(trader, &funded, "100").unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let stressed = svm.get_account(&trader).unwrap().unwrap();
+        assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
+        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
+        assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+    }
+
+    #[tokio::test]
+    async fn override_on_any_other_phoenix_account_leaves_the_local_map_usable() {
+        const EXPIRES_AT_BYTE_RANGE: core::ops::Range<usize> = 88..96;
+        let permission = Pubkey::new_unique();
+        let mut data = vec![0_u8; 168];
+        data[..8].copy_from_slice(&PhoenixAccount::PermissionAccount.discriminant());
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
+            .unwrap();
+        svm.set_account(
+            &permission,
+            Account {
+                data,
+                ..trader_account()
+            },
+        )
+        .unwrap();
+        let mut scenario = Scenario::new("permission".to_string(), "permission".to_string());
+        scenario.add_override(
+            OverrideInstance::new(
+                "phoenix-permission-limits".to_string(),
+                0,
+                AccountAddress::Pubkey(permission.to_string()),
+            )
+            .with_values(HashMap::from([(
+                "expiresAtTimestamp".to_string(),
+                serde_json::json!(1),
+            )])),
+        );
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let expired = svm.get_account(&permission).unwrap().unwrap();
+        assert_eq!(expired.data[EXPIRES_AT_BYTE_RANGE], 1_i64.to_le_bytes());
+        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
+        assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+    }
+
+    #[tokio::test]
+    async fn an_override_still_applies_when_the_map_cannot_be_kept() {
+        let trader = Pubkey::new_unique();
+        let funded = trader_account_for(trader, 500);
+        // No local map and no upstream datasource to fetch one from.
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.set_account(&trader, funded.clone()).unwrap();
+        let scenario = build_phoenix_collateral_scenario(trader, &funded, "100").unwrap();
+        svm.register_scenario(scenario, Some(100)).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, 100)
+            .await
+            .unwrap();
+
+        let stressed = svm.get_account(&trader).unwrap().unwrap();
+        assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
+        assert_eq!(svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap(), None);
     }
 }
