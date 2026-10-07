@@ -1,0 +1,132 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these offsets describe schema-8 market accounts.
+version: v8
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: humidifi-price
+    name: Override Price
+    description: Move the fair value a HumidiFi market quotes around
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: fair_value
+        offset: 576
+        encoding:
+          u64_xor:
+            mask: 13355403898140455974
+        label: Fair value
+        description: >-
+          Quote atoms per base atom times 2^48, before HumidiFi's fixed XOR encoding. Pass it as a
+          decimal string.
+    llm_context: |
+      FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
+      mint needs those masked bytes, which you cannot compute. Work from a market address the user
+      gives. If they name only a pair, use the market Studio lists for it, or else ask for the
+      market address; if they give only an address, ask which pair it is, because its mints are
+      masked too. A HumidiFi market is a 1728-byte account owned by program
+      9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Put the market in the override's account as
+      {"pubkey":"<market>"} and set fetchBeforeUse as described below. The market address is never
+      an override value.
+
+      Before create_scenario, check that the market still trades: call getTokenAccountsByOwner with
+      three positional params, the market address, {"mint":"<mint>"} and {"encoding":"jsonParsed"},
+      once for each of the pair's mints, both at once. Every vault is owned by its market. If the
+      largest account for each mint holds almost nothing, say the market looks stopped instead of
+      preparing it.
+
+      PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote older than the market's
+      staleness limit before pricing, and nothing in the local VM republishes it. Apply
+      humidifi-freshness with a current quote in the same slot as this override.
+
+      fair_value is a raw ratio, not a human price:
+        fair_value = floor(price * 2^48 / 10^(base_decimals - quote_decimals))
+      where price is quote tokens per base token and get_token_address returns both tokens'
+      decimals. Pass the result as a decimal STRING; it can exceed what a JSON number holds
+      exactly.
+
+      EXAMPLE - SOL/USDC (9/6 decimals) at 208 USDC per SOL:
+        fair_value: "58546795155816"
+      which is floor(208 * 2^48 / 10^3).
+
+      DIRECTION: raising fair_value makes the base token more expensive, so a quote-to-base swap
+      returns proportionally less base. Halving it doubles that output, subject to the market's own
+      spread and inventory.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
+
+  - id: humidifi-freshness
+    name: Override Quote Freshness
+    description: Keep a HumidiFi quote current or make the market reject it as stale
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 616
+        encoding:
+          slot_xor:
+            lead: 0
+            mask: 7970776174128919018
+        label: Quote-slot offset
+        description: Relative to the slot where the override materializes; 0 means quoted now.
+      - path: max_staleness_slots
+        offset: 608
+        encoding:
+          u64_xor:
+            mask: 7970776174128919018
+        label: Staleness limit
+        description: Oldest quote age in slots that HumidiFi still fills; 200 emulates a current maker.
+    llm_context: |
+      FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
+      mint needs those masked bytes, which you cannot compute. Work from a market address the user
+      gives. If they name only a pair, use the market Studio lists for it, or else ask for the
+      market address; if they give only an address, ask which pair it is, because its mints are
+      masked too. A HumidiFi market is a 1728-byte account owned by program
+      9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Put the market in the override's account as
+      {"pubkey":"<market>"} and set fetchBeforeUse as described below. The market address is never
+      an override value.
+
+      Before create_scenario, check that the market still trades: call getTokenAccountsByOwner with
+      three positional params, the market address, {"mint":"<mint>"} and {"encoding":"jsonParsed"},
+      once for each of the pair's mints, both at once. Every vault is owned by its market. If the
+      largest account for each mint holds almost nothing, say the market looks stopped instead of
+      preparing it.
+
+      HumidiFi fills only while clock_slot - last_update_slot <= max_staleness_slots. Both words are
+      stored XORed with the same fixed key; the values you pass stay plaintext.
+
+      last_update_slot is a relative slot offset even though the stored word is an absolute slot.
+
+      CURRENT QUOTE: set last_update_slot to 0 and max_staleness_slots to 200 to emulate a current
+      maker. The market then quotes the price it already holds, or the price humidifi-price just
+      wrote, for 200 slots from the materialization slot. The limits stored in market accounts are
+      only a few slots, so without max_staleness_slots the quote expires almost at once. For a
+      longer scenario, schedule this template again in a later slot with fetchBeforeUse: false, so
+      the later write keeps earlier overrides.
+
+      STALE QUOTE: set last_update_slot to -1000 and leave max_staleness_slots unset. -1000 is past
+      every market's limit, so every swap on that market reverts with custom error 0xfaded
+      (1027565). Do not apply a fresh override afterwards.
+
+      EXACT BOUNDARY: also set max_staleness_slots. For a swap in the slot the override
+      materializes, last_update_slot -(max_staleness_slots + 1) rejects and one slot younger still
+      fills: the boundary is inclusive.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
+
+      HOW TO USE:
+      1. For a current quote set last_update_slot to 0 and max_staleness_slots to 200
+      2. For a stale quote set last_update_slot to -1000
+      3. If a swap happens after that, schedule this template again in that later slot with
+         fetchBeforeUse: false

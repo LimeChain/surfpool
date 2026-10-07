@@ -1,0 +1,66 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these vaults belong to schema-8 market accounts.
+version: v8
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+templates:
+  - id: humidifi-vault-balance
+    name: Override Vault Balance
+    description: Change one HumidiFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+    llm_context: |
+      FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
+      mint needs those masked bytes, which you cannot compute. Work from a market address the user
+      gives; if they name only a pair, use the market Studio lists for it, or else ask for the market
+      address.
+      A HumidiFi market is a 1728-byte account owned by program
+      9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Every vault is a token account owned by its
+      market, so it is found without unmasking:
+      1. Resolve the paying side's token with get_token_address; if the user gave only an address,
+         ask which pair it is. The base vault pays buys (quote in, base out); the quote vault pays
+         sells (base in, quote out).
+      2. Call getTokenAccountsByOwner with three positional params: the market address,
+         {"mint":"<mint>"}, then {"encoding":"jsonParsed"}. The vault is among the results, often
+         next to dust someone sent to the market. Keep the account holding the most tokens; if
+         every one holds almost nothing (a drained vault or an empty market), ask for the vault
+         address instead of guessing.
+      3. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
+         described below. The vault address is never an override value, and this template never
+         targets the market account.
+
+      The input-side vault only receives tokens, so lowering it leaves that direction's output
+      unchanged.
+
+      HumidiFi prices against its payout inventory: a thin payout vault that can still settle cuts
+      the quoted output drastically. An empty payout vault rejects the swap, usually with HumidiFi
+      custom error 49 (0x31); some markets leave it to the token transfer, which fails with the
+      token program's InsufficientFunds (custom error 1).
+      This does not set the mid-price; use humidifi-price for that.
+
+      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
+      returns each mint's decimals.
+
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
+
+      LOWER FOR STRESS TESTS. Raising a wrapped-SOL vault amount without matching lamports can
+      create an impossible token account, so lowering is the safe default.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
