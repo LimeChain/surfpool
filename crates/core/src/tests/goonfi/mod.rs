@@ -15,7 +15,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: &str = "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE";
 const PROGRAMDATA: &str = "124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s";
-const DEPLOYED_SLOT: u64 = 451334772;
+const DEPLOYED_SLOT: u64 = 453915006;
 const ORACLE_PROGRAM: &str = "dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu";
 const GLOBAL: &str = "BNrK9LpEn65QA4TyBLVSMdngW3XHj3xLfFPwGdCBv8wV";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -106,7 +106,7 @@ const FEATURED_MARKETS: [MarketDef; 4] = [
 ];
 
 /// Every market account the program owns, active and stopped, as of the deployment at slot
-/// 451334772. Each template must write only its own bytes on every one of them.
+/// 453915006. Each template must write only its own bytes on every one of them.
 const ALL_MARKETS: [&str; 36] = [
     "2GwiLfAEH1LCNPZtF5JzZUS2KvZ9dEhAyoQ8WLxeYNDY",
     "2U5S52n2L9Rr8vjDiEFRmHo5iQjJQg9zAgJ5nY1aWXK1",
