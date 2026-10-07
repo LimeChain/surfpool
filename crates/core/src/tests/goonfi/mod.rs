@@ -105,7 +105,7 @@ const FEATURED_MARKETS: [MarketDef; 4] = [
     },
 ];
 
-/// Every market account the program owns, live and stopped, as of the deployment at slot
+/// Every market account the program owns, active and stopped, as of the deployment at slot
 /// 451334772. Each template must write only its own bytes on every one of them.
 const ALL_MARKETS: [&str; 36] = [
     "2GwiLfAEH1LCNPZtF5JzZUS2KvZ9dEhAyoQ8WLxeYNDY",
@@ -160,7 +160,7 @@ struct State {
 }
 
 #[derive(Clone)]
-struct GoonfiFork {
+struct GoonfiFixture {
     def: MarketDef,
     elf: Arc<Vec<u8>>,
     global: Account,
@@ -176,8 +176,8 @@ struct GoonfiFork {
     unix_timestamp: i64,
 }
 
-impl GoonfiFork {
-    fn live(&self) -> State {
+impl GoonfiFixture {
+    fn upstream(&self) -> State {
         State {
             market: self.market.data.clone(),
             oracle: self.oracle.data.clone(),
@@ -207,8 +207,9 @@ fn u32_at(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
 }
 
-async fn forks() -> Arc<Vec<GoonfiFork>> {
-    static CACHE: tokio::sync::OnceCell<Arc<Vec<GoonfiFork>>> = tokio::sync::OnceCell::const_new();
+async fn fixtures() -> Arc<Vec<GoonfiFixture>> {
+    static CACHE: tokio::sync::OnceCell<Arc<Vec<GoonfiFixture>>> =
+        tokio::sync::OnceCell::const_new();
     CACHE
         .get_or_init(|| async {
             // The public endpoint refuses ProgramData and the global account batched with a market.
@@ -262,7 +263,7 @@ async fn forks() -> Arc<Vec<GoonfiFork>> {
                 }
                 let mints = fetch(&[&base_mint.to_string(), &quote_mint.to_string()]).await;
                 let decimals = |mint: &Account| u32::from(mint.data[44]);
-                // About 100 quote tokens each way, so no live price or balance is pinned.
+                // About 100 quote tokens each way, so no current price or balance is pinned.
                 let quote_trade = 100 * 10u64.pow(decimals(&mints[1]));
                 let base_trade = (100u128 * 10u128.pow(decimals(&mints[0])) * 1_000_000
                     / u128::from(bid)) as u64;
@@ -271,7 +272,7 @@ async fn forks() -> Arc<Vec<GoonfiFork>> {
                 {
                     continue;
                 }
-                out.push(GoonfiFork {
+                out.push(GoonfiFixture {
                     slot: u64::from(u32_at(&oracle.data, 16)),
                     unix_timestamp: (u64_at(&oracle.data, 24) / 1_000) as i64,
                     def,
@@ -335,14 +336,14 @@ fn assert_writes_within(before: &[u8], after: &[u8], allowed: std::ops::Range<us
     );
 }
 
-fn scaled(fork: &GoonfiFork, numerator: u64, denominator: u64, with_band: bool) -> State {
+fn scaled(fixture: &GoonfiFixture, numerator: u64, denominator: u64, with_band: bool) -> State {
     let scale = |data: &[u8], offset: usize| {
         serde_json::json!(
             (u128::from(u64_at(data, offset)) * u128::from(numerator) / u128::from(denominator))
                 as u64
         )
     };
-    let mut state = fork.live();
+    let mut state = fixture.upstream();
     state.oracle = apply_raw(
         "goonfi-price",
         &state.oracle,
@@ -350,7 +351,7 @@ fn scaled(fork: &GoonfiFork, numerator: u64, denominator: u64, with_band: bool) 
             ("bid_price_x1e6", scale(&state.oracle, 0)),
             ("ask_price_x1e6", scale(&state.oracle, 8)),
         ],
-        fork.slot,
+        fixture.slot,
     );
     if with_band {
         state.market = apply_raw(
@@ -360,7 +361,7 @@ fn scaled(fork: &GoonfiFork, numerator: u64, denominator: u64, with_band: bool) 
                 ("reference_price_a_x1e6", scale(&state.market, 1712)),
                 ("reference_price_b_x1e6", scale(&state.market, 1720)),
             ],
-            fork.slot,
+            fixture.slot,
         );
     }
     state
@@ -389,7 +390,7 @@ fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Account {
 
 /// `clock_slot` is absolute, so a test can age the oracle.
 fn run(
-    fork: &GoonfiFork,
+    fixture: &GoonfiFixture,
     state: &State,
     side: u8,
     amount_in: u64,
@@ -406,27 +407,31 @@ fn run(
     let mut svm = LiteSVM::new()
         .with_sigverify(false)
         .with_blockhash_check(false);
-    svm.add_program(program, &fork.elf)
+    svm.add_program(program, &fixture.elf)
         .map_err(|e| format!("add_program: {e:?}"))?;
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = clock_slot;
-    clock.unix_timestamp = fork.unix_timestamp + 1;
+    clock.unix_timestamp = fixture.unix_timestamp + 1;
     svm.set_sysvar(&clock);
 
-    let market = Pubkey::from_str_const(fork.def.market);
-    let oracle = Pubkey::from_str_const(fork.def.oracle);
-    let base_vault = Pubkey::from_str_const(fork.def.base_vault);
-    let quote_vault = Pubkey::from_str_const(fork.def.quote_vault);
+    let market = Pubkey::from_str_const(fixture.def.market);
+    let oracle = Pubkey::from_str_const(fixture.def.oracle);
+    let base_vault = Pubkey::from_str_const(fixture.def.base_vault);
+    let quote_vault = Pubkey::from_str_const(fixture.def.quote_vault);
     let global = Pubkey::from_str_const(GLOBAL);
-    let (base_mint, quote_mint) = (fork.base_mint.0, fork.quote_mint.0);
+    let (base_mint, quote_mint) = (fixture.base_mint.0, fixture.quote_mint.0);
     for (key, account, data) in [
-        (global, &fork.global, &fork.global.data),
-        (market, &fork.market, &state.market),
-        (oracle, &fork.oracle, &state.oracle),
-        (base_vault, &fork.base_vault, &state.base_vault),
-        (quote_vault, &fork.quote_vault, &state.quote_vault),
-        (base_mint, &fork.base_mint.1, &fork.base_mint.1.data),
-        (quote_mint, &fork.quote_mint.1, &fork.quote_mint.1.data),
+        (global, &fixture.global, &fixture.global.data),
+        (market, &fixture.market, &state.market),
+        (oracle, &fixture.oracle, &state.oracle),
+        (base_vault, &fixture.base_vault, &state.base_vault),
+        (quote_vault, &fixture.quote_vault, &state.quote_vault),
+        (base_mint, &fixture.base_mint.1, &fixture.base_mint.1.data),
+        (
+            quote_mint,
+            &fixture.quote_mint.1,
+            &fixture.quote_mint.1.data,
+        ),
     ] {
         let mut account = account.clone();
         account.data = data.clone();
@@ -510,7 +515,7 @@ fn assert_rejects(result: Result<u64, String>, code: &str, context: &str) {
     }
 }
 
-/// Every template writes only its own bytes on every market the program owns, live or stopped.
+/// Every template writes only its own bytes on every market the program owns, active or stopped.
 #[tokio::test]
 async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
     let mut markets = Vec::new();
@@ -536,19 +541,19 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
                 .data
                 .clone()
         };
-        let live = State {
+        let upstream = State {
             market: market.data.clone(),
             oracle: linked(208),
             base_vault: linked(144),
             quote_vault: linked(176),
         };
-        let slot = u64::from(u32_at(&live.oracle, 16));
+        let slot = u64::from(u32_at(&upstream.oracle, 16));
         for (id, data) in [
-            ("goonfi-price", &live.oracle),
-            ("goonfi-freshness", &live.oracle),
-            ("goonfi-reference-band", &live.market),
-            ("goonfi-vault-balance", &live.base_vault),
-            ("goonfi-vault-balance", &live.quote_vault),
+            ("goonfi-price", &upstream.oracle),
+            ("goonfi-freshness", &upstream.oracle),
+            ("goonfi-reference-band", &upstream.market),
+            ("goonfi-vault-balance", &upstream.base_vault),
+            ("goonfi-vault-balance", &upstream.quote_vault),
         ] {
             assert_eq!(
                 &apply_raw(id, data, &[], slot),
@@ -559,14 +564,14 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
 
         let price = apply_raw(
             "goonfi-price",
-            &live.oracle,
+            &upstream.oracle,
             &[
                 ("bid_price_x1e6", serde_json::json!(99_740_000u64)),
                 ("ask_price_x1e6", serde_json::json!(99_750_000u64)),
             ],
             slot,
         );
-        assert_writes_within(&live.oracle, &price, 0..16, "goonfi-price");
+        assert_writes_within(&upstream.oracle, &price, 0..16, "goonfi-price");
         assert_eq!(
             (u64_at(&price, 0), u64_at(&price, 8)),
             (99_740_000, 99_750_000)
@@ -574,32 +579,37 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
 
         let fresh = apply_raw(
             "goonfi-freshness",
-            &live.oracle,
+            &upstream.oracle,
             &[("last_update_slot", serde_json::json!(-7))],
             slot + 100,
         );
-        assert_writes_within(&live.oracle, &fresh, 16..20, "goonfi-freshness");
+        assert_writes_within(&upstream.oracle, &fresh, 16..20, "goonfi-freshness");
         assert_eq!(u64::from(u32_at(&fresh, 16)), slot + 93);
 
         let band = apply_raw(
             "goonfi-reference-band",
-            &live.market,
+            &upstream.market,
             &[
                 ("reference_price_a_x1e6", serde_json::json!(1u64)),
                 ("reference_price_b_x1e6", serde_json::json!(2u64)),
             ],
             slot,
         );
-        assert_writes_within(&live.market, &band, 1712..1728, "goonfi-reference-band");
+        assert_writes_within(&upstream.market, &band, 1712..1728, "goonfi-reference-band");
         assert_eq!((u64_at(&band, 1712), u64_at(&band, 1720)), (1, 2));
 
         let vault = apply_raw(
             "goonfi-vault-balance",
-            &live.quote_vault,
+            &upstream.quote_vault,
             &[("amount", serde_json::json!(123u64))],
             slot,
         );
-        assert_writes_within(&live.quote_vault, &vault, 64..72, "goonfi-vault-balance");
+        assert_writes_within(
+            &upstream.quote_vault,
+            &vault,
+            64..72,
+            "goonfi-vault-balance",
+        );
         assert_eq!(u64_at(&vault, 64), 123);
     }
 }
@@ -654,19 +664,26 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
 
     use crate::surfnet::svm::SurfnetSvm;
 
-    let fork = &forks().await[0];
-    let live = fork.live();
-    let live_bid = u64_at(&live.oracle, 0);
-    let target = live_bid * 3 / 2;
-    let baseline = run(fork, &live, SELL, fork.base_trade, fork.slot + 1).expect("baseline sell");
-    let expected = (u128::from(baseline) * u128::from(target) / u128::from(live_bid)) as u64;
+    let fixture = &fixtures().await[0];
+    let upstream = fixture.upstream();
+    let upstream_bid = u64_at(&upstream.oracle, 0);
+    let target = upstream_bid * 3 / 2;
+    let baseline = run(
+        fixture,
+        &upstream,
+        SELL,
+        fixture.base_trade,
+        fixture.slot + 1,
+    )
+    .expect("baseline sell");
+    let expected = (u128::from(baseline) * u128::from(target) / u128::from(upstream_bid)) as u64;
     let payout_capacity = expected / 2;
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     for (address, seeded) in [
-        (&fork.def.oracle, &fork.oracle),
-        (&fork.def.market, &fork.market),
-        (&fork.def.quote_vault, &fork.quote_vault),
+        (&fixture.def.oracle, &fixture.oracle),
+        (&fixture.def.market, &fixture.market),
+        (&fixture.def.quote_vault, &fixture.quote_vault),
     ] {
         svm.inner
             .set_account(Pubkey::from_str_const(address), seeded.clone())
@@ -680,7 +697,7 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
     for (template_id, target_account, values) in [
         (
             "goonfi-price",
-            &fork.def.oracle,
+            &fixture.def.oracle,
             vec![
                 ("bid_price_x1e6", serde_json::json!(target)),
                 ("ask_price_x1e6", serde_json::json!(target)),
@@ -688,12 +705,12 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
         ),
         (
             "goonfi-freshness",
-            &fork.def.oracle,
+            &fixture.def.oracle,
             vec![("last_update_slot", serde_json::json!(0))],
         ),
         (
             "goonfi-reference-band",
-            &fork.def.market,
+            &fixture.def.market,
             vec![
                 ("reference_price_a_x1e6", serde_json::json!(target)),
                 ("reference_price_b_x1e6", serde_json::json!(target)),
@@ -701,7 +718,7 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
         ),
         (
             "goonfi-vault-balance",
-            &fork.def.quote_vault,
+            &fixture.def.quote_vault,
             vec![("amount", serde_json::json!(payout_capacity))],
         ),
     ] {
@@ -719,9 +736,9 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
             ),
         );
     }
-    svm.register_scenario(scenario, Some(fork.slot))
+    svm.register_scenario(scenario, Some(fixture.slot))
         .expect("register the GoonFi scenario");
-    svm.materialize_overrides_for_slot(&None, fork.slot)
+    svm.materialize_overrides_for_slot(&None, fixture.slot)
         .await
         .expect("materialize every GoonFi override");
 
@@ -733,20 +750,36 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
             .data
     };
     let prepared = State {
-        market: materialized(fork.def.market),
-        oracle: materialized(fork.def.oracle),
-        base_vault: live.base_vault.clone(),
-        quote_vault: live.quote_vault.clone(),
+        market: materialized(fixture.def.market),
+        oracle: materialized(fixture.def.oracle),
+        base_vault: upstream.base_vault.clone(),
+        quote_vault: upstream.quote_vault.clone(),
     };
-    let limited_quote_vault = materialized(fork.def.quote_vault);
-    assert_writes_within(&live.oracle, &prepared.oracle, 0..20, "oracle overrides");
-    assert_writes_within(&live.market, &prepared.market, 1712..1728, "band override");
-    assert_writes_within(&live.quote_vault, &limited_quote_vault, 64..72, "vault");
-    assert_eq!(u64::from(u32_at(&prepared.oracle, 16)), fork.slot);
+    let limited_quote_vault = materialized(fixture.def.quote_vault);
+    assert_writes_within(
+        &upstream.oracle,
+        &prepared.oracle,
+        0..20,
+        "oracle overrides",
+    );
+    assert_writes_within(
+        &upstream.market,
+        &prepared.market,
+        1712..1728,
+        "band override",
+    );
+    assert_writes_within(&upstream.quote_vault, &limited_quote_vault, 64..72, "vault");
+    assert_eq!(u64::from(u32_at(&prepared.oracle, 16)), fixture.slot);
     assert_eq!(u64_at(&limited_quote_vault, 64), payout_capacity);
 
-    let filled = run(fork, &prepared, SELL, fork.base_trade, fork.slot + 1)
-        .expect("sell against the materialized price and band");
+    let filled = run(
+        fixture,
+        &prepared,
+        SELL,
+        fixture.base_trade,
+        fixture.slot + 1,
+    )
+    .expect("sell against the materialized price and band");
     assert!(
         filled.abs_diff(expected) <= expected / 500,
         "the materialized price must set the fill: {filled} vs ~{expected}"
@@ -757,34 +790,47 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
         ..prepared.clone()
     };
     assert_rejects(
-        run(fork, &capped, SELL, fork.base_trade, fork.slot + 1),
+        run(fixture, &capped, SELL, fixture.base_trade, fixture.slot + 1),
         INSUFFICIENT_LIQUIDITY,
         "a sell larger than the capped USDC inventory",
     );
     assert!(
-        run(fork, &capped, BUY, fork.quote_trade, fork.slot + 1).expect("the base side still pays")
+        run(fixture, &capped, BUY, fixture.quote_trade, fixture.slot + 1)
+            .expect("the base side still pays")
             > 0
     );
 }
 
 #[tokio::test]
 async fn goonfi_coupled_price_and_band_scale_the_fill_on_the_fixture_markets() {
-    let forks = forks().await;
-    for fork in forks.iter() {
-        let clock = fork.slot + 1;
-        let sell = run(fork, &fork.live(), SELL, fork.base_trade, clock)
-            .unwrap_or_else(|e| panic!("{} baseline sell: {e}", fork.def.pair));
-        let buy = run(fork, &fork.live(), BUY, fork.quote_trade, clock)
-            .unwrap_or_else(|e| panic!("{} baseline buy: {e}", fork.def.pair));
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        let clock = fixture.slot + 1;
+        let sell = run(
+            fixture,
+            &fixture.upstream(),
+            SELL,
+            fixture.base_trade,
+            clock,
+        )
+        .unwrap_or_else(|e| panic!("{} baseline sell: {e}", fixture.def.pair));
+        let buy = run(
+            fixture,
+            &fixture.upstream(),
+            BUY,
+            fixture.quote_trade,
+            clock,
+        )
+        .unwrap_or_else(|e| panic!("{} baseline buy: {e}", fixture.def.pair));
 
-        let doubled = scaled(fork, 2, 1, true);
-        let halved = scaled(fork, 1, 2, true);
-        let doubled_sell = run(fork, &doubled, SELL, fork.base_trade, clock)
-            .unwrap_or_else(|e| panic!("{} doubled sell: {e}", fork.def.pair));
-        let halved_sell = run(fork, &halved, SELL, fork.base_trade, clock)
-            .unwrap_or_else(|e| panic!("{} halved sell: {e}", fork.def.pair));
-        let halved_buy = run(fork, &halved, BUY, fork.quote_trade, clock)
-            .unwrap_or_else(|e| panic!("{} halved buy: {e}", fork.def.pair));
+        let doubled = scaled(fixture, 2, 1, true);
+        let halved = scaled(fixture, 1, 2, true);
+        let doubled_sell = run(fixture, &doubled, SELL, fixture.base_trade, clock)
+            .unwrap_or_else(|e| panic!("{} doubled sell: {e}", fixture.def.pair));
+        let halved_sell = run(fixture, &halved, SELL, fixture.base_trade, clock)
+            .unwrap_or_else(|e| panic!("{} halved sell: {e}", fixture.def.pair));
+        let halved_buy = run(fixture, &halved, BUY, fixture.quote_trade, clock)
+            .unwrap_or_else(|e| panic!("{} halved buy: {e}", fixture.def.pair));
 
         for (what, got, want) in [
             ("doubled sell", doubled_sell, sell * 2),
@@ -794,7 +840,7 @@ async fn goonfi_coupled_price_and_band_scale_the_fill_on_the_fixture_markets() {
             assert!(
                 got.abs_diff(want) <= want / 100,
                 "{} {what}: {got} vs {want}",
-                fork.def.pair
+                fixture.def.pair
             );
         }
     }
@@ -802,61 +848,62 @@ async fn goonfi_coupled_price_and_band_scale_the_fill_on_the_fixture_markets() {
 
 #[tokio::test]
 async fn goonfi_band_rejects_the_unfavourable_side_with_0x24_on_the_fixture_markets() {
-    let forks = forks().await;
-    for fork in forks.iter() {
-        let clock = fork.slot + 1;
-        let live = fork.live();
-        let bid = u64_at(&live.oracle, 0);
-        let ask = u64_at(&live.oracle, 8);
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        let clock = fixture.slot + 1;
+        let upstream = fixture.upstream();
+        let bid = u64_at(&upstream.oracle, 0);
+        let ask = u64_at(&upstream.oracle, 8);
         let price = |bid: u64, ask: u64| State {
             oracle: apply_raw(
                 "goonfi-price",
-                &live.oracle,
+                &upstream.oracle,
                 &[
                     ("bid_price_x1e6", serde_json::json!(bid)),
                     ("ask_price_x1e6", serde_json::json!(ask)),
                 ],
-                fork.slot,
+                fixture.slot,
             ),
-            ..live.clone()
+            ..upstream.clone()
         };
 
         let raised_bid = price(bid * 2, ask * 2);
         assert_rejects(
-            run(fork, &raised_bid, SELL, fork.base_trade, clock),
+            run(fixture, &raised_bid, SELL, fixture.base_trade, clock),
             PRICE_OUT_OF_BAND,
-            &format!("{} sell above an untouched band", fork.def.pair),
+            &format!("{} sell above an untouched band", fixture.def.pair),
         );
         let lowered_ask = price(bid / 2, ask / 2);
         assert_rejects(
-            run(fork, &lowered_ask, BUY, fork.quote_trade, clock),
+            run(fixture, &lowered_ask, BUY, fixture.quote_trade, clock),
             PRICE_OUT_OF_BAND,
-            &format!("{} buy below an untouched band", fork.def.pair),
+            &format!("{} buy below an untouched band", fixture.def.pair),
         );
         assert!(
-            run(fork, &raised_bid, BUY, fork.quote_trade, clock)
-                .unwrap_or_else(|e| panic!("{} buy is the favourable side: {e}", fork.def.pair))
+            run(fixture, &raised_bid, BUY, fixture.quote_trade, clock)
+                .unwrap_or_else(|e| panic!("{} buy is the favourable side: {e}", fixture.def.pair))
                 > 0
         );
         assert!(
-            run(fork, &lowered_ask, SELL, fork.base_trade, clock)
-                .unwrap_or_else(|e| panic!("{} sell is the favourable side: {e}", fork.def.pair))
-                > 0
+            run(fixture, &lowered_ask, SELL, fixture.base_trade, clock).unwrap_or_else(|e| panic!(
+                "{} sell is the favourable side: {e}",
+                fixture.def.pair
+            )) > 0
         );
     }
 }
 
 #[tokio::test]
 async fn goonfi_drained_payout_vault_rejects_only_its_direction_with_0x1() {
-    let forks = forks().await;
-    for fork in forks.iter() {
-        let clock = fork.slot + 1;
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        let clock = fixture.slot + 1;
         for side in [SELL, BUY] {
-            let live = fork.live();
-            let control = run(fork, &live, side, fork.trade(side), clock)
-                .unwrap_or_else(|e| panic!("{} control: {e}", fork.def.pair));
+            let upstream = fixture.upstream();
+            let control = run(fixture, &upstream, side, fixture.trade(side), clock)
+                .unwrap_or_else(|e| panic!("{} control: {e}", fixture.def.pair));
             let with_payout = |amount: u64| {
-                let mut state = fork.live();
+                let mut state = fixture.upstream();
                 let payout = if side == SELL {
                     &mut state.quote_vault
                 } else {
@@ -866,17 +913,23 @@ async fn goonfi_drained_payout_vault_rejects_only_its_direction_with_0x1() {
                     "goonfi-vault-balance",
                     payout,
                     &[("amount", serde_json::json!(amount))],
-                    fork.slot,
+                    fixture.slot,
                 );
                 state
             };
             // A sell's price ignores the quote vault, so its boundary is exact; buys price base inventory.
             if side == SELL {
                 assert_eq!(
-                    run(fork, &with_payout(control), side, fork.trade(side), clock),
+                    run(
+                        fixture,
+                        &with_payout(control),
+                        side,
+                        fixture.trade(side),
+                        clock
+                    ),
                     Ok(control),
                     "{}: a quote vault holding exactly the output must fill",
-                    fork.def.pair
+                    fixture.def.pair
                 );
             }
             let starved = if side == SELL {
@@ -886,15 +939,21 @@ async fn goonfi_drained_payout_vault_rejects_only_its_direction_with_0x1() {
             };
             for amount in [starved, 0] {
                 assert_rejects(
-                    run(fork, &with_payout(amount), side, fork.trade(side), clock),
+                    run(
+                        fixture,
+                        &with_payout(amount),
+                        side,
+                        fixture.trade(side),
+                        clock,
+                    ),
                     INSUFFICIENT_LIQUIDITY,
-                    &format!("{} side {side} payout vault at {amount}", fork.def.pair),
+                    &format!("{} side {side} payout vault at {amount}", fixture.def.pair),
                 );
             }
             let other = 1 - side;
             assert!(
-                run(fork, &with_payout(0), other, fork.trade(other), clock)
-                    .unwrap_or_else(|e| panic!("{} opposite side: {e}", fork.def.pair))
+                run(fixture, &with_payout(0), other, fixture.trade(other), clock)
+                    .unwrap_or_else(|e| panic!("{} opposite side: {e}", fixture.def.pair))
                     > 0
             );
         }
@@ -903,41 +962,48 @@ async fn goonfi_drained_payout_vault_rejects_only_its_direction_with_0x1() {
 
 #[tokio::test]
 async fn goonfi_freshness_restamps_a_stale_quote_and_a_negative_lead_rejects_with_0x15() {
-    let forks = forks().await;
-    for fork in forks.iter() {
-        let live = fork.live();
-        let fresh = run(fork, &live, SELL, fork.base_trade, fork.slot + 1).expect("fresh sell");
-        let later = fork.slot + 5_000;
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        let upstream = fixture.upstream();
+        let fresh = run(
+            fixture,
+            &upstream,
+            SELL,
+            fixture.base_trade,
+            fixture.slot + 1,
+        )
+        .expect("fresh sell");
+        let later = fixture.slot + 5_000;
         assert_rejects(
-            run(fork, &live, SELL, fork.base_trade, later),
+            run(fixture, &upstream, SELL, fixture.base_trade, later),
             STALE_ORACLE,
-            &format!("{} live oracle 5000 slots later", fork.def.pair),
+            &format!("{} upstream oracle 5000 slots later", fixture.def.pair),
         );
 
         let stamp = |lead: i64| State {
             oracle: apply_raw(
                 "goonfi-freshness",
-                &live.oracle,
+                &upstream.oracle,
                 &[("last_update_slot", serde_json::json!(lead))],
                 later,
             ),
-            ..live.clone()
+            ..upstream.clone()
         };
         for side in [SELL, BUY] {
-            let restamped = run(fork, &stamp(0), side, fork.trade(side), later)
-                .unwrap_or_else(|e| panic!("{} side {side} restamped: {e}", fork.def.pair));
+            let restamped = run(fixture, &stamp(0), side, fixture.trade(side), later)
+                .unwrap_or_else(|e| panic!("{} side {side} restamped: {e}", fixture.def.pair));
             assert!(restamped > 0);
             assert_rejects(
-                run(fork, &stamp(-2_000), side, fork.trade(side), later),
+                run(fixture, &stamp(-2_000), side, fixture.trade(side), later),
                 STALE_ORACLE,
-                &format!("{} side {side} lead -2000", fork.def.pair),
+                &format!("{} side {side} lead -2000", fixture.def.pair),
             );
         }
-        let restamped = run(fork, &stamp(0), SELL, fork.base_trade, later).unwrap();
+        let restamped = run(fixture, &stamp(0), SELL, fixture.base_trade, later).unwrap();
         assert!(
             restamped * 100 >= fresh * 99,
             "{}: restamped {restamped} vs fresh {fresh}",
-            fork.def.pair
+            fixture.def.pair
         );
     }
 }
