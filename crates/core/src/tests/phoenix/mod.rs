@@ -430,6 +430,62 @@ async fn maintenance_margin_stress_raises_the_mainnet_requirement() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
+    let later = |graph: &PhoenixMainnetGraph| {
+        let mut clock = graph.clock.clone();
+        clock.slot += 1_000_000;
+        clock
+    };
+
+    let (unplayed, graph) = phoenix_behavior_locker().await;
+    unplayed.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
+    let refused = try_hawkeye_margin(&unplayed, &graph)
+        .expect_err("with no Phoenix scenario played, the aged readings are refused");
+    assert!(
+        refused.contains("staleness or validity check failed"),
+        "{refused}"
+    );
+
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader_account = locker
+        .with_svm_reader(|svm| svm.get_account(&graph.trader))
+        .unwrap()
+        .unwrap();
+    let collateral = hawkeye_margin(&locker, &graph).collateral_quote_lots;
+    let scenario =
+        build_phoenix_collateral_scenario(graph.trader, &trader_account, &collateral.to_string())
+            .unwrap();
+    locker
+        .register_scenario(scenario, Some(graph.clock.slot))
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, graph.clock.slot)
+        .await
+        .unwrap();
+    let prepared = hawkeye_margin(&locker, &graph);
+
+    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
+    let kept = hawkeye_margin(&locker, &graph);
+    assert_eq!(
+        (
+            kept.collateral_quote_lots,
+            kept.effective_collateral_quote_lots,
+            kept.initial_margin_quote_lots,
+            kept.maintenance_margin_quote_lots,
+            kept.unrealized_pnl_quote_lots,
+        ),
+        (
+            prepared.collateral_quote_lots,
+            prepared.effective_collateral_quote_lots,
+            prepared.initial_margin_quote_lots,
+            prepared.maintenance_margin_quote_lots,
+            prepared.unrealized_pnl_quote_lots,
+        ),
+        "the trader is priced as when the scenario was played"
+    );
+}
+
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixMainnetGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
