@@ -21,37 +21,45 @@ templates:
         offset: 1712
         encoding: u64
         label: Reference price A
-        description: First reference anchor, quote per base times 10^6, independent of mint decimals.
+        description: Sell reference (quote per base times 10^6); sells reject while the bid is above it.
       - path: reference_price_b_x1e6
         offset: 1720
         encoding: u64
         label: Reference price B
-        description: Second reference anchor, quote per base times 10^6; their order is not fixed.
+        description: Buy reference (quote per base times 10^6); buys reject while the ask is below it.
     llm_context: |
       FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Resolve both token symbols with get_token_address, both calls at once.
-      2. Make two getProgramAccounts calls at once, each with two positional params: the program id
-         string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+      2. Make three getProgramAccounts calls at once, each with two positional params: the program
+         id string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
          {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
          {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
          {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
-         The second call uses dataSlice {"offset":144,"length":32}. Offset 0 is the market tag.
-         Each result's pubkey is a market for the pair; its data is the market's oracle in the
-         first call and its base vault in the second.
-      3. No result usually means a mistyped mint. Copy both mints again exactly from
-         get_token_address and repeat once before saying GoonFi has no market for the pair.
-      4. A single result is the market. Several results mean the pair also has stopped markets:
-         call getMultipleAccounts with encoding "jsonParsed" on their base vaults and keep the
-         market whose vault holds the most tokens. If every vault is empty, say so instead of
-         guessing.
-      5. Put the market in the override's account as {"pubkey":"<market>"} and set
-         fetchBeforeUse: true. A market address the user gives is used as is. The market address
-         is never an override value.
+         The second call uses dataSlice {"offset":144,"length":32} and the third
+         {"offset":176,"length":32}. Offset 0 is the market tag. Each result's pubkey is a market
+         for the pair. Its data is the market's oracle in the first call, its base vault in the
+         second and its quote vault in the third.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Always check the vaults, even for a single result, and before create_scenario: call
+         getMultipleAccounts with encoding "jsonParsed" on the vaults from the second and third
+         calls, never on the oracles from the first. Each vault comes back as a parsed spl-token
+         account with a tokenAmount; raw bytes mean an oracle was passed. The base vault pays buys
+         and the quote vault pays sells. Keep the market whose base vault holds the most tokens; a
+         pair can also have stopped markets. If both of its vaults hold almost nothing, say the
+         market looks stopped instead of preparing it; if one does, say which direction cannot fill.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its vaults with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":144,"length":32} and
+         {"offset":176,"length":32}, and check them as in step 4. The market address is never an
+         override value.
 
       PRECONDITION - MOVE THE BAND WITH THE PRICE. GoonFi checks the oracle quote against these two
-      reference prices before it fills. A sell whose oracle bid sits above the band, or a buy whose
-      oracle ask sits below it, rejects with custom error 0x24 (36). Every goonfi-price move needs
-      this template on the same market, scaled by the same factor, in the same scenario.
+      reference prices before it fills, and each has a fixed role, within a small per-market
+      tolerance. A sell whose oracle bid sits above reference A, or a buy whose oracle ask sits
+      below reference B, rejects with custom error 0x24 (36). Every goonfi-price move needs this
+      template on the same market, scaled by the same factor, in the same scenario.
 
       UNIT: quote per base times 10^6, the same scale as the oracle and independent of mint
       decimals. SOL at 99.74 USDC is 99740000.
@@ -59,15 +67,15 @@ templates:
       CONVERSION:
         reference_price_x1e6 = human_price * 10^6
 
-      Set both anchors. Their order on the live market is not fixed, so set both to the target price
-      or scale both by the same factor as the oracle.
+      Set both anchors to the target price, or scale both by the same factor as the oracle. Each
+      fill moves its own anchor: a sell sets A to the bid it filled at, a buy sets B to the ask.
 
       Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared. The market's oracle is
       at market bytes 208..240; its vaults are at 144..176 (base) and 176..208 (quote).
 
-      ONE-SIDED BLOCK: leaving the band untouched while raising only the bid blocks sells, and
-      lowering only the ask blocks buys. The other direction keeps filling.
+      ONE-SIDED BLOCK: leave the band untouched and raise only the bid above A to block sells, or
+      lower only the ask below B to block buys. The other direction keeps filling.
 
       EXAMPLE - "SOL is worth $150" on the selected SOL/USDC market, paired with goonfi-price:
         reference_price_a_x1e6: 150000000

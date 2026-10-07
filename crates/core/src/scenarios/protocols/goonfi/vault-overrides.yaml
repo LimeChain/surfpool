@@ -25,33 +25,39 @@ templates:
     llm_context: |
       FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Resolve both token symbols with get_token_address, both calls at once.
-      2. Make two getProgramAccounts calls at once, each with two positional params: the program id
-         string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+      2. Make three getProgramAccounts calls at once, each with two positional params: the program
+         id string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
          {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
          {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
          {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
-         The second call uses dataSlice {"offset":144,"length":32}. Offset 0 is the market tag.
-         Each result's pubkey is a market for the pair; its data is the market's oracle in the
-         first call and its base vault in the second.
-      3. No result usually means a mistyped mint. Copy both mints again exactly from
-         get_token_address and repeat once before saying GoonFi has no market for the pair.
-      4. A single result is the market. Several results mean the pair also has stopped markets:
-         call getMultipleAccounts with encoding "jsonParsed" on their base vaults and keep the
-         market whose vault holds the most tokens. If every vault is empty, say so instead of
-         guessing.
+         The second call uses dataSlice {"offset":144,"length":32} and the third
+         {"offset":176,"length":32}. Offset 0 is the market tag. Each result's pubkey is a market
+         for the pair. Its data is the market's oracle in the first call, its base vault in the
+         second and its quote vault in the third.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Always check the vaults, even for a single result, and before create_scenario: call
+         getMultipleAccounts with encoding "jsonParsed" on the vaults from the second and third
+         calls, never on the oracles from the first. Each vault comes back as a parsed spl-token
+         account with a tokenAmount; raw bytes mean an oracle was passed. The base vault pays buys
+         and the quote vault pays sells. Keep the market whose base vault holds the most tokens; a
+         pair can also have stopped markets. If both of its vaults hold almost nothing, say the
+         market looks stopped instead of preparing it; if one does, say which direction cannot fill.
       5. Read the vault that pays out with getAccountInfo on the market, encoding "base58" and
          dataSlice {"offset":144,"length":32} for the base vault or {"offset":176,"length":32} for
          the quote vault; the returned data is the vault address. A market address the user gives
          starts here.
-      6. Put the vault in the override's account as {"pubkey":"<vault>"} and set
-         fetchBeforeUse: true. The vault address is never an override value.
+      6. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
+         described below. The vault address is never an override value.
 
       PRECONDITION - SELECT A VAULT FROM THE MARKET. The base vault is stored at market bytes
       144..176 and the quote vault at 176..208. Do not apply this to the market or oracle account.
 
       Apply this to the actual base or quote SPL-token vault referenced by the GoonFi market. The
       base vault pays buys (quote in, base out); the quote vault pays sells (base in, quote out).
-      Lowering a payout vault below the requested output makes GoonFi reject with custom error 0x1.
+      Lowering a payout vault below the requested output makes the token transfer fail with the SPL
+      Token program's custom error 0x1 (insufficient funds).
       The opposite direction keeps filling.
 
       UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
