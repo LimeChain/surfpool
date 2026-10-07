@@ -132,7 +132,7 @@ templates:
 
       HOW TO USE:
       1. For a fresh quote set last_update_slot to 0
-      2. For a stale quote set it to -100, past every market's limit; use minus the limit only to
+      2. For a stale quote set it to -10000, past every market's limit; use minus the limit only to
          land on the boundary, e.g. -20 on a 20-slot market
       3. A fresh quote lasts its limit; schedule this template again with fetchBeforeUse: false in
          each later slot where a quote is needed, and never after a stale override you want to keep
@@ -319,7 +319,7 @@ templates:
       whole account is too large for base58.
 
       EXAMPLE - make selling base 50% worse: sell_level_N_factor = floor(stored * 5000 / 10000) for
-      all twenty sell levels.
+      every sell level, then apply the strict-descent check above.
 
   - id: tessera-halt
     name: Halt Liquidity

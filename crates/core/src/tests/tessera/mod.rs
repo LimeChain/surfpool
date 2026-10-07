@@ -601,8 +601,8 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
             "{address} lost the observed market tag"
         );
         assert!(
-            read_u64(data, 88) < 100,
-            "{address} freshness limit must stay below the -100 the guidance uses for a stale quote"
+            read_u64(data, 88) < 10_000,
+            "{address} freshness limit must stay below the -10000 the guidance uses for a stale quote"
         );
 
         for template in &all_templates {
