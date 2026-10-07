@@ -8,8 +8,7 @@ into the market account, and two directional ladders of twenty levels decide how
 which output factor. It publishes no IDL, so every template writes the market account through a
 raw byte layout.
 
-Deployment: program `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`, last deployed at slot
-446053401; verified 2026-09-25.
+Program: `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`.
 
 ## Template index
 
@@ -32,7 +31,7 @@ Deployment: program `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`, last deployed
 | `*_levels_enabled`                  | enabled flag of all twenty levels on one side     | `0` halts that side                              |
 | `last_update_slot`                  | offset from the materialization slot              | `0` = updated now, `-20` = twenty slots old      |
 
-Price conversion, with both decimals taken from the selected market's metadata:
+Price conversion, with both decimals taken from the two mints:
 
 ```text
 quote_atoms_per_base_atom_x1e15 = price × 10^(quote_decimals - base_decimals) × 10^15
@@ -46,8 +45,9 @@ sell output = floor(base_in  × quote_atoms_per_base_atom_x1e15 × sell_level_0_
 buy output  = floor(quote_in × base_atoms_per_quote_atom_x1e15 × buy_level_0_factor  / 10^21)
 ```
 
-As a fork ages, the program can switch to a later one of the five quote-start configs at offset 1136.
-The last one pays 75 ppm less on SOL / USDC, so a fill can land up to that much below these formulas.
+As the market's local copy ages, the program can switch to a later one of the five quote-start
+configs at offset 1136. The last one pays 75 ppm less on SOL / USDC, so a fill can land up to that
+much below these formulas.
 
 ### Layout
 
@@ -74,30 +74,30 @@ quote skip leading levels, and two consumed-depth words at 0 and 8 are not expos
 
 ## Picking a market
 
-Every template starts with a market picker. When Studio or an MCP client opens a Tessera template,
-its options are read from the surfnet: every 1264-byte Tessera account with market tag `5` at
-offset 96 and a price in both directions, SOL / USDC first and then the most recently quoted. A
-market without a price has every level disabled and cannot fill. Nothing is hidden by age, so no
-market drops out as a fork ages or time travels. Markets the maker no longer quotes sink to the
-end; their `last_update_slot` trails the live ones by tens of millions of slots. On 2026-10-05 the
-program had 27 markets: 20 priced, 11 of them quoted live:
+The templates have no default account, and the backend embeds no market catalog. Studio offers a
+short list of featured markets and also accepts a market address directly; API and MCP callers must
+provide the market account in the override. Every template writes the market account itself.
 
-| Choice                         | Best suited for                                       |
-| ------------------------------ | ----------------------------------------------------- |
-| SOL / USDC, SOL / USDT         | SOL price shocks and stablecoin-quote comparisons     |
-| cbBTC / USDC, ETH / USDC       | majors with 8-decimal base tokens                     |
-| JLP / SOL                      | a quote token that is not a stablecoin                |
-| JTO, HYPE, RAY, PUMP, USELESS  | long-tail tokens quoted in USDC; PUMP is Token-2022   |
+Studio includes four featured markets:
 
-The picker supplies the market account to the template. SOL / USDC is listed first and is the
-default when no market is chosen. Each option's metadata carries the pair, both mints, both decimals and the
-market's `freshness_limit_slots`, which the price and freshness formulas need. A BONK / USDC market
-cannot be priced through `tessera-price`: its base-per-quote price exceeds the u64 field.
+| Choice       | Best suited for                                       |
+| ------------ | ----------------------------------------------------- |
+| SOL / USDC   | SOL price shocks, halts and depth tests               |
+| cbBTC / USDC | a major with an 8-decimal base token                  |
+| JLP / SOL    | a quote token that is not a stablecoin                |
+| PUMP / USDC  | a long-tail token whose mint is a Token-2022 account  |
 
-`/v1/scenarios/templates` lists the templates without these options, so it never waits on the
-network. API callers must provide the market account in the override.
+For any other pair, each template's LLM guidance finds the market on the program: one
+`getProgramAccounts` call filters the program's accounts by market tag `5` at offset 96 and the two
+mints at 24 and 56. A market without a price in both directions has every level disabled and
+cannot fill, so the guidance says so instead of preparing it.
 
-Use `fetchBeforeUse: true` so the selected market is forked before its bytes are changed.
+A BONK / USDC market cannot be priced through `tessera-price`: its base-per-quote price exceeds
+the u64 field.
+
+Use `fetchBeforeUse: true` so the selected market is loaded into the local VM from the upstream
+datasource before its bytes are changed. A later override that builds on an earlier one in the same
+scenario uses `false`, or the re-fetch undoes the earlier write.
 
 ## Two rules that prevent misleading scenarios
 
@@ -105,11 +105,11 @@ Use `fetchBeforeUse: true` so the selected market is forked before its bytes are
 freshness limit old with custom error 65535, so a correct price or depth change can appear to do
 nothing. Apply
 `tessera-freshness` with `last_update_slot: 0` alongside every price, depth or curve change, and
-schedule it again in each later slot where a quote is needed.
+schedule it again, with `fetchBeforeUse: false`, in each later slot where a quote is needed.
 
-**2. Change a ladder as a whole.** The live ladder has a different number of enabled levels on each
-market and side, and the maker can pull a side at any moment. Read the live account first, scale
-every enabled level on the side you stress by one ratio, and keep factors descending.
+**2. Change a ladder as a whole.** The stored ladder has a different number of enabled levels on
+each market and side, and the maker can pull a side at any moment. Read the selected market account
+first, scale every enabled level on the side you stress by one ratio, and keep factors descending.
 
 ## Scenario ideas
 
@@ -146,8 +146,8 @@ Use this to test order splitting when Tessera's depth drops.
 Use this to test fallback routing when Tessera stops updating.
 
 1. Choose the market in `tessera-freshness`.
-2. Set `last_update_slot` to minus the market's `freshness_limit_slots`, for example `-20` on
-   SOL / USDC.
+2. Set `last_update_slot` to minus the market's freshness limit (the u64 at bytes 88..96), for
+   example `-20` on SOL / USDC.
 3. Confirm both directions fail with custom error 65535 and that one slot younger still fills.
 
 ### Maker pulls all liquidity
@@ -159,7 +159,7 @@ Use this to test fallback routing when Tessera stops updating.
 
 Use this to test a router's slippage limit when Tessera reprices after the router quoted it.
 
-1. Add `tessera-freshness` with `last_update_slot: 0` at the first slot, so the live price quotes.
+1. Add `tessera-freshness` with `last_update_slot: 0` at the first slot, so the stored price quotes.
 2. Two slots later, add `tessera-price` 1% lower in both directions and `tessera-freshness` again.
 3. Quote a swap in the first slot and fill it after the move. The fill pays 1% less, and a tight
    slippage limit must reject it.
@@ -192,14 +192,14 @@ template: tessera-freshness
 last_update_slot: 0
 ```
 
-A fresh quote lasts `freshness_limit_slots` slots. Schedule the template again in each later slot
-where a quote is needed.
+A fresh quote lasts the market's freshness limit. Schedule the template again, with
+`fetchBeforeUse: false`, in each later slot where a quote is needed.
 
 ## Make the quote stale
 
 ```text
 template: tessera-freshness
-last_update_slot: -20      # SOL/USDC freshness_limit_slots is 20
+last_update_slot: -20      # the SOL / USDC freshness limit is 20 slots
 ```
 
 The boundary is exclusive: `-19` still fills in the slot it lands, `-20` rejects, and every later
@@ -209,7 +209,7 @@ slot ages the quote by one more. Do not schedule a fresh override after it.
 
 ```text
 template: tessera-depth
-sell_level_N_amount: floor(live sell_level_N_amount × 1000 / 10000)   # every enabled sell level
+sell_level_N_amount: floor(stored sell_level_N_amount × 1000 / 10000)   # every enabled sell level
 ```
 
 Leave disabled levels and the other side unset. A capacity that rounds to zero disables its level.
@@ -218,7 +218,7 @@ Leave disabled levels and the other side unset. A capacity that rounds to zero d
 
 ```text
 template: tessera-curve
-sell_level_N_factor: floor(live sell_level_N_factor × 5000 / 10000)   # all twenty sell levels
+sell_level_N_factor: floor(stored sell_level_N_factor × 5000 / 10000)   # all twenty sell levels
 ```
 
 Scaling every factor by one ratio keeps them descending unless two close neighbours round to the same value, so check the result stays strictly descending. A factor equal to or larger than the level
@@ -242,7 +242,7 @@ Tessera fills swaps only through a router. A direct call must carry the DFlow se
 
 1. Start surfpool with `--skip-signature-verification`, so the sentinel needs no key.
 2. Play the scenario. Studio pauses the clock, so the quote stays fresh until Complete.
-3. Simulate the swap before sending it. On a fresh fork the send otherwise fails with
+3. Simulate the swap before sending it. On a fresh surfnet the send otherwise fails with
    "Failed to fetch accounts from remote".
 
 The instruction data is tag `0x11`, the direction (`1` sells base), the input amount and the
@@ -258,11 +258,11 @@ one per mint, and the USDC vault is shared by every USDC market.
 | Symptom                                               | Fix                                                                                   |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | `Custom(65535)` after a price, depth or curve change  | The quote is stale. Add `tessera-freshness` with `last_update_slot: 0` in that slot   |
-| `Custom(65535)` on a market you did not halt          | The maker pulled that side live; every level on it is disabled                        |
+| `Custom(65535)` on a market you did not halt          | The maker pulled that side upstream; every level on it is disabled                    |
 | `Custom(8)`                                           | A curve factor is not lower than the level before it; scale all factors by one ratio  |
 | Only one direction repriced                           | Set both price fields; 128 prices sells and 144 prices buys                           |
 | A depth change has no visible effect                  | The fill was smaller than the first level; use a larger swap                          |
-| A price change lands on the wrong account          | No owner or size check exists on raw writes; pick the market from the picker, which only offers Tessera market accounts |
+| A price change lands on the wrong account          | No owner or size check exists on raw writes; pick a featured market or check that a typed address is a Tessera market account |
 | `buy_levels_enabled: 1` re-enabled maker-disabled levels | Only 0 is supported; 1 makes the program quote levels the maker had pulled                                   |
 | Price field rejected as out of range                  | The reciprocal exceeds u64; the price is too small for that market's decimals         |
 | A stale override stops rejecting                      | A later `tessera-freshness` with a non-negative offset refreshed it; remove it        |

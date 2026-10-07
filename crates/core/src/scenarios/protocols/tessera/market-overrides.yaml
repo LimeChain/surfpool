@@ -9,12 +9,6 @@ tags:
   - prop-amm
   - swap
 
-constants:
-  market:
-    label: Tessera market
-    description: Choose a Tessera market. The list is every priced market the program has on the surfnet, SOL / USDC first, then the most recently quoted. A market whose last_update_slot trails the others by millions of slots is no longer quoted by its maker, so its swaps may not fill.
-    options: []
-
 templates:
   - id: tessera-price
     name: Override Price
@@ -38,17 +32,38 @@ templates:
           Base atoms paid per quote atom, times 10^15. Prices quote-to-base buys; the integer floor
           of 10^30 divided by quote_atoms_per_base_atom_x1e15.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once; each result also
+         carries the mint's decimals.
+      2. Call getProgramAccounts with two positional params: the program id string
+         "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
+         {"encoding":"base58","dataSlice":{"offset":128,"length":8},"filters":[
+         {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
+         Offset 96 is the market tag. The result's pubkey is the pair's market.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Before create_scenario, check the data, even for a single result: "11111111" means the
+         market quotes no price and cannot fill; say so instead of preparing it.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its price with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":128,"length":8}, and check it
+         as in step 4. The market address is never an override value.
+
       PRECONDITION - THE QUOTE MUST BE FRESH. Tessera rejects a quote whose last update is at least
-      the market's freshness_limit_slots old with custom error 65535 (0xffff), so a correct price can
+      the market's freshness limit old with custom error 65535 (0xffff), so a correct price can
       appear to do nothing. Also apply tessera-freshness with last_update_slot 0 in the same slot.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
       Tessera stores one price per direction in raw atoms. Offset 128 alone moves base-to-quote
-      sells, offset 144 alone moves quote-to-base buys, so set both as one invariant. Read
-      base_decimals and quote_decimals from the selected market's metadata:
+      sells, offset 144 alone moves quote-to-base buys, so set both as one invariant. Take
+      base_decimals and quote_decimals from get_token_address. For a market address alone, read its
+      mints with getAccountInfo, encoding "base58" and dataSlice {"offset":24,"length":32} (base) or
+      {"offset":56,"length":32} (quote), then getMultipleAccounts with encoding "jsonParsed" on both
+      mints for their decimals:
         quote_atoms_per_base_atom_x1e15 = price * 10^(quote_decimals - base_decimals) * 10^15
         base_atoms_per_quote_atom_x1e15 = floor(10^30 / quote_atoms_per_base_atom_x1e15)
       Pass both as decimal integer strings.
@@ -56,8 +71,9 @@ templates:
       For a fill that starts and ends in the first ladder level:
         sell output = floor(base_in * quote_atoms_per_base_atom_x1e15 * sell_level_0_factor / 10^21)
         buy output  = floor(quote_in * base_atoms_per_quote_atom_x1e15 * buy_level_0_factor / 10^21)
-      A factor of 1000000 is neutral. As a fork ages the program can switch to a later quote-start
-      config; the last one pays 75 ppm less on SOL / USDC, so a fill can land up to that much below.
+      A factor of 1000000 is neutral. As the market's local copy ages the program can switch to a
+      later quote-start config; the last one pays 75 ppm less on SOL / USDC, so a fill can land up
+      to that much below.
 
       EXAMPLE - "SOL is worth $100" on SOL / USDC (9/6 decimals):
         quote_atoms_per_base_atom_x1e15: "100000000000000"
@@ -84,24 +100,43 @@ templates:
           Relative to the slot where the override materializes; 0 means updated now, a negative
           value ages the quote by that many slots.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once; each result also
+         carries the mint's decimals.
+      2. Call getProgramAccounts with two positional params: the program id string
+         "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
+         {"encoding":"base58","dataSlice":{"offset":128,"length":8},"filters":[
+         {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
+         Offset 96 is the market tag. The result's pubkey is the pair's market.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Before create_scenario, check the data, even for a single result: "11111111" means the
+         market quotes no price and cannot fill; say so instead of preparing it.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its price with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":128,"length":8}, and check it
+         as in step 4. The market address is never an override value.
+
       This one template covers both a fresh and a stale quote. The stored word is an absolute slot;
       the value is an offset from the slot where the override materializes, clamped at zero.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
-      Tessera rejects a quote whose age is at least the market's own limit, read from the selected
-      market's freshness_limit_slots metadata. The boundary is exclusive:
-      last_update_slot -(freshness_limit_slots - 1) still fills in the slot it materializes,
-      -freshness_limit_slots rejects both swap directions with custom error 65535 (0xffff), and
-      every later slot ages the quote by one more.
+      Tessera rejects a quote whose age is at least the market's own limit, a u64 at market bytes
+      88..96. The boundary is exclusive: last_update_slot -(limit - 1) still fills in the slot it
+      materializes, -limit rejects both swap directions with custom error 65535 (0xffff), and every
+      later slot ages the quote by one more.
 
       HOW TO USE:
       1. For a fresh quote set last_update_slot to 0
-      2. For a stale quote set it to minus the market's freshness_limit_slots, e.g. -20 on a 20-slot market
-      3. A fresh quote lasts freshness_limit_slots; schedule this template again in each later slot
-         where a quote is needed, and never after a stale override you want to keep stale
+      2. For a stale quote set it to -100, past every market's limit; use minus the limit only to
+         land on the boundary, e.g. -20 on a 20-slot market
+      3. A fresh quote lasts its limit; schedule this template again with fetchBeforeUse: false in
+         each later slot where a quote is needed, and never after a stale override you want to keep
+         stale
 
   - id: tessera-depth
     name: Override Depth
@@ -151,11 +186,29 @@ templates:
       - { path: buy_level_18_amount, offset: 1072, encoding: u64, label: "Buy level 19 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
       - { path: buy_level_19_amount, offset: 1096, encoding: u64, label: "Buy level 20 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once; each result also
+         carries the mint's decimals.
+      2. Call getProgramAccounts with two positional params: the program id string
+         "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
+         {"encoding":"base58","dataSlice":{"offset":128,"length":8},"filters":[
+         {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
+         Offset 96 is the market tag. The result's pubkey is the pair's market.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Before create_scenario, check the data, even for a single result: "11111111" means the
+         market quotes no price and cannot fill; say so instead of preparing it.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its price with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":128,"length":8}, and check it
+         as in step 4. The market address is never an override value.
+
       PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
       otherwise the swap rejects with custom error 65535 and the new depth is never used.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
       Each side is a ladder of twenty 24-byte levels: a u64 capacity at +0, a u64 output factor at
@@ -163,12 +216,12 @@ templates:
       (capacity in base atoms); the buy ladder starts at 640 and fills quote-to-base buys (capacity
       in quote atoms). Capacities are directional quoting limits, not vault balances.
 
-      Only enabled levels quote, and how many are enabled differs per market, so read the live
-      account first. For a percentage cut, multiply every enabled level's capacity on the chosen
-      side by one ratio; leave disabled levels alone and never round a live nonzero capacity to zero.
-      A fill smaller than the first level is unchanged, so only a large swap shows the change.
+      Only enabled levels quote, and how many are enabled differs per market, so read the selected
+      market account first. For a percentage cut, multiply every enabled level's capacity on the
+      chosen side by one ratio; leave disabled levels alone and never round a stored nonzero capacity
+      to zero. A fill smaller than the first level is unchanged, so only a large swap shows the change.
 
-      EXAMPLE - keep 10% of sell depth: sell_level_N_amount = floor(live sell_level_N_amount * 1000 / 10000)
+      EXAMPLE - keep 10% of sell depth: sell_level_N_amount = floor(stored sell_level_N_amount * 1000 / 10000)
       for every enabled sell level; leave the buy side unset.
 
   - id: tessera-curve
@@ -219,11 +272,29 @@ templates:
       - { path: buy_level_18_factor, offset: 1080, encoding: u64, label: "Buy level 19 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
       - { path: buy_level_19_factor, offset: 1104, encoding: u64, label: "Buy level 20 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once; each result also
+         carries the mint's decimals.
+      2. Call getProgramAccounts with two positional params: the program id string
+         "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
+         {"encoding":"base58","dataSlice":{"offset":128,"length":8},"filters":[
+         {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
+         Offset 96 is the market tag. The result's pubkey is the pair's market.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Before create_scenario, check the data, even for a single result: "11111111" means the
+         market quotes no price and cannot fill; say so instead of preparing it.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its price with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":128,"length":8}, and check it
+         as in step 4. The market address is never an override value.
+
       PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
       otherwise the swap rejects with custom error 65535 and the new curve is never used.
 
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
       The factor multiplies the directional price: output = input * price * factor / 10^21, so a
@@ -232,10 +303,11 @@ templates:
 
       Factors must strictly descend across a ladder. A level whose factor is equal to or larger than
       the one before it makes the program reject with custom error 8. To widen a side, read all
-      twenty live factors and multiply every nonzero one by the same ratio, which preserves the
-      ordering. A ratio that rounds a nonzero factor to zero disables that level.
+      twenty stored factors and multiply every nonzero one by the same ratio. Flooring can make two
+      neighbours equal, so check that each result stays strictly below the one before it and lower
+      an equal one by 1. A ratio that rounds a nonzero factor to zero disables that level.
 
-      EXAMPLE - make selling base 50% worse: sell_level_N_factor = floor(live * 5000 / 10000) for
+      EXAMPLE - make selling base 50% worse: sell_level_N_factor = floor(stored * 5000 / 10000) for
       all twenty sell levels.
 
   - id: tessera-halt
@@ -262,8 +334,26 @@ templates:
         label: Buy liquidity enabled
         description: Enabled flag of all twenty buy levels; only 0 is supported.
     llm_context: |
-      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
-      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once; each result also
+         carries the mint's decimals.
+      2. Call getProgramAccounts with two positional params: the program id string
+         "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
+         {"encoding":"base58","dataSlice":{"offset":128,"length":8},"filters":[
+         {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
+         Offset 96 is the market tag. The result's pubkey is the pair's market.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Before create_scenario, check the data, even for a single result: "11111111" means the
+         market quotes no price and cannot fill; say so instead of preparing it.
+      5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+         as described below. A market address the user gives is used as is; read its price with
+         getAccountInfo, encoding "base58" and dataSlice {"offset":128,"length":8}, and check it
+         as in step 4. The market address is never an override value.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared.
 
       Each field halts one direction; set one to 0 for a one-sided halt, both for a full halt. Each writes the enabled flag of all twenty levels on its side,

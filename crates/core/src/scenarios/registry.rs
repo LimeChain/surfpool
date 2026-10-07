@@ -1760,16 +1760,6 @@ templates: []
                     .is_some_and(|context| context.lines().count() >= 6),
                 "{id} needs substantive LLM guidance"
             );
-            assert_eq!(
-                template.address,
-                surfpool_types::AccountAddress::Pubkey(String::new()),
-                "{id} takes its default market from the first listed market"
-            );
-            let market = template.constants.get("market").expect("Tessera market");
-            assert!(
-                market.options.is_empty(),
-                "{id} lists its markets only when served"
-            );
             for property in &template.properties {
                 assert!(
                     property
@@ -1786,5 +1776,30 @@ templates: []
             checked, 85,
             "every shipped Tessera property must be checked"
         );
+    }
+
+    #[test]
+    fn tessera_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        let templates = registry.by_protocol("Tessera");
+        assert_eq!(templates.len(), 5);
+        for template in templates {
+            let id = &template.id;
+            assert_eq!(
+                template.address,
+                surfpool_types::AccountAddress::Pubkey(String::new()),
+                "{id} must require an explicit target account"
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{id} must not embed a backend account catalog"
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH")
+                ),
+                "{id} must say how to find its account on the program"
+            );
+        }
     }
 }
