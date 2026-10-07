@@ -2012,7 +2012,7 @@ impl SurfnetSvm {
 
     /// Applies an account mutation forged by a scenario and publishes it to subscribers.
     /// Upstream account hydration deliberately uses a different path and remains silent.
-    fn set_scenario_override_account(
+    pub(crate) fn set_scenario_override_account(
         &mut self,
         pubkey: &Pubkey,
         account: Account,

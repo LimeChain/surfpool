@@ -387,7 +387,11 @@ async fn keep_oracle_readings_usable(
         let Some(data) = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)? else {
             return Ok(());
         };
-        svm.set_account(&PHOENIX_PERP_ASSET_MAP, Account { data, ..map })
+        svm.set_scenario_override_account(
+            &PHOENIX_PERP_ASSET_MAP,
+            Account { data, ..map },
+            svm.get_latest_absolute_slot(),
+        )
     }
     .await;
     if let Err(e) = kept {
@@ -1243,9 +1247,11 @@ mod tests {
 
     #[tokio::test]
     async fn any_phoenix_override_leaves_the_local_map_usable() {
+        use crate::surfnet::GeyserEvent;
+
         let trader = Pubkey::new_unique();
         let funded = trader_account_for(trader, 500);
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
             .unwrap();
         svm.set_account(&trader, funded.clone()).unwrap();
@@ -1260,6 +1266,14 @@ mod tests {
         assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
         let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
         assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+        assert!(
+            geyser_rx.try_iter().any(|event| matches!(
+                event,
+                GeyserEvent::UpdateAccount(update)
+                    if update.pubkey == PHOENIX_PERP_ASSET_MAP && update.account == map
+            )),
+            "Geyser plugins receive the raised map"
+        );
     }
 
     #[tokio::test]
