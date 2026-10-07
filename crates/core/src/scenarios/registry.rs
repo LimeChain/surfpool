@@ -601,11 +601,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + HumidiFi (3) = 65
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + HumidiFi (4) = 66
         assert_eq!(
             registry.count(),
-            65,
-            "Registry should load 65 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -1007,8 +1007,8 @@ templates: []
 
         assert_eq!(
             registry.by_protocol("HumidiFi").len(),
-            3,
-            "Should have 3 HumidiFi templates"
+            4,
+            "Should have 4 HumidiFi templates"
         );
     }
 
@@ -1747,6 +1747,7 @@ templates: []
         for id in [
             "humidifi-price",
             "humidifi-freshness",
+            "humidifi-spread",
             "humidifi-vault-balance",
         ] {
             let template = registry
@@ -1774,7 +1775,7 @@ templates: []
             }
         }
         assert_eq!(
-            checked, 4,
+            checked, 8,
             "every shipped HumidiFi property must be checked"
         );
     }
@@ -1785,6 +1786,7 @@ templates: []
         for template_id in [
             "humidifi-price",
             "humidifi-freshness",
+            "humidifi-spread",
             "humidifi-vault-balance",
         ] {
             let template = registry.get(template_id).expect("HumidiFi template");

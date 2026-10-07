@@ -34,9 +34,12 @@ templates:
       9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Every vault is a token account owned by its
       market, so it is found without unmasking. ALWAYS do these steps, also when the user gives
       only an address:
-      1. Read the market's token accounts: call getTokenAccountsByOwner twice at once, with the
-         market address, {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} or
-         {"programId":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}, and {"encoding":"jsonParsed"}.
+      1. Read the market's token accounts: call Solana JSON-RPC getTokenAccountsByOwner twice at
+         once for the market address, once filtered by token program
+         TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA and once by
+         TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb, both with jsonParsed encoding. The filter
+         and the encoding are separate params: the market address, then
+         {"programId":"<token program>"}, then {"encoding":"jsonParsed"}.
       2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
          is the only other mint. If the results show more than one mint besides the stablecoin,
          or no stablecoin, ask which pair it is instead of guessing. The base vault pays buys
@@ -58,8 +61,8 @@ templates:
       with custom error 310 (0x136).
       This does not set the mid-price; use humidifi-price for that.
 
-      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
-      returns each mint's decimals.
+      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. The token accounts
+      from step 1 carry each mint's decimals.
 
       Apply this override once before the swap being tested. Do not schedule repeated vault resets
       across swaps: that can manufacture or erase inventory by undoing transaction-owned balance

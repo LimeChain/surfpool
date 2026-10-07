@@ -50,6 +50,13 @@ const FAIR_VALUE: std::ops::Range<usize> = 576..584;
 const MAX_STALENESS: std::ops::Range<usize> = 608..616;
 const LAST_UPDATE: std::ops::Range<usize> = 616..624;
 const AMOUNT: std::ops::Range<usize> = 64..72;
+const MAKER_SPREAD_MASK: u64 = 0x5041_56a2_2548_f8dc;
+const TIER_SPREADS: [(usize, u64); 3] = [
+    (176, 0x40f8_49d0_0057_07ba),
+    (256, 0x40f2_49da_005d_07b4),
+    (336, 0x40e4_49cc_004b_07ae),
+];
+const SPREAD_WORDS: [std::ops::Range<usize>; 4] = [800..808, 176..184, 256..264, 336..344];
 
 async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
     let client = SurfnetRemoteClient::new(
@@ -676,6 +683,15 @@ fn run(
     )
 }
 
+fn fixed_spread(bps: u64) -> [(&'static str, serde_json::Value); 4] {
+    [
+        ("spread", serde_json::json!(bps * 1_000)),
+        ("tier_1_spread", serde_json::json!("0")),
+        ("tier_2_spread", serde_json::json!("0")),
+        ("tier_3_spread", serde_json::json!("0")),
+    ]
+}
+
 fn priced_market(fixture: &HumidifiFixture, fair_value: u64) -> Vec<u8> {
     let priced = apply_raw(
         "humidifi-price",
@@ -735,7 +751,7 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
             );
         }
 
-        for template in ["humidifi-price", "humidifi-freshness"] {
+        for template in ["humidifi-price", "humidifi-freshness", "humidifi-spread"] {
             assert_eq!(
                 apply_raw(template, data, &[], 0),
                 *data,
@@ -773,6 +789,23 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
         );
         assert_only_within(data, &aged, &[LAST_UPDATE], address);
         assert_eq!(word(&aged, 616) ^ SLOT_MASK, slot - 3);
+
+        for (offset, mask) in TIER_SPREADS {
+            assert!(
+                (word(data, offset) ^ mask) >> 48 < 10_000,
+                "{address}: tier spread at {offset} no longer decodes to basis points"
+            );
+        }
+        let spread = apply_raw("humidifi-spread", data, &fixed_spread(25), slot);
+        assert_only_within(data, &spread, &SPREAD_WORDS, address);
+        assert_eq!(word(&spread, 800) ^ MAKER_SPREAD_MASK, 25_000);
+        for (offset, mask) in TIER_SPREADS {
+            assert_eq!(
+                word(&spread, offset) ^ mask,
+                0,
+                "{address}: tier spread at {offset}"
+            );
+        }
 
         for vault in [&fetched[1].data, &fetched[2].data] {
             assert_eq!(
@@ -858,6 +891,29 @@ async fn humidifi_price_moves_the_executed_fill_on_the_fixture_markets() {
         assert!(
             (ratio - 2.0).abs() < 0.02,
             "{}: a doubled fair value must halve the base bought, got {ratio}",
+            fixture.def.pair
+        );
+    }
+}
+
+#[tokio::test]
+async fn humidifi_spread_widens_the_executed_fill_on_the_fixture_markets() {
+    for fixture in fixtures().await.iter() {
+        let upstream = word(&fixture.market.data, 576) ^ FAIR_VALUE_MASK;
+        let priced = priced_market(fixture, upstream);
+        let outputs: Vec<u64> = [0, 100]
+            .into_iter()
+            .map(|bps| {
+                let market = apply_raw("humidifi-spread", &priced, &fixed_spread(bps), 0);
+                run(fixture, fixture.slot, market).unwrap_or_else(|e| {
+                    panic!("{} spread {bps} bps must fill: {e:?}", fixture.def.pair)
+                })
+            })
+            .collect();
+        let ratio = outputs[1] as f64 / outputs[0] as f64;
+        assert!(
+            (ratio - 1.0 / 1.01).abs() < 1e-4,
+            "{}: a 100 bps spread must cut the base bought by 1/1.01, got {ratio}",
             fixture.def.pair
         );
     }

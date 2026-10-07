@@ -1,7 +1,8 @@
 # HumidiFi
 
-A proprietary market maker (PMM), not an AMM. Three templates control the fair value a market
-quotes around, whether that quote is fresh enough to fill, and the vault inventory it pays from.
+A proprietary market maker (PMM), not an AMM. Four templates control the fair value a market
+quotes around, the spread it quotes at, whether that quote is fresh enough to fill, and the vault
+inventory it pays from.
 
 HumidiFi publishes no IDL. Every market word it reads is stored XORed with a fixed per-offset key,
 so the templates write through raw offsets with `u64_xor` and `slot_xor` encodings; the values you
@@ -14,6 +15,7 @@ pass stay plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, sch
 | ------------------------ | --------------------------------------------------------- |
 | `humidifi-price`         | the fair value HumidiFi quotes around                     |
 | `humidifi-freshness`     | whether the quote is current, and how old it may get      |
+| `humidifi-spread`        | the spread HumidiFi adds to each side of its fair value   |
 | `humidifi-vault-balance` | how many tokens HumidiFi has available to pay out a swap  |
 
 ## Number formats
@@ -23,6 +25,8 @@ pass stay plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, sch
 | `fair_value`          | quote atoms per base atom × 2^48, decimal string | SOL/USDC at 208 → `"58546795155816"`        |
 | `last_update_slot`    | offset from the materialization slot             | `0` = quoted now, `-1000` = stale           |
 | `max_staleness_slots` | oldest quote age in slots that still fills       | `2` on SOL/USDC                             |
+| `spread`              | thousandths of a basis point on each side        | `25000` = 25 bps on both sides              |
+| `tier_*_spread`       | basis points × 2^48, decimal string              | `"2814749767106560"` = 10 bps               |
 | vault `amount`        | that mint's smallest unit                        | `1000000` = 1 USDC                          |
 
 Price conversion is:
@@ -46,6 +50,10 @@ where `price` is quote tokens per base token. SOL/USDC has 9/6 decimals, so 208 
 | 576    | `u64_xor` `0xb957ed15dc877426`       | fair value          | quote atoms per base atom × 2^48 | `humidifi-price`         |
 | 608    | `u64_xor` `0x6e9de2b30b19f1ea`       | max staleness       | slots                            | `humidifi-freshness`     |
 | 616    | `slot_xor` `0x6e9de2b30b19f1ea`      | last update slot    | slot, written from an offset     | `humidifi-freshness`     |
+| 176    | `u64_xor` `0x40f849d0005707ba`       | first tier spread   | bps × 2^48                       | `humidifi-spread`        |
+| 256    | `u64_xor` `0x40f249da005d07b4`       | second tier spread  | bps × 2^48                       | `humidifi-spread`        |
+| 336    | `u64_xor` `0x40e449cc004b07ae`       | third tier spread   | bps × 2^48                       | `humidifi-spread`        |
+| 800    | `u64_xor` `0x504156a22548f8dc`       | spread              | thousandths of a bp              | `humidifi-spread`        |
 | 1720   | `u64`, plaintext                     | schema version      | version                          | read-only                |
 | 64     | `u64` (SPL token account)            | vault amount        | mint's smallest unit             | `humidifi-vault-balance` |
 
@@ -147,6 +155,24 @@ The offset is relative even though the account stores an XOR-masked absolute slo
 200 emulates a current maker for 200 slots; without it the quote expires within the stored limit of a
 few slots. For a longer scenario, schedule it again with `fetchBeforeUse: false`.
 
+## Set a fixed spread
+
+```text
+template: humidifi-spread
+spread: 25000                     # 25 bps on each side
+tier_1_spread: "0"
+tier_2_spread: "0"
+tier_3_spread: "0"
+```
+
+HumidiFi widens each side by S basis points: a buy pays `fair × (1 + S/10000)` and a sell
+receives `fair / (1 + S/10000)`. S is `spread / 1000` plus the spread of the size tier the trade
+falls in; the market sets its tiers by quote notional. The maker republishes `spread` with every
+quote upstream, while the local VM keeps the value it fetched until an override changes it. With
+the tiers at 0, every trade size prices at the set spread on both sides, apart from about 1 bp of
+inventory skew. A Jupiter swap in the local VM also pays HumidiFi's fallback spread (see
+Troubleshooting). Pair it with `humidifi-freshness`.
+
 ## Make the quote stale
 
 ```text
@@ -183,7 +209,8 @@ returns roughly a thousandth of its output. This is not an AMM reserve formula; 
 | `Custom(49)` after lowering a vault                       | The payout vault is empty; HumidiFi refuses the swap itself                          |
 | Token program `Custom(1)` (InsufficientFunds)             | The payout vault is empty on a market that leaves the refusal to the token transfer  |
 | `Custom(310)` (`0x136`) in both directions                | Both vaults are empty                                                                |
+| A Jupiter swap in the local VM prices about 100 bps wider | Jupiter's swap carries a 16-slot window of upstream slots, and the local VM's clock is outside it, so HumidiFi adds the fallback spread stored in the shared account `Fnf3RYYN4uHEzUnCNAbeN4LrezyAbSJZ6Digr2ActVXC` at offset 536 (100 bps upstream). It applies to every template on every market; compare with a control run |
 | Output collapses after lowering a vault                   | The payout vault is thin; HumidiFi prices against inventory                          |
-| Price is off by a power of ten                            | Use both tokens' decimals from `get_token_address` in the formula                    |
+| Price is off by a power of ten                            | Use both mints' decimals from the market's token accounts in the formula             |
 | A vault override has no effect                            | It targets a dust account; use the market-owned account holding the most tokens      |
 | A vault balance returns after a swap                      | Remove the later vault reset; it is undoing transaction-owned state                  |
