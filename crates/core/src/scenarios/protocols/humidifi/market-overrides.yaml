@@ -31,27 +31,36 @@ templates:
       FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
       mint needs those masked bytes, which you cannot compute. Work from a market address the user
       gives. If they name only a pair, use the market Studio lists for it, or else ask for the
-      market address; if they give only an address, ask which pair it is, because its mints are
-      masked too. A HumidiFi market is a 1728-byte account owned by program
+      market address. Never call getProgramAccounts on the HumidiFi program: the masked mints
+      cannot be matched, and the result is very large. A HumidiFi market is a 1728-byte account
+      owned by program
       9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Put the market in the override's account as
       {"pubkey":"<market>"} and set fetchBeforeUse as described below. The market address is never
-      an override value.
+      an override value. An "Invalid pubkey" error means an address was copied wrong; copy it
+      again exactly and retry.
 
-      Before create_scenario, check that the market still trades: call getTokenAccountsByOwner with
-      three positional params, the market address, {"mint":"<mint>"} and {"encoding":"jsonParsed"},
-      once for each of the pair's mints, both at once. Every vault is owned by its market. If the
-      largest account for each mint holds almost nothing, say the market looks stopped instead of
-      preparing it.
+      BEFORE create_scenario, ALWAYS do these steps, also when the user gives only an address:
+      1. Read the market's token accounts: call getTokenAccountsByOwner twice at once, with the
+         market address, {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} or
+         {"programId":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}, and {"encoding":"jsonParsed"}.
+         Every vault is a token account owned by its market, and its mint is not masked.
+      2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
+         is the only other mint. Tokens someone sent to the market can sit next to the vaults, so
+         if the results show more than one mint besides the stablecoin, or no stablecoin, ask
+         which pair it is instead of guessing. Each result carries its mint's decimals. Name the
+         pair in your answer.
+      3. If the largest account of either pair mint holds almost nothing, say the market looks
+         stopped instead of preparing it.
 
       PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote older than the market's
       staleness limit before pricing, and nothing in the local VM republishes it. Apply
       humidifi-freshness with a current quote in the same slot as this override.
 
-      fair_value is a raw ratio, not a human price:
+      fair_value is a raw ratio, not a human price, so the number the user gives is never
+      fair_value itself:
         fair_value = floor(price * 2^48 / 10^(base_decimals - quote_decimals))
-      where price is quote tokens per base token and get_token_address returns both tokens'
-      decimals. Pass the result as a decimal STRING; it can exceed what a JSON number holds
-      exactly.
+      where price is quote tokens per base token and step 2 gives both tokens' decimals. Pass the
+      result as a decimal STRING; it can exceed what a JSON number holds exactly.
 
       EXAMPLE - SOL/USDC (9/6 decimals) at 208 USDC per SOL:
         fair_value: "58546795155816"
@@ -90,17 +99,26 @@ templates:
       FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
       mint needs those masked bytes, which you cannot compute. Work from a market address the user
       gives. If they name only a pair, use the market Studio lists for it, or else ask for the
-      market address; if they give only an address, ask which pair it is, because its mints are
-      masked too. A HumidiFi market is a 1728-byte account owned by program
+      market address. Never call getProgramAccounts on the HumidiFi program: the masked mints
+      cannot be matched, and the result is very large. A HumidiFi market is a 1728-byte account
+      owned by program
       9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Put the market in the override's account as
       {"pubkey":"<market>"} and set fetchBeforeUse as described below. The market address is never
-      an override value.
+      an override value. An "Invalid pubkey" error means an address was copied wrong; copy it
+      again exactly and retry.
 
-      Before create_scenario, check that the market still trades: call getTokenAccountsByOwner with
-      three positional params, the market address, {"mint":"<mint>"} and {"encoding":"jsonParsed"},
-      once for each of the pair's mints, both at once. Every vault is owned by its market. If the
-      largest account for each mint holds almost nothing, say the market looks stopped instead of
-      preparing it.
+      BEFORE create_scenario, ALWAYS do these steps, also when the user gives only an address:
+      1. Read the market's token accounts: call getTokenAccountsByOwner twice at once, with the
+         market address, {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} or
+         {"programId":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}, and {"encoding":"jsonParsed"}.
+         Every vault is a token account owned by its market, and its mint is not masked.
+      2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
+         is the only other mint. Tokens someone sent to the market can sit next to the vaults, so
+         if the results show more than one mint besides the stablecoin, or no stablecoin, ask
+         which pair it is instead of guessing. Each result carries its mint's decimals. Name the
+         pair in your answer.
+      3. If the largest account of either pair mint holds almost nothing, say the market looks
+         stopped instead of preparing it.
 
       HumidiFi fills only while clock_slot - last_update_slot <= max_staleness_slots. Both words are
       stored XORed with the same fixed key; the values you pass stay plaintext.

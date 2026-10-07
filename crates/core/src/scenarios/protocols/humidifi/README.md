@@ -71,15 +71,15 @@ Studio includes four featured markets:
 
 HumidiFi stores each market's mints and vaults masked, and a search by mint needs those masked
 bytes, so start from a market address. When only a pair is named, each template's LLM guidance uses
-the market Studio lists for it or asks for an address, and it asks for the pair when only an address
-is given. Every vault is a token account owned by its market, so `getTokenAccountsByOwner` with the
-market and the paying side's mint returns it without unmasking. Some markets also own a dust account
-for their quote mint; the guidance keeps the account holding the most tokens and asks for the vault
-when every one is nearly empty.
+the market Studio lists for it or asks for an address. Every vault is a token account owned by its
+market, so `getTokenAccountsByOwner` with the market and a token program id lists the market's mints
+without unmasking, which also works when only an address is given. The stablecoin is the quote and
+the only other mint is the base; tokens sent to a market can add more mints, and the guidance then
+asks for the pair. Some markets also own dust accounts; the guidance keeps the account holding the
+most tokens and asks for the vault when every one is nearly empty.
 
-Before it prepares a price or freshness override, the guidance reads the market's token accounts
-for both of the pair's mints and says the market looks stopped when even the largest is nearly
-empty.
+Before it prepares any override, the guidance reads those token accounts and says the market looks
+stopped when even the largest account of a pair mint is nearly empty.
 
 Use `fetchBeforeUse: true` so the selected account is loaded into the local VM from the upstream
 datasource before its bytes are changed. A later override that builds on an earlier one in the same
@@ -182,6 +182,7 @@ returns roughly a thousandth of its output. This is not an AMM reserve formula; 
 | `Custom(1027565)` (`0xfaded`)                             | The quote is older than `max_staleness_slots`; refresh it or schedule freshness again |
 | `Custom(49)` after lowering a vault                       | The payout vault is empty; HumidiFi refuses the swap itself                          |
 | Token program `Custom(1)` (InsufficientFunds)             | The payout vault is empty on a market that leaves the refusal to the token transfer  |
+| `Custom(310)` (`0x136`) in both directions                | Both vaults are empty                                                                |
 | Output collapses after lowering a vault                   | The payout vault is thin; HumidiFi prices against inventory                          |
 | Price is off by a power of ten                            | Use both tokens' decimals from `get_token_address` in the formula                    |
 | A vault override has no effect                            | It targets a dust account; use the market-owned account holding the most tokens      |

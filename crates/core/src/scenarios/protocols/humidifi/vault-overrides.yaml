@@ -27,18 +27,23 @@ templates:
       FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
       mint needs those masked bytes, which you cannot compute. Work from a market address the user
       gives; if they name only a pair, use the market Studio lists for it, or else ask for the market
-      address.
+      address. Never call getProgramAccounts on the HumidiFi program: the masked mints cannot be
+      matched, and the result is very large. An "Invalid pubkey" error means an address was
+      copied wrong; copy it again exactly and retry.
       A HumidiFi market is a 1728-byte account owned by program
       9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Every vault is a token account owned by its
-      market, so it is found without unmasking:
-      1. Resolve the paying side's token with get_token_address; if the user gave only an address,
-         ask which pair it is. The base vault pays buys (quote in, base out); the quote vault pays
-         sells (base in, quote out).
-      2. Call getTokenAccountsByOwner with three positional params: the market address,
-         {"mint":"<mint>"}, then {"encoding":"jsonParsed"}. The vault is among the results, often
-         next to dust someone sent to the market. Keep the account holding the most tokens; if
-         every one holds almost nothing (a drained vault or an empty market), ask for the vault
-         address instead of guessing.
+      market, so it is found without unmasking. ALWAYS do these steps, also when the user gives
+      only an address:
+      1. Read the market's token accounts: call getTokenAccountsByOwner twice at once, with the
+         market address, {"programId":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} or
+         {"programId":"TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"}, and {"encoding":"jsonParsed"}.
+      2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
+         is the only other mint. If the results show more than one mint besides the stablecoin,
+         or no stablecoin, ask which pair it is instead of guessing. The base vault pays buys
+         (quote in, base out); the quote vault pays sells (base in, quote out). The vault is the
+         account of the paying side's mint holding the most tokens, often next to dust someone
+         sent to the market; if every one holds almost nothing (a drained vault or an empty
+         market), ask for the vault address instead of guessing.
       3. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
          described below. The vault address is never an override value, and this template never
          targets the market account.
@@ -49,7 +54,8 @@ templates:
       HumidiFi prices against its payout inventory: a thin payout vault that can still settle cuts
       the quoted output drastically. An empty payout vault rejects the swap, usually with HumidiFi
       custom error 49 (0x31); some markets leave it to the token transfer, which fails with the
-      token program's InsufficientFunds (custom error 1).
+      token program's InsufficientFunds (custom error 1). Emptying both vaults rejects every swap
+      with custom error 310 (0x136).
       This does not set the mid-price; use humidifi-price for that.
 
       UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
