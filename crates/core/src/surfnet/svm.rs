@@ -3215,7 +3215,8 @@ impl SurfnetSvm {
                     &account,
                     &account_values,
                     remote_ctx,
-                    fetch_from_upstream,
+                    // Only an account core has just refetched counts as fresh.
+                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
                 )
                 .await
                 {
