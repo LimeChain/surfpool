@@ -371,13 +371,13 @@ pub async fn prepare_phoenix_override(
     }
 }
 
-/// Oracle updates keep every market's readings fresh, and Phoenix refuses a market
-/// whose readings are older than its stale threshold. Nothing refreshes them on a fork, so this
-/// raises the thresholds of the local PerpAssetMap, fetching it first when it is not local yet.
-/// Prices and reading slots stay as they were, and the markets stay usable however far the local
-/// Clock moves. A failure leaves the map as it was and never fails the override. It runs on every
-/// Phoenix override, before that override's own checks, since the map is needed whether or not the
-/// override applies; each run reads the whole map.
+/// Oracle updates keep every market's readings fresh, and Phoenix refuses a market whose readings
+/// are too old (see [`RAISED_STALE_THRESHOLD_SLOTS`]). Nothing refreshes them locally, so
+/// this raises the thresholds of the local PerpAssetMap, fetching it first when it is not local
+/// yet. Prices and reading slots stay as they were, and the markets stay usable however far the
+/// local Clock moves. A failure leaves the map as it was and never fails the override. It runs on
+/// every Phoenix override, before that override's own checks, since the map is needed whether or
+/// not the override applies; each run reads the whole map.
 async fn keep_oracle_readings_usable(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,

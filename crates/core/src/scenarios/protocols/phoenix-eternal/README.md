@@ -39,11 +39,12 @@ Set `fetchBeforeUse: true` on every override, so the account is fetched from the
 datasource before its bytes are changed. Use `false` only for a later override that builds on
 state an earlier override of the same scenario prepared.
 
-Every Phoenix override also keeps the markets usable for the rest of the session. Oracle
-updates keep each market's readings fresh, and Phoenix refuses a market whose readings are older
-than its stale threshold (50 slots, 25 on some markets). Nothing refreshes them on a
-fork, so the override raises every market's threshold in the local PerpAssetMap instead, fetching
-the map first when it is not local yet. Prices and reading slots stay as they were.
+Every Phoenix override also keeps the markets usable for the rest of the session. Oracle updates
+keep each market's readings fresh, and Phoenix refuses a market once its readings are older than
+its stale threshold times its hard-stale multiplier, or than the threshold alone when the
+multiplier is 0. Nothing refreshes them locally, so the override raises every market's
+threshold in the local PerpAssetMap instead, fetching the map first when it is not local yet.
+Prices and reading slots stay as they were.
 
 ## Traders in the GlobalTraderIndex
 
