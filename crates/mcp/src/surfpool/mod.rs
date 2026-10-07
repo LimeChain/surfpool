@@ -174,9 +174,9 @@ pub struct CallSurfnetRpcParams {
     )]
     pub method: String,
     #[schemars(
-        description = "The positional JSON-RPC params, sent as given, e.g. [\"<pubkey>\", {\"encoding\": \"base64\"}]"
+        description = "The parameters to pass to the RPC method. Wrap every value at every depth by its type: a string as {\"String\":\"...\"}, a whole number as {\"Number\":5}, a boolean as {\"Bool\":true}, a list as {\"Array\":[...]} and an object as {\"Object\":{\"key\":<wrapped value>}}; object keys stay plain. Example for getProgramAccounts with a filter: [{\"String\":\"<program id>\"},{\"Object\":{\"encoding\":{\"String\":\"base64\"},\"filters\":{\"Array\":[{\"Object\":{\"memcmp\":{\"Object\":{\"offset\":{\"Number\":0},\"bytes\":{\"String\":\"<base58>\"}}}}}]}}}]"
     )]
-    pub params: Vec<Value>,
+    pub params: Vec<JsonValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +199,46 @@ impl Surfpool {
 impl Default for Surfpool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub enum JsonValue {
+    #[schemars(description = "A JSON representation of null")]
+    Null,
+    #[schemars(description = "A JSON representation of a boolean")]
+    Bool(bool),
+    #[schemars(description = "A JSON representation of a number")]
+    Number(i64),
+    #[schemars(description = "A JSON representation of a string")]
+    String(String),
+    #[schemars(description = "A JSON representation of an array")]
+    Array(Vec<JsonValue>),
+    #[schemars(description = "A JSON representation of an object with key-value pairs")]
+    Object(HashMap<String, JsonValue>),
+    #[schemars(description = "A JSON representation of a base58-encoded public key")]
+    PublicKey(String),
+    #[schemars(description = "A JSON representation of a base58-encoded mint address")]
+    MintAddress(String),
+    #[schemars(description = "A JSON representation of a program ID")]
+    ProgramId(String),
+}
+
+impl From<JsonValue> for Value {
+    fn from(val: JsonValue) -> Self {
+        match val {
+            JsonValue::Null => Value::Null,
+            JsonValue::Bool(b) => Value::Bool(b),
+            JsonValue::Number(n) => Value::Number(serde_json::Number::from(n)),
+            JsonValue::String(s) => Value::String(s),
+            JsonValue::PublicKey(s) => Value::String(s),
+            JsonValue::MintAddress(s) => Value::String(s),
+            JsonValue::ProgramId(s) => Value::String(s),
+            JsonValue::Array(arr) => Value::Array(arr.into_iter().map(Value::from).collect()),
+            JsonValue::Object(obj) => {
+                Value::Object(obj.into_iter().map(|(k, v)| (k, Value::from(v))).collect())
+            }
+        }
     }
 }
 
@@ -627,7 +667,7 @@ impl Surfpool {
         The LLM should interpret user requests and determine the appropriate method and parameters to call. To retrieve the list of RPC endpoints available check the resource str:///rpc_endpoints
 
         IMPORTANT:
-        - Do not write scenario state with this method; create scenarios with the dedicated `create_scenario` tool. Reads that find the accounts a scenario targets, such as getProgramAccounts or getAccountInfo, are fine.
+        - If a user asks to create a scenario, DO NOT USE this method. Instead, use the dedicated `create_scenario` tool.
         - There is NO RPC method called `surfnet_getOverrideTemplates`. The override templates index is available via the MCP resource str:///override_templates (use read_resource, not this RPC tool); one template's full detail comes from the get_override_template tool.
         "#)]
     async fn call_surfnet_rpc(
@@ -635,11 +675,12 @@ impl Surfpool {
         Parameters(call_params): Parameters<CallSurfnetRpcParams>,
     ) -> Result<CallToolResult, McpError> {
         let surfnet_endpoint = format!("http://127.0.0.1:{}", call_params.surfnet_port);
+        let rpc_params: Vec<Value> = call_params.params.into_iter().map(Into::into).collect();
         let rpc_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": call_params.method,
-            "params": call_params.params
+            "params": rpc_params
         });
 
         // Async client: a blocking one inside this async tool can fail after the
