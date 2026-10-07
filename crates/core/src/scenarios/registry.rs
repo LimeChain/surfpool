@@ -678,6 +678,7 @@ mod tests {
         assert!(registry.contains("pump-amm-global-config"));
         assert!(registry.contains("humidifi-price"));
         assert!(registry.contains("humidifi-freshness"));
+        assert!(registry.contains("humidifi-spread"));
         assert!(registry.contains("humidifi-vault-balance"));
     }
 
