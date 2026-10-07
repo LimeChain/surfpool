@@ -318,7 +318,8 @@ fn forge_phoenix_override(
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
 /// Every Phoenix override also leaves the local PerpAssetMap's markets usable for the rest of the
-/// session; see `keep_oracle_readings_usable`.
+/// session; see `keep_oracle_readings_usable`. `target_slot` is the slot being materialized, which
+/// the override's writes are published at.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     account_pubkey: &Pubkey,
@@ -326,6 +327,7 @@ pub async fn prepare_phoenix_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
+    target_slot: u64,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Ok(None);
@@ -353,7 +355,7 @@ pub async fn prepare_phoenix_override(
             )]))
         }
         kind => {
-            keep_oracle_readings_usable(svm, remote_ctx).await;
+            keep_oracle_readings_usable(svm, remote_ctx, target_slot).await;
             match kind {
                 Some(PhoenixAccount::Trader) => prepare_trader_override(
                     svm,
@@ -381,6 +383,7 @@ pub async fn prepare_phoenix_override(
 async fn keep_oracle_readings_usable(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    target_slot: u64,
 ) {
     let kept = async {
         let map = phoenix_dependency(svm, &PHOENIX_PERP_ASSET_MAP, remote_ctx).await?;
@@ -390,7 +393,7 @@ async fn keep_oracle_readings_usable(
         svm.set_scenario_override_account(
             &PHOENIX_PERP_ASSET_MAP,
             Account { data, ..map },
-            svm.get_latest_absolute_slot(),
+            target_slot,
         )
     }
     .await;
@@ -1270,9 +1273,11 @@ mod tests {
             geyser_rx.try_iter().any(|event| matches!(
                 event,
                 GeyserEvent::UpdateAccount(update)
-                    if update.pubkey == PHOENIX_PERP_ASSET_MAP && update.account == map
+                    if update.pubkey == PHOENIX_PERP_ASSET_MAP
+                        && update.account == map
+                        && update.slot == 100
             )),
-            "Geyser plugins receive the raised map"
+            "Geyser plugins receive the raised map at the materialized slot"
         );
     }
 
