@@ -1061,7 +1061,8 @@ impl RawEncoding {
         }
     }
 
-    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
+    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`] and
+    /// [`RawEncoding::Slot32`].
     pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
         // Read the digits as text so nothing passes through f64, which cannot hold a u128
         // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
