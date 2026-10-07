@@ -104,6 +104,33 @@ templates:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
 
+  - id: phoenix-price-freshness
+    name: Phoenix Price Freshness
+    description: >-
+      Re-stamp the oracle readings of every market in the Phoenix Eternal PerpAssetMap without
+      moving any price.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: price_age_slots
+        type: input
+        value_type: string
+        label: Price Age (slots)
+        description: How old the readings are, in slots; 0 is fresh, encoded as a decimal string
+    llm_context: |
+      Phoenix refuses margin views, withdrawals and liquidations once an oracle reading of a market
+      the trader holds is older than that market's stale threshold (50 slots for SOL on mainnet),
+      and nothing updates the readings on a fork.
+      This stamps every market's mark and oracle readings with the current slot minus
+      price_age_slots. Prices, the orderbook and positions do not change.
+      Use 0 at the slot of the transaction that needs fresh prices, or up to 49 slots before it.
+      Pass price_age_slots as a decimal string.
+      The account is the singleton PerpAssetMap, so this template carries its address.
+      Set fetchBeforeUse: false after an earlier override in the same scenario shocked a market,
+      so the shock is kept; otherwise set true so the asset map is fetched first.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
   - id: phoenix-market-fees
     name: Phoenix Market Fees
     description: >-

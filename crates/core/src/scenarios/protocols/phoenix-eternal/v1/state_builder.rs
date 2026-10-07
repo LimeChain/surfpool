@@ -42,6 +42,7 @@ const COLLATERAL_FIELD: &str = "traderState.quoteLotCollateral";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
 const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
+const PRICE_AGE_FIELD: &str = "price_age_slots";
 const MAX_RISK_FACTOR_BPS: u16 = 10_000;
 const PREPARATION_SLOT: u64 = 0;
 
@@ -183,6 +184,60 @@ fn patch_maintenance_factor(
     })
 }
 
+/// Phoenix refuses risk actions once a held market's oracle readings are older than the market's
+/// stale threshold, and nothing on a fork updates them, so every market is re-stamped at once.
+fn stamp_price_freshness(
+    account_pubkey: &Pubkey,
+    data: &[u8],
+    reading_slot: u64,
+) -> SurfpoolResult<Vec<u8>> {
+    let decode_error = |error: PhoenixAccountDecodeError| {
+        price_patch_error(
+            account_pubkey,
+            format!("invalid Phoenix PerpAssetMap account: {error}"),
+        )
+    };
+    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
+    let price_len = size_of::<PriceComponent>();
+    let mut patched = data.to_vec();
+    // Entries are stored in the order the map lists them, so each search starts after the last.
+    let mut cursor = 0;
+    for entry in map.iter() {
+        let metadata = entry.map_err(decode_error)?.metadata;
+        let metadata_bytes = metadata.as_bytes();
+        let offset = data[cursor..]
+            .windows(metadata_bytes.len())
+            .position(|window| window == metadata_bytes)
+            .map(|position| cursor + position)
+            .ok_or_else(|| {
+                price_patch_error(account_pubkey, "Phoenix market metadata was not found")
+            })?;
+        let mut price =
+            bytemuck::pod_read_unaligned::<PriceComponent>(&patched[offset..offset + price_len]);
+        let mark = &mut price.mark_price;
+        mark.price.slot = reading_slot;
+        for sample in mark
+            .spot_price_component
+            .last_exchange_spot_price
+            .iter_mut()
+            .chain(
+                mark.perp_price_component
+                    .last_exchange_perp_price
+                    .iter_mut(),
+            )
+        {
+            // An unused oracle slot stays empty rather than becoming a fresh zero price.
+            if sample.slot != 0 {
+                sample.slot = reading_slot;
+            }
+        }
+        mark.spot_price_component.slot = reading_slot;
+        patched[offset..offset + price_len].copy_from_slice(bytemuck::bytes_of(&price));
+        cursor = offset + metadata_bytes.len();
+    }
+    Ok(patched)
+}
+
 fn patch_market_metadata(
     account_pubkey: &Pubkey,
     data: &[u8],
@@ -243,23 +298,29 @@ fn forge_phoenix_override(
     match (
         account_values.get(DIRECT_MARK_TICKS_FIELD),
         account_values.get(MAINTENANCE_FACTOR_FIELD),
+        account_values.get(PRICE_AGE_FIELD),
     ) {
-        (Some(ticks), None) => patch_direct_mark(
+        (Some(ticks), None, None) => patch_direct_mark(
             account_pubkey,
             &account.data,
             symbol()?,
             parse_decimal(ticks, DIRECT_MARK_TICKS_FIELD, "an unsigned 64-bit integer")?,
             mark_slot,
         ),
-        (None, Some(factor)) => patch_maintenance_factor(
+        (None, Some(factor), None) => patch_maintenance_factor(
             account_pubkey,
             &account.data,
             symbol()?,
             parse_decimal(factor, MAINTENANCE_FACTOR_FIELD, "basis points")?,
         ),
+        (None, None, Some(age)) => stamp_price_freshness(
+            account_pubkey,
+            &account.data,
+            mark_slot.saturating_sub(parse_decimal(age, PRICE_AGE_FIELD, "a number of slots")?),
+        ),
         _ => Err(SurfpoolError::internal(
-            "Phoenix map overrides take symbol plus exactly one of target_ticks or \
-             maintenance_risk_factor_bps",
+            "Phoenix map overrides take exactly one of target_ticks, maintenance_risk_factor_bps \
+             or price_age_slots, and a symbol with the first two",
         )),
     }
 }
@@ -812,6 +873,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn price_freshness_restamps_readings_without_moving_prices() {
+        let account = perp_asset_map_account();
+        let mark = |data: &[u8]| {
+            PerpAssetMap::try_from_account_bytes(data)
+                .unwrap()
+                .find_by_symbol("SOL")
+                .unwrap()
+                .unwrap()
+                .metadata
+                .oracle_price()
+                .mark_price
+        };
+        let freshness = |age: &str| {
+            let values = HashMap::from([(PRICE_AGE_FIELD.to_string(), serde_json::json!(age))]);
+            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123)
+        };
+        let before = mark(&account.data);
+
+        let after = mark(&freshness("3").unwrap());
+        assert_eq!(
+            (after.price.ticks, after.price.slot),
+            (before.price.ticks, 120)
+        );
+        let samples = |mark: &phoenix_rise_accounts::perp_asset_map::MarkPrice| {
+            mark.spot_price_component
+                .last_exchange_spot_price
+                .into_iter()
+                .chain(mark.perp_price_component.last_exchange_perp_price)
+                .collect::<Vec<_>>()
+        };
+        for (sample, original) in samples(&after).iter().zip(samples(&before)) {
+            assert_eq!(sample.ticks, original.ticks);
+            assert_eq!(sample.slot, if original.slot == 0 { 0 } else { 120 });
+        }
+        assert_eq!(after.spot_price_component.slot, 120);
+        assert_eq!(after.book_price_component, before.book_price_component);
+
+        assert_eq!(mark(&freshness("500").unwrap()).price.slot, 0);
+        assert!(freshness("-1").is_err());
+    }
+
     // These templates' fields are codec inputs, not IDL paths, so the registry's IDL check
     // cannot cover them; this ties the YAML field names to what the codec accepts.
     #[test]
@@ -859,8 +962,8 @@ mod tests {
             .collect();
         assert_eq!(
             market_templates.len(),
-            2,
-            "direct mark and maintenance margin"
+            3,
+            "direct mark, maintenance margin and price freshness"
         );
 
         for template in market_templates {
@@ -894,6 +997,7 @@ mod tests {
         for (field, value) in [
             (DIRECT_MARK_TICKS_FIELD, "1"),
             (MAINTENANCE_FACTOR_FIELD, "10000"),
+            (PRICE_AGE_FIELD, "0"),
         ] {
             let clean = HashMap::from([
                 (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
@@ -913,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn market_overrides_need_a_symbol_and_exactly_one_codec_input() {
+    fn market_overrides_need_exactly_one_codec_input() {
         let account = perp_asset_map_account();
         let symbol = (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL"));
         let ticks = (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1"));
@@ -921,9 +1025,12 @@ mod tests {
             MAINTENANCE_FACTOR_FIELD.to_string(),
             serde_json::json!("10000"),
         );
+        let age = (PRICE_AGE_FIELD.to_string(), serde_json::json!("0"));
         for values in [
             vec![symbol.clone()],
             vec![symbol.clone(), ticks.clone(), factor.clone()],
+            vec![symbol.clone(), ticks.clone(), age.clone()],
+            vec![symbol.clone(), factor.clone(), age.clone()],
             vec![ticks.clone()],
             vec![factor.clone()],
             vec![
@@ -952,6 +1059,7 @@ mod tests {
         for (field, text, number) in [
             (DIRECT_MARK_TICKS_FIELD, "1", 1),
             (MAINTENANCE_FACTOR_FIELD, "10000", 10_000),
+            (PRICE_AGE_FIELD, "1", 1),
         ] {
             assert_eq!(
                 forge(field, serde_json::json!(number)).unwrap(),

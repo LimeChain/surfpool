@@ -430,6 +430,71 @@ async fn maintenance_margin_stress_raises_the_mainnet_requirement() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn price_freshness_restarts_the_stale_window() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let map = PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
+        .expect("mainnet PerpAssetMap decodes");
+    // Each market sets its own thresholds, so the checks stay inside the shortest one and past
+    // the longest one, whichever markets the discovered trader holds.
+    let thresholds: Vec<u64> = map
+        .iter()
+        .flat_map(|entry| {
+            let mark = entry
+                .expect("mainnet map entry decodes")
+                .metadata
+                .oracle_price()
+                .mark_price;
+            [
+                mark.spot_price_component.stale_threshold,
+                mark.perp_price_component.stale_threshold,
+            ]
+        })
+        .collect();
+    let shortest = *thresholds.iter().min().expect("mainnet lists markets");
+    let longest = *thresholds.iter().max().expect("mainnet lists markets");
+    let margin_at = |offset: u64| {
+        locker.with_svm_writer(|svm| {
+            let mut clock = graph.clock.clone();
+            clock.slot += offset;
+            svm.inner.set_sysvar(&clock);
+        });
+        try_hawkeye_margin(&locker, &graph)
+    };
+    let is_stale = |margin: Result<HawkeyeMarginView, String>| {
+        margin.is_err_and(|error| error.contains("staleness or validity check failed"))
+    };
+
+    let refresh = longest + 1;
+    assert!(
+        is_stale(margin_at(refresh)),
+        "readings older than every market's threshold must be refused"
+    );
+    let mut scenario = surfpool_types::Scenario::new(
+        "phoenix-price-freshness".to_string(),
+        "Re-stamp every Phoenix market's oracle readings".to_string(),
+    );
+    scenario.add_override(phoenix_market_override(
+        "phoenix-price-freshness",
+        graph.perp_asset_map,
+        &[("price_age_slots", "0")],
+    ));
+    locker
+        .register_scenario(scenario, Some(graph.clock.slot + refresh))
+        .unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, graph.clock.slot + refresh)
+        .await
+        .unwrap();
+
+    margin_at(refresh).expect("the re-stamped readings are fresh");
+    margin_at(refresh + shortest - 1).expect("every market is still inside its threshold");
+    assert!(
+        is_stale(margin_at(refresh + longest + 1)),
+        "the re-stamped readings age like mainnet ones"
+    );
+}
+
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixMainnetGraph) {
     let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;

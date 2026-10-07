@@ -1,6 +1,6 @@
 # Phoenix Eternal
 
-Surfpool bundles the Phoenix Eternal IDL and eight override templates, so a scenario can put
+Surfpool bundles the Phoenix Eternal IDL and nine override templates, so a scenario can put
 Phoenix perpetuals into the state your code needs to see: a trader close to liquidation, a moved
 mark price, throttled withdrawals. The templates only prepare state. Trades and liquidations are
 sent by your own code.
@@ -32,8 +32,8 @@ Phoenix itself works, see the [Phoenix docs](https://docs.phoenix.trade/).
 | Trading fees                                   | Millionths of the filled notional  | `350` = 0.035% (3.5 bps) |
 | Permission expiry                              | Unix seconds                       | `0` = never expires      |
 
-The collateral, mark and maintenance templates take their numbers as decimal strings, so large
-values stay exact in JavaScript. The other templates take JSON numbers.
+The collateral, mark, maintenance and price freshness templates take their numbers as decimal
+strings, so large values stay exact in JavaScript. The other templates take JSON numbers.
 
 Set `fetchBeforeUse: true` on every override, so the account is fetched from the upstream
 datasource before its bytes are changed. Use `false` only for a later override that builds on
@@ -67,6 +67,11 @@ GlobalTraderIndex lists it, whatever the HOT bit says. The templates follow the 
   book. Compute a relative move from `markTicks` just before Play.
 - **Maintenance margin stress** needs a factor above the market's backstop factor and at most
   10000. The maintenance margin scales linearly with it.
+- **Price freshness** stamps every market's mark and oracle readings with the current slot minus
+  `price_age_slots`, without moving any price. Phoenix refuses margin views, withdrawals and
+  liquidations once a held market's readings are older than its stale threshold (50 slots for
+  SOL), and nothing updates them on a fork. Use `0` at the slot of the transaction, or up to 49
+  slots before it.
 - **Trader capabilities** only applies to a Trader the GlobalTraderIndex does not list. The HOT
   bit cannot be set: Phoenix would look the trader up in the GlobalTraderIndex, which does not
   list it, and reject its transactions. `62` grants every capability except HOT, `54` is
@@ -107,7 +112,8 @@ GlobalTraderIndex lists it, whatever the HOT bit says. The templates follow the 
    Effective collateral then sits at half the maintenance margin.
 3. At slot 1, use `phoenix-direct-mark-risk-shock` on the trader's market, moving the mark
    against the position.
-4. Send the liquidation.
+4. Send the liquidation within 49 slots of the shock, or add `phoenix-price-freshness` at its
+   slot.
 
 Phoenix ranks a trader by its effective collateral against the margins `view_margin` returns:
 
@@ -137,7 +143,7 @@ Phoenix ranks a trader by its effective collateral against the margins `view_mar
 | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Phoenix PerpAssetMap ... was not found` or `Phoenix dependency ... is missing locally` | Neither the local VM nor the upstream datasource holds the Phoenix accounts. Start surfnet with a datasource that has the Phoenix deployment.                                     |
 | `Hot Phoenix Trader has no reachable GlobalTraderIndex entry`                           | The trader joined the GlobalTraderIndex after it was pulled; Phoenix rejects its transactions too. Restart surfnet.                                                               |
-| `Cannot get mark price, staleness or validity check failed`                             | The local PerpAssetMap aged since it was pulled. Market templates refresh it with `fetchBeforeUse: true`; for collateral-only scenarios add a market override or restart surfnet. |
+| `Cannot get mark price, staleness or validity check failed`                             | A market the trader holds has oracle readings older than its stale threshold. Add `phoenix-price-freshness` at the slot of the transaction.                                       |
 
 ## Tests against mainnet
 
