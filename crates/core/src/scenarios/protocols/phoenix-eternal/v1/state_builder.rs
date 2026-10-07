@@ -14,7 +14,8 @@ use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
 use super::collateral::{
     current_quote_lot_collateral, ensure_collateral_floor, index_trader_state_range,
-    parse_quote_lot_collateral, trader_header, validate_hot_trader_fields,
+    index_trader_state_ranges, parse_quote_lot_collateral, trader_header,
+    validate_hot_trader_fields,
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -312,8 +313,8 @@ async fn prepare_trader_override(
     let header = trader_header(trader, account)?;
     let hot = header.trader_state.is_hot();
     // Ahead of every check, so a refused override still leaves the fresh record behind.
-    if hot && fetch_before_use {
-        refresh_index_record(svm, &header.key, remote_ctx).await?;
+    if fetch_before_use {
+        refresh_index_record(svm, &header, remote_ctx).await?;
     }
     let listed = !hot
         && svm
@@ -415,13 +416,15 @@ async fn prepare_trader_override(
     Ok(writes)
 }
 
-/// A hot Trader's collateral is read from its GlobalTraderIndex record, so fetchBeforeUse refreshes
-/// the collateral there too. The rest of the record stays as the local VM has it, and so does the
-/// whole record if the fetch fails or lacks the trader. The refreshed record is stored at once, as
-/// core stores the refetched Trader, so later overrides in the same slot are checked against it.
+/// Phoenix reads a Trader's collateral from its GlobalTraderIndex record whenever the local index
+/// lists it, so fetchBeforeUse refreshes the collateral there too: from the upstream record, or from
+/// the refetched Trader account when a cold Trader has left the upstream index. The rest of the
+/// record stays as the local VM has it, and so does the whole record if the fetch fails. The
+/// refreshed record is stored at once, as core stores the refetched Trader, so later overrides in
+/// the same slot are checked against it.
 async fn refresh_index_record(
     svm: &mut SurfnetSvm,
-    trader_key: &[u8; 32],
+    header: &TraderHeader,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
 ) -> SurfpoolResult<()> {
     let Some((client, commitment)) = remote_ctx else {
@@ -431,6 +434,9 @@ async fn refresh_index_record(
     let Some(mut index) = svm.inner.get_account(&PHOENIX_GLOBAL_TRADER_INDEX)? else {
         return Ok(());
     };
+    let Ok(local) = index_trader_state_range(&index, &header.key) else {
+        return Ok(());
+    };
     let Ok(Ok(remote)) = client
         .get_account(&PHOENIX_GLOBAL_TRADER_INDEX, *commitment)
         .await
@@ -438,15 +444,26 @@ async fn refresh_index_record(
     else {
         return Ok(());
     };
-    if let (Ok(local), Ok(upstream)) = (
-        index_trader_state_range(&index, trader_key),
-        index_trader_state_range(&remote, trader_key),
-    ) && local.len() == upstream.len()
-    {
-        index.data[local.start..local.start + 8]
-            .copy_from_slice(&remote.data[upstream.start..upstream.start + 8]);
-        svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, index)?;
-    }
+    let Ok(upstream_records) = index_trader_state_ranges(&remote) else {
+        return Ok(());
+    };
+    let trader = Pubkey::new_from_array(header.key);
+    let account_collateral = header
+        .trader_state
+        .quote_lot_collateral
+        .as_inner()
+        .to_le_bytes();
+    let fresh = match upstream_records.into_iter().find(|(key, _)| *key == trader) {
+        Some((_, upstream)) if upstream.len() == local.len() => {
+            &remote.data[upstream.start..upstream.start + 8]
+        }
+        // A cold Trader that left the upstream index keeps its collateral in its own account, which
+        // core just refetched. A hot Trader's account copy is stale, so its record stays.
+        None if !header.trader_state.is_hot() => &account_collateral[..],
+        _ => return Ok(()),
+    };
+    index.data[local.start..local.start + 8].copy_from_slice(fresh);
+    svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, index)?;
     Ok(())
 }
 

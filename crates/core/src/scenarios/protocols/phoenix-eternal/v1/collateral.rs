@@ -701,6 +701,107 @@ mod tests {
         }
     }
 
+    /// A Trader the local index still lists is read from its record even with the HOT bit clear, so
+    /// fetchBeforeUse refreshes that record from upstream: from the upstream record while upstream
+    /// lists the Trader, otherwise from the refetched cold Trader account. A hot Trader's account
+    /// copy is stale, so a hot Trader missing upstream keeps its record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_before_use_refreshes_the_record_of_a_listed_trader() {
+        use std::collections::HashMap;
+
+        use base64::{Engine, prelude::BASE64_STANDARD};
+        use solana_commitment_config::CommitmentConfig;
+
+        use super::super::state_builder::{PHOENIX_GLOBAL_TRADER_INDEX, prepare_phoenix_override};
+        use crate::{
+            surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
+            tests::helpers::canned_rpc,
+        };
+
+        let trader = Pubkey::new_from_array(FIRST_KEY);
+        let mut local_index = index_account();
+        local_index.lamports = 1;
+        let range = index_trader_state_range(&local_index, &FIRST_KEY).unwrap();
+        local_index.data[range.start..range.start + 8].copy_from_slice(&1_000_i64.to_le_bytes());
+        let mut listing = local_index.clone();
+        listing.data[range.start..range.start + 8].copy_from_slice(&100_i64.to_le_bytes());
+        // The trader has left the upstream index: its reachable node now holds another key.
+        let mut not_listing = local_index.clone();
+        not_listing.data[96 + 16..96 + 48].copy_from_slice(&[33; 32]);
+        assert!(index_trader_state_ranges(&not_listing).is_ok());
+        assert!(index_trader_state_range(&not_listing, &FIRST_KEY).is_err());
+
+        for (case, upstream, hot, target, applied, record) in [
+            (
+                "listed upstream, too high",
+                &listing,
+                false,
+                500_i64,
+                false,
+                100_i64,
+            ),
+            (
+                "left upstream, too high",
+                &not_listing,
+                false,
+                500,
+                false,
+                100,
+            ),
+            ("listed upstream, lowered", &listing, false, 50, true, 50),
+            ("left upstream, lowered", &not_listing, false, 50, true, 50),
+            (
+                "hot, left upstream",
+                &not_listing,
+                true,
+                2_000,
+                false,
+                1_000,
+            ),
+        ] {
+            let url = canned_rpc(format!(
+                r#"{{"context":{{"apiVersion":"2.1.0","slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":1,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+                BASE64_STANDARD.encode(&upstream.data),
+                PHOENIX_ETERNAL_PROGRAM_ID,
+                upstream.data.len()
+            ))
+            .await;
+            let remote = Some((SurfnetRemoteClient::new(url), CommitmentConfig::confirmed()));
+            let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+            svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, local_index.clone())
+                .unwrap();
+            // The Trader account as core just refetched it.
+            let mut account = trader_account(FIRST_KEY, 100, hot);
+            account.lamports = 1;
+            let values = HashMap::from([(
+                "traderState.quoteLotCollateral".to_string(),
+                serde_json::json!(target.to_string()),
+            )]);
+
+            let result =
+                prepare_phoenix_override(&mut svm, &trader, &account, &values, &remote, true).await;
+
+            assert_eq!(result.is_ok(), applied, "{case}");
+            if let Ok(Some(writes)) = result {
+                for (pubkey, written) in writes {
+                    if pubkey == trader {
+                        assert_eq!(written.data[88..96], target.to_le_bytes(), "{case}");
+                    }
+                    svm.set_account(&pubkey, written).unwrap();
+                }
+            }
+            let index = svm
+                .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                index.data[range.start..range.start + 8],
+                record.to_le_bytes(),
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn materialize_refuses_cold_trader_writes_that_raise_collateral() {
         use crate::surfnet::svm::SurfnetSvm;
