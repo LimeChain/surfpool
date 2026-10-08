@@ -26,11 +26,6 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
-pub const HUMIDIFI_MARKET_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/humidifi/market-overrides.yaml");
-pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/humidifi/vault-overrides.yaml");
-
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -51,6 +46,11 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/idl.json");
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
+
+pub const HUMIDIFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/v8/market-overrides.yaml");
+pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/v8/vault-overrides.yaml");
 
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
@@ -153,11 +153,6 @@ impl TemplateRegistry {
         );
     }
 
-    pub fn load_humidifi_overrides(&mut self) {
-        self.load_raw_layout_overrides(HUMIDIFI_MARKET_OVERRIDES_CONTENT, "humidifi-market");
-        self.load_raw_layout_overrides(HUMIDIFI_VAULT_OVERRIDES_CONTENT, "humidifi-vault");
-    }
-
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
 
@@ -190,6 +185,11 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
         );
+    }
+
+    pub fn load_humidifi_overrides(&mut self) {
+        self.load_raw_layout_overrides(HUMIDIFI_MARKET_OVERRIDES_CONTENT, "humidifi-market");
+        self.load_raw_layout_overrides(HUMIDIFI_VAULT_OVERRIDES_CONTENT, "humidifi-vault");
     }
 
     pub fn load_drift_overrides(&mut self) {

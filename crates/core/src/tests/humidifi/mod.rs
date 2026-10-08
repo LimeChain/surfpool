@@ -24,6 +24,7 @@ use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -133,9 +134,9 @@ fn assert_only_within(
     context: &str,
 ) {
     assert_eq!(before.len(), after.len(), "{context}: length changed");
-    for (i, (a, b)) in before.iter().zip(after).enumerate() {
+    for i in diff_indices(before, after) {
         assert!(
-            a == b || ranges.iter().any(|r| r.contains(&i)),
+            ranges.iter().any(|r| r.contains(&i)),
             "{context}: byte {i} changed outside {ranges:?}"
         );
     }
