@@ -59,8 +59,8 @@ The market account is 1264 bytes. Offsets not listed are not written by any temp
 | 56        | quote mint                             | pubkey, read-only | -                        |
 | 88        | freshness limit                        | u64, read-only    | slots                    |
 | 120       | last update slot                       | `slot`            | slot offset              |
-| 128       | quote atoms per base atom              | u64               | × 10^15                  |
-| 144       | base atoms per quote atom              | u64               | × 10^15                  |
+| 128       | quote atoms per base atom              | u128              | × 10^15                  |
+| 144       | base atoms per quote atom              | u128              | × 10^15                  |
 | 160 + 24n | sell level n capacity                  | u64               | base atoms               |
 | 168 + 24n | sell level n output factor             | u64               | 10^6 = neutral           |
 | 176 + 24n | sell level n enabled                   | `u8_strided`      | 0 or 1                   |
@@ -91,9 +91,6 @@ For any other pair, each template's LLM guidance finds the market on the program
 `getProgramAccounts` call filters the program's accounts by market tag `5` at offset 96 and the two
 mints at 24 and 56. A market without a price in both directions has every level disabled and
 cannot fill, so the guidance says so instead of preparing it.
-
-A BONK / USDC market cannot be priced through `tessera-price`: its base-per-quote price exceeds
-the u64 field.
 
 Use `fetchBeforeUse: true` so the selected market is loaded into the local VM from the upstream
 datasource before its bytes are changed. A later override that builds on an earlier one in the same

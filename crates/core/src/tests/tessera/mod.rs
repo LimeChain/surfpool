@@ -21,6 +21,7 @@ use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -396,21 +397,16 @@ fn clock_slot(market: &MarketFixture) -> u64 {
     read_u64(&market.market.data, 120) + 1
 }
 
-fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
-    left.iter()
-        .zip(right)
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(index, _)| index)
-        .collect()
-}
-
 fn write_u64(data: &mut [u8], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn read_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+fn read_u128(data: &[u8], offset: usize) -> u128 {
+    u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap())
 }
 
 fn apply_raw(id: &str, data: &[u8], values: &[(String, serde_json::Value)], slot: u64) -> Vec<u8> {
@@ -435,7 +431,7 @@ fn first_level_output(market: &[u8], amount_in: u64, direction: u8) -> u64 {
         (144, 648)
     };
     let output = u128::from(amount_in)
-        * u128::from(read_u64(market, price_offset))
+        * read_u128(market, price_offset)
         * u128::from(read_u64(market, factor_offset))
         / 1_000_000_000_000_000_000_000_u128;
     u64::try_from(output).unwrap()
@@ -498,8 +494,8 @@ fn scaled_ladder(
     out
 }
 
-fn price_values(quote_per_base: u64) -> Vec<(String, serde_json::Value)> {
-    let base_per_quote = 10u128.pow(30) / u128::from(quote_per_base);
+fn price_values(quote_per_base: u128) -> Vec<(String, serde_json::Value)> {
+    let base_per_quote = 10u128.pow(30) / quote_per_base;
     values([
         (
             "quote_atoms_per_base_atom_x1e15",
@@ -507,7 +503,7 @@ fn price_values(quote_per_base: u64) -> Vec<(String, serde_json::Value)> {
         ),
         (
             "base_atoms_per_quote_atom_x1e15",
-            serde_json::json!(u64::try_from(base_per_quote).unwrap().to_string()),
+            serde_json::json!(base_per_quote.to_string()),
         ),
     ])
 }
@@ -577,7 +573,7 @@ async fn tessera_featured_markets_match_their_market_accounts() {
         assert_eq!(&data[24..56], base_mint.as_ref(), "{pair} base mint");
         assert_eq!(&data[56..88], quote_mint.as_ref(), "{pair} quote mint");
         assert!(
-            read_u64(data, 128) > 0 && read_u64(data, 144) > 0,
+            read_u128(data, 128) > 0 && read_u128(data, 144) > 0,
             "{pair} must quote a price"
         );
     }
@@ -613,6 +609,15 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
                 template.id
             );
         }
+        // Each direction's price is a u128: a cheap base token carries a non-zero high word at 152.
+        let (quote_per_base, base_per_quote) = (read_u128(data, 128), read_u128(data, 144));
+        if quote_per_base > 0 && base_per_quote > 0 {
+            let product = quote_per_base * base_per_quote;
+            assert!(
+                product.abs_diff(10u128.pow(30)) <= 10u128.pow(27),
+                "{address}: the two u128 prices must be reciprocal, got a product of {product}"
+            );
+        }
         let priced = apply_raw(
             "tessera-price",
             data,
@@ -622,9 +627,11 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
         assert!(
             diff_indices(data, &priced)
                 .iter()
-                .all(|i| (128..136).contains(i) || (144..152).contains(i)),
+                .all(|i| (128..160).contains(i)),
             "{address} escaped the price write set"
         );
+        assert_eq!(read_u128(&priced, 128), 1_000_000_000_000_000);
+        assert_eq!(read_u128(&priced, 144), 1_000_000_000_000_000);
         let halted = apply_raw(
             "tessera-halt",
             data,
@@ -672,12 +679,12 @@ async fn tessera_scenario_materializes_once_through_surfnet_svm() {
     let read = |svm: &SurfnetSvm| svm.inner.get_account(&market_key).unwrap().unwrap().data;
     let materialized = read(&svm);
     assert_eq!(read_u64(&materialized, 120), BASE_SLOT);
-    assert_eq!(read_u64(&materialized, 128), 100_000_000_000_000);
-    assert_eq!(read_u64(&materialized, 144), 10_000_000_000_000_000);
+    assert_eq!(read_u128(&materialized, 128), 100_000_000_000_000);
+    assert_eq!(read_u128(&materialized, 144), 10_000_000_000_000_000);
     assert!(
         diff_indices(&original, &materialized)
             .iter()
-            .all(|i| (120..136).contains(i) || (144..152).contains(i)),
+            .all(|i| (120..160).contains(i)),
         "materialization escaped the price and freshness write set"
     );
 
@@ -708,11 +715,11 @@ async fn tessera_price_formula_reprices_both_directions() {
         &values([
             (
                 "quote_atoms_per_base_atom_x1e15",
-                serde_json::json!(read_u64(&upstream, 128) * 2),
+                serde_json::json!((read_u128(&upstream, 128) * 2).to_string()),
             ),
             (
                 "base_atoms_per_quote_atom_x1e15",
-                serde_json::json!(read_u64(&upstream, 144) / 2),
+                serde_json::json!((read_u128(&upstream, 144) / 2).to_string()),
             ),
         ]),
         0,
@@ -727,7 +734,7 @@ async fn tessera_price_formula_reprices_both_directions() {
         &upstream,
         &values([(
             "quote_atoms_per_base_atom_x1e15",
-            serde_json::json!(read_u64(&upstream, 128) * 2),
+            serde_json::json!((read_u128(&upstream, 128) * 2).to_string()),
         )]),
         0,
     );
@@ -741,7 +748,7 @@ async fn tessera_price_formula_reprices_both_directions() {
         &upstream,
         &values([(
             "base_atoms_per_quote_atom_x1e15",
-            serde_json::json!(read_u64(&upstream, 144) / 2),
+            serde_json::json!((read_u128(&upstream, 144) / 2).to_string()),
         )]),
         0,
     );
