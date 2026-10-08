@@ -1031,6 +1031,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// LLM context shared by all templates in this collection, placed before each template's own
+    #[serde(default)]
+    pub llm_context: Option<String>,
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
@@ -1083,6 +1086,11 @@ pub enum RawEncoding {
         count: usize,
         stride: usize,
     },
+    /// An unsigned 8-bit value written to `count` slots, `stride` bytes apart.
+    U8Strided {
+        count: usize,
+        stride: usize,
+    },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
@@ -1097,7 +1105,7 @@ impl RawEncoding {
     /// Byte width of this encoding.
     pub fn width(&self) -> usize {
         match self {
-            RawEncoding::U8 => 1,
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
             RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
@@ -1112,7 +1120,8 @@ impl RawEncoding {
     /// encodings with the same loop instead of special-casing one of them.
     pub fn placements(&self) -> (usize, usize) {
         match self {
-            RawEncoding::I32Strided { count, stride } => (*count, *stride),
+            RawEncoding::I32Strided { count, stride }
+            | RawEncoding::U8Strided { count, stride } => (*count, *stride),
             other => (1, other.width()),
         }
     }
@@ -1146,7 +1155,7 @@ impl RawEncoding {
             }};
         }
         Ok(match self {
-            RawEncoding::U8 => int!(u8, "u8"),
+            RawEncoding::U8 | RawEncoding::U8Strided { .. } => int!(u8, "u8"),
             RawEncoding::U16 => int!(u16, "u16"),
             RawEncoding::U32 => int!(u32, "u32"),
             RawEncoding::U64 => int!(u64, "u64"),
@@ -1483,6 +1492,10 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
+                let llm_context = match (&self.llm_context, entry.llm_context) {
+                    (Some(shared), Some(own)) => Some(format!("{}\n\n{own}", shared.trim_end())),
+                    (shared, own) => own.or_else(|| shared.clone()),
+                };
                 let properties =
                     describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type)
                         .map_err(|e| format!("template '{}': {e}", entry.id))?;
@@ -1497,7 +1510,7 @@ impl YamlOverrideTemplateCollection {
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
-                    llm_context: entry.llm_context,
+                    llm_context,
                     raw_layout: self.raw_layout,
                 })
             })
@@ -1800,6 +1813,35 @@ mod tests {
                     *b, 0,
                     "byte {i} lies between strided slots and must not change"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn u8_strided_writes_every_slot_and_nothing_between() {
+        use super::RawEncoding;
+        let mut property = Property::field("flags".to_string());
+        property.offset = Some(16);
+        property.encoding = Some(RawEncoding::U8Strided {
+            count: 3,
+            stride: 24,
+        });
+        let template = raw_template(vec![property]);
+
+        let original = vec![0xa5; 72];
+        let out = template
+            .materialize_raw_layout(
+                &original,
+                &HashMap::from([("flags".to_string(), json!(0))]),
+                0,
+            )
+            .expect("strided write");
+
+        for (i, byte) in out.iter().enumerate() {
+            if i >= 16 && (i - 16) % 24 == 0 {
+                assert_eq!(*byte, 0, "slot at byte {i} should carry the value");
+            } else {
+                assert_eq!(*byte, original[i], "unexpected write at byte {i}");
             }
         }
     }
