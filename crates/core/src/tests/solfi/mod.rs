@@ -895,6 +895,7 @@ async fn solfi_directional_risk_off_scenario_is_isolated_to_the_target_side() {
             run(fork, fork.def.quote_trade, 1, tight, oracle.clone())
                 .expect("tight quote-to-base control"),
         ];
+        assert!(controls.iter().all(|output| *output > 0));
 
         for (target_direction, market) in [
             (1usize, directional_spread(fork, 100_000, 10_000, 100_000)),
@@ -929,14 +930,16 @@ async fn solfi_directional_risk_off_scenario_is_isolated_to_the_target_side() {
             .expect("untargeted quote");
             let targeted_delta = controls[target_direction].saturating_sub(targeted);
             let cross_delta = controls[other_direction].abs_diff(untargeted);
+            let targeted_fraction = targeted_delta as f64 / controls[target_direction] as f64;
+            let cross_fraction = cross_delta as f64 / controls[other_direction] as f64;
             assert!(
-                targeted_delta * 1_000 > controls[target_direction] * 8,
+                targeted_fraction > 0.008,
                 "{} direction {target_direction} moved by less than 0.8%",
                 fork.def.market
             );
             assert!(
-                (cross_delta as u128) * 20 < targeted_delta as u128,
-                "{} target delta {targeted_delta}, cross delta {cross_delta}",
+                cross_fraction * 20.0 < targeted_fraction,
+                "{} target fraction {targeted_fraction}, cross fraction {cross_fraction}",
                 fork.def.market
             );
             checked += 1;
@@ -1281,11 +1284,10 @@ async fn solfi_one_sided_inventory_exhaustion_and_inventory_policy_are_real() {
         } else {
             &mut base
         };
-        let starved = amount(payout) / 1000;
         *payout = apply_raw(
             "solfi-vault-balance",
             payout,
-            &[("amount", serde_json::json!(starved))],
+            &[("amount", serde_json::json!(0))],
             fork.slot,
         );
         let err = replay(

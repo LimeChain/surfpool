@@ -38,28 +38,16 @@ human price does not depend on the exponent already stored in the selected oracl
 
 ## Picking a market
 
-Studio offers a short list of featured markets and also accepts a market, oracle or vault address
-directly. Market templates target the market account, price and freshness templates target its
-embedded oracle, and the vault template targets one of its SPL-token vaults. The backend templates
-do not embed a market catalog.
-
-Studio includes four featured markets:
-
-| Choice      | Best suited for                                      |
-| ----------- | ---------------------------------------------------- |
-| WSOL / USDC | SOL price shocks, spread changes and liquidity tests |
-| USDT / USDC | Stablecoin depegs and stablecoin liquidity tests     |
-| HYPE / USDC | Altcoin price, spread and inventory stress tests     |
-| PUMP / USDC | Volatile-token price and liquidity stress tests      |
-
-The picker supplies the correct market, oracle or vault account for its featured choices. For any
-other pair, use the template's LLM guidance to discover the market from the SolFi program, verify the
-pair through both vault mints, and select the corresponding target account. Empty markets are valid
-SolFi state, but their presence on chain is not a promise that a swap can currently settle.
+Market templates target the market account, price and freshness templates target its embedded
+oracle, and the vault template targets one of its SPL-token vaults. The backend templates do not
+embed a market catalog. Use the template's LLM guidance to discover a market from the SolFi program,
+verify the pair through both vault mints, and select the corresponding target account. Empty markets
+are valid SolFi state, but their presence on chain is not a promise that a swap can currently settle.
 
 Do not reuse an oracle or vault merely because the token pair looks similar. Use
 `fetchBeforeUse: true` so the selected account is loaded into the local VM from the upstream
-datasource before its bytes are changed.
+datasource before its bytes are changed. Fetch an account only on its first override. A later fetch
+replaces the full local account and can erase earlier overrides on its other fields.
 
 ## Two rules that prevent misleading scenarios
 
@@ -67,7 +55,8 @@ datasource before its bytes are changed.
 still never reach the quote if the oracle has expired. Apply `solfi-freshness` with
 `publication_slot: 0` and `validity_horizon: 200` when setup spans multiple slots. That keeps the
 quote valid for 200 slots. For a longer scenario, schedule the same freshness override again in each
-later slot where a quote is needed.
+later slot where a quote is needed with `fetchBeforeUse: false`. If a later upstream fetch is
+required, reapply `solfi-price` after it in that slot.
 
 **2. Do not repeatedly reset transaction-owned inventory.** Price, freshness and spline settings are
 configuration inputs. A vault balance is state that swaps modify. Reapplying a vault override after
@@ -77,9 +66,9 @@ every swap can undo the swap and manufacture or erase inventory.
 
 ### PMM risk-off during a SOL crash
 
-This is the scenario exposed in Studio's Bento examples. It models a maker that remains available
-for small trades but protects itself after SOL falls: it marks SOL at $50, pays 1% less when buying
-SOL, and limits its USDC payout inventory to 25 USDC.
+This scenario models a maker that remains available for small trades but protects itself after SOL
+falls: it marks SOL at $50, pays 1% less when buying SOL, and limits its USDC payout inventory to 25
+USDC.
 
 1. On **WSOL / USDC**, use `solfi-price` with exponent `-10` and coefficient `500000000`.
 2. Use `solfi-freshness` with publication slot `0` and validity horizon `200` so the new quote is
@@ -102,7 +91,8 @@ price moves suddenly.
 2. Set both price fields to the new price. For example, exponent `-10` and coefficient `500000000`
    means $50 per SOL.
 3. Add `solfi-freshness` for **WSOL / USDC** with publication slot `0` and validity horizon `200`.
-4. If the swap executes more than 200 slots later, schedule another freshness override in that slot.
+4. If the swap executes more than 200 slots later, schedule another freshness override in that slot
+   with `fetchBeforeUse: false`, or reapply `solfi-price` after any required fetch.
 5. Compare a swap before and after the price change. Also keep a run with the original price as a
    control.
 
@@ -166,8 +156,9 @@ output, subject to spread and rounding. The price-looking word in the market acc
 authoritative input, but changing the external oracle is what reprices a fill.
 
 For a multi-slot scenario, `solfi-freshness` keeps the quote valid for its configured horizon. If a
-swap executes after that horizon, schedule another freshness override in the execution slot. The
-price remains set unless another override or transaction writes the oracle account.
+swap executes after that horizon, schedule another freshness override in the execution slot with
+`fetchBeforeUse: false`. Fetching the upstream oracle replaces the full local account and erases the
+earlier price override. If a later fetch is required, reapply `solfi-price` after it in that slot.
 Repricing only SolFi while leaving another venue unchanged creates a real cross-venue dislocation
 suitable for router, arbitrage and liquidation-path testing. Always include an undislocated control leg.
 
@@ -181,7 +172,8 @@ validity_horizon:  200
 
 Both inputs are relative offsets even though the account stores XOR-obfuscated absolute slots.
 This keeps the quote valid for 200 slots from materialization. For a longer scenario, schedule this
-template again in each later slot where a quote is needed.
+template again in each later slot where a quote is needed with `fetchBeforeUse: false`. If that slot
+must fetch the oracle from upstream, reapply `solfi-price` after the fetch.
 
 An expired SolFi oracle rejects the transaction with error 23.
 
