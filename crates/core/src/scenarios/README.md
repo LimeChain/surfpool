@@ -20,6 +20,9 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Drift v2** - Perp and spot markets, user state, and global state
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
+ - **GoonFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, freshness,
+   reference-band and vault-inventory templates. See
+   [protocols/goonfi/README.md](./protocols/goonfi/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 
@@ -77,6 +80,42 @@ Each collection uses exactly one write model: an IDL-backed collection cannot se
 `raw_layout: true`, and an IDL-less collection must set it. Raw-layout collections are currently
 compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
 endpoint.
+
+### Constants read from program accounts
+
+A constant can list the program's own accounts instead of a hardcoded catalog. The options are read
+through the surfnet RPC (local state first, then its datasource) when templates are served to Studio
+and MCP, cached for 60 seconds, and never at startup:
+
+```yaml
+constants:
+  market:
+    label: Example market
+    source:
+      program_accounts:
+        program: <program id>
+        size: 1264
+        filters: [{ offset: 96, bytes: [5, 0, 0, 0, 0, 0, 0, 0] }]
+        fields:
+          base_mint: { offset: 24, encoding: pubkey }
+          quote_mint: { offset: 56, encoding: pubkey, mask: [1, 2, 3, 4] }
+          base_vault: { offset: 88, encoding: pubkey }
+          limit: { offset: 120, encoding: u64 }
+        pair: { base: base_mint, quote: quote_mint }
+        value: base_vault
+        default: { base: <base mint>, quote: <quote mint> }
+        fresh: { field: limit, within_slots: 5000 }
+```
+
+Each matching account becomes one option labelled with its pair's token symbols, sorted by label.
+Its value is the account address, or the pubkey field named by `value`. Its metadata holds every
+field, `account`, `pair`, `base_decimals` and `quote_decimals`. `mask` holds one XOR key per 8-byte
+word of a field. `expand: [{ value: <field>, suffix: " base vault", metadata: { side: base } }]`
+turns each account into one option per entry instead. `fresh` drops accounts whose u64 slot field
+is more than `within_slots` behind the surfnet's current slot, and `default` moves the option with
+those two mints to the front. A template whose address is
+`{ type: pubkey }` with no value targets the first option. If the read fails the constant is
+served with no options.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.

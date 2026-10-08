@@ -1,0 +1,124 @@
+protocol: GoonFi
+version: v2
+account_type: PriceOracle
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - oracle
+
+constants:
+  market:
+    label: GoonFi market
+    description: Choose a GoonFi market that has traded within the last day; the value is its oracle.
+    source:
+      program_accounts:
+        program: goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE
+        size: 2048
+        filters:
+          - offset: 0
+            bytes: [48, 188, 47, 53, 52, 88, 50, 154]
+        fields:
+          base_mint: { offset: 80, encoding: pubkey }
+          quote_mint: { offset: 112, encoding: pubkey }
+          base_vault: { offset: 144, encoding: pubkey }
+          quote_vault: { offset: 176, encoding: pubkey }
+          oracle: { offset: 208, encoding: pubkey }
+          activity_slot: { offset: 40, encoding: u64 }
+        pair: { base: base_mint, quote: quote_mint }
+        value: oracle
+        default:
+          base: So11111111111111111111111111111111111111112
+          quote: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+        fresh: { field: activity_slot, within_slots: 216000 }
+
+templates:
+  - id: goonfi-price
+    name: Override Price
+    description: Move the bid and ask a GoonFi market quotes from its oracle
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: bid_price_x1e6
+        offset: 0
+        encoding: u64
+        label: Bid price
+        description: Price GoonFi buys base at, quote per base times 10^6, independent of mint decimals.
+      - path: ask_price_x1e6
+        offset: 8
+        encoding: u64
+        label: Ask price
+        description: Price GoonFi sells base at, quote per base times 10^6; keep it at or above the bid.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      PRECONDITION - MOVE THE REFERENCE BAND TOO. The market account holds a reference band that
+      guards this quote. A sell whose bid sits above the band, or a buy whose ask sits below it,
+      rejects with custom error 0x24 (36). Apply goonfi-reference-band to the paired market, scaled
+      by the same factor, in the same scenario.
+
+      This is GoonFi's authoritative price input. The 32-byte oracle is owned by a companion
+      publisher program and the market points at it from bytes 208..240.
+
+      CONVERSION:
+        bid_price_x1e6 = human_price * 10^6
+      The scale is independent of mint decimals: SOL at 99.74 USDC is 99740000 on a 9/6 market,
+      and USDT at 1.0001 USDC is 1000100 on a 6/6 market. Set both fields with ask >= bid.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Price and freshness are independent. A quote older than its per-market window rejects with
+      custom error 0x15 (21) before the new price is used; apply goonfi-freshness in the slot where
+      the quote is needed.
+
+      DIRECTION: raising the bid raises what a seller receives; lowering the ask raises what a buyer
+      receives. The deployed-program test confirms a coupled 2x move doubles a sell's output.
+
+      EXAMPLE - "SOL is worth $150" on the selected SOL/USDC market, paired with the band:
+        bid_price_x1e6: 150000000
+        ask_price_x1e6: 150000000
+
+  - id: goonfi-freshness
+    name: Override Oracle Freshness
+    description: Keep a GoonFi quote current or make the market reject it as stale
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 16
+        encoding:
+          slot32:
+            lead: 0
+        label: Update-slot offset
+        description: Relative to the slot where the override materializes; 0 is current, -2000 is stale.
+    llm_context: |
+      The target account is chosen through account.pubkey (a market option's value); never put a market key in values.
+      The oracle's 4-byte update slot is GoonFi's only staleness input. The value is a relative slot
+      offset: Surfpool writes the materialization slot plus the offset. The publish timestamp at
+      oracle bytes 24..32 is not consulted, and the decay multiplier at 20..24 is left untouched.
+
+      FRESH: set last_update_slot to 0. The quote is undecayed in the materialization slot. The
+      stamp is written once; for a longer scenario, schedule this template again in each later slot
+      where a quote is needed.
+
+      STALE: set last_update_slot to a negative offset. A quote decays with age inside its
+      per-market window and then rejects with custom error 0x15 (21). The window is live, per-market
+      configuration: volatile pairs reject after roughly 16 to 21 slots, stablecoin pairs after
+      hundreds. -2000 is past the window of every market the deployed-program tests replay.
+
+      A decayed fill that drops about 5% below the fresh quote can reject with custom error 0x26 (38)
+      before 0x15 is reached.
+
+      Do not schedule a fresh override over an interval that is meant to stay stale.
+
+      Set fetchBeforeUse: true so the live account is forked first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared, such as a goonfi-price
+      move applied to the same oracle.
+
+      HOW TO USE:
+      1. Set last_update_slot to 0 for a current quote, or -2000 for a rejected one
+      2. If a quote is needed later, schedule this template again in that later slot
