@@ -61,6 +61,7 @@
     "build:native:debug": "napi build --platform surfpool-sdk --dts internal.d.ts --js internal.js",
     "build:ts": "tsc && tsc -p tsconfig.kit.json && tsc -p tsconfig.kit.esm.json && node ./scripts/sync-dist.js",
     "create-npm-dir": "napi create-npm-dir -t .",
+    "inject-platform-deps": "node ./scripts/inject-platform-deps.js",
     "generate:kit-types": "node ./scripts/generate-kit-types.js",
     "artifacts": "napi artifacts",
     "pack:dry-run": "npm pack --dry-run",
@@ -91,10 +92,5 @@
     "@solana/kit-plugin-signer": {
       "optional": true
     }
-  },
-  "optionalDependencies": {
-    "@solana/surfpool-darwin-x64": "1.6.0",
-    "@solana/surfpool-darwin-arm64": "1.6.0",
-    "@solana/surfpool-linux-x64-gnu": "1.6.0"
   }
 }
