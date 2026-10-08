@@ -20,7 +20,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Drift v2** - Perp and spot markets, user state, and global state
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
-- **GoonFi V2** - Proprietary market maker (no published IDL), with price, freshness, reference-band and vault-inventory templates; callers choose the market, oracle or vault account. See [protocols/goonfi/README.md](./protocols/goonfi/README.md)
+- **GoonFi V2** - Proprietary market maker (no published IDL), with price, freshness, reference-band and vault-inventory templates; callers choose the market, oracle or vault account. See [protocols/goonfi/v2/README.md](./protocols/goonfi/v2/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 

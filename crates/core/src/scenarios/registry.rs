@@ -26,12 +26,6 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
-pub const GOONFI_ORACLE_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/goonfi/oracle-overrides.yaml");
-pub const GOONFI_MARKET_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/goonfi/market-overrides.yaml");
-pub const GOONFI_VAULT_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/goonfi/vault-overrides.yaml");
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -52,6 +46,13 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/idl.json");
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
+
+pub const GOONFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/oracle-overrides.yaml");
+pub const GOONFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/market-overrides.yaml");
+pub const GOONFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/vault-overrides.yaml");
 
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
@@ -154,11 +155,6 @@ impl TemplateRegistry {
         );
     }
 
-    pub fn load_goonfi_overrides(&mut self) {
-        self.load_raw_layout_overrides(GOONFI_ORACLE_OVERRIDES_CONTENT, "goonfi-oracle");
-        self.load_raw_layout_overrides(GOONFI_MARKET_OVERRIDES_CONTENT, "goonfi-market");
-        self.load_raw_layout_overrides(GOONFI_VAULT_OVERRIDES_CONTENT, "goonfi-vault");
-    }
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
 
@@ -191,6 +187,12 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
         );
+    }
+
+    pub fn load_goonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(GOONFI_ORACLE_OVERRIDES_CONTENT, "goonfi-oracle");
+        self.load_raw_layout_overrides(GOONFI_MARKET_OVERRIDES_CONTENT, "goonfi-market");
+        self.load_raw_layout_overrides(GOONFI_VAULT_OVERRIDES_CONTENT, "goonfi-vault");
     }
 
     pub fn load_drift_overrides(&mut self) {

@@ -9,6 +9,7 @@ use solana_pubkey::Pubkey;
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient},
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -316,15 +317,6 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
     assert!(t.raw_layout, "{id} must use raw-layout writes");
     t.materialize_raw_layout(data, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
-}
-
-fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
-    left.iter()
-        .zip(right)
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(index, _)| index)
-        .collect()
 }
 
 fn assert_writes_within(before: &[u8], after: &[u8], allowed: std::ops::Range<usize>, what: &str) {
