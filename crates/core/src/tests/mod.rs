@@ -4,6 +4,8 @@ pub mod integration;
 pub mod kamino;
 #[cfg(feature = "integration-tests")]
 pub mod meteora_dlmm;
+#[cfg(feature = "integration-tests")]
+pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;

@@ -53,8 +53,9 @@ use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
+    BlockEncodingOptions, ConfirmedBlock,
     TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
-    TransactionStatusMeta, UiConfirmedBlock,
+    TransactionStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
 };
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
@@ -92,37 +93,48 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
-    scenarios::{TemplateRegistry, account_data_values, template_registry},
+    scenarios::{
+        TemplateRegistry, account_data_values,
+        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+    },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
-        MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
+        GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
         SurfnetTransactionStatus, SyntheticBlockhash, TokenAccount, TransactionWithStatusMeta,
     },
 };
 
+/// Simulated time between garbage collections of the lite SVM cache.
+pub const GARBAGE_COLLECTION_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+/// Simulated time between checkpoints of the latest slot to storage.
+pub const CHECKPOINT_INTERVAL_MS: u64 = 60 * 1000;
+
 lazy_static::lazy_static! {
-    /// Interval (in slots) at which to perform garbage collection on the lite SVM cache.
-    /// About 1 hour at standard 400ms slot time.
-    /// Configurable via SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS env var.
-    pub static ref GARBAGE_COLLECTION_INTERVAL_SLOTS: u64 = {
+    /// Overrides the garbage collection interval with a fixed number of slots.
+    /// Set via SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS env var.
+    pub static ref GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE: Option<u64> =
         std::env::var("SURFPOOL_GARBAGE_COLLECTION_INTERVAL_SLOTS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(9_000)
-    };
+            .and_then(|s| s.parse().ok());
 
-    /// Interval (in slots) at which to checkpoint the latest slot to storage.
-    /// About 1 minute at standard 400ms slot time (60000ms / 400ms = 150 slots).
-    /// Configurable via SURFPOOL_CHECKPOINT_INTERVAL_SLOTS env var.
-    pub static ref CHECKPOINT_INTERVAL_SLOTS: u64 = {
+    /// Overrides the checkpoint interval with a fixed number of slots.
+    /// Set via SURFPOOL_CHECKPOINT_INTERVAL_SLOTS env var.
+    pub static ref CHECKPOINT_INTERVAL_SLOTS_OVERRIDE: Option<u64> =
         std::env::var("SURFPOOL_CHECKPOINT_INTERVAL_SLOTS")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(150)
-    };
+            .and_then(|s| s.parse().ok());
+}
+
+/// Converts a simulated-time interval into slots at the given slot time, unless a slot
+/// count override is set. Never returns 0.
+fn interval_in_slots(override_slots: Option<u64>, interval_ms: u64, slot_time: u64) -> u64 {
+    override_slots
+        .unwrap_or_else(|| interval_ms / slot_time.max(1))
+        .max(1)
 }
 
 /// Determines how an account result may change the SVM.
@@ -1444,7 +1456,7 @@ impl SurfnetSvm {
                     post_token_balances: Some(vec![]),
                     rewards: Some(vec![]),
                     loaded_addresses: LoadedAddresses::default(),
-                    return_data: Some(tx_result.return_data.clone()),
+                    return_data: Some(tx_result.return_data.clone()).filter(|d| !d.data.is_empty()),
                     compute_units_consumed: Some(tx_result.compute_units_consumed),
                     cost_units: None,
                 },
@@ -1544,6 +1556,24 @@ impl SurfnetSvm {
         // Calculate time relative to genesis_slot (when this surfnet started)
         let slots_since_genesis = slot.saturating_sub(self.genesis_slot);
         self.genesis_updated_at + (slots_since_genesis * self.slot_time)
+    }
+
+    /// Slots between garbage collections of the lite SVM cache at the current slot time.
+    pub fn garbage_collection_interval_slots(&self) -> u64 {
+        interval_in_slots(
+            *GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE,
+            GARBAGE_COLLECTION_INTERVAL_MS,
+            self.slot_time,
+        )
+    }
+
+    /// Slots between checkpoints of the latest slot at the current slot time.
+    pub fn checkpoint_interval_slots(&self) -> u64 {
+        interval_in_slots(
+            *CHECKPOINT_INTERVAL_SLOTS_OVERRIDE,
+            CHECKPOINT_INTERVAL_MS,
+            self.slot_time,
+        )
     }
 
     /// Checks if a slot is within the valid range for sparse block storage.
@@ -1943,6 +1973,21 @@ impl SurfnetSvm {
     /// # Returns
     /// `Ok(())` on success, or an error if the operation fails.
     pub fn set_account(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        self.set_account_inner(pubkey, account, true)
+    }
+
+    /// Inserts an upstream account into the fork without publishing a local account update.
+    fn set_account_silently(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        self.set_account_inner(pubkey, account, false)
+    }
+
+    fn set_account_inner(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+        notify_subscribers: bool,
+    ) -> SurfpoolResult<()> {
+        let before = self.get_account(pubkey)?;
         self.inner
             .set_account(*pubkey, account.clone())
             .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
@@ -1951,21 +1996,48 @@ impl SurfnetSvm {
             .insert(*pubkey, self.get_latest_absolute_slot());
 
         // Update the account registries and indexes
-        self.update_account_registries(pubkey, &account)?;
+        self.update_account_registries(pubkey, before.as_ref(), &account)?;
 
-        // Notify account subscribers
-        self.notify_account_subscribers(pubkey, &account);
+        if notify_subscribers {
+            // Notify account subscribers
+            self.notify_account_subscribers(pubkey, &account);
 
-        // Notify program subscribers
-        self.notify_program_subscribers(pubkey, &account);
+            // Notify program subscribers
+            self.notify_program_subscribers(pubkey, &account);
 
-        let _ = self.simnet_events_tx.account_update(*pubkey);
+            let _ = self.simnet_events_tx.account_update(*pubkey);
+        }
         Ok(())
     }
 
+    /// Applies an account mutation forged by a scenario and publishes it to subscribers.
+    /// Upstream account hydration deliberately uses a different path and remains silent.
+    pub(crate) fn set_scenario_override_account(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+        slot: Slot,
+    ) -> SurfpoolResult<()> {
+        if self.get_account(pubkey)?.as_ref() == Some(&account) {
+            return Ok(());
+        }
+
+        self.set_account(pubkey, account.clone())?;
+        self.account_update_slots.insert(*pubkey, slot);
+
+        let write_version = self.increment_write_version();
+        let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
+            GeyserAccountUpdate::block_update(*pubkey, account, slot, write_version),
+        ));
+        Ok(())
+    }
+
+    /// `before` is the account as it was before this update: the inner SVM already holds the new
+    /// state, so it can no longer be read back from there.
     pub fn update_account_registries(
         &mut self,
         pubkey: &Pubkey,
+        before: Option<&Account>,
         account: &Account,
     ) -> SurfpoolResult<()> {
         let is_deleted_account = account == &Account::default();
@@ -1980,27 +2052,23 @@ impl SurfnetSvm {
                 .set_account_in_db(*pubkey, account.clone().into())?;
         }
 
+        // Drop the owner/mint/delegate entries of the prior version of the
+        // account; otherwise a closed account, or the old owner's bucket after
+        // a change of owner, would keep pointing at `pubkey`.
+        if let Some(before) = before {
+            self.remove_from_indexes(pubkey, before)?;
+        }
+
         if is_deleted_account {
             // Record the account as offline so the surfnet does not re-fetch
-            // it from the upstream RPC, then drop any stale index entries
-            // that pointed at its prior on-chain state.
+            // it from the upstream RPC.
             self.offline_accounts.store(
                 pubkey.to_string(),
                 OfflineAccountConfig {
                     include_owned_accounts: false,
                 },
             )?;
-            if let Some(old_account) = self.get_account(pubkey)? {
-                self.remove_from_indexes(pubkey, &old_account)?;
-            }
             return Ok(());
-        }
-
-        // Drop any stale owner/mint/delegate entries for the prior version of
-        // the account before indexing the new one; otherwise a change of
-        // owner would leave the old owner's bucket pointing at `pubkey`.
-        if let Some(old_account) = self.get_account(pubkey)? {
-            self.remove_from_indexes(pubkey, &old_account)?;
         }
 
         let pubkey_str = pubkey.to_string();
@@ -2134,7 +2202,12 @@ impl SurfnetSvm {
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
     ) -> SurfpoolResult<()> {
+        // A fresh LiteSVM starts LastRestartSlot at 0; keep the one loaded from the datasource.
+        let last_restart_slot = self
+            .inner
+            .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>();
         self.inner.reset(self.feature_set.clone())?;
+        self.inner.set_sysvar(&last_restart_slot);
 
         let native_mint_account = self
             .inner
@@ -2737,7 +2810,7 @@ impl SurfnetSvm {
         // sample. See https://solana.com/docs/rpc/websocket/slotsupdatessubscribe
         let slots_update_ts: u64 = Utc::now().timestamp_millis().max(0) as u64;
         let previous_chain_tip = self.chain_tip.clone();
-        if slot % *GARBAGE_COLLECTION_INTERVAL_SLOTS == 0 {
+        if slot.is_multiple_of(self.garbage_collection_interval_slots()) {
             debug!("Clearing liteSVM cache at slot {}", slot);
             self.inner.garbage_collect(self.feature_set.clone());
         }
@@ -2765,9 +2838,9 @@ impl SurfnetSvm {
             )?;
         }
 
-        // Checkpoint the latest slot periodically (~every 150 slots / 1 minute at standard slot time)
+        // Checkpoint the latest slot periodically (~every minute of simulated time)
         // This allows recovery after restart without storing every empty block
-        if slot.saturating_sub(self.last_checkpoint_slot) >= *CHECKPOINT_INTERVAL_SLOTS {
+        if slot.saturating_sub(self.last_checkpoint_slot) >= self.checkpoint_interval_slots() {
             self.slot_checkpoint
                 .store("latest_slot".to_string(), slot)?;
             self.last_checkpoint_slot = slot;
@@ -3006,7 +3079,9 @@ impl SurfnetSvm {
             );
 
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
+            let fetch_from_upstream =
+                override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey);
+            if fetch_from_upstream {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -3060,7 +3135,7 @@ impl SurfnetSvm {
                             match self.inner.get_account(&coupled_pubkey) {
                                 Ok(None) => {
                                     if let Err(e) =
-                                        self.inner.set_account(coupled_pubkey, coupled_account)
+                                        self.set_account_silently(&coupled_pubkey, coupled_account)
                                     {
                                         warn!(
                                             "Failed to set coupled account {} from remote: {}",
@@ -3079,7 +3154,7 @@ impl SurfnetSvm {
                         }
 
                         // Set the fresh account data in the SVM
-                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
+                        if let Err(e) = self.set_account_silently(&account_pubkey, remote_account) {
                             warn!(
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
@@ -3157,7 +3232,11 @@ impl SurfnetSvm {
                                 executable: account.executable(),
                                 rent_epoch: account.rent_epoch(),
                             };
-                            if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                            if let Err(e) = self.set_scenario_override_account(
+                                &account_pubkey,
+                                modified,
+                                target_slot,
+                            ) {
                                 warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
                             } else {
                                 debug!(
@@ -3177,11 +3256,62 @@ impl SurfnetSvm {
                     continue;
                 }
 
+                match prepare_phoenix_override(
+                    self,
+                    &account_pubkey,
+                    &account,
+                    &account_values,
+                    remote_ctx,
+                    // Only an account core has just refetched counts as fresh.
+                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
+                    target_slot,
+                )
+                .await
+                {
+                    Ok(Some(writes)) => {
+                        for (pubkey, written) in writes {
+                            if let Err(e) =
+                                self.set_scenario_override_account(&pubkey, written, target_slot)
+                            {
+                                warn!(
+                                    "Failed to set {} for override {}: {}",
+                                    pubkey, override_instance.id, e
+                                );
+                                break;
+                            }
+                            settled_this_slot.insert(pubkey);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "Skipping override {} for {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        // A bad value in one override is that override's failure, never the
+                        // batch's: an error returned from this loop aborts block production.
+                        continue;
+                    }
+                }
+
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to forge token account data for {} (override {}): {}",
+                                    account_pubkey, override_instance.id, e
+                                );
+                                continue;
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3189,7 +3319,14 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.inner.set_account(account_pubkey, modified_account)?;
+                        if let Err(e) = self.set_scenario_override_account(
+                            &account_pubkey,
+                            modified_account,
+                            target_slot,
+                        ) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
                         continue;
                     }
                 }
@@ -3270,7 +3407,11 @@ impl SurfnetSvm {
                 };
 
                 // Update the account in the SVM
-                if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                if let Err(e) = self.set_scenario_override_account(
+                    &account_pubkey,
+                    modified_account,
+                    target_slot,
+                ) {
                     warn!(
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
@@ -3341,16 +3482,26 @@ impl SurfnetSvm {
                 ))
             })?;
 
-        // Find the corresponding type definition
+        let encoded =
+            Self::get_forged_idl_type_data(serialized_data, idl, &account_def.name, overrides)?;
+        let mut result = discriminator.to_vec();
+        result.extend_from_slice(&encoded);
+        Ok(result)
+    }
+
+    pub(crate) fn get_forged_idl_type_data(
+        serialized_data: &[u8],
+        idl: &Idl,
+        type_name: &str,
+        overrides: &HashMap<String, serde_json::Value>,
+    ) -> SurfpoolResult<Vec<u8>> {
+        // A type can also describe a record embedded in a dynamically addressed account.
         let account_type = idl
             .types
             .iter()
-            .find(|t| t.name == account_def.name)
+            .find(|t| t.name == type_name)
             .ok_or_else(|| {
-                SurfpoolError::internal(format!(
-                    "Type definition for account '{}' not found in IDL",
-                    account_def.name
-                ))
+                SurfpoolError::internal(format!("Type definition '{}' not found in IDL", type_name))
             })?;
 
         // Set up generics for parsing
@@ -3410,10 +3561,8 @@ impl SurfnetSvm {
                     ))
                 })?;
 
-        // Reconstruct the account data with discriminator and preserve any trailing bytes
-        let mut new_account_data =
-            Vec::with_capacity(8 + re_encoded_data.len() + leftover_bytes.len());
-        new_account_data.extend_from_slice(discriminator);
+        // Preserve trailing data outside the IDL type.
+        let mut new_account_data = Vec::with_capacity(re_encoded_data.len() + leftover_bytes.len());
         new_account_data.extend_from_slice(&re_encoded_data);
         new_account_data.extend_from_slice(leftover_bytes);
 
@@ -3620,69 +3769,43 @@ impl SurfnetSvm {
             return Ok(None);
         };
 
-        let show_rewards = config.rewards.unwrap_or(true);
-        let transaction_details = config
-            .transaction_details
-            .unwrap_or(TransactionDetails::Full);
-
+        let transaction_details = config.transaction_details.unwrap_or_default();
+        // Signatures mode answers from the block header, so a missing tx record
+        // cannot drop a signature and no transaction is loaded.
         let transactions = match transaction_details {
-            TransactionDetails::Full => Some(
-                block
-                    .signatures
-                    .iter()
-                    .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
-                        meta.encode(
-                            config.encoding.unwrap_or(
-                                solana_transaction_status::UiTransactionEncoding::JsonParsed,
-                            ),
-                            config.max_supported_transaction_version,
-                            show_rewards,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(SurfpoolError::from)?,
-            ),
-            TransactionDetails::Signatures => None,
-            TransactionDetails::None => None,
-            TransactionDetails::Accounts => Some(
-                block
-                    .signatures
-                    .iter()
-                    .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
-                        meta.to_json_accounts(
-                            config.max_supported_transaction_version,
-                            show_rewards,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(SurfpoolError::from)?,
-            ),
+            TransactionDetails::None | TransactionDetails::Signatures => vec![],
+            TransactionDetails::Full | TransactionDetails::Accounts => block
+                .signatures
+                .iter()
+                .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
+                .filter_map(SurfnetTransactionStatus::as_processed)
+                .map(|(tx, _)| {
+                    solana_transaction_status::TransactionWithStatusMeta::Complete(tx.into())
+                })
+                .collect(),
         };
 
-        let signatures = match transaction_details {
-            TransactionDetails::Signatures => {
-                Some(block.signatures.iter().map(|t| t.to_string()).collect())
-            }
-            TransactionDetails::Full | TransactionDetails::Accounts | TransactionDetails::None => {
-                None
-            }
-        };
-
-        let block = UiConfirmedBlock {
-            previous_blockhash: block.previous_blockhash.clone(),
-            blockhash: block.hash.clone(),
+        let signatures = matches!(transaction_details, TransactionDetails::Signatures)
+            .then(|| block.signatures.iter().map(ToString::to_string).collect());
+        let mut block = ConfirmedBlock {
+            previous_blockhash: block.previous_blockhash,
+            blockhash: block.hash,
             parent_slot: block.parent_slot,
             transactions,
-            signatures,
-            rewards: if show_rewards { Some(vec![]) } else { None },
-            num_reward_partitions: None,
+            rewards: vec![],
+            num_partitions: None,
             block_time: Some(block.block_time),
             block_height: Some(block.block_height),
-        };
+        }
+        .encode_with_options(
+            config.encoding.unwrap_or(UiTransactionEncoding::Json),
+            BlockEncodingOptions {
+                transaction_details,
+                show_rewards: config.rewards.unwrap_or(true),
+                max_supported_transaction_version: config.max_supported_transaction_version,
+            },
+        )?;
+        block.signatures = signatures;
         Ok(Some(block))
     }
 
@@ -4621,7 +4744,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
+    use crate::{
+        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+    };
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -4774,44 +4899,26 @@ mod tests {
         assert_eq!(&patched[72..], &account.data[72..]);
     }
 
-    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
-    /// the remote-fetch branches can be exercised without a network.
-    async fn canned_rpc(result_json: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
+    /// A 165-byte SPL token account of `mint` (state = Initialized), which sends `get_account`
+    /// down the coupled-mint path. The canned server answers the mint lookup with the same body.
+    fn canned_token_account(mint: Pubkey) -> &'static str {
+        use base64::Engine;
 
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16 * 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-
-        format!("http://{addr}")
+        let mut data = [0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        let body = format!(
+            r#"{{"context":{{"slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":2039280,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+            base64::prelude::BASE64_STANDARD.encode(data),
+            spl_token_interface::id(),
+            data.len()
+        );
+        Box::leak(body.into_boxed_str())
     }
-
-    /// A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
-    /// coupled-mint path. The canned server answers the mint lookup with the same body, and the
-    /// account's zeroed mint field makes the coupled mint land on the default pubkey.
-    const CANNED_TOKEN_ACCOUNT: &str = concat!(
-        r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        r#"","base64"],"executable":false,"lamports":2039280,"#,
-        r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
-    );
 
     fn fetch_before_use_scenario(target: Pubkey) -> surfpool_types::Scenario {
         let mut scenario = surfpool_types::Scenario::new(
@@ -4830,14 +4937,22 @@ mod tests {
 
     /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
     /// a catch-all that logged and dropped the account, so the fetch reported success while the
-    /// target was never forked.
+    /// target was never forked. Both accounts are also indexed like any fetched account, so
+    /// `getProgramAccounts` lists them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_before_use_materializes_a_coupled_account() {
-        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let (target, mint) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let url = canned_rpc(canned_token_account(mint)).await;
         let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
-        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
-        let target = Pubkey::new_unique();
+        let (target_updates, coupled_updates, program_updates) = locker.with_svm_writer(|svm| {
+            (
+                svm.subscribe_for_account_updates(&target, None),
+                svm.subscribe_for_account_updates(&Pubkey::default(), None),
+                svm.subscribe_for_program_updates(&spl_token_interface::id(), None, None),
+            )
+        });
 
         locker
             .register_scenario(fetch_before_use_scenario(target), Some(100))
@@ -4847,6 +4962,18 @@ mod tests {
             .await
             .unwrap();
 
+        let mut forked = locker.with_svm_reader(|svm| {
+            svm.get_account_owned_by(&spl_token_interface::id())
+                .unwrap()
+                .into_iter()
+                .map(|(pubkey, _)| pubkey)
+                .filter(|pubkey| [target, mint].contains(pubkey))
+                .collect::<Vec<_>>()
+        });
+        forked.sort();
+        let mut expected = vec![target, mint];
+        expected.sort();
+        assert_eq!(forked, expected);
         let fetched = locker
             .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
             .unwrap();
@@ -4861,11 +4988,16 @@ mod tests {
             coupled_mint.is_some(),
             "the coupled mint must fill the gap in the fork"
         );
+        assert!(target_updates.try_recv().is_err());
+        assert!(coupled_updates.try_recv().is_err());
+        assert!(program_updates.try_recv().is_err());
+        assert!(geyser_rx.try_iter().next().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_before_use_keeps_a_locally_modified_coupled_account() {
-        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let mint = Pubkey::new_unique();
+        let url = canned_rpc(canned_token_account(mint)).await;
         let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
@@ -4875,7 +5007,7 @@ mod tests {
         locker.with_svm_writer(|svm_writer| {
             svm_writer
                 .set_account(
-                    &Pubkey::default(),
+                    &mint,
                     Account {
                         lamports: 1_000_000,
                         data: marker.clone(),
@@ -4896,7 +5028,7 @@ mod tests {
             .unwrap();
 
         let mint = locker
-            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&mint))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -5845,11 +5977,12 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let target_slot = (*CHECKPOINT_INTERVAL_SLOTS).max(FINALIZATION_SLOT_THRESHOLD);
-
         let checkpoint_slot = {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            let target_slot = svm
+                .checkpoint_interval_slots()
+                .max(FINALIZATION_SLOT_THRESHOLD);
             while svm.get_latest_absolute_slot() <= target_slot {
                 svm.confirm_current_block().unwrap();
             }
@@ -5902,13 +6035,13 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let block_slot = (*CHECKPOINT_INTERVAL_SLOTS)
-            .max(FINALIZATION_SLOT_THRESHOLD)
-            .saturating_add(7);
-
-        {
+        let block_slot = {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            let block_slot = svm
+                .checkpoint_interval_slots()
+                .max(FINALIZATION_SLOT_THRESHOLD)
+                .saturating_add(7);
             svm.blocks
                 .store(
                     block_slot,
@@ -5929,7 +6062,8 @@ mod tests {
                     .is_none()
             );
             svm.shutdown();
-        }
+            block_slot
+        };
 
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
@@ -6405,6 +6539,37 @@ mod tests {
 
     // Garbage collection tests
 
+    /// LiteSVM starts LastRestartSlot at 0, so a rebuild must not drop the datasource's value.
+    #[test]
+    fn the_last_restart_slot_survives_garbage_collection_and_network_resets() {
+        use solana_sysvar::last_restart_slot::LastRestartSlot;
+
+        let last_restart_slot = LastRestartSlot {
+            last_restart_slot: 246_464_040,
+        };
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        svm.inner.set_sysvar(&last_restart_slot);
+
+        svm.inner.garbage_collect(svm.feature_set.clone());
+        assert_eq!(
+            svm.inner.get_sysvar::<LastRestartSlot>(),
+            last_restart_slot,
+            "after garbage collection"
+        );
+
+        let epoch_schedule = SurfnetSvm::default_epoch_schedule();
+        svm.reset_network(
+            SurfnetSvm::default_epoch_info(&epoch_schedule),
+            epoch_schedule,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.inner.get_sysvar::<LastRestartSlot>(),
+            last_restart_slot,
+            "after a network reset"
+        );
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
@@ -6434,7 +6599,7 @@ mod tests {
         assert_eq!(svm.get_account_owned_by(&owner).unwrap().len(), 1);
 
         let empty_account = Account::default();
-        svm.update_account_registries(&account_pubkey, &empty_account)
+        svm.update_account_registries(&account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -6482,7 +6647,8 @@ mod tests {
             rent_epoch: 0,
         };
 
-        svm.set_account(&token_account_pubkey, account).unwrap();
+        svm.set_account(&token_account_pubkey, account.clone())
+            .unwrap();
 
         assert_eq!(
             svm.get_token_accounts_by_owner(&token_owner).unwrap().len(),
@@ -6496,7 +6662,7 @@ mod tests {
         );
 
         let empty_account = Account::default();
-        svm.update_account_registries(&token_account_pubkey, &empty_account)
+        svm.update_account_registries(&token_account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -7917,8 +8083,13 @@ mod tests {
 
     /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
     /// the bundled template IDLs, so klend's is resolvable by owner program.
-    fn scheduled_override_fixture() -> (SurfnetSvm, Pubkey, surfpool_types::OverrideInstance) {
-        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    fn scheduled_override_fixture() -> (
+        SurfnetSvm,
+        Pubkey,
+        surfpool_types::OverrideInstance,
+        Receiver<GeyserEvent>,
+    ) {
+        let (mut surfnet_svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
 
         let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
         let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
@@ -7957,12 +8128,12 @@ mod tests {
             "unhealthy_borrow_value_sf".to_string(),
             serde_json::json!(1_234u64),
         )]));
-        (surfnet_svm, account_pubkey, instance)
+        (surfnet_svm, account_pubkey, instance, geyser_events_rx)
     }
 
     #[tokio::test]
     async fn test_scenario_relative_slot_overflow_is_an_error_not_a_wrap() {
-        let (mut svm, account_pubkey, _instance) = scheduled_override_fixture();
+        let (mut svm, account_pubkey, _instance, _geyser_events_rx) = scheduled_override_fixture();
 
         let mut far = surfpool_types::OverrideInstance::new(
             "kamino-obligation-health".to_string(),
@@ -7984,6 +8155,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn forged_scenario_override_notifies_subscribers_and_geyser_once() {
+        const SLOT: u64 = 500;
+        let (mut svm, account_pubkey, instance, geyser_events_rx) = scheduled_override_fixture();
+        let account_updates = svm.subscribe_for_account_updates(&account_pubkey, None);
+        let program_updates = svm.subscribe_for_program_updates(
+            &Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
+            None,
+            None,
+        );
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize override");
+
+        account_updates
+            .try_recv()
+            .expect("forged account should notify its account subscriber");
+        program_updates
+            .try_recv()
+            .expect("forged account should notify its program subscriber");
+        let updates = geyser_events_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                GeyserEvent::UpdateAccount(update) => Some(update),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1, "emit one Geyser account update");
+        let update = updates.into_iter().next().expect("one update was checked");
+        assert_eq!(update.pubkey, account_pubkey);
+        assert_eq!(update.slot, SLOT);
+        assert!(update.write_version > 0);
+        assert!(update.sanitized_transaction.is_none());
+        assert_eq!(
+            &update.account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16],
+            &1_234u128.to_le_bytes()
+        );
+
+        // Reapplying the same value is not an account mutation and should stay silent.
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("reschedule unchanged override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize unchanged override");
+        assert!(account_updates.try_recv().is_err());
+        assert!(program_updates.try_recv().is_err());
+        assert!(geyser_events_rx.try_iter().next().is_none());
+    }
+
     /// Guards the ordering invariant only. The re-fetch that used to clobber the first override
     /// needs a remote client, so `remote_ctx: &None` cannot reproduce it here - that path is
     /// covered against a live fork.
@@ -7993,7 +8218,7 @@ mod tests {
         // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
         const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
 
-        let (mut svm, account_pubkey, first) = scheduled_override_fixture();
+        let (mut svm, account_pubkey, first, _geyser_events_rx) = scheduled_override_fixture();
         let mut first = first;
         first.fetch_before_use = true;
 
@@ -8086,7 +8311,7 @@ mod tests {
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     fn garbage_collection_keeps_the_epoch_schedule(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-        let gc_slot = *GARBAGE_COLLECTION_INTERVAL_SLOTS;
+        let gc_slot = svm.garbage_collection_interval_slots();
         svm.latest_epoch_info.absolute_slot = gc_slot;
         svm.latest_epoch_info.slot_index = gc_slot;
 
@@ -8102,5 +8327,206 @@ mod tests {
             ),
             (EpochSchedule::without_warmup(), gc_slot + 1, 0, gc_slot + 1)
         );
+    }
+
+    #[test_case(1, 3_600_000, 60_000; "1ms slots")]
+    #[test_case(DEFAULT_SLOT_TIME_MS, 14_400, 240; "default slots")]
+    #[test_case(4_000, 900, 15; "4s slots")]
+    fn maintenance_intervals_follow_slot_time(
+        slot_time: u64,
+        gc_slots: u64,
+        checkpoint_slots: u64,
+    ) {
+        assert_eq!(
+            interval_in_slots(None, GARBAGE_COLLECTION_INTERVAL_MS, slot_time),
+            gc_slots
+        );
+        assert_eq!(
+            interval_in_slots(None, CHECKPOINT_INTERVAL_MS, slot_time),
+            checkpoint_slots
+        );
+    }
+
+    #[test]
+    fn maintenance_interval_override_and_bounds() {
+        assert_eq!(interval_in_slots(Some(42), CHECKPOINT_INTERVAL_MS, 1), 42);
+        assert_eq!(interval_in_slots(Some(0), CHECKPOINT_INTERVAL_MS, 1), 1);
+        assert_eq!(interval_in_slots(None, CHECKPOINT_INTERVAL_MS, u64::MAX), 1);
+        assert_eq!(
+            interval_in_slots(None, CHECKPOINT_INTERVAL_MS, 0),
+            CHECKPOINT_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn maintenance_intervals_track_slot_time_updates() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.slot_time = 4_000;
+        assert_eq!(
+            svm.checkpoint_interval_slots(),
+            CHECKPOINT_INTERVAL_SLOTS_OVERRIDE.unwrap_or(15)
+        );
+        svm.slot_time = 1;
+        assert_eq!(
+            svm.garbage_collection_interval_slots(),
+            GARBAGE_COLLECTION_INTERVAL_SLOTS_OVERRIDE
+                .unwrap_or(3_600_000)
+                .max(1)
+        );
+    }
+
+    /// An account that changes owner is listed only under its new owner.
+    #[test]
+    fn an_account_is_listed_only_under_its_current_owner() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (account, old_owner, new_owner) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let owned_by = |owner| Account {
+            lamports: 1_000_000,
+            owner,
+            ..Default::default()
+        };
+
+        svm.set_account(&account, owned_by(old_owner)).unwrap();
+        svm.set_account(&account, owned_by(new_owner)).unwrap();
+
+        let listed = |svm: &SurfnetSvm, owner| {
+            svm.get_account_owned_by(&owner)
+                .unwrap()
+                .into_iter()
+                .map(|(pubkey, _)| pubkey)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (listed(&svm, old_owner), listed(&svm, new_owner)),
+            (vec![], vec![account])
+        );
+    }
+
+    /// A scenario override writes an account like any other write, so the token index, which
+    /// `getTokenLargestAccounts` reads, holds the amount the override set.
+    #[tokio::test]
+    async fn a_token_amount_override_reaches_the_token_index() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        svm.set_account(
+            &token_account,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: spl_token_interface::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let set_amount = surfpool_types::OverrideInstance::new(
+            "token-amount".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(token_account.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!(500u64),
+        )]));
+        svm.scheduled_overrides
+            .store(SLOT, vec![set_amount])
+            .unwrap();
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .unwrap();
+
+        let amounts = svm
+            .get_token_accounts_by_mint(&mint)
+            .into_iter()
+            .map(|(pubkey, account)| (pubkey, account.amount()))
+            .collect::<Vec<_>>();
+        assert_eq!(amounts, vec![(token_account, 500)]);
+    }
+
+    /// An override whose values cannot be applied is skipped, like an IDL override that fails to
+    /// forge, and the overrides after it in the same slot still apply.
+    #[tokio::test]
+    async fn a_bad_token_override_does_not_drop_the_overrides_after_it() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        svm.set_account(
+            &token_account,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: spl_token_interface::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let set_amount = |amount| {
+            surfpool_types::OverrideInstance::new(
+                "token-amount".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(token_account.to_string()),
+            )
+            .with_values(HashMap::from([("amount".to_string(), amount)]))
+        };
+        svm.scheduled_overrides
+            .store(
+                SLOT,
+                vec![
+                    set_amount(serde_json::json!("not an amount")),
+                    set_amount(serde_json::json!(500u64)),
+                ],
+            )
+            .unwrap();
+
+        let materialized = svm.materialize_overrides_for_slot(&None, SLOT).await;
+
+        let amount = TokenAccount::unpack(&svm.get_account(&token_account).unwrap().unwrap().data)
+            .unwrap()
+            .amount;
+        assert_eq!((materialized.is_ok(), amount), (true, 500));
+    }
+
+    /// An override that rewrites an account through its IDL notifies the account's subscribers,
+    /// like any other write.
+    #[tokio::test]
+    async fn an_idl_override_notifies_account_subscribers() {
+        const SLOT: u64 = 500;
+        let (mut svm, account_pubkey, instance, _geyser_events_rx) = scheduled_override_fixture();
+        let updates =
+            svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
+        svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .unwrap();
+
+        let account = svm.get_account(&account_pubkey).unwrap().unwrap();
+        let update = updates
+            .try_recv()
+            .expect("the override must notify the account's subscribers");
+        assert_eq!(update.data.decode(), Some(account.data));
     }
 }

@@ -271,13 +271,13 @@ templates:
       templates for those.
 
       HOW TO USE THIS TEMPLATE:
-      1. Set config.rewards_amount_per_slot to the emission rate (smallest unit per slot, ~2.5
+      1. Set config.rewards_amount_per_slot to the emission rate (smallest unit per slot, ~4
          slots per second)
       2. Raise liquidity.rewards_amount_available too, or emissions stop when the budget empties
       3. Check reserve_rewards_max_apr_bps on kamino-lending-market-risk is not capping you
 
-      EXAMPLE - "emit 1 USDC per second to depositors" (6 decimals, ~2.5 slots/sec):
-      config.rewards_amount_per_slot: 400000
+      EXAMPLE - "emit 1 USDC per second to depositors" (6 decimals, ~4 slots/sec):
+      config.rewards_amount_per_slot: 250000
       liquidity.rewards_amount_available: 1000000000
 
   - id: kamino-reserve-debt-term
