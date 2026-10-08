@@ -67,7 +67,7 @@ async fn real_mainnet_whirlpool_round_trips_unchanged() {
         .expect("whirlpool-pool-state template");
 
     let forged = surfnet_svm
-        .get_forged_account_data(&pubkey, &data, &template.idl, &HashMap::new())
+        .get_forged_account_data(&pubkey, &data, template.idl(), &HashMap::new())
         .expect("live mainnet Whirlpool should decode/re-encode with the bundled IDL");
 
     assert_eq!(
