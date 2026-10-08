@@ -2573,9 +2573,8 @@ async fn bisonfi_depth_lever_is_monotonic_on_every_quoting_market() {
 /// template's direction guidance is the right way round.
 #[tokio::test]
 async fn bisonfi_depth_lever_is_direction_specific() {
-    const SELL: u64 = 10_000_000_000_000; // 10k SOL
-    const BUY: u64 = 500_000_000_000; // 500k USDC
     let fork = bisonfi_fork(BISONFI_POOL).await;
+    let base_reserve = u64::from_le_bytes(fork.pool[48..56].try_into().unwrap());
     let scale = |off: usize, num: u64| {
         move |d: &mut Vec<u8>| {
             let v = u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
@@ -2583,21 +2582,42 @@ async fn bisonfi_depth_lever_is_direction_specific() {
         }
     };
 
-    let sell_base = bisonfi_run(&fork, SELL, 0, |_| {}).expect("control sell");
+    // Size each direction from this snapshot rather than assuming the live market can settle a
+    // fixed notional. The control sell also gives the matching quote-side input for the buy leg,
+    // without hardcoding either mint's decimals or price.
+    let sell = base_reserve / 50;
+    assert!(
+        sell > 0,
+        "the reference market must have a non-zero base reserve"
+    );
+    let sell_base = bisonfi_run(&fork, sell, 0, |_| {}).expect("control sell");
     assert_eq!(
-        bisonfi_run(&fork, SELL, 0, scale(48, 10)).expect("sell with deeper base"),
+        bisonfi_run(&fork, sell, 0, scale(48, 10)).expect("sell with deeper base"),
         sell_base,
         "the base reserve must not affect a sell, which pays out quote"
     );
+    let sell_deeper_quote =
+        bisonfi_run(&fork, sell, 0, scale(56, 10)).expect("sell with deeper quote");
     assert!(
-        bisonfi_run(&fork, SELL, 0, scale(56, 10)).expect("sell with deeper quote") > sell_base,
+        sell_deeper_quote > sell_base,
         "the quote reserve must affect a sell"
     );
-
-    let buy_base = bisonfi_run(&fork, BUY, 1, |_| {}).expect("control buy");
     assert!(
-        bisonfi_run(&fork, BUY, 1, scale(48, 10)).expect("buy with deeper base") > buy_base,
+        sell_deeper_quote <= spl_amount(&fork.quote_vault.1),
+        "the deeper sell must remain within the real quote vault balance"
+    );
+
+    let buy = sell_base;
+    let buy_base = bisonfi_run(&fork, buy, 1, |_| {}).expect("control buy");
+    let buy_deeper_base =
+        bisonfi_run(&fork, buy, 1, scale(48, 10)).expect("buy with deeper base");
+    assert!(
+        buy_deeper_base > buy_base,
         "the base reserve must affect a buy, which pays out base"
+    );
+    assert!(
+        buy_deeper_base <= spl_amount(&fork.base_vault.1),
+        "the deeper buy must remain within the real base vault balance"
     );
 }
 
@@ -3074,20 +3094,26 @@ async fn whirlpool_fork(pool: &str) -> WhirlpoolFork {
         })
         .collect();
 
-    let mut addrs: Vec<String> = array_keys.iter().map(|k| k.to_string()).collect();
+    // The probe above is only for discovering dependent addresses. Re-read the pool together with
+    // its tick arrays and vaults so the replay cannot combine state from different upstream slots.
+    let mut addrs = vec![pool.to_string()];
+    addrs.extend(array_keys.iter().map(|k| k.to_string()));
     addrs.push(vault_a_key.to_string());
     addrs.push(vault_b_key.to_string());
     let refs: Vec<&str> = addrs.iter().map(|s| s.as_str()).collect();
     let got = fetch_optional(&refs).await;
+    let data = got[0].clone().expect("pool exists in the final snapshot");
+    let snapshot_tick = i32::from_le_bytes(data[81..85].try_into().unwrap());
+    let snapshot_start = (snapshot_tick as f32 / per_array as f32).floor() as i32 * per_array;
 
     let arrays: Vec<(i32, Pubkey, Vec<u8>)> = starts
         .iter()
         .zip(array_keys.iter())
-        .zip(got.iter())
+        .zip(got[1..=array_keys.len()].iter())
         .filter_map(|((s, k), d)| d.as_ref().map(|d| (*s, *k, d.clone())))
         .collect();
     assert!(
-        arrays.iter().any(|(s, _, _)| *s == start),
+        arrays.iter().any(|(s, _, _)| *s == snapshot_start),
         "{pool}: the tick array holding the current tick does not exist, so no swap can be replayed"
     );
 
@@ -3097,10 +3123,16 @@ async fn whirlpool_fork(pool: &str) -> WhirlpoolFork {
         data,
         mint_a,
         mint_b,
-        vault_a: (vault_a_key, got[4].clone().expect("vault_a exists")),
-        vault_b: (vault_b_key, got[5].clone().expect("vault_b exists")),
+        vault_a: (
+            vault_a_key,
+            got[1 + array_keys.len()].clone().expect("vault_a exists"),
+        ),
+        vault_b: (
+            vault_b_key,
+            got[2 + array_keys.len()].clone().expect("vault_b exists"),
+        ),
         arrays,
-        start,
+        start: snapshot_start,
         per_array,
     }
 }
