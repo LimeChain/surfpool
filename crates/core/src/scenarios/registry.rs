@@ -70,6 +70,11 @@ pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/
 pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pump-amm/v1/overrides.yaml");
 
+pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/idl.json");
+pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -119,6 +124,7 @@ impl TemplateRegistry {
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
         default.load_pump_overrides();
+        default.load_phoenix_overrides();
         default
     }
 
@@ -224,6 +230,14 @@ impl TemplateRegistry {
         );
     }
 
+    pub fn load_phoenix_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PHOENIX_ETERNAL_IDL_CONTENT,
+            PHOENIX_ETERNAL_OVERRIDES_CONTENT,
+            "phoenix-eternal",
+        );
+    }
+
     fn load_protocol_overrides(
         &mut self,
         idl_content: &str,
@@ -267,7 +281,9 @@ impl TemplateRegistry {
         let requires_raw_layout = idl.is_none();
 
         // Convert all templates in the collection
-        let templates = collection.to_override_templates(idl);
+        let templates = collection
+            .to_override_templates(idl)
+            .unwrap_or_else(|e| panic!("unable to load {} overrides: {}", protocol_name, e));
 
         // Validate the entire collection before mutating the registry, so one malformed entry
         // cannot leave its valid siblings partially registered.
@@ -382,7 +398,7 @@ templates:
 "#,
         )
         .unwrap();
-        let templates = collection.to_override_templates(None);
+        let templates = collection.to_override_templates(None).unwrap();
         assert_eq!(
             templates[0].llm_context.as_deref(),
             Some("Shared lookup.\n\nOwn guidance.\n")
@@ -640,11 +656,11 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) = 66
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + Phoenix Eternal (8) = 74
         assert_eq!(
             registry.count(),
-            66,
-            "Registry should load 66 templates total"
+            74,
+            "Registry should load 74 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -719,6 +735,9 @@ templates:
         assert!(registry.contains("goonfi-freshness"));
         assert!(registry.contains("goonfi-reference-band"));
         assert!(registry.contains("goonfi-vault-balance"));
+
+        assert!(registry.contains("phoenix-trader-collateral-stress"));
+        assert!(registry.contains("phoenix-direct-mark-risk-shock"));
     }
 
     #[test]
@@ -1049,6 +1068,13 @@ templates: []
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        let phoenix_templates = registry.by_protocol("Phoenix Eternal");
+        assert_eq!(
+            phoenix_templates.len(),
+            8,
+            "Should have 8 Phoenix Eternal templates"
         );
     }
 
@@ -1539,9 +1565,7 @@ templates: []
                 continue;
             };
             for property in &template.properties {
-                // constant_ref properties are UI dropdowns (e.g. token pickers), not
-                // account fields, so they are not expected to resolve against the IDL.
-                if property.is_constant_ref() {
+                if !property.is_field() {
                     continue;
                 }
                 checked += 1;
