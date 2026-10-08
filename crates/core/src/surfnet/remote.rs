@@ -34,6 +34,7 @@ use solana_rpc_client_api::client_error::{
     Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
 };
 use solana_signature::Signature;
+use solana_sysvar::last_restart_slot::{self, LastRestartSlot};
 use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock};
 use surfpool_types::sanitized_datasource_url;
 
@@ -119,6 +120,19 @@ fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
     matches!(filter, TokenAccountsFilter::Mint(_)) && is_unknown_mint_error(error)
 }
 
+/// Drops the URL a transport error carries.
+fn without_datasource_url(error: ClientError) -> ClientError {
+    let ClientError { request, kind } = error;
+    let kind = match *kind {
+        ClientErrorKind::Reqwest(error) => ClientErrorKind::Reqwest(error.without_url()),
+        kind => kind,
+    };
+    ClientError {
+        request,
+        kind: Box::new(kind),
+    }
+}
+
 /// Bounds how long the sender it wraps may take, so a datasource that stops
 /// answering surfaces as an error rather than as a surfnet that appears stuck.
 struct DeadlineSender<S> {
@@ -140,7 +154,7 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
         params: serde_json::Value,
     ) -> ClientResult<serde_json::Value> {
         match tokio::time::timeout(self.deadline, self.inner.send(request, params)).await {
-            Ok(response) => response,
+            Ok(response) => response.map_err(without_datasource_url),
             // Scheme and host only. This message reaches a client through
             // JSON-RPC error data, and a datasource URL carries credentials in
             // its query, its path, and its userinfo. A URL that will not parse
@@ -225,6 +239,16 @@ impl SurfnetRemoteClient {
 
     pub async fn get_epoch_schedule(&self) -> SurfpoolResult<EpochSchedule> {
         self.client.get_epoch_schedule().await.map_err(Into::into)
+    }
+
+    pub async fn get_last_restart_slot(&self) -> SurfpoolResult<LastRestartSlot> {
+        let account = self
+            .client
+            .get_account(&last_restart_slot::ID)
+            .await
+            .map_err(|e| SurfpoolError::get_account(last_restart_slot::ID, e))?;
+        wincode::deserialize(&account.data)
+            .map_err(|e| SurfpoolError::internal(format!("Invalid LastRestartSlot sysvar: {e}")))
     }
 
     pub async fn get_account(
@@ -1115,6 +1139,41 @@ mod tests {
             assert!(
                 message.contains("rpc.example.com"),
                 "the failure should still name the host: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_does_not_disclose_the_datasource_credentials() {
+        // Bind an OS-assigned port and release it, so nothing listens there and
+        // every request fails to connect.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a local port should be free")
+            .local_addr()
+            .expect("the listener should have a local address")
+            .port();
+        let secrets = [
+            format!("http://127.0.0.1:{port}/?api-key=SUPERSECRET"),
+            format!("http://127.0.0.1:{port}/SUPERSECRET"),
+            format!("http://user:SUPERSECRET@127.0.0.1:{port}"),
+        ];
+
+        for url in secrets {
+            let sender = DeadlineSender::new(HttpSender::new(url), Duration::from_secs(5));
+
+            let error = sender
+                .send(RpcRequest::GetSlot, serde_json::Value::Null)
+                .await
+                .expect_err("a datasource with no listener should not succeed");
+
+            assert!(
+                matches!(error.kind(), ClientErrorKind::Reqwest(error) if error.is_connect()),
+                "the failure should come from the transport, not the deadline: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                !message.contains("SUPERSECRET"),
+                "the failure disclosed the datasource credential: {message}"
             );
         }
     }

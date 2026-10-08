@@ -4,12 +4,6 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-const PLATFORM_PACKAGES = [
-  "@solana/surfpool-darwin-x64",
-  "@solana/surfpool-darwin-arm64",
-  "@solana/surfpool-linux-x64-gnu",
-];
-
 const VERSION_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
@@ -68,19 +62,6 @@ function assertNpmVersionMatchesCi() {
   }
 }
 
-function updateOptionalDependencies(optionalDependencies, version) {
-  if (!optionalDependencies) {
-    throw new Error("package.json is missing optionalDependencies");
-  }
-
-  for (const packageName of PLATFORM_PACKAGES) {
-    if (!Object.hasOwn(optionalDependencies, packageName)) {
-      throw new Error(`optionalDependencies is missing ${packageName}`);
-    }
-    optionalDependencies[packageName] = version;
-  }
-}
-
 function main() {
   const version = process.argv[2];
   if (!version || process.argv.length > 3) {
@@ -101,39 +82,13 @@ function main() {
 
   const packageJson = readJson(packageJsonPath);
   packageJson.version = version;
-  updateOptionalDependencies(packageJson.optionalDependencies, version);
   writeJson(packageJsonPath, packageJson);
 
   run("npm", ["install", "--package-lock-only", "--ignore-scripts"], {
     cwd: packageDir,
   });
 
-  // `npm install` drops lockfile entries for optionalDependencies whose target
-  // version isn't published yet (the platform packages are published from this
-  // same release). Without these stub entries `npm ci` errors with
-  // "Missing: <pkg> from lock file". Re-add them so CI install stays in sync.
-  ensureOptionalStubs(path.join(packageDir, "package-lock.json"));
-
   console.log(`Prepared @solana/surfpool npm release ${version}`);
-}
-
-function ensureOptionalStubs(lockfilePath) {
-  const lockfile = readJson(lockfilePath);
-  const packages = lockfile.packages || {};
-  let changed = false;
-
-  for (const packageName of PLATFORM_PACKAGES) {
-    const key = `node_modules/${packageName}`;
-    if (!Object.hasOwn(packages, key)) {
-      packages[key] = { optional: true };
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    lockfile.packages = packages;
-    writeJson(lockfilePath, lockfile);
-  }
 }
 
 main();

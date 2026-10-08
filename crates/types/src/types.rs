@@ -37,7 +37,7 @@ pub const DEFAULT_WS_PORT: u16 = 8900;
 pub const DEFAULT_STUDIO_PORT: u16 = 8488;
 pub const CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED: u16 = 18488;
 pub const DEFAULT_NETWORK_HOST: &str = "127.0.0.1";
-pub const DEFAULT_SLOT_TIME_MS: u64 = 400;
+pub const DEFAULT_SLOT_TIME_MS: u64 = 250;
 pub type Idl = anchor_lang_idl::types::Idl;
 pub const DEFAULT_PROFILING_MAP_CAPACITY: usize = 200;
 
@@ -926,7 +926,7 @@ impl Default for SimnetConfig {
         Self {
             offline_mode: false,
             remote_rpc_url: Some(DEFAULT_MAINNET_RPC_URL.to_string()),
-            slot_time: DEFAULT_SLOT_TIME_MS, // Default to 400ms to match CLI default
+            slot_time: DEFAULT_SLOT_TIME_MS,
             block_production_mode: BlockProductionMode::Clock,
             airdrop_addresses: vec![],
             airdrop_token_amount: 0,

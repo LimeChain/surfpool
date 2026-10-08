@@ -271,11 +271,15 @@ impl SurfnetSvmLocker {
             let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
             (epoch_info, epoch_schedule, some_genesis_hash)
         };
+        let last_restart_slot = remote_client.get_last_restart_slot().await;
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
+            svm_writer
+                .inner
+                .set_sysvar(&last_restart_slot.unwrap_or_default());
         });
         Ok(())
     }
@@ -1372,7 +1376,11 @@ impl SurfnetSvmLocker {
             let mut data = Vec::with_capacity(page.len());
             for record in page {
                 let entry = if full {
-                    let encoded = record.tx.encode(encoding, max_version, true)?;
+                    let encoded = VersionedTransactionWithStatusMeta::from(record.tx).encode(
+                        encoding,
+                        max_version,
+                        true,
+                    )?;
                     RpcTransactionForAddressEntry::Full(Box::new(
                         RpcTransactionForAddressFullInfo {
                             slot: record.slot,
@@ -1720,18 +1728,21 @@ impl SurfnetSvmLocker {
                 });
             };
 
-            let (transaction_with_status_meta, _) = entry.expect_processed();
+            let (transaction_with_status_meta, _) = entry
+                .as_processed()
+                .expect("only processed transactions are stored");
             let slot = transaction_with_status_meta.slot;
             // `None` (spec: null) when the block isn't stored — never a fake 0.
             let block_time = svm_reader
                 .blocks
                 .get(&slot)?
                 .map(|b| b.block_time as UnixTimestamp);
-            let encoded = transaction_with_status_meta.encode(
-                config.encoding.unwrap_or(UiTransactionEncoding::JsonParsed),
-                config.max_supported_transaction_version,
-                true,
-            )?;
+            let encoded = VersionedTransactionWithStatusMeta::from(transaction_with_status_meta)
+                .encode(
+                    config.encoding.unwrap_or(UiTransactionEncoding::Json),
+                    config.max_supported_transaction_version,
+                    true,
+                )?;
             Ok(LocalTransactionLookup {
                 result: GetTransactionResult::found_transaction(
                     *signature,
@@ -2267,7 +2278,7 @@ impl SurfnetSvmLocker {
         {
             if before.ne(&after) {
                 if let Some(after) = &after {
-                    let _ = svm_writer.update_account_registries(pubkey, after);
+                    let _ = svm_writer.update_account_registries(pubkey, before.as_ref(), after);
                     svm_writer.notify_account_subscribers(pubkey, after);
                     svm_writer.notify_program_subscribers(pubkey, after);
                 } else {
@@ -2430,7 +2441,7 @@ impl SurfnetSvmLocker {
                 if before.ne(&after) {
                     mutated_account_pubkeys.insert(*pubkey);
                     let after = after.unwrap_or_default();
-                    svm_writer.update_account_registries(pubkey, &after)?;
+                    svm_writer.update_account_registries(pubkey, before.as_ref(), &after)?;
                     let write_version = svm_writer.increment_write_version();
 
                     if let Some(sanitized_transaction) = sanitized_transaction.clone() {
@@ -4624,7 +4635,7 @@ mod tests {
         async fn send(
             &self,
             request: RpcRequest,
-            _params: serde_json::Value,
+            params: serde_json::Value,
         ) -> ClientResult<serde_json::Value> {
             self.requests.fetch_add(1, Ordering::Relaxed);
 
@@ -4641,6 +4652,22 @@ mod tests {
                     serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
                 }
                 RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
+                // The LastRestartSlot sysvar; the data is 246_464_040 as a little-endian u64.
+                RpcRequest::GetAccountInfo
+                    if params[0] == solana_sysvar::last_restart_slot::ID.to_string() =>
+                {
+                    serde_json::json!({
+                        "context": { "slot": 2 },
+                        "value": {
+                            "lamports": 946_560,
+                            "data": ["KL6wDgAAAAA=", "base64"],
+                            "owner": "Sysvar1111111111111111111111111111111111111",
+                            "executable": false,
+                            "rentEpoch": 0,
+                            "space": 8,
+                        },
+                    })
+                }
                 _ => panic!("unexpected startup RPC request: {request:?}"),
             })
         }
@@ -4693,7 +4720,15 @@ mod tests {
                 .inner,
             expected_hash
         );
-        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            svm_locker.with_svm_reader(|svm| {
+                svm.inner
+                    .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>()
+                    .last_restart_slot
+            }),
+            246_464_040
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 
     #[cfg(feature = "sqlite")]
@@ -7133,5 +7168,91 @@ mod tests {
             .expect("cached genesis hash should not require the remote RPC");
 
         assert_eq!(result.inner, expected_hash);
+    }
+
+    /// A token account the transaction closes is not in its post token balances: a validator
+    /// reads them from the accounts after execution, where a closed account no longer exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_token_account_has_no_post_token_balance() {
+        use crossbeam_channel::unbounded;
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint};
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let owner = Keypair::new();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let _ = locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .expect("airdrop should succeed");
+        locker.with_svm_writer(|svm| {
+            let mut account = |pubkey, data: Vec<u8>| {
+                let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
+                svm.set_account(
+                    pubkey,
+                    Account {
+                        lamports,
+                        data,
+                        owner: spl_token_interface::ID,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+            };
+            let mut mint_data = vec![0; Mint::LEN];
+            Mint {
+                is_initialized: true,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut mint_data);
+            account(&mint, mint_data);
+            let mut token_data = vec![0; TokenAccount::LEN];
+            TokenAccount {
+                mint,
+                owner: owner.pubkey(),
+                state: AccountState::Initialized,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut token_data);
+            account(&token_account, token_data);
+        });
+
+        let close = spl_token_interface::instruction::close_account(
+            &spl_token_interface::ID,
+            &token_account,
+            &owner.pubkey(),
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let message = Message::new_with_blockhash(
+            &[close],
+            Some(&owner.pubkey()),
+            &locker.latest_absolute_blockhash(),
+        );
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+            .expect("transaction should sign");
+        let signature = tx.signatures[0];
+        let (status_tx, _status_rx) = unbounded();
+        locker
+            .process_transaction(&None, tx, status_tx, true, true)
+            .await
+            .expect("transaction processing should succeed");
+
+        let meta = locker.with_svm_reader(|svm| {
+            let (transaction, _) = svm
+                .transactions
+                .get(&signature.to_string())
+                .unwrap()
+                .unwrap()
+                .expect_processed()
+                .clone();
+            transaction.meta
+        });
+        assert_eq!(
+            (meta.status, meta.post_token_balances),
+            (Ok(()), Some(vec![]))
+        );
     }
 }
