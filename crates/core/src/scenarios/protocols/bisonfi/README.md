@@ -15,10 +15,6 @@ worth reaching for this protocol to test.
 | `bisonfi-spread` | the spread BisonFi quotes around its mid |
 | `bisonfi-freshness` | keeps the maker quoting in a slot, or models it going offline |
 
-Studio shows this template as **Keep Quote Live**. For every later slot containing a BisonFi swap,
-add that action to the same slot and set **Slots behind the chain** to `0`. Price, depth and spread
-actions also repeat this requirement in their visible descriptions.
-
 ## Number formats
 
 | You'll see | It means | Example |
@@ -33,8 +29,8 @@ actions also repeat this requirement in their visible descriptions.
 
 ## Picking a market
 
-The templates intentionally have no default account. Choose one of Studio's active-market shortcuts
-or enter a pool address directly. API callers must provide the pool account in the override.
+The templates intentionally have no default account. Callers must provide the pool account in the
+override. The template guidance explains how to discover a pool when only the token pair is known.
 
 Only version-3 pool accounts are supported. Direct API callers are responsible for supplying an
 account that uses this layout.
@@ -48,7 +44,8 @@ template: bisonfi-fair-value
 fair_value: "15474250491067253436239052800"    # $50 x 2^88, as a STRING
 ```
 
-Set `fetchBeforeUse: true` so the pool is loaded from the upstream datasource first.
+Set `fetchBeforeUse: true` only if this is the pool's first override, so the pool is loaded from the
+upstream datasource before it is changed.
 
 ## Make large trades slip
 
@@ -70,8 +67,9 @@ the vault cannot cover, and the swap fails when it settles.
 
 ## Make a market unable to fill
 
-The same template, taken further - around `quote_reserve / 10` the swap stops slipping and starts
-failing outright with an insufficient-liquidity error. Useful for testing how a router handles a venue
+The same template, taken further: set the payout reserve to `0` to make that direction return no fill
+or fail with insufficient liquidity. Use `quote_reserve: 0` for a base-asset sale and
+`base_reserve: 0` for a base-asset purchase. This is useful for testing how a router handles a venue
 that cannot fill at all.
 
 ## Keep the venue quoting
@@ -81,9 +79,6 @@ the mid. The exact allowed age is maker policy and can vary between markets or d
 stale, the price, depth and spread templates are silently ignored. Refresh the timestamp to keep the
 venue alive for as long as your scenario needs.
 
-**Studio:** add **Keep Quote Live** to every later slot containing a BisonFi swap, then set
-**Slots behind the chain** to `0`. It does not need to be added to intermediate slots with no swap.
-
 ```
 template: bisonfi-freshness
 last_update_slot: 0              # relative to the materialization slot
@@ -92,7 +87,8 @@ last_update_slot: 0              # relative to the materialization slot
 Refreshing resumes the price the venue already held - no new price is needed. The value is a signed
 offset, not an absolute slot: `0` means "published in this slot". If the scenario spans enough slots
 for the quote to become stale again, schedule another freshness override in each slot where the quote
-must be usable.
+must be usable with `fetchBeforeUse: false`. A later upstream fetch replaces the full pool account;
+if one is required, reapply the scenario's price, depth and spread overrides after it in that slot.
 
 An immediate scenario may not need this. A scenario that spans multiple slots should keep the quote
 fresh explicitly rather than depending on the venue's current tolerance.
@@ -145,7 +141,7 @@ executable margin - both legs fit in one transaction. Two things to get right:
 | The pool quotes nothing at any size | Probably one of the dormant markets. Check how far `last_update_slot` is behind the chain |
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
-| The quote becomes stale again later in the scenario | Schedule another freshness override in each slot where the quote must be usable |
+| The quote becomes stale again later in the scenario | Schedule another freshness override with `fetchBeforeUse: false` in each slot where the quote must be usable |
 | `Custom(60)` | A Token-2022 mint whose token accounts need extension data matching that mint |
 | A large swap exhausts its compute budget | The default 200k compute budget may be too small; request about 1.4M units |
 | A freshness override does not seem to age the pool | If your harness derives its clock from the pool's own `last_update_slot`, aging the account moves the clock with it. Apply the override after the clock is taken |

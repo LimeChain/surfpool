@@ -916,37 +916,18 @@ async fn bisonfi_scenario_market_cannot_fill() {
     let rig = bisonfi_rig().await;
     for (pool, data, tp) in &rig.quoting {
         let size = BisonfiRig::sell_size(data);
-        let quote_reserve = u64::from_le_bytes(data[56..64].try_into().unwrap());
-        // Escalate until the venue gives up. Which divisor does it depends on how much of the pool's
-        // depth the trade draws, so the claim is that SOME reachable setting refuses, not a
-        // particular number.
-        let mut refused_at = None;
-        for div in [4u64, 10, 100, 1_000, 100_000] {
-            let r = rig.try_scenario(
-                pool,
-                data,
-                *tp,
-                "bisonfi-depth",
-                &[("quote_reserve", serde_json::json!(quote_reserve / div))],
-                size,
-                0,
-            );
-            match r {
-                Err(_) => {
-                    refused_at = Some(div);
-                    break;
-                }
-                Ok(0) => {
-                    refused_at = Some(div);
-                    break;
-                }
-                Ok(_) => {}
-            }
-        }
+        let result = rig.try_scenario(
+            pool,
+            data,
+            *tp,
+            "bisonfi-depth",
+            &[("quote_reserve", serde_json::json!(0))],
+            size,
+            0,
+        );
         assert!(
-            refused_at.is_some(),
-            "{pool}: no reduction of quote_reserve down to a hundred-thousandth made the venue \
-             refuse the trade, so the 'cannot fill' scenario is not reachable on this market"
+            matches!(result, Err(_) | Ok(0)),
+            "{pool}: quote_reserve 0 must prevent a sell from filling, got {result:?}"
         );
     }
 }
@@ -3603,7 +3584,7 @@ async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
     let two_percent_profit = two_percent_profit.expect("the 2% leg must run");
     assert!(
         two_percent_profit > 0,
-        "the hardcoded Studio scenario claims a 2% premium clears both venues' fees, got \
+        "the documented scenario claims a 2% premium clears both venues' fees, got \
          {two_percent_profit}"
     );
     assert!(

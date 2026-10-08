@@ -5,7 +5,7 @@ version: v3
 account_type: PoolStat
 
 # BisonFi publishes no IDL and none is reconstructed here. Properties are written using their byte
-# offsets and encodings; Studio limits account selection to the supported v3 pools.
+# offsets and encodings.
 raw_layout: true
 
 tags:
@@ -35,9 +35,10 @@ templates:
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
-      usable quote.
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this value. If a later upstream fetch is required, reapply this override after it in that slot.
 
-      FINDING A MARKET WHEN THE USER NAMES A PAIR OR THE UI LIST IS MISSING IT:
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
       1. Call Solana JSON-RPC getProgramAccounts for program
          BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
          offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
@@ -52,8 +53,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
-         vaults, say so instead of guessing.
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
 
       This is the only price lever. The reserves control depth, not price: BisonFi quotes around a mid
       the operator publishes, so changing vault balances will not move the quote.
@@ -61,7 +62,7 @@ templates:
       HOW TO USE:
       1. Multiply the price by 2^88 (309485009821345068724781056)
       2. Pass the result as a decimal STRING, since it exceeds what a JSON number holds exactly
-      3. Set fetchBeforeUse: true so the pool is loaded from the upstream datasource first
+      3. Set fetchBeforeUse: true only if this is the pool's first override
 
       MID-FLIGHT VARIANT: schedule two steps on this field a couple of slots apart, and a caller
       prices on one mid and executes against another. A reprice is caught by the caller's own
@@ -105,9 +106,10 @@ templates:
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
-      usable quote.
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this depth. If a later upstream fetch is required, reapply this override after it in that slot.
 
-      FINDING A MARKET WHEN THE USER NAMES A PAIR OR THE UI LIST IS MISSING IT:
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
       1. Call Solana JSON-RPC getProgramAccounts for program
          BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
          offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
@@ -122,8 +124,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
-         vaults, say so instead of guessing.
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
 
       The depth lever: how far a trade moves the price. For how wide the venue quotes around its mid,
       use bisonfi-spread instead.
@@ -233,9 +235,10 @@ templates:
       with your value sitting correctly in the account. That tolerance is maker policy and can vary
       between markets or deployments. Because the local VM does not republish the mid, refresh
       last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
-      usable quote.
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this spread. If a later upstream fetch is required, reapply this override after it in that slot.
 
-      FINDING A MARKET WHEN THE USER NAMES A PAIR OR THE UI LIST IS MISSING IT:
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
       1. Call Solana JSON-RPC getProgramAccounts for program
          BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
          offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
@@ -250,8 +253,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
-         vaults, say so instead of guessing.
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
 
       The spread lever: how wide the venue quotes around its mid, independently of how much inventory
       it holds. Use bisonfi-depth to make a venue THIN and this one to make it EXPENSIVE.
@@ -298,7 +301,7 @@ templates:
     llm_context: |
       This field is the venue's liveness signal.
 
-      FINDING A MARKET WHEN THE USER NAMES A PAIR OR THE UI LIST IS MISSING IT:
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
       1. Call Solana JSON-RPC getProgramAccounts for program
          BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
          offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
@@ -313,8 +316,8 @@ templates:
          balances but a publication slot millions of slots behind.
       4. Put the chosen getProgramAccounts result pubkey in the override's account as
          {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
-         fetchBeforeUse: true. If no matching v3 pool has a recent last_update_slot and funded
-         vaults, say so instead of guessing.
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
 
       A POOL LOADED INTO THE LOCAL VM GOES STALE BY ITSELF. Surfpool loads the account from the
       upstream datasource once, and the local VM does not republish the mid. Once the maker's allowed
@@ -332,7 +335,9 @@ templates:
       1. Set last_update_slot to 0. The venue resumes quoting the price it already held - a fresh
          timestamp is enough, no new price is needed
       2. If the scenario spans enough slots for the quote to become stale again, schedule another
-         freshness override in every slot where the quote must be usable
+         freshness override in every slot where the quote must be usable with fetchBeforeUse: false.
+         If a later upstream fetch is required, reapply the scenario's fair-value, depth and spread
+         overrides after that fetch in the same slot
 
       A scenario that executes immediately after the account is loaded may not need this. A
       multi-slot scenario should keep the publication fresh explicitly rather than depending on the
