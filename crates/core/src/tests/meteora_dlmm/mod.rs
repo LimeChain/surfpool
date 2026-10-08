@@ -105,7 +105,7 @@ async fn live_lb_pair_matches_the_bundled_layout() {
     let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
     let template = registry.get("meteora-dlmm-pool-state").expect("template");
-    let idl = &template.idl;
+    let idl = template.idl();
 
     let declared = 8 + type_size(
         idl,
