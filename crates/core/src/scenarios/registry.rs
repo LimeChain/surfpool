@@ -347,7 +347,7 @@ mod tests {
     fn account_data_values_exclude_constant_ref_selectors() {
         let registry = TemplateRegistry::new();
         let template = registry
-            .get("raydium-amm-custom")
+            .get("raydium-clmm-amm-config")
             .expect("template with a non-PDA constant_ref");
         let instance = OverrideInstance::new(
             template.id.clone(),
@@ -355,8 +355,11 @@ mod tests {
             AccountAddress::Pubkey(Pubkey::default().to_string()),
         )
         .with_values(HashMap::from([
-            ("market".to_string(), serde_json::json!("selected-market")),
-            ("status".to_string(), serde_json::json!(1)),
+            (
+                "config_index".to_string(),
+                serde_json::json!("selected-config"),
+            ),
+            ("trade_fee_rate".to_string(), serde_json::json!(1)),
         ]));
 
         let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
@@ -364,7 +367,7 @@ mod tests {
         assert_eq!(constant_refs, 1);
         assert_eq!(
             values,
-            HashMap::from([("status".to_string(), serde_json::json!(1))])
+            HashMap::from([("trade_fee_rate".to_string(), serde_json::json!(1))])
         );
     }
 
@@ -1139,9 +1142,8 @@ templates: []
 
         let registry = TemplateRegistry::new();
         let mut idls: BTreeMap<String, &Idl> = BTreeMap::new();
-        for template in registry.templates.values() {
-            idls.entry(template.idl.address.clone())
-                .or_insert(&template.idl);
+        for idl in registry.templates.values().filter_map(|t| t.idl.as_ref()) {
+            idls.entry(idl.address.clone()).or_insert(idl);
         }
         assert!(
             idls.len() > 10,

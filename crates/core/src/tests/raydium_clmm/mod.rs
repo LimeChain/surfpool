@@ -72,7 +72,12 @@ async fn real_mainnet_pool_round_trips_unchanged() {
         .expect("pool state template should exist");
 
     let forged = surfnet_svm
-        .get_forged_account_data(&Pubkey::new_unique(), &data, &template.idl, &HashMap::new())
+        .get_forged_account_data(
+            &Pubkey::new_unique(),
+            &data,
+            template.idl(),
+            &HashMap::new(),
+        )
         .unwrap_or_else(|e| panic!("live mainnet PoolState failed to decode/re-encode: {e}"));
     assert_eq!(
         forged, data,
@@ -96,7 +101,7 @@ async fn every_amm_config_index_option_is_a_live_amm_config_account() {
     );
 
     let account_def = template
-        .idl
+        .idl()
         .accounts
         .iter()
         .find(|a| a.name == "AmmConfig")

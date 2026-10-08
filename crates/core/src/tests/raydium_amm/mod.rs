@@ -80,10 +80,10 @@ async fn real_mainnet_pools_round_trip_unchanged() {
 
     let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
-    let idl = &registry
+    let idl = registry
         .get("raydium-amm-pool-state")
         .expect("template")
-        .idl;
+        .idl();
     let pubkey = Pubkey::new_unique();
 
     for (address, account) in pools.iter().zip(&accounts) {
@@ -122,10 +122,10 @@ async fn a_live_target_orders_account_resolves_to_its_own_type() {
 
     let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
-    let idl = &registry
+    let idl = registry
         .get("raydium-amm-pool-state")
         .expect("template")
-        .idl;
+        .idl();
 
     let forged = surfnet_svm
         .get_forged_account_data(&Pubkey::new_unique(), data, idl, &HashMap::new())

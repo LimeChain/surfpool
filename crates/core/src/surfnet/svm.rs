@@ -4928,7 +4928,7 @@ mod tests {
     #[test]
     fn forge_round_trips_a_synthetic_amm_info() {
         let registry = crate::scenarios::TemplateRegistry::new();
-        let idl = &registry.get("raydium-amm-fees").expect("template").idl;
+        let idl = registry.get("raydium-amm-fees").expect("template").idl();
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
 
         // status 6 (swap only) and a 25/10000 swap fee, at the offsets state.rs declares.
