@@ -2,13 +2,12 @@ use core::mem::size_of;
 use std::{collections::HashMap, str::FromStr, sync::OnceLock};
 
 use anchor_lang_idl::types::{
-    IdlDefinedFields, IdlInstructionAccountItem, IdlType, IdlTypeDef, IdlTypeDefTy,
+    IdlDefinedFields, IdlInstruction, IdlInstructionAccountItem, IdlType, IdlTypeDef, IdlTypeDefTy,
 };
-use log::warn;
+use log::{info, warn};
 use phoenix_rise_accounts::{
-    PhoenixAccountDecodeError,
     global_config::GlobalConfig,
-    perp_asset_map::{FundingAccumulator, PerpAssetMap, PerpAssetMetadata, PriceComponent},
+    perp_asset_map::{FundingAccumulator, PerpAssetMetadata, PriceComponent},
 };
 use solana_account::Account;
 use solana_clock::Clock;
@@ -23,7 +22,7 @@ use surfpool_types::Idl;
 use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 
 use super::{
-    market::{Market, move_market},
+    market::{Market, invalid_perp_asset_map, map_entries, move_market},
     trader::{
         Side, cancel_orders, deposit, place_market_order, prepare_cascade, prepare_liquidation,
         withdraw,
@@ -70,10 +69,7 @@ impl Exchange {
             &[PHOENIX_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG],
         )
         .await?;
-        let account = svm
-            .inner
-            .get_account(&PHOENIX_GLOBAL_CONFIG)?
-            .ok_or_else(|| SurfpoolError::internal("Phoenix GlobalConfig is missing"))?;
+        let account = local_account(svm, &PHOENIX_GLOBAL_CONFIG)?;
         let config = GlobalConfig::try_from_account_bytes(&account.data).map_err(|e| {
             SurfpoolError::invalid_account_data(
                 PHOENIX_GLOBAL_CONFIG,
@@ -117,6 +113,14 @@ pub fn phoenix_instruction_from(
     encode_instruction(name, known, args, false)
 }
 
+fn instruction_definition(name: &str) -> SurfpoolResult<&'static IdlInstruction> {
+    phoenix_idl()
+        .instructions
+        .iter()
+        .find(|instruction| instruction.name == name)
+        .ok_or_else(|| SurfpoolError::internal(format!("the Phoenix IDL has no {name}")))
+}
+
 fn encode_instruction(
     name: &str,
     accounts: &[(&str, Pubkey)],
@@ -126,11 +130,7 @@ fn encode_instruction(
     let idl = phoenix_idl();
     let program_id = Pubkey::from_str(&idl.address)
         .map_err(|e| SurfpoolError::internal(format!("invalid Phoenix IDL address: {e}")))?;
-    let definition = idl
-        .instructions
-        .iter()
-        .find(|instruction| instruction.name == name)
-        .ok_or_else(|| SurfpoolError::internal(format!("the Phoenix IDL has no {name}")))?;
+    let definition = instruction_definition(name)?;
 
     let mut data = definition.discriminator.clone();
     for arg in &definition.args {
@@ -201,11 +201,7 @@ pub fn instruction_args(
     symbol: Option<&str>,
 ) -> SurfpoolResult<serde_json::Value> {
     let idl = phoenix_idl();
-    let definition = idl
-        .instructions
-        .iter()
-        .find(|instruction| instruction.name == name)
-        .ok_or_else(|| SurfpoolError::internal(format!("the Phoenix IDL has no {name}")))?;
+    let definition = instruction_definition(name)?;
     let mut args = serde_json::Map::new();
     for arg in &definition.args {
         let fields = match &arg.ty {
@@ -363,6 +359,12 @@ pub async fn hydrate(
         svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
     }
     Ok(())
+}
+
+pub(crate) fn local_account(svm: &SurfnetSvm, address: &Pubkey) -> SurfpoolResult<Account> {
+    svm.inner
+        .get_account(address)?
+        .ok_or_else(|| SurfpoolError::internal(format!("{address} is missing locally")))
 }
 
 /// A copy of the local VM where instructions run without signature checks, so each runs as the
@@ -606,10 +608,7 @@ async fn run_config_template(
         .and_then(serde_json::Value::as_str);
     let mut values = values.clone();
     if let Some(symbol) = symbol {
-        let map = svm
-            .inner
-            .get_account(&exchange.perp_asset_map)?
-            .ok_or_else(|| SurfpoolError::internal("the Phoenix PerpAssetMap is missing"))?;
+        let map = local_account(svm, &exchange.perp_asset_map)?;
         let market = Market::find(&exchange.perp_asset_map, &map.data, symbol)?;
         hydrate(svm, remote_ctx, &[market.orderbook]).await?;
         known.push(("orderbook", market.orderbook));
@@ -689,7 +688,6 @@ fn capability_toggles(
 /// Every Phoenix override first keeps the local PerpAssetMap's markets usable for the rest of the
 /// session; see [`keep_markets_usable`]. `target_slot` is the slot being materialized,
 /// which the override's writes are published at.
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     template_id: &str,
@@ -697,7 +695,6 @@ pub async fn prepare_phoenix_override(
     account: &Account,
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    _fetch_before_use: bool,
     target_slot: u64,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     let ours = CONFIG_TEMPLATES
@@ -736,7 +733,13 @@ pub async fn prepare_phoenix_override(
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             prepare_liquidation(svm, remote_ctx, *account_pubkey, symbol)
                 .await
-                .map(|ready| Some(ready.writes))
+                .map(|ready| {
+                    info!(
+                        "Phoenix {symbol} moved to {} ticks: {account_pubkey} is liquidatable",
+                        ready.target_ticks
+                    );
+                    Some(ready.writes)
+                })
         }
         LIQUIDATION_CASCADE_TEMPLATE_ID => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
@@ -749,11 +752,21 @@ pub async fn prepare_phoenix_override(
                     )));
                 }
             };
-            let count = usize::try_from(whole_number_input(values, "count")?)
-                .map_err(|_| SurfpoolError::internal("count is too large"))?;
-            prepare_cascade(svm, remote_ctx, symbol, long, count)
+            prepare_cascade(svm, remote_ctx, symbol, long)
                 .await
-                .map(|ready| Some(ready.writes))
+                .map(|ready| {
+                    let traders: Vec<String> = ready
+                        .liquidations
+                        .iter()
+                        .map(|(trader, _)| trader.to_string())
+                        .collect();
+                    info!(
+                        "Phoenix {symbol} moved to {} ticks: liquidatable in turn: {}",
+                        ready.target_ticks,
+                        traders.join(", ")
+                    );
+                    Some(ready.writes)
+                })
         }
         OPEN_POSITION_TEMPLATE_ID => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
@@ -836,10 +849,7 @@ async fn keep_markets_usable(
 ) {
     let kept = async {
         hydrate(svm, remote_ctx, &[PHOENIX_PERP_ASSET_MAP]).await?;
-        let map = svm
-            .inner
-            .get_account(&PHOENIX_PERP_ASSET_MAP)?
-            .ok_or_else(|| SurfpoolError::internal("the Phoenix PerpAssetMap is missing"))?;
+        let map = local_account(svm, &PHOENIX_PERP_ASSET_MAP)?;
         let raised = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)?;
         let now = u64::try_from(svm.inner.get_sysvar::<Clock>().unix_timestamp).unwrap_or(0);
         let rewound = rewind_funding_timestamps(
@@ -862,39 +872,24 @@ async fn keep_markets_usable(
     }
 }
 
-fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) -> SurfpoolError {
-    SurfpoolError::invalid_account_data(
-        account_pubkey,
-        "Expected a valid Phoenix Eternal PerpAssetMap account",
-        Some(message),
-    )
-}
-
 /// Every market's metadata in the map, with the offset it starts at in `data`.
 fn markets_in_map(
     account_pubkey: &Pubkey,
     data: &[u8],
 ) -> SurfpoolResult<Vec<(usize, PerpAssetMetadata)>> {
-    let decode_error = |error: PhoenixAccountDecodeError| {
-        price_patch_error(
-            account_pubkey,
-            format!("invalid Phoenix PerpAssetMap account: {error}"),
-        )
-    };
-    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
     let mut markets = Vec::new();
     // The decoder walks the entries in storage order, and each market's metadata holds its own
     // market account, so it occurs once in the map
     let mut cursor = 0;
-    for entry in map.iter() {
-        let metadata = entry.map_err(decode_error)?.metadata;
+    for entry in map_entries(account_pubkey, data)? {
+        let metadata = entry.metadata;
         let metadata_bytes = metadata.as_bytes();
         let offset = data[cursor..]
             .windows(metadata_bytes.len())
             .position(|window| window == metadata_bytes)
             .map(|position| cursor + position)
             .ok_or_else(|| {
-                price_patch_error(account_pubkey, "Phoenix market metadata was not found")
+                invalid_perp_asset_map(account_pubkey, "Phoenix market metadata was not found")
             })?;
         cursor = offset + metadata_bytes.len();
         markets.push((offset, metadata));
@@ -967,12 +962,53 @@ fn rewind_funding_timestamps(
 }
 
 #[cfg(test)]
-mod tests {
-    use phoenix_rise_accounts::perp_asset_map::PerpAssetMetadata;
+pub(crate) mod tests {
+    use std::collections::HashSet;
+
+    use phoenix_rise_accounts::perp_asset_map::{PerpAssetMap, PerpAssetMetadata};
     use solana_system_interface::instruction as system_instruction;
+    use surfpool_types::AccountAddress;
 
     use super::*;
-    use crate::scenarios::protocols::phoenix_eternal::v1::market::tests::perp_asset_map_account;
+    use crate::scenarios::{
+        protocols::phoenix_eternal::v1::market::tests::perp_asset_map_account,
+        registry::template_registry,
+    };
+
+    /// Every Phoenix template that carries a fixed address: its id, account type and address.
+    pub(crate) fn template_addresses() -> Vec<(&'static str, &'static str, Pubkey)> {
+        template_registry()
+            .by_protocol("Phoenix Eternal")
+            .into_iter()
+            .filter_map(|template| match &template.address {
+                AccountAddress::Pubkey(address) if !address.is_empty() => Some((
+                    template.id.as_str(),
+                    template.account_type.as_str(),
+                    Pubkey::from_str(address).unwrap_or_else(|e| panic!("{}: {e}", template.id)),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn templates_carry_the_addresses_the_writers_use() {
+        let addresses = template_addresses();
+        assert!(!addresses.is_empty());
+        let mut withdraw_queues = HashSet::new();
+        for (id, account_type, address) in addresses {
+            match account_type {
+                "PerpAssetMap" => assert_eq!(address, PHOENIX_PERP_ASSET_MAP, "{id}"),
+                "GlobalConfiguration" => assert_eq!(address, PHOENIX_GLOBAL_CONFIG, "{id}"),
+                // The writers read this one from GlobalConfig; the mainnet tests check it there.
+                "WithdrawQueueHeader" => {
+                    withdraw_queues.insert(address);
+                }
+                other => panic!("{id} carries an address for {other}, which nothing checks"),
+            }
+        }
+        assert_eq!(withdraw_queues.len(), 1, "{withdraw_queues:?}");
+    }
 
     /// Where the fixture markets' PriceComponents start: after the 48-byte map header, each
     /// 1584-byte entry holds a 16-byte symbol and then the metadata, which starts with them.

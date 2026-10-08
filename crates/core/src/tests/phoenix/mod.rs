@@ -16,15 +16,20 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 
 use crate::{
     scenarios::protocols::phoenix_eternal::v1::{
         market::{MarketContext, move_market, phoenix_markets},
-        state_builder::{PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID},
+        state_builder::{
+            PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID,
+            tests::template_addresses,
+        },
         trader::{
-            Side, deposit, index_trader_state_range, index_trader_state_ranges, liquidation,
-            place_market_order, prepare_cascade, prepare_liquidation, withdraw,
+            HAWKEYE_PROGRAM_ID, MarginView, Side, VIEW_MARGIN, deposit, index_trader_state_ranges,
+            liquidation, place_market_order, prepare_cascade, prepare_liquidation,
+            tests::index_trader_state_range, withdraw,
         },
     },
     surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
@@ -97,6 +102,19 @@ async fn mainnet_accounts_satisfy_the_typed_layout_invariants() {
         PHOENIX_PERP_ASSET_MAP,
         "the PerpAssetMap the templates carry moved; update it to what GlobalConfig points at"
     );
+    for (id, account_type, address) in template_addresses() {
+        let named = match account_type {
+            "PerpAssetMap" => global.perp_asset_map_key(),
+            "GlobalConfiguration" => global.account_key(),
+            "WithdrawQueueHeader" => global.withdraw_queue_key(),
+            other => panic!("{id} carries an address for {other}, which nothing checks"),
+        };
+        assert_eq!(
+            address,
+            Pubkey::new_from_array(named),
+            "{id} carries the address GlobalConfig names"
+        );
+    }
 
     let map_account = graph.account(&graph.perp_asset_map);
     assert_eq!(map_account.owner, PHOENIX_PROGRAM_ID);
@@ -136,7 +154,6 @@ async fn mainnet_accounts_satisfy_the_typed_layout_invariants() {
     }
 }
 
-const HAWKEYE_VIEW_MARGIN_DISCRIMINANT: [u8; 8] = [0xb2, 0x0a, 0x7c, 0xad, 0xec, 0xd2, 0x75, 0x06];
 const HAWKEYE_VIEW_BBO_DISCRIMINANT: [u8; 8] = [0x37, 0x5f, 0x23, 0x2d, 0x53, 0xaf, 0x12, 0x52];
 const ETERNAL_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("B5ayDaz9HegiNZqYeBtcFqfZBVSGwjB2CJgHshoSfMQg");
@@ -247,6 +264,9 @@ async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixMainnetGraph) {
     let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
     let graph = phoenix_mainnet_graph().await;
     let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
+    // A surfnet loads this sysvar from its datasource; the bare test VM has none.
+    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
+    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     (locker, graph)
 }
 
@@ -490,7 +510,7 @@ fn try_hawkeye_view(
     })
 }
 
-fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph) -> HawkeyeMarginView {
+fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph) -> MarginView {
     try_hawkeye_margin(locker, graph)
         .unwrap_or_else(|e| panic!("Hawkeye margin view failed for {}: {e}", graph.trader))
 }
@@ -498,22 +518,9 @@ fn hawkeye_margin(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph) -> Haw
 fn try_hawkeye_margin(
     locker: &SurfnetSvmLocker,
     graph: &PhoenixMainnetGraph,
-) -> Result<HawkeyeMarginView, String> {
-    let data = try_hawkeye_view(
-        locker,
-        graph,
-        HAWKEYE_VIEW_MARGIN_DISCRIMINANT,
-        &[graph.trader],
-    )?;
-    let margin = bytemuck::try_pod_read_unaligned::<HawkeyeMarginView>(&data)
-        .map_err(|e| format!("the margin view returned {} bytes: {e:?}", data.len()))?;
-    if margin.magic != HAWKEYE_MARGIN_RETURN_MAGIC {
-        return Err(format!(
-            "the margin view returned magic {:#x}",
-            margin.magic
-        ));
-    }
-    Ok(margin)
+) -> Result<MarginView, String> {
+    let data = try_hawkeye_view(locker, graph, VIEW_MARGIN, &[graph.trader])?;
+    MarginView::from_return_data(&data).map_err(|e| e.to_string())
 }
 
 fn hawkeye_bbo_for_market(
@@ -535,30 +542,6 @@ fn hawkeye_bbo_for_market(
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
-struct HawkeyeMarginView {
-    magic: u64,
-    version: u16,
-    position_count: u16,
-    risk_state: u8,
-    risk_tier: u8,
-    is_liquidatable: u8,
-    padding: u8,
-    collateral_quote_lots: i64,
-    effective_collateral_quote_lots: i64,
-    free_collateral_quote_lots: i64,
-    withdrawable_collateral_quote_lots: u64,
-    initial_margin_quote_lots: u64,
-    maintenance_margin_quote_lots: u64,
-    cancel_margin_quote_lots: u64,
-    backstop_margin_quote_lots: u64,
-    high_risk_margin_quote_lots: u64,
-    unrealized_pnl_quote_lots: i64,
-    discounted_unrealized_pnl_quote_lots: i64,
-    unsettled_funding_quote_lots: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct HawkeyeBboView {
     magic: u64,
     version: u16,
@@ -571,11 +554,6 @@ struct HawkeyeBboView {
     mark_price_last_updated_slot: u64,
     index_price_last_updated_slot: u64,
 }
-
-const HAWKEYE_PROGRAM_ID: Pubkey =
-    Pubkey::from_str_const("RiSeVw3ZjNfsaXPRb4mgaqYaEEt41pNNJoDvVh7pgQj");
-
-const HAWKEYE_MARGIN_RETURN_MAGIC: u64 = 0x955f5b9d3dff253f;
 
 const HAWKEYE_BBO_RETURN_MAGIC: u64 = 0xefca1fa31fa74171;
 
@@ -600,9 +578,6 @@ fn phoenix_market_override(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_market_move_reprices_the_oracles_and_the_book_together() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    // A surfnet loads this sysvar from its datasource; the bare test VM has none.
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
 
     for (symbol, orderbook, spline) in graph.markets.clone() {
@@ -637,14 +612,6 @@ async fn a_market_move_reprices_the_oracles_and_the_book_together() {
         });
 
         let after = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
-        println!(
-            "{symbol}: {} -> {target}: bid {} ask {} mark {} index {}",
-            before.mark_price_ticks,
-            after.best_bid_ticks,
-            after.best_ask_ticks,
-            after.mark_price_ticks,
-            after.index_price_ticks
-        );
         assert_eq!(
             after.index_price_ticks, target,
             "{symbol}: the index is the oracle reports"
@@ -669,8 +636,6 @@ async fn a_market_move_reprices_the_oracles_and_the_book_together() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_market_move_scenario_plays_through_the_materializer() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let (symbol, orderbook, spline) = graph.markets[0].clone();
     let target =
         hawkeye_bbo_for_market(&graph, &locker, orderbook, spline).mark_price_ticks * 90 / 100;
@@ -758,8 +723,6 @@ async fn play(
 #[tokio::test(flavor = "multi_thread")]
 async fn configuration_templates_run_phoenix_own_instructions() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let map_before =
         PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
             .unwrap()
@@ -803,7 +766,6 @@ async fn configuration_templates_run_phoenix_own_instructions() {
     );
 
     // A market status, signed by the market authority: a paused market refuses orders.
-    let (_, orderbook, spline) = graph.markets[0].clone();
     play(
         &locker,
         slot + 1,
@@ -812,10 +774,6 @@ async fn configuration_templates_run_phoenix_own_instructions() {
         &[("symbol", "SOL"), ("nextMarketStatus", "Paused")],
     )
     .await;
-    let book_status = locker
-        .with_svm_reader(|svm| svm.get_account(&orderbook))
-        .unwrap()
-        .unwrap();
     let paused = {
         let mut svm = locker.0.write().await;
         crate::scenarios::protocols::phoenix_eternal::v1::trader::place_market_order(
@@ -828,12 +786,13 @@ async fn configuration_templates_run_phoenix_own_instructions() {
         )
         .await
     };
+    let refused = paused
+        .expect_err("a paused SOL market refuses a market order")
+        .to_string();
     assert!(
-        paused.is_err(),
-        "a paused SOL market refuses a market order, orderbook {} bytes",
-        book_status.data.len()
+        refused.contains("Market status Paused does not satisfy"),
+        "{refused}"
     );
-    let _ = spline;
 
     // An exchange status, signed by the root authority.
     let global_before = graph.account(&PHOENIX_GLOBAL_CONFIG).data.clone();
@@ -859,14 +818,12 @@ async fn configuration_templates_run_phoenix_own_instructions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_trader_crosses_into_liquidatable_between_two_slots() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     // Where the liquidation-ready fixture would move SOL for some long, found on a copy.
     let (trader, target) = {
         let mut svm = locker.0.write().await;
         let ready = crate::scenarios::protocols::phoenix_eternal::v1::trader::prepare_cascade(
-            &mut svm, &remote, "SOL", true, 1,
+            &mut svm, &remote, "SOL", true,
         )
         .await
         .unwrap_or_else(|e| panic!("no eligible mainnet candidate: {e}"));
@@ -927,7 +884,6 @@ async fn configure(
             &target,
             &values,
             &Some((client(), CommitmentConfig::confirmed())),
-            false,
             0,
         )
         .await
@@ -962,8 +918,6 @@ fn sol_metadata(
 #[tokio::test(flavor = "multi_thread")]
 async fn market_and_exchange_configuration_reaches_the_accounts_phoenix_reads() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let (_, orderbook, _) = graph.markets[0].clone();
     let before = sol_metadata(&locker, &graph);
 
@@ -1164,9 +1118,6 @@ async fn sol_position_holders(graph: &PhoenixMainnetGraph) -> Vec<Pubkey> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prepared_trader_is_liquidated_by_a_market_order() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    // A surfnet loads this sysvar from its datasource; the bare test VM has none.
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let (_, orderbook, spline) = graph
         .markets
@@ -1213,38 +1164,11 @@ async fn a_prepared_trader_is_liquidated_by_a_market_order() {
             "{trader}: and not underwater"
         );
 
-        let payer = Keypair::new();
-        let result = locker.with_svm_writer(|svm| {
-            svm.inner.set_sigverify(false);
-            svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
-            let mut transaction = Transaction::new_with_payer(
-                &[
-                    ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                    ready.liquidation.clone(),
-                ],
-                Some(&payer.pubkey()),
-            );
-            transaction.partial_sign(&[&payer], svm.inner.svm.latest_blockhash());
-            svm.inner
-                .send_transaction(transaction)
-                .map(|_| ())
-                .map_err(|failed| format!("{:?}: {:?}", failed.err, failed.meta.logs))
-        });
-        result.unwrap_or_else(|e| panic!("{trader}: the liquidation failed: {e}"));
+        send_liquidation(&locker, ready.liquidation)
+            .unwrap_or_else(|e| panic!("{trader}: the liquidation failed: {e}"));
 
         let after = hawkeye_margin(&locker, &traded);
         let book = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
-        println!(
-            "{trader}: SOL moved to {}, effective {} -> {}, positions {} -> {}, book {} / {} mark {}",
-            ready.target_ticks,
-            before.effective_collateral_quote_lots,
-            after.effective_collateral_quote_lots,
-            before.position_count,
-            after.position_count,
-            book.best_bid_ticks,
-            book.best_ask_ticks,
-            book.mark_price_ticks
-        );
         assert_eq!(
             after.is_liquidatable, 0,
             "{trader}: the liquidation restored it"
@@ -1263,8 +1187,6 @@ async fn a_prepared_trader_is_liquidated_by_a_market_order() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_liquidation_ready_scenario_plays_through_the_materializer() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     // A market moved by an earlier scenario, after Phoenix last validated its mark, and this
     // scenario some slots later, both behind mainnet's time.
@@ -1363,24 +1285,7 @@ async fn a_liquidation_ready_scenario_plays_through_the_materializer() {
             let context = MarketContext::load(&mut svm, &remote, "SOL").await.unwrap();
             liquidation(&context, trader, long, mark).unwrap()
         };
-        let payer = Keypair::new();
-        locker
-            .with_svm_writer(|svm| {
-                svm.inner.set_sigverify(false);
-                svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
-                let mut transaction = Transaction::new_with_payer(
-                    &[
-                        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                        instruction,
-                    ],
-                    Some(&payer.pubkey()),
-                );
-                transaction.partial_sign(&[&payer], svm.inner.svm.latest_blockhash());
-                svm.inner
-                    .send_transaction(transaction)
-                    .map(|_| ())
-                    .map_err(|failed| format!("{:?}: {:?}", failed.err, failed.meta.logs))
-            })
+        send_liquidation(&locker, instruction)
             .unwrap_or_else(|e| panic!("{trader}: the keeper's liquidation failed: {e}"));
         assert_eq!(
             hawkeye_margin(&locker, &traded).is_liquidatable,
@@ -1408,6 +1313,28 @@ fn mint_supply(locker: &SurfnetSvmLocker, mint: &Pubkey) -> u64 {
     u64::from_le_bytes(account.data[36..44].try_into().unwrap())
 }
 
+/// Sends a keeper's liquidation on the test VM. Its liquidator wallet has no key, so signatures go
+/// unchecked.
+fn send_liquidation(locker: &SurfnetSvmLocker, liquidation: Instruction) -> Result<(), String> {
+    let payer = Keypair::new();
+    locker.with_svm_writer(|svm| {
+        svm.inner.set_sigverify(false);
+        svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+        let mut transaction = Transaction::new_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                liquidation,
+            ],
+            Some(&payer.pubkey()),
+        );
+        transaction.partial_sign(&[&payer], svm.inner.svm.latest_blockhash());
+        svm.inner
+            .send_transaction(transaction)
+            .map(|_| ())
+            .map_err(|failed| format!("{:?}: {:?}", failed.err, failed.meta.logs))
+    })
+}
+
 async fn apply(locker: &SurfnetSvmLocker, writes: Vec<(Pubkey, Account)>) {
     locker.with_svm_writer(|svm| {
         for (pubkey, account) in writes {
@@ -1419,8 +1346,6 @@ async fn apply(locker: &SurfnetSvmLocker, writes: Vec<(Pubkey, Account)>) {
 #[tokio::test(flavor = "multi_thread")]
 async fn collateral_moves_through_real_withdrawals_and_deposits() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let global =
         GlobalConfig::try_from_account_bytes(&graph.account(&PHOENIX_GLOBAL_CONFIG).data).unwrap();
@@ -1444,14 +1369,14 @@ async fn collateral_moves_through_real_withdrawals_and_deposits() {
             .await
             .unwrap()
     };
-    let wallet = writes
-        .iter()
-        .map(|(pubkey, _)| *pubkey)
-        .find(|pubkey| {
-            *pubkey != vault && *pubkey != graph.trader && token_amount(&locker, pubkey) == 0
-        })
-        .unwrap_or_default();
+    let token_program = locker
+        .with_svm_reader(|svm| svm.get_account(&mint))
+        .unwrap()
+        .expect("withdraw put the quote mint in the local VM")
+        .owner;
+    let wallet = get_associated_token_address_with_program_id(&authority, &mint, &token_program);
     let (vault_before, mint_before) = (token_amount(&locker, &vault), mint_supply(&locker, &mint));
+    let wallet_before = token_amount(&locker, &wallet);
     apply(&locker, writes).await;
     let withdrawn = hawkeye_margin(&locker, &graph);
     // Phoenix settles accrued funding into collateral before it pays a withdrawal out.
@@ -1465,8 +1390,9 @@ async fn collateral_moves_through_real_withdrawals_and_deposits() {
         vault_before - amount,
         "the vault paid it out"
     );
-    assert!(
-        wallet == Pubkey::default() || token_amount(&locker, &wallet) >= amount,
+    assert_eq!(
+        token_amount(&locker, &wallet),
+        wallet_before + amount,
         "the wallet {authority} received it"
     );
 
@@ -1498,8 +1424,6 @@ async fn collateral_moves_through_real_withdrawals_and_deposits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_market_order_opens_a_position() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let map = PerpAssetMap::try_from_account_bytes(&graph.account(&graph.perp_asset_map).data)
         .expect("mainnet PerpAssetMap decodes");
@@ -1536,8 +1460,6 @@ async fn a_market_order_opens_a_position() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cascade_liquidates_several_traders_one_after_another() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let (_, orderbook, spline) = graph
         .markets
@@ -1548,15 +1470,10 @@ async fn a_cascade_liquidates_several_traders_one_after_another() {
 
     let ready = {
         let mut svm = locker.0.write().await;
-        prepare_cascade(&mut svm, &remote, "SOL", true, 3)
+        prepare_cascade(&mut svm, &remote, "SOL", true)
             .await
             .unwrap_or_else(|e| panic!("no eligible mainnet candidate: {e}"))
     };
-    println!(
-        "SOL moved to {} for {} longs",
-        ready.target_ticks,
-        ready.liquidations.len()
-    );
     assert!(
         ready.liquidations.len() >= 2,
         "no eligible mainnet candidate: only {} long fits one price",
@@ -1564,7 +1481,6 @@ async fn a_cascade_liquidates_several_traders_one_after_another() {
     );
     apply(&locker, ready.writes).await;
 
-    let payer = Keypair::new();
     for (trader, instruction) in ready.liquidations {
         let traded = PhoenixMainnetGraph {
             trader,
@@ -1575,29 +1491,9 @@ async fn a_cascade_liquidates_several_traders_one_after_another() {
             before.is_liquidatable, 1,
             "{trader}: liquidatable after Play"
         );
-        locker
-            .with_svm_writer(|svm| {
-                svm.inner.set_sigverify(false);
-                svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
-                let mut transaction = Transaction::new_with_payer(
-                    &[
-                        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                        instruction,
-                    ],
-                    Some(&payer.pubkey()),
-                );
-                transaction.partial_sign(&[&payer], svm.inner.svm.latest_blockhash());
-                svm.inner
-                    .send_transaction(transaction)
-                    .map(|_| ())
-                    .map_err(|failed| format!("{:?}: {:?}", failed.err, failed.meta.logs))
-            })
+        send_liquidation(&locker, instruction)
             .unwrap_or_else(|e| panic!("{trader}: liquidation in turn failed: {e}"));
         let after = hawkeye_margin(&locker, &traded);
-        println!(
-            "  {trader}: effective {} -> {}",
-            before.effective_collateral_quote_lots, after.effective_collateral_quote_lots
-        );
         assert_eq!(
             after.is_liquidatable, 0,
             "{trader}: restored by its liquidation"
@@ -1613,8 +1509,6 @@ async fn a_cascade_liquidates_several_traders_one_after_another() {
 #[tokio::test(flavor = "multi_thread")]
 async fn trader_configuration_reaches_what_phoenix_reads() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let withdraw_one = || async {
         let mut svm = locker.0.write().await;
@@ -1634,10 +1528,11 @@ async fn trader_configuration_reaches_what_phoenix_reads() {
     )
     .await
     .unwrap();
-    assert!(
-        withdraw_one().await.is_err(),
-        "WithdrawCollateral false blocks withdrawals"
-    );
+    let refused = withdraw_one()
+        .await
+        .expect_err("WithdrawCollateral false blocks withdrawals")
+        .to_string();
+    assert!(refused.contains("Trader cannot withdraw"), "{refused}");
     configure(
         &locker,
         "phoenix-trader-capabilities",

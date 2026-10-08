@@ -1142,8 +1142,8 @@ impl Surfpool {
                         "markTicks": market.mark_ticks,
                         "tickSize": market.tick_size,
                         "baseLotDecimals": market.base_lot_decimals,
-                        "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
-                        "backstopRiskFactorBps": market.backstop_risk_factor_bps,
+                        "maintenanceRiskFactorBps": market.risk_factors[0],
+                        "backstopRiskFactorBps": market.risk_factors[1],
                     })
                 })
                 .collect::<Vec<_>>(),

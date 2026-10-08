@@ -20,8 +20,8 @@ use spl_token_interface::state::Mint;
 use super::{
     market::{MarketContext, market_books},
     state_builder::{
-        Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, log_authority,
-        phoenix_instruction, run_instructions,
+        Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, local_account,
+        log_authority, phoenix_instruction, run_instructions,
     },
 };
 use crate::{
@@ -301,7 +301,7 @@ impl QuoteTokens {
 
 pub const HAWKEYE_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("RiSeVw3ZjNfsaXPRb4mgaqYaEEt41pNNJoDvVh7pgQj");
-const VIEW_MARGIN: [u8; 8] = [0xb2, 0x0a, 0x7c, 0xad, 0xec, 0xd2, 0x75, 0x06];
+pub(crate) const VIEW_MARGIN: [u8; 8] = [0xb2, 0x0a, 0x7c, 0xad, 0xec, 0xd2, 0x75, 0x06];
 const MARGIN_VIEW_MAGIC: u64 = 0x955f5b9d3dff253f;
 /// The most steps a price search takes.
 const SEARCH_STEPS: usize = 40;
@@ -332,6 +332,23 @@ pub struct MarginView {
 }
 
 impl MarginView {
+    /// The view in `view_margin`'s return data.
+    pub(crate) fn from_return_data(data: &[u8]) -> SurfpoolResult<Self> {
+        let view = bytemuck::try_pod_read_unaligned::<Self>(data).map_err(|e| {
+            SurfpoolError::internal(format!(
+                "Hawkeye's margin view returned {} bytes: {e:?}",
+                data.len()
+            ))
+        })?;
+        if view.magic != MARGIN_VIEW_MAGIC {
+            return Err(SurfpoolError::internal(format!(
+                "Hawkeye's margin view returned magic {:#x}",
+                view.magic
+            )));
+        }
+        Ok(view)
+    }
+
     /// Effective collateral at or below half the maintenance margin: liquidatable, and still far
     /// from the underwater state where the program refuses a market-order liquidation.
     fn reached(&self) -> bool {
@@ -361,10 +378,7 @@ pub async fn prepare_liquidation(
 ) -> SurfpoolResult<LiquidationReady> {
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
     hydrate(svm, remote_ctx, &[trader, HAWKEYE_PROGRAM_ID]).await?;
-    let account = svm
-        .inner
-        .get_account(&trader)?
-        .ok_or_else(|| SurfpoolError::internal(format!("{trader} is missing locally")))?;
+    let account = local_account(svm, &trader)?;
     let cancels = cancel_everywhere(svm, remote_ctx, &context.exchange, trader, &account).await?;
 
     // The margin reads only the mark, so the search moves the oracles alone. Moves come a slot
@@ -444,8 +458,8 @@ pub struct CascadeReady {
     pub liquidations: Vec<(Pubkey, Instruction)>,
 }
 
-/// The writes that leave up to `count` traders holding long (or short) positions in `symbol`
-/// liquidatable at one price, each by `liquidate_via_market_order` in turn. Every holder's band
+/// The writes that leave every trader holding long (or short) positions in `symbol` that one
+/// price can make liquidatable ready for `liquidate_via_market_order`, in turn. Every holder's band
 /// runs from where it turns liquidatable to where it goes underwater and Phoenix refuses a
 /// market-order liquidation; the market moves, splines and book included, to the price inside
 /// the most bands. The liquidations run one after another on a copy first; a trader whose
@@ -455,13 +469,7 @@ pub async fn prepare_cascade(
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     symbol: &str,
     long: bool,
-    count: usize,
 ) -> SurfpoolResult<CascadeReady> {
-    if count == 0 {
-        return Err(SurfpoolError::internal(
-            "a cascade needs at least one trader",
-        ));
-    }
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
     hydrate(svm, remote_ctx, &[HAWKEYE_PROGRAM_ID]).await?;
     let index = local_account(svm, &context.exchange.global_trader_index)?;
@@ -572,7 +580,6 @@ pub async fn prepare_cascade(
         .iter()
         .filter(|(_, low, high)| (low..=high).contains(&&target))
         .map(|(trader, ..)| *trader)
-        .take(count)
         .collect();
 
     // A trader the book cannot absorb in turn is dropped, and the rest are prepared again.
@@ -680,10 +687,7 @@ async fn cancel_everywhere(
     })?;
     let assets: Vec<u64> = view.positions().map(|(asset, _)| asset).collect();
     let authority = Pubkey::new_from_array(view.header().authority);
-    let map = svm
-        .inner
-        .get_account(&exchange.perp_asset_map)?
-        .ok_or_else(|| SurfpoolError::internal("the Phoenix PerpAssetMap is missing locally"))?;
+    let map = local_account(svm, &exchange.perp_asset_map)?;
     let books = market_books(&exchange.perp_asset_map, &map.data, &assets)?;
     let book_accounts: Vec<Pubkey> = books
         .iter()
@@ -757,19 +761,7 @@ pub fn margin(
         accounts,
         data: VIEW_MARGIN.to_vec(),
     })?;
-    let view = bytemuck::try_pod_read_unaligned::<MarginView>(&data).map_err(|e| {
-        SurfpoolError::internal(format!(
-            "Hawkeye's margin view returned {} bytes: {e:?}",
-            data.len()
-        ))
-    })?;
-    if view.magic != MARGIN_VIEW_MAGIC {
-        return Err(SurfpoolError::internal(format!(
-            "Hawkeye's margin view returned magic {:#x}",
-            view.magic
-        )));
-    }
-    Ok(view)
+    MarginView::from_return_data(&data)
 }
 
 /// Every hot Trader the GlobalTraderIndex tree reaches, paired with the byte range of its
@@ -833,30 +825,26 @@ pub fn index_trader_state_ranges(index: &Account) -> SurfpoolResult<Vec<(Pubkey,
     Ok(ranges)
 }
 
-pub fn index_trader_state_range(
-    index: &Account,
-    trader_key: &[u8; 32],
-) -> SurfpoolResult<Range<usize>> {
-    let trader_key = Pubkey::new_from_array(*trader_key);
-    index_trader_state_ranges(index)?
-        .into_iter()
-        .find_map(|(key, range)| (key == trader_key).then_some(range))
-        .ok_or_else(|| {
-            SurfpoolError::internal("Hot Phoenix Trader has no reachable GlobalTraderIndex entry")
-        })
-}
-
-fn local_account(svm: &SurfnetSvm, address: &Pubkey) -> SurfpoolResult<Account> {
-    svm.inner
-        .get_account(address)?
-        .ok_or_else(|| SurfpoolError::internal(format!("{address} is missing locally")))
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use phoenix_rise_accounts::trader::TRADER_CAPABILITY_HOT;
 
     use super::*;
+
+    pub(crate) fn index_trader_state_range(
+        index: &Account,
+        trader_key: &[u8; 32],
+    ) -> SurfpoolResult<Range<usize>> {
+        let trader_key = Pubkey::new_from_array(*trader_key);
+        index_trader_state_ranges(index)?
+            .into_iter()
+            .find_map(|(key, range)| (key == trader_key).then_some(range))
+            .ok_or_else(|| {
+                SurfpoolError::internal(
+                    "Hot Phoenix Trader has no reachable GlobalTraderIndex entry",
+                )
+            })
+    }
 
     #[test]
     fn a_midpoint_always_narrows_the_search() {

@@ -35,9 +35,9 @@ templates:
       list_phoenix_markets; compute a relative move from markTicks there.
       Pass target_ticks as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
-      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
-      false only for a later override that builds on state an earlier one prepared in the same
-      scenario.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -54,23 +54,25 @@ templates:
         source: list_phoenix_markets
         description: Exact symbol of a market the trader holds a position in
     llm_context: |
-      This cancels the trader's resting orders, which Phoenix requires before it liquidates
-      anyone, and moves the market the way Phoenix Market Move does, to the price where the
+      This cancels the trader's resting orders on every market it holds, which Phoenix requires
+      before it liquidates anyone, and moves the market the way Phoenix Market Move does, to the price where the
       trader's effective collateral is half its maintenance margin: liquidatable, and still far
       from the underwater state where a market-order liquidation is refused. A liquidation is
       tried on a copy of the result first, and nothing is written unless it goes through.
       It does not send the liquidation; the user's own keeper does.
       The account is the trader's Trader account, and the trader must hold a position in the
-      market. Set fetchBeforeUse: true so the Trader is fetched from the upstream datasource
-      first.
+      market.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
   - id: phoenix-liquidation-cascade
     name: Phoenix Liquidation Cascade
     description: >-
-      Leave several Phoenix Eternal traders liquidatable at one price in one market, so a keeper can
-      liquidate them one after another.
+      Leave every Phoenix Eternal trader that one price can make liquidatable in one market ready
+      for a keeper to liquidate one after another.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -83,20 +85,19 @@ templates:
         value_type: string
         label: Positions to liquidate
         description: long liquidates longs after a drop, short liquidates shorts after a rise
-      - path: count
-        type: input
-        value_type: string
-        label: Traders
-        description: The most traders to leave liquidatable, encoded as a decimal string
     llm_context: |
       Each holder of the chosen side becomes liquidatable at one price and underwater, where
-      Phoenix refuses a market-order liquidation, at another. This finds the price inside the most
-      of those bands, cancels the chosen traders' resting orders and moves the market there the
-      way Phoenix Market Move does. Their liquidations are tried one after another on a copy, and
-      a trader whose liquidation would fail is left out, so it can leave fewer than count.
+      Phoenix refuses a market-order liquidation, at another. This looks at up to 24 holders of
+      that side, finds the price inside the most of their bands, cancels the resting orders of
+      every holder whose band covers it, on every market they hold, and moves the market there
+      the way Phoenix Market Move does. How many traders that is depends on the market, not on an
+      input. Their liquidations are tried one after another on a copy, and a trader whose
+      liquidation would fail is left out. Surfpool's log names the price and the traders.
       It does not send the liquidations; the user's own keeper does.
       The account is the singleton PerpAssetMap, so this template carries its address.
-      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -128,8 +129,10 @@ templates:
       positions all change the way a real trade changes them. Phoenix refuses an order the
       trader's margin cannot carry.
       A base lot is 10^-baseLotDecimals of one unit, from list_phoenix_markets.
-      The account is the trader's Trader account. Set fetchBeforeUse: true so the Trader is
-      fetched from the upstream datasource first.
+      The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
@@ -149,8 +152,10 @@ templates:
       that still has risk-increasing resting orders, and cancelling also drops the margin those
       orders held. Put it at slot 0 and phoenix-market-move at a later slot to watch traders cross
       from healthy into the Liquidatable tier.
-      The account is the trader's Trader account. Set fetchBeforeUse: true so the Trader is
-      fetched from the upstream datasource first.
+      The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
@@ -170,8 +175,10 @@ templates:
       stays backed. Phoenix first settles the trader's accrued funding, and refuses more than the
       trader's margin leaves free, so a withdrawal never makes a trader liquidatable: use
       phoenix-liquidation-ready for that.
-      The account is the trader's Trader account. Set fetchBeforeUse: true so the Trader is
-      fetched from the upstream datasource first.
+      The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
@@ -190,8 +197,10 @@ templates:
       The quote mint's authority first mints the amount to the trader's wallet, and the trader
       deposits it, so the vault holds real tokens for the new collateral. Phoenix then makes the
       trader wait the deposit cooldown before it may withdraw.
-      The account is the trader's Trader account. Set fetchBeforeUse: true so the Trader is
-      fetched from the upstream datasource first.
+      The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
@@ -234,6 +243,9 @@ templates:
       list_phoenix_markets shows the current maintenance and backstop factors. Pass every factor
       as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -261,6 +273,9 @@ templates:
       Phoenix keeps every maintenance factor at or below this one, so raise it before setting a
       maintenance factor above 7500. Pass the factor as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -288,6 +303,9 @@ templates:
       A keeper's liquidation asking for more is refused, so a small value forces a large position to
       be liquidated in several steps. Pass the size as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -314,6 +332,9 @@ templates:
       it on mainnet, so the program validates and applies the change itself.
       Pass the cap as a decimal string.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -352,6 +373,9 @@ templates:
       it on mainnet, so the program validates and applies the change itself.
       Every field is optional: one left out keeps its current value. Pass values as decimal strings.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -386,6 +410,9 @@ templates:
       overrides. A fee left out keeps its current value. Keep the maker fee below the taker fee.
       Pass the fees as decimal strings.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -413,6 +440,9 @@ templates:
       Paused stops all trading in the market, PostOnly accepts only orders that rest on the book,
       and Active trades normally. Closed and Tombstoned are one-way steps toward removing a market.
       The account is the singleton PerpAssetMap, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -446,6 +476,9 @@ templates:
       it on mainnet, so the program validates and applies the change itself.
       Each flag left out keeps its current value. An inactive exchange refuses trading for everyone.
       The account is the singleton GlobalConfig, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ
@@ -477,6 +510,9 @@ templates:
       A field left out keeps its current value. Amounts are quote lots of Phoenix USDC with
       6 decimals, passed as decimal strings.
       The account is the singleton WithdrawQueue, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -510,6 +546,9 @@ templates:
       it on mainnet, so the program validates and applies the change itself.
       A field left out keeps its current value. Pass values as decimal strings.
       The account is the singleton WithdrawQueue, so this template carries its address.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -537,6 +576,9 @@ templates:
       it on mainnet, so the program validates and applies the change itself.
       Both multipliers are required. Pass them as decimal strings.
       The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
@@ -588,6 +630,9 @@ templates:
       Set a capability to false to block it, true to allow it; one left out keeps its current value.
       RiskIncreasingTrade false makes the trader reduce-only; every capability false freezes it.
       The account is the trader's Trader account.
+      fetchBeforeUse: true refetches this account from the upstream datasource before Play and
+      drops what earlier Phoenix scenarios prepared in it, while the market's other accounts keep
+      their local state. Use true for the first Phoenix scenario on a surfnet and false after that.
     address:
       type: pubkey
 
