@@ -222,6 +222,14 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
     }
 }
 
+/// Clears `min_context_slot` from [RpcAccountInfoConfig], since this value is only relevant against the local surfnet, not the upstream.
+fn clear_min_context_slot(config: &RpcAccountInfoConfig) -> RpcAccountInfoConfig {
+    RpcAccountInfoConfig {
+        min_context_slot: None,
+        ..config.clone()
+    }
+}
+
 impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
         Self::try_new(remote_rpc_url).expect("unable to initialize datasource client")
@@ -537,7 +545,11 @@ impl SurfnetRemoteClient {
             .client
             .send(
                 RpcRequest::GetTokenAccountsByOwner,
-                json!([owner.to_string(), token_account_filter, config]),
+                json!([
+                    owner.to_string(),
+                    token_account_filter,
+                    clear_min_context_slot(config)
+                ]),
             )
             .await;
         match res {
@@ -605,7 +617,11 @@ impl SurfnetRemoteClient {
             .client
             .send(
                 RpcRequest::GetTokenAccountsByDelegate,
-                json!([delegate.to_string(), token_account_filter, config]),
+                json!([
+                    delegate.to_string(),
+                    token_account_filter,
+                    clear_min_context_slot(config)
+                ]),
             )
             .await;
 
@@ -626,7 +642,7 @@ impl SurfnetRemoteClient {
                     RpcProgramAccountsConfig {
                         filters,
                         with_context: Some(false),
-                        account_config,
+                        account_config: clear_min_context_slot(&account_config),
                         ..Default::default()
                     },
                 )
@@ -713,10 +729,22 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use solana_client::rpc_request::RpcResponseErrorData;
+    use solana_client::{
+        rpc_config::{RpcContextConfig, RpcProgramAccountsConfig, RpcTokenAccountsFilter},
+        rpc_custom_error::RpcCustomError,
+        rpc_request::RpcResponseErrorData,
+    };
 
     use super::*;
-    use crate::surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm};
+    use crate::{
+        rpc::{
+            accounts_data::{AccountsData, SurfpoolAccountsDataRpc},
+            accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc},
+            minimal::{Minimal, SurfpoolMinimalRpc},
+        },
+        surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm},
+        tests::helpers::TestSetup,
+    };
 
     struct ReturnsNull {
         requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
@@ -1393,38 +1421,126 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
+    async fn forwarded_reads_leave_min_context_slot_to_the_surfnet() {
+        let requests = Arc::new(Mutex::new(vec![]));
         let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+            client: RpcClient::new_sender(
+                ReturnsNull {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
         };
-
-        let accounts = client
-            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
-            .await
-            .expect("a mint the datasource has never seen has no remote holders, not a failure");
-
-        assert!(accounts.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_largest_accounts_provider_failure_is_still_an_error() {
-        let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()).into(),
+        let config = RpcAccountInfoConfig {
+            min_context_slot: Some(42),
+            ..Default::default()
         };
+        let token_program = TokenAccountsFilter::ProgramId(spl_token_interface::ID);
 
-        let error = client
-            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
-            .await
-            .expect_err("a provider failure must not be reported as an empty answer");
+        // Only what was sent matters; a null answer is not a valid response.
+        let _ = client
+            .get_token_accounts_by_owner(Pubkey::new_unique(), &token_program, &config)
+            .await;
+        let _ = client
+            .get_token_accounts_by_delegate(Pubkey::new_unique(), &token_program, &config)
+            .await;
+        let _ = client
+            .get_program_accounts(&Pubkey::new_unique(), config, None)
+            .await;
 
-        assert!(
-            error
-                .to_string()
-                .contains("Failed to get largest token accounts")
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            [
+                &requests[0].1[2]["minContextSlot"],
+                &requests[1].1[2]["minContextSlot"],
+                &requests[2].1[1]["minContextSlot"],
+            ],
+            [&serde_json::Value::Null; 3]
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_refused_for_min_context_slot_never_reaches_the_datasource() {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                ReturnsNull {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let processed = setup.context.svm_locker.get_latest_absolute_slot();
+        let context = RpcContextConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            min_context_slot: Some(processed + 1),
+        };
+        let config = RpcAccountInfoConfig {
+            commitment: context.commitment,
+            min_context_slot: context.min_context_slot,
+            ..Default::default()
+        };
+        let meta = || Some(setup.context.clone());
+        let pubkey = || Pubkey::new_unique().to_string();
+        let token_program =
+            || RpcTokenAccountsFilter::ProgramId(spl_token_interface::ID.to_string());
+
+        let refusals = [
+            (SurfpoolAccountsDataRpc.get_account_info(meta(), pubkey(), Some(config.clone())))
+                .await
+                .err(),
+            (SurfpoolAccountsDataRpc.get_multiple_accounts(
+                meta(),
+                vec![pubkey()],
+                Some(config.clone()),
+            ))
+            .await
+            .err(),
+            (SurfpoolMinimalRpc.get_balance(meta(), pubkey(), Some(context)))
+                .await
+                .err(),
+            (SurfpoolAccountsScanRpc.get_program_accounts(
+                meta(),
+                pubkey(),
+                Some(RpcProgramAccountsConfig {
+                    account_config: config.clone(),
+                    ..Default::default()
+                }),
+            ))
+            .await
+            .err(),
+            (SurfpoolAccountsScanRpc.get_token_accounts_by_owner(
+                meta(),
+                pubkey(),
+                token_program(),
+                Some(config.clone()),
+            ))
+            .await
+            .err(),
+            (SurfpoolAccountsScanRpc.get_token_accounts_by_delegate(
+                meta(),
+                pubkey(),
+                token_program(),
+                Some(config),
+            ))
+            .await
+            .err(),
+        ];
+
+        let not_reached: jsonrpc_core::Error = RpcCustomError::MinContextSlotNotReached {
+            context_slot: processed,
+        }
+        .into();
+        assert_eq!(refusals, [(); 6].map(|_| Some(not_reached.clone())));
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the datasource was asked"
+        );
+    }
+
     async fn any_other_invalid_params_rejection_on_largest_accounts_is_still_an_error() {
         let client = SurfnetRemoteClient {
             client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
@@ -1483,5 +1599,36 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].address, holder.to_string());
         assert_eq!(accounts[0].amount.amount, "42");
+    }
+
+    async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let accounts = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect("a mint the datasource has never seen has no remote holders, not a failure");
+
+        assert!(accounts.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_largest_accounts_provider_failure_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect_err("a provider failure must not be reported as an empty answer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to get largest token accounts")
+        );
     }
 }
