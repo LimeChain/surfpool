@@ -301,7 +301,7 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
-fn json_to_txtx_value_for_idl_type(
+pub(crate) fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
     idl_type: &IdlType,
     idl_types: &[IdlTypeDef],
@@ -3258,6 +3258,7 @@ impl SurfnetSvm {
 
                 match prepare_phoenix_override(
                     self,
+                    &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,

@@ -20,9 +20,7 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
-            phoenix_eternal::v1::state_builder::{
-                PHOENIX_PERP_ASSET_MAP, build_phoenix_collateral_scenario, phoenix_markets,
-            },
+            phoenix_eternal::v1::{market::phoenix_markets, state_builder::PHOENIX_PERP_ASSET_MAP},
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
             },
@@ -155,17 +153,6 @@ pub struct GetTemplateParams {
         description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
     )]
     pub template_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CreatePhoenixCollateralScenarioParams {
-    #[schemars(description = "Phoenix Eternal Trader account pubkey.")]
-    pub trader: String,
-    #[schemars(
-        description = "Exact signed collateral target in quote lots, encoded as a decimal string."
-    )]
-    pub target_quote_lots: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -472,23 +459,6 @@ impl Surfpool {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| format!("Studio's config at {endpoint} has no rpc_url"))
-    }
-
-    async fn build_phoenix_collateral_scenario_from_surfnet(
-        &self,
-        studio_url: &str,
-        params: &CreatePhoenixCollateralScenarioParams,
-    ) -> Result<Scenario, String> {
-        let trader = Pubkey::from_str(params.trader.trim())
-            .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
-        // Studio plays the scenario on its own surfnet, so the Trader is checked there.
-        let rpc_url = self.studio_rpc_url(studio_url).await?;
-        let accounts = self.fetch_accounts_at(&rpc_url, &[trader]).await?;
-        let trader_account = accounts[0]
-            .as_ref()
-            .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
-        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots)
-            .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -1149,28 +1119,6 @@ impl Surfpool {
         };
 
         self.stage_scenario(preparation.scenario).await
-    }
-
-    #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's current quoteLotCollateral with a warning, since raising it needs a real deposit. quoteLotCollateral excludes the unrealized PnL and funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective collateral by N. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
-    )]
-    async fn create_phoenix_collateral_scenario(
-        &self,
-        Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let studio_url = format!(
-            "http://127.0.0.1:{}",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let scenario = match self
-            .build_phoenix_collateral_scenario_from_surfnet(&studio_url, &params)
-            .await
-        {
-            Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-
-        self.stage_scenario(scenario).await
     }
 
     async fn list_phoenix_markets_at(&self, rpc_url: &str) -> Result<serde_json::Value, String> {
@@ -1938,7 +1886,7 @@ mod tests {
     async fn create_scenario_rejects_a_missing_dynamic_ref_value() {
         let surfpool = Surfpool::new();
         let template = TemplateRegistry::new()
-            .get("phoenix-direct-mark-risk-shock")
+            .get("phoenix-market-move")
             .expect("template")
             .clone();
         let mut scenario = surfpool_types::Scenario::new(
