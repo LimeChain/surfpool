@@ -967,6 +967,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// LLM context shared by all templates in this collection, placed before each template's own
+    #[serde(default)]
+    pub llm_context: Option<String>,
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
@@ -1435,6 +1438,10 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
+                let llm_context = match (&self.llm_context, entry.llm_context) {
+                    (Some(shared), Some(own)) => Some(format!("{}\n\n{own}", shared.trim_end())),
+                    (shared, own) => own.or_else(|| shared.clone()),
+                };
                 OverrideTemplate {
                     id: entry.id,
                     name: entry.name,
@@ -1450,7 +1457,7 @@ impl YamlOverrideTemplateCollection {
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
-                    llm_context: entry.llm_context,
+                    llm_context,
                     raw_layout: self.raw_layout,
                 }
             })
