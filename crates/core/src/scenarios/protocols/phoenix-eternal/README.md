@@ -18,16 +18,20 @@ orderbook, and each trader's collateral and positions in its Trader account, the
 GlobalTraderIndex and the ActiveTraderBuffer. Writing one of them alone leaves the others behind;
 a mark moved without the liquidity, for example, lets a liquidation fill at the old price.
 
-So every template runs Phoenix's own instructions, signed by whoever signs them on mainnet: the
-oracle keys, the makers, the trader, or the GlobalConfig role that owns a setting. Play runs them
-on a copy of the local VM with signature checks off, then writes back every account they changed
-at once. The program keeps the accounts consistent itself, and refuses what it would refuse on
-mainnet: a maintenance factor above the cancel order factor, a withdrawal beyond the free
-margin, an order the margin cannot carry. A refused template is skipped with a warning naming the
-program's reason.
+The instruction templates run Phoenix's own instructions on a copy of the local VM. They name the
+same signer accounts as on mainnet: the oracle keys, the makers, the trader, or the GlobalConfig
+role that owns a setting. Their private keys are not used: signature checks are disabled in the
+copy, and only a temporary local fee payer signs. Phoenix still checks the instructions' account
+and state constraints: a maintenance factor above the cancel order factor, a withdrawal beyond
+the free margin, or an order the margin cannot carry is refused. A refused template is skipped
+with a warning naming the program's reason.
 
-The stop-loss and permission templates are the exception: they patch one field of one account
-through the IDL.
+After the instructions succeed, Play writes back the accounts they changed. These writes are
+applied sequentially by the shared materializer, not as an atomic group: a storage error can leave
+earlier writes applied. Successful preparation in the copy does not guarantee atomic writeback.
+
+The stop-loss and permission templates patch one field of one account through the IDL. The
+maintenance described under "Keeping markets usable" also patches the PerpAssetMap directly.
 
 ## Terms
 
@@ -77,7 +81,7 @@ four in one `getMultipleAccounts` call.
 
 ## Templates
 
-| Template                              | What it does                                                                                           | Signed by                    |
+| Template                              | What it does                                                                                           | Signer accounts              |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------- |
 | `phoenix-market-move`                 | Moves a market's oracle readings, its makers' splines and its book to a price, and uncrosses the book. | oracle keys, makers          |
 | `phoenix-liquidation-ready`           | Leaves one or more positions of one trader liquidatable one after another.                             | trader, oracle keys, makers  |
@@ -115,9 +119,15 @@ Hawkeye reports a position or orders of the trader, before they move the price.
 - **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at up to 24
   holders of that side in Phoenix's active trader index (cold holders are not examined), finds the
   price inside the most of their bands, and prepares every holder whose band covers it, leaving out
-  any trader whose liquidation would fail once the others have gone first. How many traders that is
-  depends on the market. Surfpool's log names the price and the traders, in the order their
-  liquidations were tried.
+  any trader whose liquidation would fail once the others have gone first. After dropping a holder,
+  it prepares the remaining holders again from the initial copy at the same price. Each unsuccessful
+  round removes at least one holder, so there are at most 24 rounds. An empty set is refused.
+  How many traders remain depends on the market. Surfpool's log names the price and the traders,
+  in the order their liquidations were tried.
+
+Market moves run uncross cranks until the book is uncrossed or neither its best prices nor its
+resting-order count changes. They stop with an error after 128 cranks. This is an execution budget,
+not a guarantee that every possible book can be uncrossed within that many calls.
 
 ### Liquidation-ready positions
 
@@ -139,6 +149,10 @@ Oracle updates keep each market's readings fresh on mainnet, and Phoenix refuses
 readings are older than its stale threshold. Nothing updates them in the local VM, so every
 Phoenix override also raises every market's stale thresholds in the local PerpAssetMap. Prices
 stay as they were.
+
+This maintenance runs before template validation, including for the two generic IDL templates,
+and writes the map only when its data changes. A refused template can therefore leave these
+maintenance changes applied.
 
 Every Phoenix override also moves readings older than the local clock up to its slot. An oracle
 report folds the gap between book and oracle into the price, weighted by the slots since the last
@@ -183,7 +197,7 @@ timestamps back to the local clock. Funding then accrues from the local time.
 | `... holds no ... position`                                   | The trader has no position in that market.                                                                                        |
 | `no common move leaves ... liquidatable in turn on ...`       | No share of the marks lets each position be liquidated in turn, largest maintenance margin last. Try fewer or other markets.      |
 | `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, and Phoenix did not liquidate such traders anywhere in the band.                             |
-| `the ... book stayed crossed after ... uncross cranks`        | Each uncross crank still matched resting orders, yet the book stayed crossed after as many cranks as a full book side needs. Restart the surfnet (or reset the Phoenix accounts) and play again. |
+| `the ... book stayed crossed after ... uncross cranks`        | The book was still crossed when the execution budget was exhausted. Try a smaller move; this error alone does not establish that the local accounts are inconsistent. |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
 | `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
 

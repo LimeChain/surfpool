@@ -617,7 +617,7 @@ pub async fn prepare_cascade(
         .collect();
 
     // A trader the book cannot absorb in turn is dropped, and the rest are prepared again.
-    for _ in 0..2 {
+    while !chosen.is_empty() {
         let mut prepared = base.trial();
         for (trader, cancels) in &holders {
             if chosen.contains(trader) {
@@ -644,9 +644,6 @@ pub async fn prepare_cascade(
             });
         }
         chosen = liquidations.into_iter().map(|(trader, _)| trader).collect();
-        if chosen.is_empty() {
-            break;
-        }
     }
     Err(SurfpoolError::internal(format!(
         "no liquidation of a {symbol} holder goes through at {target} ticks"

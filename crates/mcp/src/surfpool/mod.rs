@@ -1191,7 +1191,7 @@ impl Surfpool {
         rpc_url: &str,
         trader: &str,
     ) -> Result<serde_json::Value, String> {
-        let trader = Pubkey::from_str(trader)
+        let trader = Pubkey::from_str(trader.trim())
             .map_err(|_| format!("'{trader}' is not a valid Phoenix Trader account address"))?;
         let positions = trader_positions(SurfnetRemoteClient::new(rpc_url), trader)
             .await
@@ -1986,6 +1986,26 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[tokio::test]
+    async fn trader_positions_accept_surrounding_address_whitespace() {
+        let surfpool = Surfpool::new();
+        let trader = Pubkey::new_unique().to_string();
+        let rpc_url = "not-a-url";
+        let expected = surfpool
+            .list_phoenix_trader_positions_at(rpc_url, &trader)
+            .await
+            .unwrap_err();
+        assert!(!expected.contains("is not a valid Phoenix Trader account address"));
+
+        for input in [format!(" {trader} "), format!("\t{trader}\r\n")] {
+            let error = surfpool
+                .list_phoenix_trader_positions_at(rpc_url, &input)
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+        }
     }
 
     #[tokio::test]
