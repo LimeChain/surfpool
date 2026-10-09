@@ -1,9 +1,10 @@
 # Phoenix Eternal
 
 Surfpool bundles the Phoenix Eternal IDL and 21 override templates, so a scenario can put
-Phoenix perpetuals into the state your code needs to see: a market moved to a new price, a trader
-ready to be liquidated, several traders liquidatable at once, a paused market, throttled
-withdrawals. The templates only prepare state. Liquidations and trades are sent by your own code.
+Phoenix perpetuals into the state your code needs to see: a market moved to a new price, a trader's
+positions ready to be liquidated one after another, several traders liquidatable at once, a paused
+market, throttled withdrawals. The templates only prepare state. Liquidations and trades are sent
+by your own code.
 
 Every field's meaning and units are on the template itself, visible in Studio and through
 `get_override_templates`. This page covers what the templates cannot say on their own. For how
@@ -66,12 +67,20 @@ and a refetch replaces only the override's own account. Refetching the PerpAsset
 puts every market's price back to mainnet's, while the order books, market status and traders keep
 what earlier scenarios prepared, and the two no longer agree.
 
+**Known limitation:** on a live surfnet, Phoenix accounts fetched at different moments while
+mainnet trades can disagree, such as an order book copied seconds after the trader index. That
+shows up as the uncross-crank message, the refusal of a hot trader the GlobalTraderIndex does not
+list, or a skipped override failing with `InvalidAccountData` in Hawkeye before any program log.
+Restart the surfnet (or reset the Phoenix accounts) and play again. If it comes back, reset the
+market's order book and splines with the GlobalTraderIndex and ActiveTraderBuffer, and fetch all
+four in one `getMultipleAccounts` call.
+
 ## Templates
 
 | Template                              | What it does                                                                                           | Signed by                    |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------- |
 | `phoenix-market-move`                 | Moves a market's oracle readings, its makers' splines and its book to a price, and uncrosses the book. | oracle keys, makers          |
-| `phoenix-liquidation-ready`           | Leaves one trader liquidatable, and not underwater, in one market.                                     | trader, oracle keys, makers  |
+| `phoenix-liquidation-ready`           | Leaves one or more positions of one trader liquidatable one after another.                             | trader, oracle keys, makers  |
 | `phoenix-liquidation-cascade`         | Leaves several traders liquidatable at one price in one market.                                        | traders, oracle keys, makers |
 | `phoenix-open-position`               | Sends a market order for the trader.                                                                   | trader                       |
 | `phoenix-cancel-orders`               | Cancels the trader's resting orders in a market.                                                       | trader                       |
@@ -93,41 +102,47 @@ what earlier scenarios prepared, and the two no longer agree.
 
 ## Recipes
 
-Phoenix ranks a trader by its effective collateral against the margins `view_margin` returns:
-
-| Effective collateral                                                 | Tier                 |
-| -------------------------------------------------------------------- | -------------------- |
-| At or above `initial_margin_quote_lots`                              | Safe                 |
-| Below the initial margin, above `cancel_margin_quote_lots`           | AtRisk               |
-| At or below the cancel margin, above `maintenance_margin_quote_lots` | Cancellable          |
-| Below the maintenance margin                                         | Liquidatable         |
-| Below `backstop_margin_quote_lots`                                   | BackstopLiquidatable |
-| Below `high_risk_margin_quote_lots`                                  | HighRisk             |
-
 `liquidate_via_market_order` refuses a trader that still has risk-increasing resting orders on any
 market, and one whose effective collateral is already below zero. The band between liquidatable
 and underwater is narrow, which is why the liquidation templates pick the price themselves. Only
-the trader can cancel its orders, so the templates cancel them for it, on every market it holds,
-before they move the price.
+the trader can cancel its orders, so the templates cancel them for it, on every market where
+Hawkeye reports a position or orders of the trader, before they move the price.
 
-- **One trader, ready now:** `phoenix-liquidation-ready` on the trader. It cancels its orders and
-  moves the market to where effective collateral is half the maintenance margin. A liquidation is
-  tried on a copy first, and nothing is written unless it goes through. Surfpool's log names the
-  price.
+- **One trader:** `phoenix-liquidation-ready` on the trader, with one or more of the markets
+  `list_phoenix_trader_positions` lists for it. See below.
 - **Watch traders cross:** `phoenix-cancel-orders` on each trader at slot 0, then
   `phoenix-market-move` at slot 1. The traders are healthy until the move.
 - **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at up to 24
-  holders of that side, finds the price inside the most of their bands, and prepares every holder
-  whose band covers it, leaving out any trader whose liquidation would fail once the others have
-  gone first. How many traders that is depends on the market. Surfpool's log names the price and
-  the traders, in the order their liquidations were tried.
+  holders of that side in Phoenix's active trader index (cold holders are not examined), finds the
+  price inside the most of their bands, and prepares every holder whose band covers it, leaving out
+  any trader whose liquidation would fail once the others have gone first. How many traders that is
+  depends on the market. Surfpool's log names the price and the traders, in the order their
+  liquidations were tried.
+
+### Liquidation-ready positions
+
+`phoenix-liquidation-ready` cancels the trader's orders, then moves every listed market by the
+same share of its mark against the position: longs down, shorts up. The positions run largest
+maintenance margin last. Each liquidation releases margin, so the account can recover before the
+last position. The template tries the run on a copy and prepares the state in the middle of the
+moves where it goes through. Surfpool's log names the order and each market's price:
+
+```text
+Phoenix liquidation-ready: <trader> liquidatable in turn: SOL, BTC (SOL moved to 15446 ticks, BTC to 112194 ticks)
+```
+
+Send one liquidation per position, in that order. A trader that quotes splines is refused.
 
 ## Keeping markets usable
 
 Oracle updates keep each market's readings fresh on mainnet, and Phoenix refuses a market whose
 readings are older than its stale threshold. Nothing updates them in the local VM, so every
 Phoenix override also raises every market's stale thresholds in the local PerpAssetMap. Prices
-and reading slots stay as they were.
+stay as they were.
+
+Every Phoenix override also moves readings older than the local clock up to its slot. An oracle
+report folds the gap between book and oracle into the price, weighted by the slots since the last
+reading, so on a map fetched long before the clock a deep move would leave no positive price.
 
 A running surfnet's clock trails mainnet, so a PerpAssetMap fetched from the upstream datasource
 records funding updates from after the local time. Phoenix refuses to update funding, and with it
@@ -150,6 +165,10 @@ timestamps back to the local clock. Funding then accrues from the local time.
 
 - `list_phoenix_markets` returns every market with its symbol, orderbook, `markTicks`,
   `tickSize`, `baseLotDecimals` and risk factors, read from the local VM.
+- `list_phoenix_trader_positions` returns the markets where a trader holds a position, with its
+  side, size in base lots and maintenance margin. Hawkeye's views run on a copy of the surfnet's
+  state, with its markets kept usable the way Play keeps them, and write nothing back. The reads
+  go through the surfnet, which loads any account it is missing.
 - `create_scenario` accepts any template and refuses a market symbol `list_phoenix_markets` does
   not list.
 
@@ -161,8 +180,11 @@ timestamps back to the local clock. Funding then accrues from the local time.
 | `... accounts are missing locally and there is no datasource` | The template needs Phoenix accounts that are not in the local VM, and surfnet has no upstream datasource to fetch them from.      |
 | `... is offline and missing locally`                          | The account is marked offline, so surfnet will not fetch it.                                                                      |
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |
-| `... holds no ... position: moving its price changes nothing` | The trader has no position in that market.                                                                                        |
-| `a liquidation of ... would still fail`                       | The prepared state still does not let a market-order liquidation through, usually because the book cannot absorb the size.        |
+| `... holds no ... position`                                   | The trader has no position in that market.                                                                                        |
+| `no common move leaves ... liquidatable in turn on ...`       | No share of the marks lets each position be liquidated in turn, largest maintenance margin last. Try fewer or other markets.      |
+| `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, and Phoenix did not liquidate such traders anywhere in the band.                             |
+| `the ... book stayed crossed after ... uncross cranks`        | Each uncross crank still matched resting orders, yet the book stayed crossed after as many cranks as a full book side needs. Restart the surfnet (or reset the Phoenix accounts) and play again. |
+| `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
 | `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
 
 ## Tests against mainnet

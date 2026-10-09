@@ -20,7 +20,11 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
-            phoenix_eternal::v1::{market::phoenix_markets, state_builder::PHOENIX_PERP_ASSET_MAP},
+            phoenix_eternal::v1::{
+                market::phoenix_markets,
+                state_builder::PHOENIX_PERP_ASSET_MAP,
+                trader::{TraderPosition, trader_positions},
+            },
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
             },
@@ -158,6 +162,17 @@ pub struct GetTemplateParams {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ListPhoenixMarketsParams {
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPhoenixTraderPositionsParams {
+    #[schemars(description = "The address of the trader's Phoenix Trader account.")]
+    pub trader: String,
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
@@ -1171,6 +1186,43 @@ impl Surfpool {
         }
     }
 
+    async fn list_phoenix_trader_positions_at(
+        &self,
+        rpc_url: &str,
+        trader: &str,
+    ) -> Result<serde_json::Value, String> {
+        let trader = Pubkey::from_str(trader)
+            .map_err(|_| format!("'{trader}' is not a valid Phoenix Trader account address"))?;
+        let positions = trader_positions(SurfnetRemoteClient::new(rpc_url), trader)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(trader_positions_json(&trader, &positions))
+    }
+
+    #[tool(
+        description = "Lists the markets where one Phoenix Eternal trader holds a position, as Phoenix's Hawkeye program reports them on a copy of the surfnet's state, sorted by symbol. Each position comes with its market symbol, its orderbook address, its side (long or short), its size in base lots (baseLots) and its maintenance margin in quote lots (maintenanceMarginQuoteLots), both decimal strings. Use it to pick the symbols phoenix-liquidation-ready takes. Hawkeye reads positions where Phoenix keeps them, so this is right even when the Trader account's own copy is not; never decode the Trader account yourself."
+    )]
+    async fn list_phoenix_trader_positions(
+        &self,
+        Parameters(params): Parameters<ListPhoenixTraderPositionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .list_phoenix_trader_positions_at(
+                &format!(
+                    "http://127.0.0.1:{}",
+                    params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+                ),
+                &params.trader,
+            )
+            .await
+        {
+            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )])),
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
+
     #[tool(
         description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options; dynamic_ref properties with the tool named in their source."
     )]
@@ -1447,6 +1499,24 @@ impl ServerHandler for Surfpool {
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
     }
+}
+
+fn trader_positions_json(trader: &Pubkey, positions: &[TraderPosition]) -> serde_json::Value {
+    serde_json::json!({
+        "trader": trader.to_string(),
+        "positions": positions
+            .iter()
+            .map(|position| {
+                serde_json::json!({
+                    "symbol": position.symbol,
+                    "orderbook": position.orderbook.to_string(),
+                    "side": if position.base_lots > 0 { "long" } else { "short" },
+                    "baseLots": position.base_lots.unsigned_abs().to_string(),
+                    "maintenanceMarginQuoteLots": position.maintenance_margin_quote_lots.to_string(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn unlisted_phoenix_symbols(
@@ -1880,6 +1950,60 @@ mod tests {
         assert!(errors[0].contains("'sol'") && errors[0].contains("Did you mean 'SOL'?"));
         assert!(errors[1].contains("'SOL-PERP'") && !errors[1].contains("Did you mean"));
         assert!(errors[2].contains("'BONK'") && errors[2].contains("list_phoenix_markets"));
+    }
+
+    #[test]
+    fn trader_positions_keep_the_contract_studio_reads() {
+        let trader = Pubkey::new_unique();
+        let orderbook = Pubkey::new_unique();
+        let position = |symbol: &str, base_lots| TraderPosition {
+            symbol: symbol.to_string(),
+            orderbook,
+            base_lots,
+            maintenance_margin_quote_lots: 12_345_678_901,
+        };
+        let payload =
+            trader_positions_json(&trader, &[position("ETH", 250), position("SOL", -1_000)]);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "trader": trader.to_string(),
+                "positions": [
+                    {
+                        "symbol": "ETH",
+                        "orderbook": orderbook.to_string(),
+                        "side": "long",
+                        "baseLots": "250",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                    {
+                        "symbol": "SOL",
+                        "orderbook": orderbook.to_string(),
+                        "side": "short",
+                        "baseLots": "1000",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn trader_positions_refuse_an_invalid_address_before_any_call() {
+        let result = Surfpool::new()
+            .list_phoenix_trader_positions(Parameters(ListPhoenixTraderPositionsParams {
+                trader: "not-an-address".to_string(),
+                surfnet_port: None,
+            }))
+            .await
+            .unwrap();
+        let payload = json_of(&result);
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("'not-an-address' is not a valid")),
+            "{payload}"
+        );
     }
 
     #[tokio::test]

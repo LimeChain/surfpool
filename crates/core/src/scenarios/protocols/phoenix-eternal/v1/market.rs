@@ -2,6 +2,7 @@ use core::fmt::Display;
 
 use phoenix_rise_accounts::{
     PhoenixAccountDecodeError,
+    orderbook::ORDERBOOK_CAPACITY,
     pda::{derive_permission_address, derive_spline_collection_address},
     perp_asset_map::{PerpAssetMap, PerpAssetMetadataEntry},
     spline_collection::SplineCollection,
@@ -13,17 +14,23 @@ use solana_commitment_config::CommitmentConfig;
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 
-use super::state_builder::{
-    Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, hydrate, local_account, log_authority,
-    phoenix_instruction, run_instructions, symbol_bytes,
+use super::{
+    state_builder::{
+        Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, local_account,
+        log_authority, phoenix_instruction, symbol_bytes,
+    },
+    trader::{BboView, HAWKEYE_PROGRAM_ID, bbo},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
 };
 
-/// Crossed resting orders the uncross crank matches in one call.
+/// Crossed resting orders the uncross crank matches in one call: about 12,000 compute units each,
+/// so 64 stay well inside a transaction's 1.4 million.
 const UNCROSS_MATCH_LIMIT: u64 = 64;
+/// A book side holds at most `ORDERBOOK_CAPACITY` resting orders, so no move needs more cranks.
+const MAX_UNCROSS_CRANKS: usize = ORDERBOOK_CAPACITY / UNCROSS_MATCH_LIMIT as usize;
 
 pub(crate) fn invalid_perp_asset_map(
     perp_asset_map: &Pubkey,
@@ -66,23 +73,8 @@ pub fn phoenix_markets(perp_asset_map: Pubkey, account: &Account) -> SurfpoolRes
     Ok(markets)
 }
 
-/// The orderbook and spline collection of every listed market whose asset id is in `assets`.
-pub fn market_books(
-    perp_asset_map: &Pubkey,
-    data: &[u8],
-    assets: &[u64],
-) -> SurfpoolResult<Vec<(Pubkey, Pubkey)>> {
-    let books = map_entries(perp_asset_map, data)?
-        .iter()
-        .map(Market::from_entry)
-        .filter(|market| assets.contains(&market.asset_id))
-        .map(|market| (market.orderbook, market.splines))
-        .collect();
-    Ok(books)
-}
-
 /// One market as the PerpAssetMap describes it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Market {
     pub symbol: String,
     pub asset_id: u64,
@@ -135,13 +127,7 @@ impl Market {
             .into_iter()
             .find(|entry| entry.symbol.matches(symbol))
             .ok_or_else(|| SurfpoolError::internal(format!("Phoenix lists no market {symbol}")))?;
-        let market = Self::from_entry(&entry);
-        if market.oracle_keys.is_empty() {
-            return Err(SurfpoolError::internal(format!(
-                "Phoenix market {symbol} has no oracle that reports its price"
-            )));
-        }
-        Ok(market)
+        Ok(Self::from_entry(&entry))
     }
 
     /// The oracle price for `ticks`, as a value and a decimal exponent: USD per base unit is
@@ -189,6 +175,17 @@ impl MarketContext {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         symbol: &str,
     ) -> SurfpoolResult<Self> {
+        let mut contexts = Self::load_all(svm, remote_ctx, &[symbol]).await?;
+        Ok(contexts.remove(0))
+    }
+
+    /// The markets of `symbols`, in that order. Their accounts come in two batched fetches, the
+    /// books and spline collections first and then what those name, rather than market by market.
+    pub async fn load_all(
+        svm: &mut SurfnetSvm,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        symbols: &[&str],
+    ) -> SurfpoolResult<Vec<Self>> {
         let exchange = Exchange::load(svm, remote_ctx).await?;
         hydrate(
             svm,
@@ -201,64 +198,96 @@ impl MarketContext {
         )
         .await?;
         let map = local_account(svm, &exchange.perp_asset_map)?;
-        let market = Market::find(&exchange.perp_asset_map, &map.data, symbol)?;
-        hydrate(svm, remote_ctx, &[market.orderbook, market.splines]).await?;
+        let markets = symbols
+            .iter()
+            .map(|symbol| {
+                let market = Market::find(&exchange.perp_asset_map, &map.data, symbol)?;
+                if market.oracle_keys.is_empty() {
+                    return Err(SurfpoolError::internal(format!(
+                        "Phoenix market {symbol} has no oracle that reports its price"
+                    )));
+                }
+                Ok(market)
+            })
+            .collect::<SurfpoolResult<Vec<_>>>()?;
+        let books: Vec<Pubkey> = markets
+            .iter()
+            .flat_map(|market| [market.orderbook, market.splines])
+            .collect();
+        hydrate(svm, remote_ctx, &books).await?;
 
-        let splines = local_account(svm, &market.splines)?;
-        let collection = SplineCollection::try_from_account_bytes(&splines.data).map_err(|e| {
-            SurfpoolError::invalid_account_data(
-                market.splines,
-                "Expected a Phoenix spline collection",
-                Some(e),
-            )
-        })?;
         // A spline refuses an update slot below its last one, and a running surfnet's slot trails
         // the mainnet slot that last update came from.
         let slot = svm.inner.get_sysvar::<Clock>().slot;
-        let enabled: Vec<(Pubkey, u64, u64)> = collection
-            .splines()
-            .filter_map(Result::ok)
-            .filter(|spline| spline.is_enabled())
-            .map(|spline| {
-                (
-                    Pubkey::new_from_array(spline.trader()),
-                    spline.user_price_sequence_number(),
-                    spline.user_update_slot().max(slot),
-                )
-            })
-            .collect();
         let oracle_authority = Pubkey::new_from_array(exchange.config.oracle_authority());
-        let oracle_permissions: Vec<Pubkey> = market
-            .oracle_keys
-            .iter()
-            .map(|key| derive_permission_address(&PHOENIX_PROGRAM_ID, &oracle_authority, key))
-            .collect();
-        let mut dependencies: Vec<Pubkey> = enabled.iter().map(|(trader, ..)| *trader).collect();
-        dependencies.extend(&oracle_permissions);
+        let mut loaded = Vec::with_capacity(markets.len());
+        let mut dependencies = Vec::new();
+        for market in markets {
+            let splines = local_account(svm, &market.splines)?;
+            let collection =
+                SplineCollection::try_from_account_bytes(&splines.data).map_err(|e| {
+                    SurfpoolError::invalid_account_data(
+                        market.splines,
+                        "Expected a Phoenix spline collection",
+                        Some(e),
+                    )
+                })?;
+            let enabled: Vec<(Pubkey, u64, u64)> = collection
+                .splines()
+                .filter_map(Result::ok)
+                .filter(|spline| spline.is_enabled())
+                .map(|spline| {
+                    (
+                        Pubkey::new_from_array(spline.trader()),
+                        spline.user_price_sequence_number(),
+                        spline.user_update_slot().max(slot),
+                    )
+                })
+                .collect();
+            let oracle_permissions: Vec<Pubkey> = market
+                .oracle_keys
+                .iter()
+                .map(|key| derive_permission_address(&PHOENIX_PROGRAM_ID, &oracle_authority, key))
+                .collect();
+            dependencies.extend(enabled.iter().map(|(trader, ..)| *trader));
+            dependencies.extend(&oracle_permissions);
+            loaded.push((market, enabled, oracle_permissions));
+        }
         hydrate(svm, remote_ctx, &dependencies).await?;
 
-        let mut makers = Vec::with_capacity(enabled.len());
-        for (trader, sequence, update_slot) in enabled {
-            let account = local_account(svm, &trader)?;
-            let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
-                SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
-            })?;
-            makers.push(Maker {
-                trader,
-                authority: Pubkey::new_from_array(header.authority),
-                sequence,
-                update_slot,
-            });
-        }
         // An oracle refuses a report older than its last one.
         let clock_ms = (svm.inner.get_sysvar::<Clock>().unix_timestamp.max(0) as u64) * 1000;
-        Ok(Self {
-            next_timestamp: clock_ms.max(market.latest_oracle_timestamp) + 1,
-            exchange,
-            market,
-            oracle_permissions,
-            makers,
-        })
+        let config = local_account(svm, &PHOENIX_GLOBAL_CONFIG)?;
+        loaded
+            .into_iter()
+            .map(|(market, enabled, oracle_permissions)| {
+                let mut makers = Vec::with_capacity(enabled.len());
+                for (trader, sequence, update_slot) in enabled {
+                    let account = local_account(svm, &trader)?;
+                    let header =
+                        TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+                            SurfpoolError::invalid_account_data(
+                                trader,
+                                "Expected a Phoenix Trader",
+                                Some(e),
+                            )
+                        })?;
+                    makers.push(Maker {
+                        trader,
+                        authority: Pubkey::new_from_array(header.authority),
+                        sequence,
+                        update_slot,
+                    });
+                }
+                Ok(Self {
+                    next_timestamp: clock_ms.max(market.latest_oracle_timestamp) + 1,
+                    exchange: Exchange::from_config(&config)?,
+                    market,
+                    oracle_permissions,
+                    makers,
+                })
+            })
+            .collect()
     }
 
     /// Every oracle key reporting `ticks`, which moves the mark there. Each call reports later
@@ -351,19 +380,39 @@ impl MarketContext {
         )
     }
 
-    /// The whole move to `ticks`: oracle reports, spline moves and the uncross crank.
-    pub fn move_to(&mut self, ticks: u64) -> SurfpoolResult<Vec<Instruction>> {
+    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves, and the uncross crank
+    /// until [`uncross_done`]. Hawkeye must be in the local VM.
+    pub fn move_in(&mut self, sandbox: &mut Sandbox, ticks: u64) -> SurfpoolResult<()> {
         let mut instructions = self.oracle_reports(ticks)?;
         instructions.extend(self.spline_moves(ticks)?);
-        instructions.push(self.uncross()?);
-        Ok(instructions)
+        sandbox.run(&instructions)?;
+        let uncross = self.uncross()?;
+        let mut before = bbo(sandbox, &self.exchange, &self.market)?;
+        for _ in 0..MAX_UNCROSS_CRANKS {
+            sandbox.run(std::slice::from_ref(&uncross))?;
+            let after = bbo(sandbox, &self.exchange, &self.market)?;
+            if uncross_done(&before, &after) {
+                return Ok(());
+            }
+            before = after;
+        }
+        Err(SurfpoolError::internal(format!(
+            "the {} book stayed crossed after {MAX_UNCROSS_CRANKS} uncross cranks",
+            self.market.symbol
+        )))
     }
 }
 
-/// The writes that move one market to `target_ticks` the way mainnet moves it: every oracle key
-/// reports the new price, every active maker re-centres its spline on it, and the crank matches
-/// resting orders the move left crossed. Prices come out of the program itself, so the mark,
-/// the book and the oracle readings agree.
+/// Whether a crank that took the best bid and ask from `before` to `after` was the last: the book
+/// is uncrossed, or neither price moved because the crank leaves that cross alone.
+fn uncross_done(before: &BboView, after: &BboView) -> bool {
+    !after.crossed()
+        || (after.best_bid_ticks, after.best_ask_ticks)
+            == (before.best_bid_ticks, before.best_ask_ticks)
+}
+
+/// The writes that move one market to `target_ticks` the way mainnet does: oracle reports, makers'
+/// splines re-centred and the crank uncrossing the book, so the mark, book and oracles agree.
 pub async fn move_market(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -371,8 +420,26 @@ pub async fn move_market(
     target_ticks: u64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
-    let instructions = context.move_to(target_ticks)?;
-    run_instructions(svm, &instructions)
+    hydrate(svm, remote_ctx, &[HAWKEYE_PROGRAM_ID]).await?;
+    let mut sandbox = Sandbox::new(svm);
+    context
+        .move_in(&mut sandbox, target_ticks)
+        .map_err(explain_move_failure)?;
+    sandbox.writes()
+}
+
+/// Phoenix's uncross crank breaks on books that do not match the local trader index, which
+/// happens when surfnet fetched the two at different times; the raw program panic says nothing.
+pub fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
+    let text = error.to_string();
+    if !text.contains("Uncross Crank") {
+        return error;
+    }
+    SurfpoolError::internal(format!(
+        "moving the market failed in Phoenix's uncross crank, which happens when the local order \
+         books and Phoenix's trader index were fetched at different times; restart the surfnet \
+         (or reset the Phoenix accounts) and play again. {text}"
+    ))
 }
 
 fn checked_ticks(ticks: u64) -> SurfpoolResult<()> {
@@ -388,6 +455,7 @@ fn checked_ticks(ticks: u64) -> SurfpoolResult<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use base64::{Engine, prelude::BASE64_STANDARD};
+    use phoenix_rise_accounts::perp_asset_map::PriceComponent;
 
     use super::{super::state_builder::PHOENIX_PERP_ASSET_MAP, *};
 
@@ -468,5 +536,38 @@ pub(crate) mod tests {
             ..perp_asset_map_account()
         };
         assert!(phoenix_markets(PHOENIX_PERP_ASSET_MAP, &foreign).is_err());
+    }
+
+    #[test]
+    fn configuration_finds_a_market_without_oracles() {
+        let mut data = perp_asset_map_fixture();
+        // The fixture's only market starts after the 48-byte header with its 16-byte symbol.
+        let range = 64..64 + size_of::<PriceComponent>();
+        let mut price: PriceComponent = bytemuck::pod_read_unaligned(&data[range.clone()]);
+        for oracle in &mut price.mark_price.oracle_data {
+            oracle.oracle_pubkey = [0; 32];
+        }
+        data[range].copy_from_slice(bytemuck::bytes_of(&price));
+        let market = Market::find(&PHOENIX_PERP_ASSET_MAP, &data, "SOL").unwrap();
+        assert!(market.oracle_keys.is_empty());
+    }
+
+    fn bbo_at(bid: u64, ask: u64) -> BboView {
+        let mut view: BboView = bytemuck::Zeroable::zeroed();
+        view.best_bid_ticks = bid;
+        view.best_ask_ticks = ask;
+        view
+    }
+
+    #[test]
+    fn uncross_cranks_stop_once_the_book_uncrosses_or_a_crank_changes_nothing() {
+        let crossed = bbo_at(120, 100);
+        assert!(!uncross_done(&crossed, &bbo_at(110, 100)), "bid moved");
+        assert!(!uncross_done(&crossed, &bbo_at(120, 105)), "ask moved");
+        assert!(uncross_done(&crossed, &bbo_at(99, 100)), "uncrossed");
+        assert!(uncross_done(&crossed, &bbo_at(100, 100)), "locked");
+        assert!(uncross_done(&crossed, &bbo_at(0, 100)), "no bids");
+        assert!(uncross_done(&crossed, &bbo_at(120, 0)), "no asks");
+        assert!(uncross_done(&crossed, &crossed), "no progress");
     }
 }

@@ -24,7 +24,7 @@ use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 use super::{
     market::{Market, invalid_perp_asset_map, map_entries, move_market},
     trader::{
-        Side, cancel_orders, deposit, place_market_order, prepare_cascade, prepare_liquidation,
+        Side, cancel_orders, deposit, place_market_order, prepare_cascade, prepare_cross_margin,
         withdraw,
     },
 };
@@ -69,7 +69,11 @@ impl Exchange {
             &[PHOENIX_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG],
         )
         .await?;
-        let account = local_account(svm, &PHOENIX_GLOBAL_CONFIG)?;
+        Self::from_config(&local_account(svm, &PHOENIX_GLOBAL_CONFIG)?)
+    }
+
+    /// The exchange the GlobalConfig `account` describes.
+    pub fn from_config(account: &Account) -> SurfpoolResult<Self> {
         let config = GlobalConfig::try_from_account_bytes(&account.data).map_err(|e| {
             SurfpoolError::invalid_account_data(
                 PHOENIX_GLOBAL_CONFIG,
@@ -150,21 +154,17 @@ fn encode_instruction(
                 "{name} groups its accounts, which the Phoenix IDL does not do"
             )));
         };
-        match accounts.iter().find(|(given, _)| *given == account.name) {
-            Some((_, pubkey)) => metas.push(AccountMeta {
-                pubkey: *pubkey,
-                is_signer: account.signer,
-                is_writable: account.writable,
-            }),
-            // The program reads its own id in an optional slot as "not passed".
-            None if account.optional => metas.push(AccountMeta::new_readonly(program_id, false)),
-            None => {
-                return Err(SurfpoolError::internal(format!(
-                    "{name} needs the account {}",
-                    account.name
-                )));
-            }
-        }
+        let Some((_, pubkey)) = accounts.iter().find(|(given, _)| *given == account.name) else {
+            return Err(SurfpoolError::internal(format!(
+                "{name} needs the account {}",
+                account.name
+            )));
+        };
+        metas.push(AccountMeta {
+            pubkey: *pubkey,
+            is_signer: account.signer,
+            is_writable: account.writable,
+        });
     }
     if let Some((unknown, _)) = accounts.iter().filter(|_| strict).find(|(given, _)| {
         !definition
@@ -192,77 +192,59 @@ pub fn symbol_bytes(symbol: &str) -> [u8; 16] {
     bytes
 }
 
+/// The type `ty` names, when it names one in `types`.
+fn defined<'t>(ty: &IdlType, types: &'t [IdlTypeDef]) -> Option<&'t IdlTypeDefTy> {
+    let IdlType::Defined { name, .. } = ty else {
+        return None;
+    };
+    types.iter().find(|t| &t.name == name).map(|t| &t.ty)
+}
+
 /// The arguments of `name` built from a template's flat values: every IDL field takes the value
-/// named after it, shaped to its IDL type, and a market symbol fills `perpAssetSymbol`. An optional
-/// field without a value leaves that setting as it is.
+/// named after it, a market symbol fills `perpAssetSymbol`, and an optional field left out is kept.
 pub fn instruction_args(
     name: &str,
     values: &HashMap<String, serde_json::Value>,
     symbol: Option<&str>,
 ) -> SurfpoolResult<serde_json::Value> {
     let idl = phoenix_idl();
-    let definition = instruction_definition(name)?;
     let mut args = serde_json::Map::new();
-    for arg in &definition.args {
-        let fields = match &arg.ty {
-            IdlType::Defined {
-                name: type_name, ..
-            } => {
-                match idl
-                    .types
-                    .iter()
-                    .find(|t| &t.name == type_name)
-                    .map(|t| &t.ty)
-                {
-                    Some(IdlTypeDefTy::Struct {
-                        fields: Some(IdlDefinedFields::Named(fields)),
-                    }) => Some(fields),
-                    _ => None,
-                }
-            }
-            _ => None,
+    for arg in &instruction_definition(name)?.args {
+        let Some(IdlTypeDefTy::Struct {
+            fields: Some(IdlDefinedFields::Named(fields)),
+        }) = defined(&arg.ty, &idl.types)
+        else {
+            return Err(SurfpoolError::internal(format!(
+                "{name} {} is not a struct of named fields",
+                arg.name
+            )));
         };
-        let value = match fields {
-            Some(fields) => {
-                let mut object = serde_json::Map::new();
-                for field in fields {
-                    let value = if field.name == "perpAssetSymbol" {
-                        let symbol = symbol.ok_or_else(|| {
-                            SurfpoolError::internal(format!("{name} needs a market symbol"))
-                        })?;
-                        serde_json::json!({ "symbolBytes": symbol_bytes(symbol) })
-                    } else if let Some(value) = given(values, &field.name) {
-                        shape(value, &field.ty, &idl.types)?
-                    } else if matches!(field.ty, IdlType::Option(_)) {
-                        serde_json::Value::Null
-                    } else {
-                        return Err(SurfpoolError::internal(format!(
-                            "{name} needs {}",
-                            field.name
-                        )));
-                    };
-                    object.insert(field.name.clone(), value);
-                }
-                serde_json::Value::Object(object)
-            }
-            None => match given(values, &arg.name) {
-                Some(value) => shape(value, &arg.ty, &idl.types)?,
-                None => {
-                    return Err(SurfpoolError::internal(format!(
-                        "{name} needs {}",
-                        arg.name
-                    )));
-                }
-            },
-        };
-        args.insert(arg.name.clone(), value);
+        let mut object = serde_json::Map::new();
+        for field in fields {
+            let value = if field.name == "perpAssetSymbol" {
+                let symbol = symbol.ok_or_else(|| {
+                    SurfpoolError::internal(format!("{name} needs a market symbol"))
+                })?;
+                serde_json::json!({ "symbolBytes": symbol_bytes(symbol) })
+            } else if let Some(value) = given(values, &field.name) {
+                shape(value, &field.ty, &idl.types)?
+            } else if matches!(field.ty, IdlType::Option(_)) {
+                serde_json::Value::Null
+            } else {
+                return Err(SurfpoolError::internal(format!(
+                    "{name} needs {}",
+                    field.name
+                )));
+            };
+            object.insert(field.name.clone(), value);
+        }
+        args.insert(arg.name.clone(), object.into());
     }
-    Ok(serde_json::Value::Object(args))
+    Ok(args.into())
 }
 
 /// A template value in the JSON shape the IDL encoder expects for `ty`: decimal strings become
-/// numbers, a bare value fills a one-field wrapper such as `BaseLots`, and a name picks an enum
-/// variant.
+/// numbers, a bare value fills a one-field wrapper such as `BaseLots`, and a name picks a variant.
 fn shape(
     value: &serde_json::Value,
     ty: &IdlType,
@@ -274,47 +256,27 @@ fn shape(
         (IdlType::Option(_), Value::Null) => Value::Null,
         (IdlType::Option(inner), _) => shape(value, inner, types)?,
         (IdlType::Bool, Value::String(text)) => Value::Bool(text.parse().map_err(|_| invalid())?),
-        (IdlType::U128 | IdlType::I128, _) => value.clone(),
         (IdlType::U8 | IdlType::U16 | IdlType::U32 | IdlType::U64, Value::String(text)) => {
             Value::from(text.trim().parse::<u64>().map_err(|_| invalid())?)
         }
         (IdlType::I8 | IdlType::I16 | IdlType::I32 | IdlType::I64, Value::String(text)) => {
             Value::from(text.trim().parse::<i64>().map_err(|_| invalid())?)
         }
-        (IdlType::Vec(inner) | IdlType::Array(inner, _), Value::Array(items)) => Value::Array(
-            items
-                .iter()
-                .map(|item| shape(item, inner, types))
-                .collect::<SurfpoolResult<_>>()?,
-        ),
-        (IdlType::Defined { name, .. }, _) => {
-            match types.iter().find(|t| &t.name == name).map(|t| &t.ty) {
+        (IdlType::Defined { .. }, _) => match (defined(ty, types), value) {
+            (
                 Some(IdlTypeDefTy::Struct {
                     fields: Some(IdlDefinedFields::Named(fields)),
-                }) => match value {
-                    Value::Object(given) => {
-                        let mut object = serde_json::Map::new();
-                        for (key, item) in given {
-                            let shaped = match fields.iter().find(|f| &f.name == key) {
-                                Some(field) => shape(item, &field.ty, types)?,
-                                None => item.clone(),
-                            };
-                            object.insert(key.clone(), shaped);
-                        }
-                        Value::Object(object)
-                    }
-                    _ if fields.len() == 1 => {
-                        serde_json::json!({ &fields[0].name: shape(value, &fields[0].ty, types)? })
-                    }
-                    _ => return Err(invalid()),
-                },
-                Some(IdlTypeDefTy::Enum { .. }) => match value {
-                    Value::String(variant) => serde_json::json!({ variant: null }),
-                    _ => value.clone(),
-                },
-                _ => value.clone(),
+                }),
+                _,
+            ) => match fields.as_slice() {
+                [field] => serde_json::json!({ &field.name: shape(value, &field.ty, types)? }),
+                _ => return Err(invalid()),
+            },
+            (Some(IdlTypeDefTy::Enum { .. }), Value::String(variant)) => {
+                serde_json::json!({ variant: null })
             }
-        }
+            _ => value.clone(),
+        },
         _ => value.clone(),
     })
 }
@@ -367,9 +329,8 @@ pub(crate) fn local_account(svm: &SurfnetSvm, address: &Pubkey) -> SurfpoolResul
         .ok_or_else(|| SurfpoolError::internal(format!("{address} is missing locally")))
 }
 
-/// A copy of the local VM where instructions run without signature checks, so each runs as the
-/// signers it names, the way their own keys would sign it on mainnet. Nothing reaches the local VM
-/// until the caller writes back what [`Sandbox::writes`] returns.
+/// A copy of the local VM without signature checks, so instructions run as the signers they name.
+/// Nothing reaches the local VM until the caller writes back what [`Sandbox::writes`] returns.
 pub struct Sandbox<'a> {
     live: &'a SurfnetSvm,
     svm: SurfnetSvm,
@@ -477,27 +438,10 @@ pub fn run_instructions(
 /// limit beyond any session and keeps within a `u64`.
 const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 
-pub const MARKET_MOVE_TEMPLATE_ID: &str = "phoenix-market-move";
 pub const LIQUIDATION_READY_TEMPLATE_ID: &str = "phoenix-liquidation-ready";
-pub const LIQUIDATION_CASCADE_TEMPLATE_ID: &str = "phoenix-liquidation-cascade";
-pub const OPEN_POSITION_TEMPLATE_ID: &str = "phoenix-open-position";
-pub const CANCEL_ORDERS_TEMPLATE_ID: &str = "phoenix-cancel-orders";
-pub const WITHDRAW_TEMPLATE_ID: &str = "phoenix-withdraw";
-pub const DEPOSIT_TEMPLATE_ID: &str = "phoenix-deposit";
 const TRADER_CAPABILITIES_TEMPLATE_ID: &str = "phoenix-trader-capabilities";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const TARGET_TICKS_FIELD: &str = "target_ticks";
-
-/// Templates whose writer runs Phoenix instructions of its own choosing.
-const INSTRUCTION_TEMPLATES: [&str; 7] = [
-    MARKET_MOVE_TEMPLATE_ID,
-    LIQUIDATION_READY_TEMPLATE_ID,
-    LIQUIDATION_CASCADE_TEMPLATE_ID,
-    OPEN_POSITION_TEMPLATE_ID,
-    CANCEL_ORDERS_TEMPLATE_ID,
-    WITHDRAW_TEMPLATE_ID,
-    DEPOSIT_TEMPLATE_ID,
-];
 
 /// The GlobalConfig role that signs a configuration instruction on mainnet.
 #[derive(Clone, Copy, Debug)]
@@ -560,9 +504,8 @@ const CONFIG_TEMPLATES: [(&str, &str, Role); 12] = [
     ),
 ];
 
-/// The writes of a configuration template: its instruction, signed by its GlobalConfig role. A
-/// role calling directly passes its own key where a delegate would pass a permission account,
-/// as mainnet's configuration transactions do.
+/// The writes of a configuration template's instruction, signed by its GlobalConfig role, which
+/// passes its own key as the permission account, as mainnet's configuration transactions do.
 async fn run_config_template(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -638,12 +581,14 @@ async fn run_config_template(
     )
 }
 
-/// A template input, unless it was left out or left empty.
+/// A template input, unless it was left out, left empty or null.
 fn given<'v>(
     values: &'v HashMap<String, serde_json::Value>,
     field: &str,
 ) -> Option<&'v serde_json::Value> {
-    values.get(field).filter(|value| value.as_str() != Some(""))
+    values
+        .get(field)
+        .filter(|value| !value.is_null() && value.as_str() != Some(""))
 }
 
 /// `SetTraderCapability` takes a list of toggles; its template takes one boolean per Phoenix
@@ -661,8 +606,8 @@ fn capability_toggles(
     ];
     let mut toggles = Vec::new();
     for target in TARGETS {
-        let enable = match values.get(target) {
-            None | Some(serde_json::Value::Null) => continue,
+        let enable = match given(values, target) {
+            None => continue,
             Some(serde_json::Value::Bool(enable)) => *enable,
             Some(serde_json::Value::String(text)) => text
                 .parse()
@@ -685,9 +630,7 @@ fn capability_toggles(
 }
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
-/// Every Phoenix override first keeps the local PerpAssetMap's markets usable for the rest of the
-/// session; see [`keep_markets_usable`]. `target_slot` is the slot being materialized,
-/// which the override's writes are published at.
+/// Each first keeps the markets usable ([`keep_markets_usable`]); `target_slot` is the slot played.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     template_id: &str,
@@ -697,11 +640,7 @@ pub async fn prepare_phoenix_override(
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     target_slot: u64,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
-    let ours = CONFIG_TEMPLATES
-        .iter()
-        .any(|(config_template, ..)| *config_template == template_id)
-        || INSTRUCTION_TEMPLATES.contains(&template_id);
-    if !ours && account.owner != PHOENIX_PROGRAM_ID {
+    if !template_id.starts_with("phoenix-") && account.owner != PHOENIX_PROGRAM_ID {
         return Ok(None);
     }
     keep_markets_usable(svm, remote_ctx, target_slot).await;
@@ -722,26 +661,14 @@ pub async fn prepare_phoenix_override(
         .map(Some);
     }
     match template_id {
-        MARKET_MOVE_TEMPLATE_ID => {
+        "phoenix-market-move" => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             let target_ticks = whole_number_input(values, TARGET_TICKS_FIELD)?;
             move_market(svm, remote_ctx, symbol, target_ticks)
                 .await
                 .map(Some)
         }
-        LIQUIDATION_READY_TEMPLATE_ID => {
-            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
-            prepare_liquidation(svm, remote_ctx, *account_pubkey, symbol)
-                .await
-                .map(|ready| {
-                    info!(
-                        "Phoenix {symbol} moved to {} ticks: {account_pubkey} is liquidatable",
-                        ready.target_ticks
-                    );
-                    Some(ready.writes)
-                })
-        }
-        LIQUIDATION_CASCADE_TEMPLATE_ID => {
+        "phoenix-liquidation-cascade" => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             let long = match text_input(values, "side")? {
                 "long" => true,
@@ -768,7 +695,30 @@ pub async fn prepare_phoenix_override(
                     Some(ready.writes)
                 })
         }
-        OPEN_POSITION_TEMPLATE_ID => {
+        LIQUIDATION_READY_TEMPLATE_ID => {
+            let symbols: Vec<&str> = text_input(values, "symbols")?
+                .split(',')
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .collect();
+            prepare_cross_margin(svm, remote_ctx, *account_pubkey, &symbols)
+                .await
+                .map(|ready| {
+                    let (mut order, mut moves) = (Vec::new(), Vec::new());
+                    for (index, (symbol, ticks)) in ready.moves.iter().enumerate() {
+                        let verb = if index == 0 { " moved" } else { "" };
+                        order.push(symbol.as_str());
+                        moves.push(format!("{symbol}{verb} to {ticks} ticks"));
+                    }
+                    info!(
+                        "Phoenix liquidation-ready: {account_pubkey} liquidatable in turn: {} ({})",
+                        order.join(", "),
+                        moves.join(", ")
+                    );
+                    Some(ready.writes)
+                })
+        }
+        "phoenix-open-position" => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             let side = match text_input(values, "side")? {
                 "Bid" => Side::Bid,
@@ -784,19 +734,19 @@ pub async fn prepare_phoenix_override(
                 .await
                 .map(Some)
         }
-        CANCEL_ORDERS_TEMPLATE_ID => {
+        "phoenix-cancel-orders" => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             cancel_orders(svm, remote_ctx, *account_pubkey, symbol)
                 .await
                 .map(Some)
         }
-        WITHDRAW_TEMPLATE_ID => {
+        "phoenix-withdraw" => {
             let quote_lots = whole_number_input(values, "quote_lots")?;
             withdraw(svm, remote_ctx, *account_pubkey, quote_lots)
                 .await
                 .map(Some)
         }
-        DEPOSIT_TEMPLATE_ID => {
+        "phoenix-deposit" => {
             let quote_lots = whole_number_input(values, "quote_lots")?;
             deposit(svm, remote_ctx, *account_pubkey, quote_lots)
                 .await
@@ -834,15 +784,9 @@ fn whole_number_input(
     })
 }
 
-/// Oracle updates keep every market's readings fresh, and Phoenix refuses a market whose readings
-/// are too old (see [`RAISED_STALE_THRESHOLD_SLOTS`]). Nothing refreshes them locally, so
-/// this raises the thresholds of the local PerpAssetMap, fetching it first when it is not local
-/// yet. Prices and reading slots stay as they were, and the markets stay usable however far the
-/// local Clock moves. It also moves funding timestamps that are ahead of the local Clock back to
-/// it (see [`rewind_funding_timestamps`]). A failure leaves the map as it was and never fails the
-/// override. It runs on every Phoenix override, before that override's own checks, since the map
-/// is needed whether or not the override applies; each run reads the whole map.
-async fn keep_markets_usable(
+/// Nothing refreshes oracle readings locally, so this raises the map's stale thresholds, restamps
+/// old readings and rewinds funding ahead of the Clock. A failure only warns and keeps the map.
+pub(crate) async fn keep_markets_usable(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     target_slot: u64,
@@ -850,14 +794,21 @@ async fn keep_markets_usable(
     let kept = async {
         hydrate(svm, remote_ctx, &[PHOENIX_PERP_ASSET_MAP]).await?;
         let map = local_account(svm, &PHOENIX_PERP_ASSET_MAP)?;
+        let clock = svm.inner.get_sysvar::<Clock>();
         let raised = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)?;
-        let now = u64::try_from(svm.inner.get_sysvar::<Clock>().unix_timestamp).unwrap_or(0);
+        let now = u64::try_from(clock.unix_timestamp).unwrap_or(0);
         let rewound = rewind_funding_timestamps(
             &PHOENIX_PERP_ASSET_MAP,
             raised.as_deref().unwrap_or(&map.data),
             now,
         )?;
-        let Some(data) = rewound.or(raised) else {
+        let patched = rewound.or(raised);
+        let restamped = restamp_readings(
+            &PHOENIX_PERP_ASSET_MAP,
+            patched.as_deref().unwrap_or(&map.data),
+            clock.slot,
+        )?;
+        let Some(data) = restamped.or(patched) else {
             return Ok(());
         };
         svm.set_scenario_override_account(
@@ -924,11 +875,50 @@ fn raise_stale_thresholds(account_pubkey: &Pubkey, data: &[u8]) -> SurfpoolResul
     Ok(patched)
 }
 
-/// The map with every market's funding interval start and last funding update moved back to
-/// `now` (Unix seconds) where they are after it, or `None` when none is. Phoenix fails to update
-/// funding, and with it every price, when the Clock is before the last update. A running
-/// surfnet's Clock trails mainnet, so a map fetched from upstream is ahead of it until the Clock
-/// catches up. Funding then accrues from the local time, a difference of the Clock's lag.
+/// The map with reading slots before `slot` moved up to it, or `None`; prices stay. On an old map a
+/// report's EMA leaves a deep search move no positive price, and Phoenix refuses the margin.
+fn restamp_readings(
+    account_pubkey: &Pubkey,
+    data: &[u8],
+    slot: u64,
+) -> SurfpoolResult<Option<Vec<u8>>> {
+    let price_len = size_of::<PriceComponent>();
+    let mut patched: Option<Vec<u8>> = None;
+    for (offset, metadata) in markets_in_map(account_pubkey, data)? {
+        // The PriceComponent is the metadata's first field.
+        let mut price = *metadata.oracle_price();
+        let mark = &mut price.mark_price;
+        let samples = mark
+            .spot_price_component
+            .last_exchange_spot_price
+            .iter_mut()
+            .chain(
+                mark.perp_price_component
+                    .last_exchange_perp_price
+                    .iter_mut(),
+            )
+            .map(|sample| &mut sample.slot);
+        let mut stamped = false;
+        for reading in [&mut mark.price.slot, &mut mark.spot_price_component.slot]
+            .into_iter()
+            .chain(samples)
+        {
+            // An unused oracle sample stays empty rather than becoming a fresh zero price.
+            if *reading != 0 && *reading < slot {
+                *reading = slot;
+                stamped = true;
+            }
+        }
+        if stamped {
+            patched.get_or_insert_with(|| data.to_vec())[offset..offset + price_len]
+                .copy_from_slice(bytemuck::bytes_of(&price));
+        }
+    }
+    Ok(patched)
+}
+
+/// The map with funding timestamps after `now` (Unix seconds) moved back to it, or `None`. Phoenix
+/// fails to update funding, and every price, while the Clock is before the last update.
 fn rewind_funding_timestamps(
     account_pubkey: &Pubkey,
     data: &[u8],
@@ -965,7 +955,12 @@ fn rewind_funding_timestamps(
 pub(crate) mod tests {
     use std::collections::HashSet;
 
-    use phoenix_rise_accounts::perp_asset_map::{PerpAssetMap, PerpAssetMetadata};
+    use bytemuck::Zeroable;
+    use phoenix_rise_accounts::{
+        PhoenixAccount,
+        perp_asset_map::{PerpAssetMap, PerpAssetMetadata},
+        trader::TraderHeader,
+    };
     use solana_system_interface::instruction as system_instruction;
     use surfpool_types::AccountAddress;
 
@@ -1144,6 +1139,62 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn restamping_moves_old_reading_slots_to_the_clock_and_keeps_prices() {
+        let account = two_market_map_account();
+        let readings = |data: &[u8], symbol: &str| {
+            let mark = market(data, symbol).oracle_price().mark_price;
+            let samples: Vec<_> = mark
+                .spot_price_component
+                .last_exchange_spot_price
+                .into_iter()
+                .chain(mark.perp_price_component.last_exchange_perp_price)
+                .collect();
+            (mark, samples)
+        };
+        let (sol, _) = readings(&account.data, "SOL");
+        let slot = sol.price.slot + 300;
+
+        let restamped = restamp_readings(&PHOENIX_PERP_ASSET_MAP, &account.data, slot)
+            .unwrap()
+            .expect("the fixture's readings are before the slot");
+
+        for symbol in ["SOL", "BTC"] {
+            let (before, before_samples) = readings(&account.data, symbol);
+            let (after, after_samples) = readings(&restamped, symbol);
+            assert_eq!(after.price.ticks, before.price.ticks, "{symbol}");
+            assert_eq!(after.price.slot, slot, "{symbol}");
+            assert_eq!(after.spot_price_component.slot, slot, "{symbol}");
+            for (after, before) in after_samples.iter().zip(&before_samples) {
+                assert_eq!(after.ticks, before.ticks, "{symbol}");
+                assert_eq!(
+                    after.slot,
+                    if before.slot == 0 { 0 } else { slot },
+                    "{symbol}"
+                );
+            }
+            assert_eq!(
+                after.book_price_component, before.book_price_component,
+                "{symbol}"
+            );
+            assert_eq!(
+                market(&restamped, symbol).risk_params(),
+                market(&account.data, symbol).risk_params(),
+                "{symbol}"
+            );
+        }
+        assert_eq!(
+            restamp_readings(&PHOENIX_PERP_ASSET_MAP, &restamped, slot).unwrap(),
+            None,
+            "a restamped map is written once"
+        );
+        assert_eq!(
+            restamp_readings(&PHOENIX_PERP_ASSET_MAP, &account.data, 1).unwrap(),
+            None,
+            "readings ahead of the clock stay"
+        );
+    }
+
     #[tokio::test]
     async fn keeps_every_local_market_usable_and_never_fails_an_override() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -1194,6 +1245,65 @@ pub(crate) mod tests {
         assert!(text_input(&bad, "missing").is_err());
         assert!(whole_number_input(&bad, "target_ticks").is_err());
         assert!(whole_number_input(&bad, "as_number").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_liquidation_ready_run_takes_one_or_more_different_symbols() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let trader = Pubkey::new_unique();
+        for (symbols, refusal) in [
+            (" , ", "list at least one market symbol"),
+            ("SOL, ETH, SOL", "SOL is listed twice"),
+        ] {
+            let error = prepare_phoenix_override(
+                &mut svm,
+                LIQUIDATION_READY_TEMPLATE_ID,
+                &trader,
+                &Account::default(),
+                &HashMap::from([("symbols".to_string(), serde_json::json!(symbols))]),
+                &None,
+                0,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(refusal), "{symbols:?}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spline_market_maker_is_refused_before_anything_is_fetched() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let trader = Pubkey::new_unique();
+        let mut header = TraderHeader::zeroed();
+        header.discriminant = u64::from_le_bytes(PhoenixAccount::Trader.discriminant());
+        header.num_markets_with_splines = 2;
+        let account = Account {
+            lamports: 1,
+            data: bytemuck::bytes_of(&header).to_vec(),
+            owner: PHOENIX_PROGRAM_ID,
+            ..Account::default()
+        };
+        svm.inner.set_account(trader, account.clone()).unwrap();
+        let error = prepare_phoenix_override(
+            &mut svm,
+            LIQUIDATION_READY_TEMPLATE_ID,
+            &trader,
+            &account,
+            &HashMap::from([("symbols".to_string(), serde_json::json!("SOL"))]),
+            &None,
+            0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!(
+                "{trader} quotes splines on 2 markets; liquidating a spline market maker is not \
+                 supported"
+            )),
+            "{error}"
+        );
     }
 
     const LIQUIDATOR: Pubkey =
@@ -1257,34 +1367,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_absent_optional_account_is_passed_as_the_program_id() {
-        let program_id = Pubkey::from_str(&phoenix_idl().address).unwrap();
-        let instruction = phoenix_instruction(
-            "UpdateSplinePrice",
-            &[
-                ("phoenixProgram", program_id),
-                ("phoenixLogAuthority", Pubkey::new_unique()),
-                ("signerAccount", Pubkey::new_unique()),
-                ("traderAccount", Pubkey::new_unique()),
-                ("splineAccount", Pubkey::new_unique()),
-            ],
-            &serde_json::json!({
-                "params": {
-                    "newMidPrice": 10824,
-                    "userUpdateSlot": null,
-                    "refreshRegions": true,
-                    "userSequenceNumber": 0,
-                    "clientOrderId": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    "overrideSequenceNumber": true,
-                }
-            }),
-        )
-        .unwrap();
-        let orderbook = instruction.accounts.last().unwrap();
+    fn capability_toggles_keep_a_capability_left_empty() {
+        let values = HashMap::from([
+            ("PlaceLimitOrder".to_string(), serde_json::json!("")),
+            ("WithdrawCollateral".to_string(), serde_json::json!("false")),
+            ("DepositCollateral".to_string(), serde_json::json!(true)),
+        ]);
         assert_eq!(
-            (orderbook.pubkey, orderbook.is_signer, orderbook.is_writable),
-            (program_id, false, false)
+            capability_toggles(&values).unwrap(),
+            serde_json::json!({ "params": { "toggles": [
+                { "target": { "DepositCollateral": null }, "enable": true },
+                { "target": { "WithdrawCollateral": null }, "enable": false },
+            ] } })
         );
+        let empty = HashMap::from([("PlaceLimitOrder".to_string(), serde_json::json!(""))]);
+        let error = capability_toggles(&empty).unwrap_err().to_string();
+        assert!(error.contains("set at least one"), "{error}");
+        let bad = HashMap::from([("PlaceLimitOrder".to_string(), serde_json::json!("yes"))]);
+        assert!(capability_toggles(&bad).is_err());
     }
 
     #[test]
