@@ -1,11 +1,7 @@
 use std::{collections::HashSet, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
-use phoenix_rise_accounts::{
-    PhoenixAccount,
-    multi_arena::MultiArenaHeader,
-    trader::{Trader, TraderHeader},
-};
+use phoenix_rise_accounts::{PhoenixAccount, multi_arena::MultiArenaHeader, trader::TraderHeader};
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
@@ -498,17 +494,24 @@ pub async fn prepare_cascade(
     let mut candidates = Vec::new();
     let mut views = Sandbox::new(svm);
     for trader in listed {
-        let account = local_account(svm, &trader)?;
-        let Ok(view) = Trader::try_from_account_bytes(&account.data) else {
+        // Hawkeye, not the Trader account's copy, which can miss a hot trader's positions.
+        let Ok(position) = views
+            .view(&asset_view(
+                &context.exchange,
+                &trader,
+                context.market.asset_id,
+            )?)
+            .and_then(|data| AssetView::from_return_data(&data))
+        else {
             continue;
         };
-        let lots = view
-            .positions()
-            .find(|(asset, _)| *asset == context.market.asset_id)
-            .map(|(_, position)| position.base_lot_position().as_inner())
-            .unwrap_or(0);
+        let lots = position.base_lots;
         if (long && lots > 0) || (!long && lots < 0) {
-            let authority = Pubkey::new_from_array(view.header().authority);
+            let account = local_account(svm, &trader)?;
+            let Ok(header) = TraderHeader::try_read_from_account_bytes(&account.data) else {
+                continue;
+            };
+            let authority = Pubkey::new_from_array(header.authority);
             let Ok(held) = holdings_in(&mut views, &context.exchange, &trader, &markets) else {
                 continue;
             };

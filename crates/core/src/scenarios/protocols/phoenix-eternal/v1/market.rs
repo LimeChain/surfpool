@@ -2,7 +2,7 @@ use core::fmt::Display;
 
 use phoenix_rise_accounts::{
     PhoenixAccountDecodeError,
-    orderbook::ORDERBOOK_CAPACITY,
+    orderbook::{ORDERBOOK_CAPACITY, Orderbook},
     pda::{derive_permission_address, derive_spline_collection_address},
     perp_asset_map::{PerpAssetMap, PerpAssetMetadataEntry},
     spline_collection::SplineCollection,
@@ -387,10 +387,10 @@ impl MarketContext {
         instructions.extend(self.spline_moves(ticks)?);
         sandbox.run(&instructions)?;
         let uncross = self.uncross()?;
-        let mut before = bbo(sandbox, &self.exchange, &self.market)?;
+        let mut before = self.book_top(sandbox)?;
         for _ in 0..MAX_UNCROSS_CRANKS {
             sandbox.run(std::slice::from_ref(&uncross))?;
-            let after = bbo(sandbox, &self.exchange, &self.market)?;
+            let after = self.book_top(sandbox)?;
             if uncross_done(&before, &after) {
                 return Ok(());
             }
@@ -401,14 +401,30 @@ impl MarketContext {
             self.market.symbol
         )))
     }
+
+    /// Hawkeye's best bid and ask in `sandbox`, with the number of resting orders in the book.
+    fn book_top(&self, sandbox: &mut Sandbox) -> SurfpoolResult<(BboView, usize)> {
+        let account = sandbox.account(&self.market.orderbook)?;
+        let book = Orderbook::try_from_account_bytes(&account.data).map_err(|e| {
+            SurfpoolError::invalid_account_data(
+                self.market.orderbook,
+                "Expected a Phoenix orderbook",
+                Some(e),
+            )
+        })?;
+        let resting = book.num_bids() + book.num_asks();
+        Ok((bbo(sandbox, &self.exchange, &self.market)?, resting))
+    }
 }
 
-/// Whether a crank that took the best bid and ask from `before` to `after` was the last: the book
-/// is uncrossed, or neither price moved because the crank leaves that cross alone.
-fn uncross_done(before: &BboView, after: &BboView) -> bool {
+/// Whether a crank that took the book from `before` to `after` was the last: the book is uncrossed,
+/// or the crank matched nothing because it leaves that cross alone. Every match moves a price or
+/// removes a resting order; prices alone miss fills that all sit at the best price.
+fn uncross_done(before: &(BboView, usize), after: &(BboView, usize)) -> bool {
+    let ((before, before_orders), (after, after_orders)) = (before, after);
     !after.crossed()
-        || (after.best_bid_ticks, after.best_ask_ticks)
-            == (before.best_bid_ticks, before.best_ask_ticks)
+        || (after.best_bid_ticks, after.best_ask_ticks, after_orders)
+            == (before.best_bid_ticks, before.best_ask_ticks, before_orders)
 }
 
 /// The writes that move one market to `target_ticks` the way mainnet does: oracle reports, makers'
@@ -552,22 +568,32 @@ pub(crate) mod tests {
         assert!(market.oracle_keys.is_empty());
     }
 
-    fn bbo_at(bid: u64, ask: u64) -> BboView {
+    fn book_at(bid: u64, ask: u64, orders: usize) -> (BboView, usize) {
         let mut view: BboView = bytemuck::Zeroable::zeroed();
         view.best_bid_ticks = bid;
         view.best_ask_ticks = ask;
-        view
+        (view, orders)
     }
 
     #[test]
     fn uncross_cranks_stop_once_the_book_uncrosses_or_a_crank_changes_nothing() {
-        let crossed = bbo_at(120, 100);
-        assert!(!uncross_done(&crossed, &bbo_at(110, 100)), "bid moved");
-        assert!(!uncross_done(&crossed, &bbo_at(120, 105)), "ask moved");
-        assert!(uncross_done(&crossed, &bbo_at(99, 100)), "uncrossed");
-        assert!(uncross_done(&crossed, &bbo_at(100, 100)), "locked");
-        assert!(uncross_done(&crossed, &bbo_at(0, 100)), "no bids");
-        assert!(uncross_done(&crossed, &bbo_at(120, 0)), "no asks");
+        let crossed = book_at(120, 100, 200);
+        assert!(
+            !uncross_done(&crossed, &book_at(110, 100, 200)),
+            "bid moved"
+        );
+        assert!(
+            !uncross_done(&crossed, &book_at(120, 105, 200)),
+            "ask moved"
+        );
+        assert!(
+            !uncross_done(&crossed, &book_at(120, 100, 136)),
+            "filled at the best price"
+        );
+        assert!(uncross_done(&crossed, &book_at(99, 100, 200)), "uncrossed");
+        assert!(uncross_done(&crossed, &book_at(100, 100, 200)), "locked");
+        assert!(uncross_done(&crossed, &book_at(0, 100, 200)), "no bids");
+        assert!(uncross_done(&crossed, &book_at(120, 0, 200)), "no asks");
         assert!(uncross_done(&crossed, &crossed), "no progress");
     }
 }

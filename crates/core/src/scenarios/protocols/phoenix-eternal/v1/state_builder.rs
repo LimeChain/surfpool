@@ -367,6 +367,11 @@ impl<'a> Sandbox<'a> {
         self.send(instruction).map_err(SurfpoolError::internal)
     }
 
+    /// An account as the instructions run so far left it.
+    pub fn account(&self, address: &Pubkey) -> SurfpoolResult<Account> {
+        local_account(&self.svm, address)
+    }
+
     /// Moves the copy's Clock one slot on. Phoenix fixes the mark it uses for risk for the rest of
     /// a slot once a risk action, such as a cancel, has read it.
     pub fn next_slot(&mut self) {
