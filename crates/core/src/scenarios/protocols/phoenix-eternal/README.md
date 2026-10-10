@@ -71,13 +71,19 @@ and a refetch replaces only the override's own account. Refetching the PerpAsset
 puts every market's price back to mainnet's, while the order books, market status and traders keep
 what earlier scenarios prepared, and the two no longer agree.
 
-**Known limitation:** on a live surfnet, Phoenix accounts fetched at different moments while
-mainnet trades can disagree, such as an order book copied seconds after the trader index. That
-shows up as the uncross-crank message, the refusal of a hot trader the GlobalTraderIndex does not
-list, or a skipped override failing with `InvalidAccountData` in Hawkeye before any program log.
-Restart the surfnet (or reset the Phoenix accounts) and play again. If it comes back, reset the
-market's order book and splines with the GlobalTraderIndex and ActiveTraderBuffer, and fetch all
-four in one `getMultipleAccounts` call.
+Surfnet copies each account from mainnet the first time it is read, while mainnet keeps trading.
+Order books and the ActiveTraderBuffer name traders by their node in the GlobalTraderIndex, so the
+three must come from the same moment. The first Phoenix template or tool that needs the index on a
+surfnet loads it with the buffer and every market's book in one request. Splines, Trader accounts
+and the PerpAssetMap are still copied when first needed, which can leave a collateral or a price
+slightly behind mainnet but breaks no reference.
+
+**Known limitation:** that does not help when your own code read Phoenix accounts on a fresh
+surfnet before any Phoenix template or tool ran, or once Phoenix lists more than 98 markets and the
+request splits. It shows up as the uncross-crank message, the refusal of a hot trader the
+GlobalTraderIndex does not list, or a skipped override failing with `InvalidAccountData` in Hawkeye
+before any program log. Reset the Phoenix accounts (`surfnet_resetAccount` on the Phoenix program
+with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 
 ## Templates
 
@@ -116,17 +122,17 @@ Hawkeye reports a position or orders of the trader, before they move the price.
   `list_phoenix_trader_positions` lists for it. See below.
 - **Watch traders cross:** `phoenix-cancel-orders` on each trader at slot 0, then
   `phoenix-market-move` at slot 1. The traders are healthy until the move.
-- **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at up to 24
-  holders of that side in Phoenix's active trader index (cold holders are not examined), finds the
-  price inside the most of their bands, and prepares every holder whose band covers it, leaving out
-  any trader whose liquidation would fail once the others have gone first. After dropping a holder,
-  it prepares the remaining holders again from the initial copy at the same price. Each unsuccessful
-  round removes at least one holder, so there are at most 24 rounds. An empty set is refused.
-  How many traders remain depends on the market. Surfpool's log names the price and the traders,
-  in the order their liquidations were tried.
+- **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at the first 24
+  holders of that side, in address order, in Phoenix's active trader index (cold holders are not
+  examined), finds the price inside the most of their bands, and prepares every holder whose band
+  covers it, leaving out any trader whose liquidation would fail once the others have gone first.
+  After dropping a holder, it prepares the remaining holders again from the initial copy at the same
+  price. Each unsuccessful round removes at least one holder, so there are at most 24 rounds. An
+  empty set is refused. How many traders remain depends on the market. Surfpool's log names the
+  price and the traders, in the order their liquidations were tried.
 
 Market moves run uncross cranks until the book is uncrossed or neither its best prices nor its
-resting-order count changes. They stop with an error after 128 cranks. This is an execution budget,
+resting-order count changes. They stop with an error after 256 cranks. This is an execution budget,
 not a guarantee that every possible book can be uncrossed within that many calls.
 
 ### Liquidation-ready positions

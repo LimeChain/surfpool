@@ -1623,6 +1623,34 @@ async fn a_cross_margin_run_works_on_a_map_older_than_the_clock() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_first_load_brings_the_index_with_the_buffer_and_every_book() {
+    let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let exchange = Exchange::load(&mut svm, &remote).await.unwrap();
+
+    let map = svm
+        .inner
+        .get_account(&exchange.perp_asset_map)
+        .unwrap()
+        .unwrap();
+    let books: Vec<Pubkey> = phoenix_markets(exchange.perp_asset_map, &map)
+        .unwrap()
+        .into_iter()
+        .map(|market| market.orderbook)
+        .collect();
+    assert!(!books.is_empty());
+    for address in [exchange.global_trader_index, exchange.active_trader_buffer]
+        .into_iter()
+        .chain(books)
+    {
+        assert!(
+            svm.inner.get_account(&address).unwrap().is_some(),
+            "{address} did not come with the index"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn positions_of_an_address_without_a_trader_say_so() {
     // `Pubkey::new_unique` counts up from low addresses, and some of those exist on mainnet.
     let address = Keypair::new().pubkey();
@@ -1641,8 +1669,23 @@ async fn positions_of_an_address_without_a_trader_say_so() {
 async fn a_liquidation_ready_run_refuses_a_market_the_trader_does_not_hold() {
     let (locker, graph) = phoenix_behavior_locker().await;
     let remote = Some((client(), CommitmentConfig::confirmed()));
-    let held = held_positions(&locker, &remote, &graph.trader).await;
-    let (holding, _) = held.first().expect("the graph's trader holds a position");
+    // The graph's trader can hold resting orders alone, so this picks one with a position.
+    let mut picked = None;
+    for trader in cross_margin_candidates(&graph, 1..=4)
+        .await
+        .into_iter()
+        .take(12)
+    {
+        let account = fetch(&[trader]).await.remove(0);
+        locker.with_svm_writer(|svm| svm.set_account(&trader, account.clone()).unwrap());
+        let held = held_positions(&locker, &remote, &trader).await;
+        if !held.is_empty() {
+            picked = Some((trader, account, held));
+            break;
+        }
+    }
+    let (trader, account, held) = picked.expect("a mainnet trader holds a position");
+    let (holding, _) = &held[0];
     let markets = phoenix_markets(graph.perp_asset_map, graph.account(&graph.perp_asset_map))
         .expect("mainnet PerpAssetMap decodes");
     let missing = markets
@@ -1656,8 +1699,8 @@ async fn a_liquidation_ready_run_refuses_a_market_the_trader_does_not_hold() {
         prepare_phoenix_override(
             &mut svm,
             LIQUIDATION_READY_TEMPLATE_ID,
-            &graph.trader,
-            graph.account(&graph.trader),
+            &trader,
+            &account,
             &HashMap::from([(
                 "symbols".to_string(),
                 serde_json::json!(format!("{holding},{missing}")),
@@ -1670,7 +1713,7 @@ async fn a_liquidation_ready_run_refuses_a_market_the_trader_does_not_hold() {
         .to_string()
     };
     assert!(
-        error.contains(&format!("{} holds no {missing} position", graph.trader)),
+        error.contains(&format!("{trader} holds no {missing} position")),
         "{error}"
     );
 }

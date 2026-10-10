@@ -58,7 +58,8 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    /// Reads GlobalConfig from the local VM, after putting it and the program there.
+    /// Reads GlobalConfig from the local VM, after putting it and the program there, and on the
+    /// first load the index, the buffer and every book ([`Exchange::hydrate_index_with_books`]).
     pub async fn load(
         svm: &mut SurfnetSvm,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -69,7 +70,31 @@ impl Exchange {
             &[PHOENIX_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG],
         )
         .await?;
-        Self::from_config(&local_account(svm, &PHOENIX_GLOBAL_CONFIG)?)
+        let exchange = Self::from_config(&local_account(svm, &PHOENIX_GLOBAL_CONFIG)?)?;
+        exchange.hydrate_index_with_books(svm, remote_ctx).await?;
+        Ok(exchange)
+    }
+
+    /// Resting orders and the buffer's positions name traders by their node in the index, so a
+    /// book fetched after the index can name a node the index has since freed. While the index is
+    /// missing locally, it comes with the buffer and every book in one read. Past 100 accounts
+    /// the client splits that read, and the parts can come from different slots.
+    async fn hydrate_index_with_books(
+        &self,
+        svm: &mut SurfnetSvm,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<()> {
+        if svm.inner.get_account(&self.global_trader_index)?.is_some() {
+            return Ok(());
+        }
+        hydrate(svm, remote_ctx, &[self.perp_asset_map]).await?;
+        let map = local_account(svm, &self.perp_asset_map)?;
+        let mut group = vec![self.global_trader_index, self.active_trader_buffer];
+        for entry in map_entries(&self.perp_asset_map, &map.data)? {
+            let params = entry.metadata.static_market_params();
+            group.push(Pubkey::new_from_array(params.market_account));
+        }
+        hydrate(svm, remote_ctx, &group).await
     }
 
     /// The exchange the GlobalConfig `account` describes.

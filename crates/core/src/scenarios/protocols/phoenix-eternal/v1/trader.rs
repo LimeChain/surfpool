@@ -462,6 +462,9 @@ fn holdings_in(
 /// The most position holders a cascade examines.
 const MAX_CASCADE_CANDIDATES: usize = 24;
 
+/// Stands in for the user's keeper, which signs the real liquidation.
+const PLACEHOLDER_LIQUIDATOR: Pubkey = Pubkey::new_from_array([1; 32]);
+
 /// Traders a cascade leaves liquidatable at one price, and where the market was moved for them.
 pub struct CascadeReady {
     pub writes: Vec<(Pubkey, Account)>,
@@ -1064,7 +1067,7 @@ pub fn liquidation(
             ("phoenixProgram", PHOENIX_PROGRAM_ID),
             ("phoenixLogAuthority", log_authority()),
             ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("liquidatorWallet", Pubkey::new_unique()),
+            ("liquidatorWallet", PLACEHOLDER_LIQUIDATOR),
             ("liquidatedTrader", trader),
             ("traderAccount", trader),
             ("perpAssetMap", context.exchange.perp_asset_map),

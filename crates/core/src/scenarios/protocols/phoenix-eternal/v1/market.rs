@@ -29,8 +29,9 @@ use crate::{
 /// Crossed resting orders the uncross crank matches in one call: about 12,000 compute units each,
 /// so 64 stay well inside a transaction's 1.4 million.
 const UNCROSS_MATCH_LIMIT: u64 = 64;
-/// A book side holds at most `ORDERBOOK_CAPACITY` resting orders, so no move needs more cranks.
-const MAX_UNCROSS_CRANKS: usize = ORDERBOOK_CAPACITY / UNCROSS_MATCH_LIMIT as usize;
+/// Each side holds up to `ORDERBOOK_CAPACITY` resting orders and a match between two removes at
+/// least one; spline fills make this a budget, not a guarantee.
+const MAX_UNCROSS_CRANKS: usize = 2 * ORDERBOOK_CAPACITY / UNCROSS_MATCH_LIMIT as usize;
 
 pub(crate) fn invalid_perp_asset_map(
     perp_asset_map: &Pubkey,
