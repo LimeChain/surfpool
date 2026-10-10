@@ -26,11 +26,12 @@ config. For how scenarios work in general see the [scenarios README](../../READM
 
 ## Picking a pool
 
-There is no catalog: pass the pool address. Find one at `https://api.orca.so/v2/solana/pools`
-(filter by mint pair, sort by `tvl`). SOL/USDC: `HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ`,
-and with tick spacing 4 `Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE`.
+There is no catalog. Pass the pool address, or name a pair: the template's `llm_context` tells the
+model to search the program by the two mints and take the pool whose token A vault holds the
+most. For SOL/USDC that is `Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE` (tick spacing 4). Orca also
+lists pools at `https://api.orca.so/v2/solana/pools`.
 
-Set `fetchBeforeUse: true` so the live pool is forked first.
+Set `fetchBeforeUse: true` so the pool is pulled from upstream first.
 
 # Recipes
 

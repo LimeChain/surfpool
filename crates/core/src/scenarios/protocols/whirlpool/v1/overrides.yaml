@@ -32,9 +32,29 @@ templates:
     address:
       type: pubkey
     llm_context: |
-      fetchBeforeUse: set to true so the live pool is forked before this override is applied;
-      set it to false only for a later override that builds on state an earlier override in the
-      same scenario already prepared.
+      FINDING THE POOL WHEN THE USER NAMES A PAIR:
+      1. Resolve both token symbols with get_token_address, both calls at once.
+      2. Make two getProgramAccounts calls at once, each with two positional params: the program
+         id string "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc", then the config object
+         {"encoding":"base58","dataSlice":{"offset":133,"length":32},"filters":[{"dataSize":653},
+         {"memcmp":{"offset":101,"bytes":"<mint A>"}},{"memcmp":{"offset":181,"bytes":"<mint B>"}}]}.
+         The second call swaps the two mints. A pool stores its mints in a fixed order, so only one
+         call returns pools. Each result's pubkey is a pool for the pair and its data is the pool's
+         token A vault.
+      3. No result from either call means a mistyped mint or no pool for the pair. Copy both mints
+         again exactly and repeat once; if there is still no result, ask the user for the pool
+         address instead of saying none exists.
+      4. A pair has a pool per tick spacing. Unless the user names one, call getMultipleAccounts
+         with encoding "jsonParsed" on the returned vaults and keep the pool whose vault holds the
+         most tokens. Name the pool in your answer.
+      5. A pool address the user gives is used as is; check with getAccountInfo, encoding "base64"
+         and dataSlice {"offset":0,"length":0}, that its owner is the program above and its space
+         is 653.
+      6. Put the pool in the override's account as {"pubkey":"<pool>"}. The pool address is never an
+         override value.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
 
       UNITS
       - fee_rate: hundredths of a basis point (divide by 1,000,000 for the fraction charged).
@@ -61,11 +81,6 @@ templates:
       so swaps return wrong amounts without failing. The Studio price shock computes this; without
       the tick arrays, keep the move between the initialized ticks around the current one.
 
-      CLOCK - the program compares the Clock sysvar with the pool's reward_last_updated_timestamp
-      and rejects a swap with InvalidTimestamp while the surfnet clock is behind it. A Studio
-      Play pauses the clock and fetchBeforeUse pulls a fresh timestamp, so resume the clock (or
-      time-travel past that timestamp) before swapping against the prepared pool.
-
       VAULT BALANCES - a swap's output is paid from token_vault_a / token_vault_b (plain
       spl-token accounts; override them separately with the spl-token templates). Raising
       liquidity or moving sqrt_price without funding the vault the swap pays out from makes the
@@ -88,9 +103,8 @@ templates:
       type: pubkey
       value: 2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ
     llm_context: |
-      fetchBeforeUse: set to true so the live config singleton is forked before this override is
-      applied; false only for a later override that builds on state an earlier override in the
-      same scenario already prepared.
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
 
       default_protocol_fee_rate is read once, at pool creation (initialize_pool), to seed the new
       pool's own Whirlpool.protocol_fee_rate. It has no effect on pools that already exist -
