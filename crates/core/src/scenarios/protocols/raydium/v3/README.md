@@ -30,15 +30,17 @@ human price. `status` bits: 0 open or increase liquidity, 1 decrease liquidity, 
 
 ## Picking a pool
 
-Raydium's API lists pools by liquidity:
-`https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=liquidity`. SOL/USDC
-on fee tier 8: `3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv`.
+Find the pools of a pair with `getProgramAccounts` on the program, filtered by size `1544` and the
+two mints at offsets `73` and `105`. A pair has a pool per fee tier; the one whose vaults hold the
+most is usually the one you want. For SOL/USDC that is
+`3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv`, on fee tier 8. Raydium's API also lists pools by
+liquidity: `https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=liquidity`.
 
 **Order the mints for `raydium-clmm-custom`.** `token_mint_0` is the mint whose raw 32 bytes are
 numerically smaller, not the smaller base58 string. A reversed pair derives an empty address and
 nothing checks it. SOL sorts before USDC.
 
-Set `fetchBeforeUse: true` so the live pool is forked first.
+Set `fetchBeforeUse: true` to pull the pool from upstream first.
 
 # Recipes
 

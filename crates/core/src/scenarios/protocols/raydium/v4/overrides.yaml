@@ -8,6 +8,22 @@ tags:
   - constant-product
   - defi
 
+llm_context: |
+  Raydium AMM v4, program 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8. Pools are keypair accounts
+  (AmmInfo, 752 bytes); put the pool in the override's account as {"pubkey":"<pool>"}, never in
+  values.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 752 and memcmp of the two mints at offsets 400 and 432, once in each
+  order (a pair can have pools in both). Read each pool's vault of the first mint with dataSlice
+  {offset 336, length 32} and encoding base58 (368 in the second order), compare the vaults with
+  getMultipleAccounts jsonParsed and keep the pool whose vault holds the most; name it. If neither
+  order returns a pool, recheck the mints once, then ask for the pool address. A pool address the user
+  gives is used as is.
+
+  Set fetchBeforeUse: true. The price is not in this account: a swap prices off the vault token
+  accounts token_coin and token_pc, which spl-token-account-balance overrides.
+
 templates:
   - id: raydium-amm-pool-state
     name: Override AMM Pool State
@@ -28,38 +44,10 @@ templates:
         label: LP Supply
         description: LP tokens the pool has minted, in raw units of the LP mint
     llm_context: |
-      Trading status of a Raydium AMM v4 pool (program
-      675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8). Use it to open or close a pool to
-      swaps without touching its liquidity.
-
-      FETCH RULE: set fetchBeforeUse: true so the live account is forked first; false only
-      for a later override that builds on state an earlier override in the same scenario
-      prepared.
-
-      ADDRESS: pass the pool account (AmmInfo, 752 bytes). AMM v4 pools are keypair
-      accounts, not PDAs, so there is nothing to derive. There is no bundled catalog of
-      pools; the protocol README's "Finding a pool" section says where to look one up.
-
-      STATUS (u64, raw): swap_base_in and swap_base_out run only at 1 (initialized), 6
-      (swap only) and 7 (waiting trade). 7 additionally requires the cluster clock to have
-      passed out_put.pool_open_time, and the program then rewrites status to 6 itself. 2
-      (disabled), 3 (withdraw only), 4 (liquidity only) and 5 (orderbook only) all make a
-      swap fail with InvalidStatus, which is the point of this template. Keep the value in
-      0..=7: the program maps status through an exhaustive match that panics on anything
-      else, so a larger number aborts every instruction that reads the pool.
-
-      MACHINE STATE (u64, raw): drives the pool's OpenBook order planning, not swaps. Same
-      bound applies - keep it in 0..=6.
-
-      LP SUPPLY (u64, raw units of the LP mint): the deposit path reads it to size the LP
-      tokens it mints, and a zero supply makes a deposit take the initialising branch. It
-      does not enter the swap price.
-
-      PRICE IS NOT IN THIS ACCOUNT: a swap prices off the live vault balances (the coin
-      vault minus out_put.need_take_pnl_coin, the pc vault minus
-      out_put.need_take_pnl_pc), so the price lever is the vault token accounts through the
-      spl-token-account-balance template. The vault addresses are the AmmInfo fields
-      token_coin and token_pc.
+      status (u64): swaps run at 1 (initialized), 6 (swap only) and 7 (waiting trade, once the cluster
+      clock passes out_put.pool_open_time). 2 disabled, 3 withdraw only, 4 liquidity only and 5 orderbook
+      only reject swaps with InvalidStatus. Keep status in 0..=7 and state in 0..=6; a larger value aborts
+      every instruction on the pool. lp_amount sizes deposits only.
     address:
       type: pubkey
 
@@ -81,35 +69,10 @@ templates:
         label: Trade Fee Denominator
         description: Denominator of the trade fee; 25/10000 is the mainnet default of 0.25%
     llm_context: |
-      Fee rates of a Raydium AMM v4 pool (program
-      675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8). Use it to make swaps cost more or
-      nothing at all and watch the output amount move.
-
-      FETCH RULE: set fetchBeforeUse: true so the live account is forked first; false only
-      for a later override that builds on state an earlier override in the same scenario
-      prepared.
-
-      ADDRESS: pass the pool account (AmmInfo, 752 bytes). AMM v4 pools are keypair
-      accounts, not PDAs. There is no bundled catalog of pools; the protocol README's
-      "Finding a pool" section says where to look one up.
-
-      UNITS AND GROUPING: each fee is a raw u64 numerator over a raw u64 denominator, and
-      the two are one group - override both or neither, because a numerator left against
-      the other pair's denominator is a silently different rate. The swap charges
-      ceil(amount_in * swap_fee_numerator / swap_fee_denominator) on the input before
-      pricing the remainder against the reserves. 25/10000 = 0.25% is the mainnet default.
-      A numerator of 0 makes swaps free; a numerator at or above the denominator consumes
-      the whole input and the swap returns nothing.
-
-      WHICH PAIR THE SWAP READS: swap_base_in and swap_base_out read fees.swap_fee_* only.
-      fees.trade_fee_* is read by the OpenBook order-planning path when the pool quotes on
-      the orderbook, so overriding it alone changes no swap result.
-
-      PRICE IS NOT IN THIS ACCOUNT: a swap prices off the live vault balances (the coin
-      vault minus out_put.need_take_pnl_coin, the pc vault minus
-      out_put.need_take_pnl_pc), so the price lever is the vault token accounts through the
-      spl-token-account-balance template. The vault addresses are the AmmInfo fields
-      token_coin and token_pc.
+      Each fee is a numerator over a denominator; override both of a pair together. Swaps charge
+      ceil(amount_in * swap_fee_numerator / swap_fee_denominator) and read only fees.swap_fee_*; the
+      trade_fee_* pair prices OpenBook orders. The mainnet default is 25/10000 = 0.25%; a numerator of 0
+      makes swaps free.
     address:
       type: pubkey
 
@@ -134,29 +97,8 @@ templates:
         label: Pool Open Time
         description: Unix timestamp from which a pool with status 7 accepts swaps
     llm_context: |
-      Lifetime swap counters and the open time of a Raydium AMM v4 pool (program
-      675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8). Use it to hand an indexer or a
-      dashboard a pool with a chosen trading history, or to open a scheduled pool early.
-
-      FETCH RULE: set fetchBeforeUse: true so the live account is forked first; false only
-      for a later override that builds on state an earlier override in the same scenario
-      prepared.
-
-      ADDRESS: pass the pool account (AmmInfo, 752 bytes). AMM v4 pools are keypair
-      accounts, not PDAs. There is no bundled catalog of pools; the protocol README's
-      "Finding a pool" section says where to look one up.
-
-      UNITS: the four swap_* counters are raw u128 totals in the smallest unit of their
-      mint (coin = the mintA side, pc = the mintB side), and the program only ever adds to
-      them. They are bookkeeping - no instruction prices off them, so changing them moves
-      no swap output. Their natural groups are the two directions: coin in with pc out, pc
-      in with coin out. Leaving one side of a direction untouched produces a pool whose
-      recorded history has no average price.
-
-      POOL OPEN TIME (u64, unix seconds): read only while status is 7 (waiting trade). A
-      swap before it fails with InvalidStatus; the first swap at or after it flips the
-      pool's status to 6 (swap only). Set it into the past together with
-      raydium-amm-pool-state status 7 to model a launch that is about to open, or leave it
-      alone on a pool that already trades.
+      The four out_put.swap_* counters are lifetime totals in raw mint units; no instruction prices off
+      them. out_put.pool_open_time (unix seconds) matters only at status 7: swaps before it fail, and the
+      first swap after it sets status to 6.
     address:
       type: pubkey

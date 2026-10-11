@@ -31,13 +31,16 @@ then the program sets the status to 6 itself.
 
 ## Picking a pool
 
-There is no catalog: pass the pool address. Raydium's API lists pools by liquidity:
+There is no catalog: pass the pool address. Find the pools of a pair with `getProgramAccounts` on
+the program, filtered by size `752` and the two mints at offsets `400` (coin) and `432` (pc). A pair
+can have pools in both orders, so query both. The one whose vaults hold the most is usually the one
+you want; for SOL/USDC that is `58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2`. Raydium's API also
+lists pools by liquidity:
 `https://api-v3.raydium.io/pools/info/list?poolType=standard&poolSortField=liquidity`. Its
 `standard` type also covers CP-Swap, a different program, so keep only entries whose `programId`
-is `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`. SOL/USDC:
-`58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2`.
+is `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`.
 
-Set `fetchBeforeUse: true` so the live pool is forked first.
+Set `fetchBeforeUse: true` to pull the pool from upstream first.
 
 # Recipes
 
