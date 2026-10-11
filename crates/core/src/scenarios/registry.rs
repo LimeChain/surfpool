@@ -20,6 +20,10 @@ pub const RAYDIUM_AMM_V4_IDL_CONTENT: &str = include_str!("./protocols/raydium/v
 pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/raydium/v4/overrides.yaml");
 
+pub const RAYDIUM_CPMM_IDL_CONTENT: &str = include_str!("./protocols/raydium/cpmm/v1/idl.json");
+pub const RAYDIUM_CPMM_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/raydium/cpmm/v1/overrides.yaml");
+
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
@@ -149,6 +153,11 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             RAYDIUM_AMM_V4_IDL_CONTENT,
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
+            "raydium",
+        );
+        self.load_protocol_overrides(
+            RAYDIUM_CPMM_IDL_CONTENT,
+            RAYDIUM_CPMM_OVERRIDES_CONTENT,
             "raydium",
         );
     }
@@ -654,13 +663,14 @@ templates:
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (3) + Raydium AMM v4 (3) + Drift (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (3) + Raydium AMM v4 (3) + Raydium CPMM (2)
+        // + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 71
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 73
         assert_eq!(
             registry.count(),
-            71,
-            "Registry should load 71 templates total"
+            73,
+            "Registry should load 73 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -674,6 +684,9 @@ templates:
         assert!(registry.contains("raydium-amm-pool-state"));
         assert!(registry.contains("raydium-amm-fees"));
         assert!(registry.contains("raydium-amm-swap-stats"));
+
+        assert!(registry.contains("raydium-cpmm-pool-state"));
+        assert!(registry.contains("raydium-cpmm-amm-config"));
 
         assert!(registry.contains("meteora-dlmm-sol-usdc"));
         assert!(registry.contains("meteora-dlmm-usdt-sol"));
@@ -975,8 +988,8 @@ templates: []
         let raydium_templates = registry.by_protocol("Raydium");
         assert_eq!(
             raydium_templates.len(),
-            6,
-            "Should have 6 Raydium templates (3 CLMM + 3 AMM v4)"
+            8,
+            "Should have 8 Raydium templates (3 CLMM + 3 AMM v4 + 2 CPMM)"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
