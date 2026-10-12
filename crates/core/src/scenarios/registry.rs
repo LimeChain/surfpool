@@ -23,6 +23,11 @@ pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
+
+pub const METEORA_DAMM_V2_IDL_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/idl.json");
+pub const METEORA_DAMM_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/overrides.yaml");
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
@@ -136,6 +141,11 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             METEORA_DLMM_IDL_CONTENT,
             METEORA_DLMM_OVERRIDES_CONTENT,
+            "meteora",
+        );
+        self.load_protocol_overrides(
+            METEORA_DAMM_V2_IDL_CONTENT,
+            METEORA_DAMM_V2_OVERRIDES_CONTENT,
             "meteora",
         );
     }
@@ -640,13 +650,14 @@ templates:
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (1)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4)
+        // + Meteora (DLMM 1, DAMM v2 1)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 69
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
         assert_eq!(
             registry.count(),
-            69,
-            "Registry should load 69 templates total"
+            70,
+            "Registry should load 70 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -661,6 +672,7 @@ templates:
         assert!(registry.contains("raydium-amm-custom"));
 
         assert!(registry.contains("meteora-dlmm-pool-state"));
+        assert!(registry.contains("meteora-damm-v2-pool-state"));
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
@@ -966,8 +978,8 @@ templates: []
         let meteora_templates = registry.by_protocol("Meteora");
         assert_eq!(
             meteora_templates.len(),
-            1,
-            "Should have 1 Meteora DLMM template"
+            2,
+            "Should have 2 Meteora templates (DLMM + DAMM v2)"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
@@ -1799,7 +1811,12 @@ templates: []
             "bin_step must not be exposed as a property"
         );
 
-        for property in &template.properties {
+        let damm = registry
+            .get("meteora-damm-v2-pool-state")
+            .expect("meteora-damm-v2-pool-state should exist");
+        assert_eq!(damm.account_type, "Pool");
+
+        for property in template.properties.iter().chain(&damm.properties) {
             assert!(
                 property
                     .label

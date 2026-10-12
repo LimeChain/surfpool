@@ -1,0 +1,60 @@
+protocol: Meteora
+version: v0.2.5
+account_type: Pool
+idl_file_path: idl.json
+
+tags:
+  - damm-v2
+  - amm
+  - constant-product
+  - defi
+
+llm_context: |
+  Meteora DAMM v2 (cp-amm), program cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 1112 and memcmp of the two mints at offsets 168 and 200, once in each
+  order (a pair can have pools in both). Read each pool's vault of the first mint with dataSlice
+  {offset 232, length 32} and encoding base58 (264 in the second order), compare the vaults with
+  getMultipleAccounts jsonParsed and keep the pool whose vault holds the most; name it. If neither
+  order returns a pool, recheck the mints once, then ask for the pool address. A pool address the
+  user gives is used as is.
+
+  Set fetchBeforeUse: true. Put the pool in the override's account as {"pubkey":"<pool>"}, never in
+  values.
+
+templates:
+  - id: meteora-damm-v2-pool-state
+    name: Override DAMM v2 Pool State
+    description: Override a Meteora DAMM v2 pool found by pair or by address, its status and its price
+    idl_account_name: Pool
+    properties:
+      - path: pool_status
+        label: Pool Status
+        description: 0 enabled, 1 disabled (swaps rejected)
+      - path: sqrt_price
+        label: Square Root Price (Q64.64)
+        description: sqrt(token B per token A in raw units) x 2^64, raw u128; set with the tracked reserves
+      - path: liquidity
+        label: Liquidity
+        description: Raw u128 liquidity of the pool's single range; a swap never changes it
+      - path: token_a_amount
+        label: Tracked Reserve A
+        description: Reserve of token A the program prices and pays from, raw units
+      - path: token_b_amount
+        label: Tracked Reserve B
+        description: Reserve of token B the program prices and pays from, raw units
+      - path: pool_fees.dynamic_fee.sqrt_price_reference
+        label: Variable Fee Price Reference
+        description: Q64.64 price the variable fee measures moves from; follows sqrt_price after a shock
+    address:
+      type: pubkey
+    llm_context: |
+      pool_status 1 halts swaps (PoolDisabled, 6003); 0 enables them.
+
+      PRICE: collect_fee_mode (byte 484) picks the model. Modes 0 and 1 trade one concentrated range:
+      sqrt_price must stay inside [sqrt_min_price, sqrt_max_price] and both tracked reserves follow
+      from liquidity and the new sqrt_price. Mode 2 compounds: the price is token_b_amount /
+      token_a_amount and sqrt_price follows from them. A swap that pays out more than a stale tracked
+      reserve fails with MathOverflow, so never move sqrt_price alone. The Studio price shock writes
+      all of it; prefer it to hand-computed values.
