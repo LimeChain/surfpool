@@ -26,11 +26,12 @@ the pair's address, so pick another pair to test another bin step.
 
 ## Picking a pair
 
-DLMM pairs are keypairs, so there is no seed recipe. Find one at
-`https://dlmm.datapi.meteora.ag/pools` (filter by mint or bin step). SOL/USDC at bin step 10:
-`BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y`.
+DLMM pairs are keypairs, so there is no seed recipe. Find the pairs of two mints with
+`getProgramAccounts` on the program, filtered by size `904` and the two mints at offsets `88` and
+`120`; a pair can have pools in both orders, so query both. The one whose vaults hold the most is
+usually the one you want. Pairs are also listed at `https://dlmm.datapi.meteora.ag/pools`.
 
-Set `fetchBeforeUse: true` so the live pair is forked first.
+Set `fetchBeforeUse: true` to pull the pair from upstream first.
 
 # Recipes
 
