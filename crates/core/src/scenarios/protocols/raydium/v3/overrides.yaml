@@ -84,9 +84,9 @@ llm_context: |
 
 templates:
   - id: raydium-clmm-custom
-    name: Override Any CLMM Pool (Custom)
+    name: Override CLMM Pool (By Fee Tier and Mints)
     description: |
-      Override any Raydium CLMM v3 pool by specifying the config index and token mints.
+      Override a Raydium CLMM pool given its fee tier index and its two token mints.
       Both the AMM config address AND the pool address are dynamically derived:
       - AMM Config: PDA from ["amm_config", config_index.to_be_bytes()]
       - Pool: PDA from ["pool", amm_config, token_mint_0, token_mint_1]
@@ -144,10 +144,8 @@ templates:
           value: token_mint_1
 
   - id: raydium-clmm-pool-state
-    name: Override CLMM Pool State (By Address)
-    description: |
-      Override any Raydium CLMM v3 pool by its own address, for a pubkey the caller
-      already has (no mint/config lookup).
+    name: Override CLMM Pool State
+    description: Override a Raydium CLMM pool found by pair or by address
     idl_account_name: PoolState
     properties:
       - path: liquidity
