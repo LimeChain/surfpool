@@ -204,12 +204,29 @@ constants:
     description: Select a token mint address from verified tokens
     source: verified_tokens
 
+llm_context: |
+  PancakeSwap CLMM, program HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq, a fork of Raydium CLMM.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 1544 and memcmp of the two mints at offsets 73 and 105, once in each
+  order (only one returns pools). Read each pool's token_vault_0 with dataSlice {offset 137, length
+  32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
+  whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
+  ask for the pool address. A pool address the user gives is used as is.
+
+  Set fetchBeforeUse: true.
+
+  PRICE: sqrt_price_x64 = sqrt(price_raw) x 2^64, where price_raw is token_1 per token_0 in raw units,
+  and tick_current = floor(log(price_raw) / log(1.0001)); set both together. A price move must also
+  set liquidity to the active liquidity at the new tick, and the tick array covering the new tick must
+  exist. The Studio price shock computes all three; prefer it to hand-computed values.
+
 templates:
   - id: pancakeswap-clmm-custom
-    name: Override Any CLMM Pool (Custom)
+    name: Override CLMM Pool (By Fee Tier and Mints)
     description: |
-      Override any PancakeSwap CLMM pool by specifying the fee tier index and token
-      mints. Both the AMM config address AND the pool address are dynamically derived:
+      Override a PancakeSwap CLMM pool given its fee tier index and its two token mints.
+      Both the AMM config address AND the pool address are dynamically derived:
       - AMM Config: PDA from ["amm_config", config_index.to_be_bytes()]
       - Pool: PDA from ["pool", amm_config, token_mint_0, token_mint_1]
     idl_account_name: PoolState
@@ -242,68 +259,10 @@ templates:
         constant: token_mint
         description: Second mint of the pair as the program stores it, the higher of the two by raw bytes.
     llm_context: |
-      Set fetchBeforeUse: true so the live account is forked first and every field you
-      don't override keeps its live value; set it to false only for a later override
-      that builds on state an earlier override in the same scenario already prepared.
-
-      CRITICAL: token_mint_0 and token_mint_1 must be SPL TOKEN MINT addresses, NOT
-      program IDs!
-
-      CORRECT examples of token mints:
-      - SOL (wrapped): So11111111111111111111111111111111111111112
-      - USDC: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-
-      WRONG - these are PROGRAM IDs, not token mints:
-      - HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq (PancakeSwap CLMM)
-      - CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK (Raydium CLMM)
-
-      Always use get_token_address tool to look up token mints by symbol (e.g., "SOL",
-      "USDC").
-
-      MINT ORDER: token_mint_0 must be the mint whose raw 32-byte pubkey is numerically
-      smaller than token_mint_1's (compare the decoded bytes, not the base58 string).
-      The pool PDA is ["pool", amm_config, token_mint_0, token_mint_1] in that exact
-      order, so swapping the two mints derives a different, almost certainly empty,
-      address. token_mint_0/token_mint_1 are plain property_ref seeds here and the
-      caller is responsible for the ordering.
-
-      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
-      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
-        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
-        human-readable price
-      - tick_current = floor(log(raw price) / log(1.0001))
-      - a swap walks TickArrayState accounts starting from tick_current; if
-        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
-        never initialized, the swap fails. Overriding one of the pair without
-        recomputing the other from the formula above leaves the pool in a state no
-        real swap can trade against.
-
-      TICK ARRAYS: the array covering a tick is the PDA ["tick_array", pool,
-      start_index as i32 big-endian] under HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq,
-      60 ticks per array, start_index = floor(tick / (tick_spacing * 60)) *
-      tick_spacing * 60. The destination array must exist: check it with getAccountInfo
-      on the derived PDA; a null result means the swap will fail.
-
-      LIQUIDITY RULE: a price move must also set liquidity to the active liquidity at the
-      new tick. Start from the live liquidity and, for every initialized tick t the move
-      crosses, add its liquidity_net when the price rises (old < t <= new) and subtract it
-      when it falls (new < t <= old). Leaving liquidity unchanged keeps the old range's depth
-      at the new price, so swaps return wrong amounts without failing. The Studio price
-      shock computes this; without the tick arrays, keep the move between the initialized
-      ticks around the current one.
-
-      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
-      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
-      price is still bounded by what the vaults actually hold, so fund the vaults (or
-      accept that only small trades succeed) when the override should support a real
-      swap at depth.
-
-      FINDING A POOL: the PancakeSwap CLMM program is
-      HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq. A live PoolState account is 1544
-      bytes and starts with the 8-byte discriminator [247, 237, 227, 245, 215, 195,
-      222, 70]. The deepest SOL/USDC pool is DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ
-      (fee tier index 0, tick spacing 10). Browse pools at
-      https://solana.pancakeswap.finance/liquidity-pools/.
+      Derives the pool from config_index and the two mints, from get_token_address (never program ids).
+      token_mint_0 must be the mint whose raw 32 bytes are smaller (SOL before USDC); reversed mints
+      derive an empty address and nothing checks it. For a pool found by address, use
+      pancakeswap-clmm-pool-state.
     address:
       type: pda
       program_id: HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
@@ -324,10 +283,8 @@ templates:
           value: token_mint_1
 
   - id: pancakeswap-clmm-pool-state
-    name: Override CLMM Pool State (By Address)
-    description: |
-      Override any PancakeSwap CLMM pool by its own address, for a pubkey the caller
-      already has (no mint/config lookup).
+    name: Override CLMM Pool State
+    description: Override a PancakeSwap CLMM pool found by pair or by address
     idl_account_name: PoolState
     properties:
       - path: liquidity
@@ -343,52 +300,9 @@ templates:
         label: Pool Status
         description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
     llm_context: |
-      Set fetchBeforeUse: true so the live account is forked first and every field you
-      don't override keeps its live value; set it to false only for a later override
-      that builds on state an earlier override in the same scenario already prepared.
+      Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
 
-      This template takes the pool's own address directly (no PDA derivation): supply a
-      pubkey you already have. If you only have the fee tier index and the two mints,
-      use pancakeswap-clmm-custom instead, which derives the address for you.
-
-      PRICE / TICK COUPLING (sqrt_price_x64 and tick_current must agree):
-      - raw price = (sqrt_price_x64 / 2^64)^2, a token_1-per-token_0 ratio in raw
-        (undecimaled) units; multiply by 10^(mint_decimals_0 - mint_decimals_1) for a
-        human-readable price
-      - tick_current = floor(log(raw price) / log(1.0001))
-      - a swap walks TickArrayState accounts starting from tick_current; if
-        tick_current doesn't match sqrt_price_x64, or the tick array covering it was
-        never initialized, the swap fails. Overriding one of the pair without
-        recomputing the other from the formula above leaves the pool in a state no
-        real swap can trade against.
-
-      TICK ARRAYS: the array covering a tick is the PDA ["tick_array", pool,
-      start_index as i32 big-endian] under HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq,
-      60 ticks per array, start_index = floor(tick / (tick_spacing * 60)) *
-      tick_spacing * 60. The destination array must exist: check it with getAccountInfo
-      on the derived PDA; a null result means the swap will fail.
-
-      LIQUIDITY RULE: a price move must also set liquidity to the active liquidity at the
-      new tick. Start from the live liquidity and, for every initialized tick t the move
-      crosses, add its liquidity_net when the price rises (old < t <= new) and subtract it
-      when it falls (new < t <= old). Leaving liquidity unchanged keeps the old range's depth
-      at the new price, so swaps return wrong amounts without failing. The Studio price
-      shock computes this; without the tick arrays, keep the move between the initialized
-      ticks around the current one.
-
-      VAULTS: sqrt_price_x64/tick_current only change the pool's quoted price; they do
-      not move token_vault_0/token_vault_1 balances. A swap that would trade at the new
-      price is still bounded by what the vaults actually hold, so fund the vaults (or
-      accept that only small trades succeed) when the override should support a real
-      swap at depth.
-
-      FINDING A POOL: the PancakeSwap CLMM program is
-      HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq. A live PoolState account is 1544
-      bytes and starts with the 8-byte discriminator [247, 237, 227, 245, 215, 195,
-      222, 70]. Three known pools: 1Piz3kL4v9fcS8GRkArpskfDG9BeSVc5eHMRjnvSfoX,
-      DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ (SOL/USDC, the deepest),
-      14qfdHrPWhduozgCkwosL9AC3DnKY12GySXP9bz3BJ6F. Browse pools at
-      https://solana.pancakeswap.finance/liquidity-pools/.
+      status is a bitmask of disabled operations: 16 disables swaps, 0 enables everything.
     address:
       type: pubkey
 
@@ -415,32 +329,12 @@ templates:
         constant: amm_config_index
         description: Fee tier whose AmmConfig account is overridden. The address derives from this index.
     llm_context: |
-      Set fetchBeforeUse: true so the live account is forked first and every field you
-      don't override (owner, fund_owner, tick_spacing, bump) keeps its live value; set
-      it to false only for a later override that builds on state an earlier override in
-      the same scenario already prepared.
+      To change the fees of a pool's tier, read the pool's amm_config with getAccountInfo, dataSlice
+      {offset 9, length 32} and encoding base58, and pick the config_index option whose derived_address
+      matches. Every pool on the tier shares the account.
 
-      BLAST RADIUS: this AmmConfig is shared by every pool created with the same index
-      - overriding it changes fees for all of them at once, not one pool. To change a
-      single pool's price instead, use pancakeswap-clmm-pool-state or
-      pancakeswap-clmm-custom.
-
-      UNITS AND DENOMINATOR (all three fields use FEE_RATE_DENOMINATOR_VALUE = 1,000,000):
-      - trade_fee_rate is a fraction of TRADE VOLUME: fee = amount_in * trade_fee_rate
-        / 1,000,000. E.g. 2500 = 0.25% (25 bps). The program requires trade_fee_rate to
-        stay strictly below 1,000,000.
-      - protocol_fee_rate and fund_fee_rate are fractions of the FEE trade_fee_rate
-        ALREADY COLLECTED, not of trade volume: protocol_cut = trade_fee *
-        protocol_fee_rate / 1,000,000 (and likewise for fund_fee_rate). E.g. 160000
-        means 16% of the trade fee goes to the protocol treasury, not 16% of the trade.
-        The program requires protocol_fee_rate + fund_fee_rate to stay at or below
-        1,000,000.
-
-      This template has no sqrt_price_x64/tick_current or mint fields of its own; for
-      an actual price or tick override on a specific pool use
-      pancakeswap-clmm-pool-state or pancakeswap-clmm-custom, and keep this config's
-      fee-rate change and that pool's price change in the same scenario when both need
-      to move together.
+      Rates are parts per million: trade_fee_rate of the input (2500 = 0.25%, below 1,000,000);
+      protocol_fee_rate and fund_fee_rate of the collected fee, together at most 1,000,000.
     address:
       type: pda
       program_id: HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq

@@ -28,8 +28,11 @@ tiers differ.
 
 ## Picking a pool
 
-Browse pools at `https://solana.pancakeswap.finance/liquidity-pools/`. The deepest SOL/USDC pool
-is `DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ` (fee tier 0, tick spacing 10).
+Find the pools of a pair with `getProgramAccounts` on the program, filtered by size `1544` and the
+two mints at offsets `73` and `105`. A pair has a pool per fee tier; the one whose vaults hold the
+most is usually the one you want. For SOL/USDC that is
+`DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ` (fee tier 0, tick spacing 10). Pools are also listed
+at `https://solana.pancakeswap.finance/liquidity-pools/`.
 
 **Order the mints for `pancakeswap-clmm-custom`.** `token_mint_0` is the mint whose raw 32 bytes
 are numerically smaller, not the smaller base58 string. A reversed pair derives an empty address
@@ -38,7 +41,7 @@ and nothing checks it.
 **Check the owner.** The layouts match Raydium's, so a PancakeSwap template pointed at a Raydium
 pool writes it without complaint.
 
-Set `fetchBeforeUse: true` so the live pool is forked first.
+Set `fetchBeforeUse: true` to pull the pool from upstream first.
 
 # Recipes
 
