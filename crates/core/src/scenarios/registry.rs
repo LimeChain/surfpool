@@ -569,76 +569,6 @@ templates:
         );
     }
 
-    #[test]
-    fn pancakeswap_amm_config_options_derive_their_documented_address() {
-        let registry = TemplateRegistry::new();
-        let template = registry
-            .get("pancakeswap-clmm-amm-config")
-            .expect("template");
-        let custom = registry.get("pancakeswap-clmm-custom").expect("template");
-
-        let options = &custom
-            .constants
-            .get("amm_config_index")
-            .expect("amm_config_index constant")
-            .options;
-        assert_eq!(options.len(), 22, "22 live AmmConfig accounts");
-
-        for option in options {
-            let expected = option
-                .metadata
-                .get("derived_address")
-                .and_then(|address| address.as_str())
-                .map(|address| Pubkey::from_str(address).expect("a valid address"))
-                .unwrap_or_else(|| panic!("option {} documents no derived_address", option.id));
-
-            let values = HashMap::from([(
-                "config_index".to_string(),
-                serde_json::Value::String(option.value.clone()),
-            )]);
-
-            assert_eq!(
-                template
-                    .address
-                    .resolve(Some(&values))
-                    .unwrap_or_else(|| panic!("option {} did not resolve", option.id)),
-                expected,
-                "option {}",
-                option.id
-            );
-        }
-    }
-
-    #[test]
-    fn pancakeswap_template_derives_a_live_pool() {
-        let registry = TemplateRegistry::new();
-        let template = registry.get("pancakeswap-clmm-custom").expect("template");
-
-        let values = HashMap::from([
-            (
-                "config_index".to_string(),
-                serde_json::Value::String("0".to_string()),
-            ),
-            (
-                "token_mint_0".to_string(),
-                serde_json::Value::String(
-                    "CGiwPp7bzmpYkUChduemtXKMZsUB54hB82tuFR7euJ8R".to_string(),
-                ),
-            ),
-            (
-                "token_mint_1".to_string(),
-                serde_json::Value::String(
-                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
-                ),
-            ),
-        ]);
-
-        assert_eq!(
-            template.address.resolve(Some(&values)).expect("resolves"),
-            Pubkey::from_str("1Piz3kL4v9fcS8GRkArpskfDG9BeSVc5eHMRjnvSfoX").expect("address"),
-        );
-    }
-
     /// Both singleton addresses are documented in pump-public-docs: the Pump Global
     /// account at 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf and the PumpSwap
     /// GlobalConfig at ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw.
@@ -726,11 +656,11 @@ templates:
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8)
-        // + PancakeSwap CLMM (3) = 73
+        // + PancakeSwap CLMM (2) = 72
         assert_eq!(
             registry.count(),
-            73,
-            "Registry should load 73 templates total"
+            72,
+            "Registry should load 72 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -805,7 +735,6 @@ templates:
         assert!(registry.contains("phoenix-trader-collateral-stress"));
         assert!(registry.contains("phoenix-direct-mark-risk-shock"));
 
-        assert!(registry.contains("pancakeswap-clmm-custom"));
         assert!(registry.contains("pancakeswap-clmm-pool-state"));
         assert!(registry.contains("pancakeswap-clmm-amm-config"));
     }
@@ -1144,8 +1073,8 @@ templates: []
         let pancakeswap_templates = registry.by_protocol("PancakeSwap");
         assert_eq!(
             pancakeswap_templates.len(),
-            3,
-            "Should have 3 PancakeSwap templates"
+            2,
+            "Should have 2 PancakeSwap templates"
         );
     }
 

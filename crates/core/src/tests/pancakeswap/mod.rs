@@ -19,17 +19,20 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const POOL_STATE_TEMPLATE: &str = "pancakeswap-clmm-pool-state";
+const AMM_CONFIG_TEMPLATE: &str = "pancakeswap-clmm-amm-config";
 
+const PANCAKESWAP_CLMM_PROGRAM: Pubkey =
+    Pubkey::from_str_const("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq");
 const SOL_USDC_POOL: Pubkey =
     Pubkey::from_str_const("DJNtGuBGEQiUCWE8F981M2C3ZghZt2XLD8f2sQdZ6rsZ");
 
+const AMM_CONFIG_RANGE: std::ops::Range<usize> = 9..41;
 const LIQUIDITY_RANGE: std::ops::Range<usize> = 237..253;
 const SQRT_PRICE_X64_RANGE: std::ops::Range<usize> = 253..269;
 const TICK_CURRENT_RANGE: std::ops::Range<usize> = 269..273;
 const STATUS_OFFSET: usize = 389;
 
-const TRADE_FEE_RATE_OFFSET: usize = 47;
-const TICK_SPACING_OFFSET: usize = 51;
+const POOL_STATE_LEN: usize = 1544;
 const AMM_CONFIG_LEN: usize = 117;
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
@@ -71,6 +74,22 @@ async fn real_mainnet_pool_round_trips_unchanged() {
     let template = registry
         .get(POOL_STATE_TEMPLATE)
         .expect("pool state template should exist");
+    let account_def = template
+        .idl()
+        .accounts
+        .iter()
+        .find(|a| a.name == "PoolState")
+        .expect("PoolState not in the IDL");
+    assert_eq!(
+        data.len(),
+        POOL_STATE_LEN,
+        "the SOL/USDC pool has the wrong size live"
+    );
+    assert_eq!(
+        &data[..8],
+        account_def.discriminator.as_slice(),
+        "the SOL/USDC pool has the wrong discriminator live"
+    );
 
     let forged = surfnet_svm
         .get_forged_account_data(
@@ -87,93 +106,75 @@ async fn real_mainnet_pool_round_trips_unchanged() {
 }
 
 #[tokio::test]
-async fn every_amm_config_index_option_is_a_live_amm_config_account() {
+async fn pool_amm_config_at_offset_9_is_a_live_amm_config_that_round_trips() {
+    let pool = fetch(&[SOL_USDC_POOL]).await.remove(0).data;
+    let config_address = Pubkey::try_from(&pool[AMM_CONFIG_RANGE]).expect("32 bytes");
+    let config = fetch(&[config_address]).await.remove(0);
+
+    let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
     let template = registry
-        .get("pancakeswap-clmm-amm-config")
-        .expect("template pancakeswap-clmm-amm-config should exist");
-    let amm_config_index = template
-        .constants
-        .get("amm_config_index")
-        .expect("amm_config_index constant should exist");
-    assert!(
-        !amm_config_index.options.is_empty(),
-        "the fee tiers are the fixture here"
-    );
-
+        .get(AMM_CONFIG_TEMPLATE)
+        .expect("amm config template should exist");
     let account_def = template
         .idl()
         .accounts
         .iter()
         .find(|a| a.name == "AmmConfig")
         .expect("AmmConfig not in the IDL");
+    assert_eq!(
+        config.owner, PANCAKESWAP_CLMM_PROGRAM,
+        "the SOL/USDC pool's AmmConfig has the wrong owner live"
+    );
+    assert_eq!(
+        config.data.len(),
+        AMM_CONFIG_LEN,
+        "the SOL/USDC pool's AmmConfig has the wrong size live"
+    );
+    assert_eq!(
+        &config.data[..8],
+        account_def.discriminator.as_slice(),
+        "the SOL/USDC pool's AmmConfig has the wrong discriminator live"
+    );
 
-    let addresses: Vec<Pubkey> = amm_config_index
-        .options
-        .iter()
-        .map(|option| {
-            let address = option
-                .metadata
-                .get("derived_address")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("option {} documents no derived_address", option.id));
-            Pubkey::from_str_const(address)
-        })
-        .collect();
-    let accounts = fetch(&addresses).await;
-
-    for (option, account) in amm_config_index.options.iter().zip(&accounts) {
-        let data = &account.data;
-        assert_eq!(
-            data.len(),
-            AMM_CONFIG_LEN,
-            "AmmConfig for option {} has the wrong size live",
-            option.id
-        );
-        assert_eq!(
-            &data[..8],
-            account_def.discriminator.as_slice(),
-            "AmmConfig for option {} has the wrong discriminator live",
-            option.id
-        );
-
-        let tick_spacing = u16::from_le_bytes(
-            data[TICK_SPACING_OFFSET..TICK_SPACING_OFFSET + 2]
-                .try_into()
-                .unwrap(),
-        );
-        let trade_fee_rate = u32::from_le_bytes(
-            data[TRADE_FEE_RATE_OFFSET..TRADE_FEE_RATE_OFFSET + 4]
-                .try_into()
-                .unwrap(),
-        );
-
-        let expect_u64 = |field: &str| -> u64 {
-            option
-                .metadata
-                .get(field)
-                .and_then(|v| v.as_u64())
-                .unwrap_or_else(|| panic!("option {} documents no {field} metadata", option.id))
-        };
-
-        assert_eq!(
-            tick_spacing as u64,
-            expect_u64("tick_spacing"),
-            "option {} tick_spacing metadata disagrees with the live AmmConfig",
-            option.id
-        );
-        assert_eq!(
-            trade_fee_rate as u64,
-            expect_u64("fee_rate_bps") * 100,
-            "option {} live trade_fee_rate should be fee_rate_bps * 100",
-            option.id
-        );
-    }
+    let forged = surfnet_svm
+        .get_forged_account_data(
+            &config_address,
+            &config.data,
+            template.idl(),
+            &HashMap::new(),
+        )
+        .unwrap_or_else(|e| panic!("live mainnet AmmConfig failed to decode/re-encode: {e}"));
+    assert_eq!(
+        forged, config.data,
+        "live mainnet AmmConfig was altered by a no-op round-trip"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn overrides_through_materializer_touch_only_their_own_bytes() {
     let before = fetch(&[SOL_USDC_POOL]).await.remove(0);
+
+    let registry = TemplateRegistry::new();
+    let template = registry
+        .get(POOL_STATE_TEMPLATE)
+        .expect("pool state template should exist");
+    let account_def = template
+        .idl()
+        .accounts
+        .iter()
+        .find(|a| a.name == "PoolState")
+        .expect("PoolState not in the IDL");
+    assert_eq!(
+        before.data.len(),
+        POOL_STATE_LEN,
+        "the SOL/USDC pool has the wrong size live"
+    );
+    assert_eq!(
+        &before.data[..8],
+        account_def.discriminator.as_slice(),
+        "the SOL/USDC pool has the wrong discriminator live"
+    );
 
     let new_status: u8 = if before.data[STATUS_OFFSET] == 0 {
         31
@@ -190,11 +191,6 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         .set_account(&SOL_USDC_POOL, before.clone())
         .unwrap();
     let locker = SurfnetSvmLocker::new(surfnet_svm);
-
-    let registry = TemplateRegistry::new();
-    let template = registry
-        .get(POOL_STATE_TEMPLATE)
-        .expect("pool state template should exist");
 
     let pool_override = OverrideInstance::new(
         template.id.clone(),
