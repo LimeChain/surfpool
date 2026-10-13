@@ -33,7 +33,8 @@ templates:
       at the target, so trades and liquidations fill at the new price.
       USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
       list_phoenix_markets; compute a relative move from markTicks there.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -67,7 +68,8 @@ templates:
       It does not send the liquidations; the user's own keeper does, in the logged order.
       The account is the trader's Trader account. list_phoenix_trader_positions lists the markets
       it holds a position in; pass one or more of their symbols, comma-separated.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
     address:
       type: pubkey
 
@@ -90,112 +92,21 @@ templates:
         description: long liquidates longs after a drop, short liquidates shorts after a rise
     llm_context: |
       Each holder of the chosen side becomes liquidatable at one price and underwater, where
-      Phoenix refuses a market-order liquidation, at another. This looks at up to 24 holders of
-      that side in Phoenix's active trader index, so cold holders are not examined, finds the price
-      inside the most of their bands, cancels the resting orders of every holder whose band covers
-      it, on every market they hold, and moves the market there the way Phoenix Market Move does.
+      Phoenix refuses a market-order liquidation, at another. This looks at the 24 holders of that
+      side closest to liquidation in Phoenix's active trader index, so cold holders are not
+      examined, finds the smallest move that leaves at least two of them liquidatable (the nearest
+      one when no two bands meet), cancels the resting orders of every holder whose band covers
+      that price, on every market they hold, and moves the market there the way Phoenix Market
+      Move does.
       How many traders that is depends on the market, not on an input. Their liquidations are tried
       one after another on a copy, and a trader whose liquidation would fail is left out.
       Surfpool's log names the price and the traders.
       It does not send the liquidations; the user's own keeper does.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
-
-  - id: phoenix-open-position
-    name: Phoenix Open Position
-    description: >-
-      Open or grow one trader's position with a market order the trader sends itself.
-    idl_account_name: Trader
-    properties:
-      - path: symbol
-        type: dynamic_ref
-        label: Market Symbol
-        source: list_phoenix_markets
-        description: Exact Phoenix market symbol
-      - path: side
-        type: input
-        value_type: string
-        label: Side
-        description: Bid buys (goes long), Ask sells (goes short)
-      - path: base_lots
-        type: input
-        value_type: string
-        label: Size (base lots)
-        description: Base lots to trade, at least 1, encoded as a decimal string
-    llm_context: |
-      This sends the trader's own immediate-or-cancel market order, filled against the market's
-      book and makers at whatever price they offer, so the position, margin and the makers'
-      positions all change the way a real trade changes them. Phoenix refuses an order the
-      trader's margin cannot carry.
-      A base lot is 10^-baseLotDecimals of one unit, from list_phoenix_markets.
-      The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
-    address:
-      type: pubkey
-
-  - id: phoenix-cancel-orders
-    name: Phoenix Cancel Orders
-    description: >-
-      Cancel all of one trader's resting orders in one market.
-    idl_account_name: Trader
-    properties:
-      - path: symbol
-        type: dynamic_ref
-        label: Market Symbol
-        source: list_phoenix_markets
-        description: Exact Phoenix market symbol
-    llm_context: |
-      This sends the trader's own cancel-all for one market. Phoenix refuses to liquidate a trader
-      that still has risk-increasing resting orders, and cancelling also drops the margin those
-      orders held. Put it at slot 0 and phoenix-market-move at a later slot to watch traders cross
-      from healthy into the Liquidatable tier.
-      The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
-    address:
-      type: pubkey
-
-  - id: phoenix-withdraw
-    name: Phoenix Withdraw
-    description: >-
-      Lower one trader's collateral with a withdrawal the trader sends itself.
-    idl_account_name: Trader
-    properties:
-      - path: quote_lots
-        type: input
-        value_type: string
-        label: Amount (quote lots)
-        description: Quote lots to withdraw (1000000 = 1 USDC), encoded as a decimal string
-    llm_context: |
-      The global vault pays the amount out to the trader's wallet, so the collateral that remains
-      stays backed. Phoenix first settles the trader's accrued funding, and refuses more than the
-      trader's margin leaves free, so a withdrawal never makes a trader liquidatable: use
-      phoenix-liquidation-ready for that.
-      The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
-    address:
-      type: pubkey
-
-  - id: phoenix-deposit
-    name: Phoenix Deposit
-    description: >-
-      Raise one trader's collateral with a deposit the trader sends itself.
-    idl_account_name: Trader
-    properties:
-      - path: quote_lots
-        type: input
-        value_type: string
-        label: Amount (quote lots)
-        description: Quote lots to deposit (1000000 = 1 USDC), encoded as a decimal string
-    llm_context: |
-      The quote mint's authority first mints the amount to the trader's wallet, and the trader
-      deposits it, so the vault holds real tokens for the new collateral. Phoenix then makes the
-      trader wait the deposit cooldown before it may withdraw.
-      The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
-    address:
-      type: pubkey
 
   - id: phoenix-market-risk-factors
     name: Phoenix Market Risk Factors
@@ -233,7 +144,8 @@ templates:
       order risk factor (7500 on mainnet); raise that first with phoenix-market-cancel-risk-factor.
       list_phoenix_markets shows the current maintenance and backstop factors. Pass every factor
       as a decimal string.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -258,7 +170,8 @@ templates:
     llm_context: |
       Phoenix keeps every maintenance factor at or below this one, so raise it before setting a
       maintenance factor above 7500. Pass the factor as a decimal string.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -283,7 +196,8 @@ templates:
     llm_context: |
       A keeper's liquidation asking for more is refused, so a small value forces a large position to
       be liquidated in several steps. Pass the size as a decimal string.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -306,7 +220,8 @@ templates:
         description: >-
           The most open interest the market accepts
     llm_context: |
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -342,7 +257,8 @@ templates:
           Signed; leave empty to keep the current value
     llm_context: |
       Every field is optional: one left out keeps its current value. Pass values as decimal strings.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -373,7 +289,8 @@ templates:
     llm_context: |
       This changes the fees a market charges on every fill. It does not change per-trader fee
       overrides. A fee left out keeps its current value. Keep the maker fee below the taker fee.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -398,7 +315,8 @@ templates:
     llm_context: |
       Paused stops all trading in the market, PostOnly accepts only orders that rest on the book,
       and Active trades normally. Closed and Tombstoned are one-way steps toward removing a market.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -429,7 +347,8 @@ templates:
           true or false; leave empty to keep it
     llm_context: |
       Each flag left out keeps its current value. An inactive exchange refuses trading for everyone.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
     address:
       type: pubkey
       value: 2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ
@@ -458,7 +377,8 @@ templates:
       the remaining budget; otherwise it waits for the permissionless ConsumeWithdrawQueue.
       A field left out keeps its current value. Amounts are quote lots of Phoenix USDC with
       6 decimals, passed as decimal strings.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -489,7 +409,8 @@ templates:
           Quote lots charged when a withdrawal is queued. Mainnet: 500000
     llm_context: |
       A field left out keeps its current value. Pass values as decimal strings.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
@@ -515,7 +436,8 @@ templates:
     llm_context: |
       Both multipliers are required. Pass them as decimal strings.
       The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
     address:
       type: pubkey
 
@@ -565,7 +487,8 @@ templates:
       Set a capability to false to block it, true to allow it; one left out keeps its current value.
       RiskIncreasingTrade false makes the trader reduce-only; every capability false freezes it.
       The account is the trader's Trader account.
-      Use fetchBeforeUse: true on the first Phoenix scenario on a surfnet, false after that.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
     address:
       type: pubkey
 

@@ -5,7 +5,7 @@ use phoenix_rise_accounts::{
     orderbook::{ORDERBOOK_CAPACITY, Orderbook},
     pda::{derive_permission_address, derive_spline_collection_address},
     perp_asset_map::{PerpAssetMap, PerpAssetMetadataEntry},
-    spline_collection::SplineCollection,
+    spline_collection::{SplineCollection, TickRegion},
     trader::TraderHeader,
 };
 use solana_account::Account;
@@ -29,6 +29,10 @@ use crate::{
 /// Crossed resting orders the uncross crank matches in one call: about 12,000 compute units each,
 /// so 64 stay well inside a transaction's 1.4 million.
 const UNCROSS_MATCH_LIMIT: u64 = 64;
+/// How long the makers' re-sent spline regions keep quoting, past any session. Mainnet makers update
+/// every few slots and their regions lapse a set number of slots later (6 to 60 on SOL); nobody
+/// updates on a fork.
+const QUOTE_LIFESPAN_SLOTS: u64 = u32::MAX as u64;
 /// Each side holds up to `ORDERBOOK_CAPACITY` resting orders and a match between two removes at
 /// least one; spline fills make this a budget, not a guarantee.
 const MAX_UNCROSS_CRANKS: usize = 2 * ORDERBOOK_CAPACITY / UNCROSS_MATCH_LIMIT as usize;
@@ -381,8 +385,9 @@ impl MarketContext {
         )
     }
 
-    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves, and the uncross crank
-    /// until [`uncross_done`]. Hawkeye must be in the local VM.
+    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves, the uncross crank
+    /// until [`uncross_done`], then the makers re-quoting ([`MarketContext::requotes`]). Hawkeye
+    /// must be in the local VM.
     pub fn move_in(&mut self, sandbox: &mut Sandbox, ticks: u64) -> SurfpoolResult<()> {
         let mut instructions = self.oracle_reports(ticks)?;
         instructions.extend(self.spline_moves(ticks)?);
@@ -393,7 +398,8 @@ impl MarketContext {
             sandbox.run(std::slice::from_ref(&uncross))?;
             let after = self.book_top(sandbox)?;
             if uncross_done(&before, &after) {
-                return Ok(());
+                let requotes = self.requotes(sandbox)?;
+                return sandbox.run(&requotes);
             }
             before = after;
         }
@@ -401,6 +407,62 @@ impl MarketContext {
             "the {} book stayed crossed after {MAX_UNCROSS_CRANKS} uncross cranks",
             self.market.symbol
         )))
+    }
+
+    /// Every maker's spline regions sent again as they are, quoting for [`QUOTE_LIFESPAN_SLOTS`], so
+    /// the moved book keeps its liquidity while the surfnet's clock runs.
+    fn requotes(&self, sandbox: &Sandbox) -> SurfpoolResult<Vec<Instruction>> {
+        let account = sandbox.account(&self.market.splines)?;
+        let collection = SplineCollection::try_from_account_bytes(&account.data).map_err(|e| {
+            SurfpoolError::invalid_account_data(
+                self.market.splines,
+                "Expected a Phoenix spline collection",
+                Some(e),
+            )
+        })?;
+        let regions = |regions: &[TickRegion]| -> Vec<serde_json::Value> {
+            regions
+                .iter()
+                .map(|region| {
+                    serde_json::json!({
+                        "startOffset": { "inner": region.start_offset().as_inner() },
+                        "endOffset": { "inner": region.end_offset().as_inner() },
+                        "density": { "inner": region.density().as_inner() },
+                        "lifespan": QUOTE_LIFESPAN_SLOTS,
+                    })
+                })
+                .collect()
+        };
+        let mut requotes = Vec::with_capacity(self.makers.len());
+        for spline in collection.splines().flatten() {
+            let trader = Pubkey::new_from_array(spline.trader());
+            let Some(maker) = self.makers.iter().find(|maker| maker.trader == trader) else {
+                continue;
+            };
+            let client_order_id = [0_u8; 16];
+            requotes.push(phoenix_instruction(
+                "UpdateSplineParameters",
+                &[
+                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                    ("phoenixLogAuthority", log_authority()),
+                    ("signerAccount", maker.authority),
+                    ("traderAccount", maker.trader),
+                    ("splineAccount", self.market.splines),
+                    ("orderbook", self.market.orderbook),
+                ],
+                &serde_json::json!({
+                    "params": {
+                        "bidRegions": regions(spline.active_bid_regions()),
+                        "askRegions": regions(spline.active_ask_regions()),
+                        "refreshRegions": true,
+                        "userSequenceNumber": spline.user_parameter_sequence_number() + 1,
+                        "clientOrderId": client_order_id,
+                        "overrideSequenceNumber": false,
+                    }
+                }),
+            )?);
+        }
+        Ok(requotes)
     }
 
     /// Hawkeye's best bid and ask in `sandbox`, with the number of resting orders in the book.

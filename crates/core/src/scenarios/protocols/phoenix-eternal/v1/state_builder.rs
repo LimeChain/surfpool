@@ -23,10 +23,7 @@ use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 
 use super::{
     market::{Market, invalid_perp_asset_map, map_entries, move_market},
-    trader::{
-        Side, cancel_orders, deposit, place_market_order, prepare_cascade, prepare_cross_margin,
-        withdraw,
-    },
+    trader::{prepare_cascade, prepare_cross_margin},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -453,6 +450,30 @@ impl<'a> Sandbox<'a> {
     }
 }
 
+/// Writes every account of one Phoenix override, or puts back the ones already written when a
+/// write fails: Phoenix needs its accounts to agree with each other. Returns the addresses written.
+pub(crate) fn write_all_or_none(
+    svm: &mut SurfnetSvm,
+    writes: Vec<(Pubkey, Account)>,
+    slot: u64,
+) -> SurfpoolResult<Vec<Pubkey>> {
+    let mut written: Vec<(Pubkey, Option<Account>)> = Vec::with_capacity(writes.len());
+    for (pubkey, account) in writes {
+        let before = svm.inner.get_account(&pubkey)?;
+        if let Err(error) = svm.set_scenario_override_account(&pubkey, account, slot) {
+            for (pubkey, before) in written.into_iter().rev() {
+                let Some(before) = before else { continue };
+                if let Err(e) = svm.set_scenario_override_account(&pubkey, before, slot) {
+                    warn!("Could not put back {pubkey} after a failed Phoenix write: {e}");
+                }
+            }
+            return Err(error);
+        }
+        written.push((pubkey, before));
+    }
+    Ok(written.into_iter().map(|(pubkey, _)| pubkey).collect())
+}
+
 /// Runs the instructions in a [`Sandbox`] and returns what they changed.
 pub fn run_instructions(
     svm: &SurfnetSvm,
@@ -748,40 +769,6 @@ pub async fn prepare_phoenix_override(
                     Some(ready.writes)
                 })
         }
-        "phoenix-open-position" => {
-            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
-            let side = match text_input(values, "side")? {
-                "Bid" => Side::Bid,
-                "Ask" => Side::Ask,
-                other => {
-                    return Err(SurfpoolError::internal(format!(
-                        "side must be Bid or Ask, not {other}"
-                    )));
-                }
-            };
-            let base_lots = whole_number_input(values, "base_lots")?;
-            place_market_order(svm, remote_ctx, *account_pubkey, symbol, side, base_lots)
-                .await
-                .map(Some)
-        }
-        "phoenix-cancel-orders" => {
-            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
-            cancel_orders(svm, remote_ctx, *account_pubkey, symbol)
-                .await
-                .map(Some)
-        }
-        "phoenix-withdraw" => {
-            let quote_lots = whole_number_input(values, "quote_lots")?;
-            withdraw(svm, remote_ctx, *account_pubkey, quote_lots)
-                .await
-                .map(Some)
-        }
-        "phoenix-deposit" => {
-            let quote_lots = whole_number_input(values, "quote_lots")?;
-            deposit(svm, remote_ctx, *account_pubkey, quote_lots)
-                .await
-                .map(Some)
-        }
         // Phoenix's other accounts take the generic IDL path.
         _ => Ok(None),
     }
@@ -999,6 +986,40 @@ pub(crate) mod tests {
         protocols::phoenix_eternal::v1::market::tests::perp_asset_map_account,
         registry::template_registry,
     };
+
+    #[test]
+    fn a_failed_write_puts_back_the_accounts_written_before_it() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (first, unloadable) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let before = Account {
+            lamports: 1_000_000,
+            data: vec![1; 8],
+            owner: PHOENIX_PROGRAM_ID,
+            ..Account::default()
+        };
+        svm.set_account(&first, before.clone()).unwrap();
+        // A program account whose bytes are no program is refused.
+        let broken_program = Account {
+            lamports: 1_000_000,
+            data: vec![0xff; 64],
+            owner: Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
+            executable: true,
+            rent_epoch: 0,
+        };
+        let writes = vec![
+            (
+                first,
+                Account {
+                    data: vec![2; 8],
+                    ..before.clone()
+                },
+            ),
+            (unloadable, broken_program),
+        ];
+
+        assert!(write_all_or_none(&mut svm, writes, 1).is_err());
+        assert_eq!(svm.inner.get_account(&first).unwrap(), Some(before));
+    }
 
     /// Every Phoenix template that carries a fixed address: its id, account type and address.
     pub(crate) fn template_addresses() -> Vec<(&'static str, &'static str, Pubkey)> {

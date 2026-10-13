@@ -95,7 +95,10 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            prepare_phoenix_override, write_all_or_none,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
@@ -3268,17 +3271,12 @@ impl SurfnetSvm {
                 .await
                 {
                     Ok(Some(writes)) => {
-                        for (pubkey, written) in writes {
-                            if let Err(e) =
-                                self.set_scenario_override_account(&pubkey, written, target_slot)
-                            {
-                                warn!(
-                                    "Failed to set {} for override {}: {}",
-                                    pubkey, override_instance.id, e
-                                );
-                                break;
-                            }
-                            settled_this_slot.insert(pubkey);
+                        match write_all_or_none(self, writes, target_slot) {
+                            Ok(written) => settled_this_slot.extend(written),
+                            Err(e) => warn!(
+                                "Skipping override {} for {}: {}",
+                                override_instance.id, account_pubkey, e
+                            ),
                         }
                         continue;
                     }

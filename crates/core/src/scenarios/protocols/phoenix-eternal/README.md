@@ -1,6 +1,6 @@
 # Phoenix Eternal
 
-Surfpool bundles the Phoenix Eternal IDL and 21 override templates, so a scenario can put
+Surfpool bundles the Phoenix Eternal IDL and 17 override templates, so a scenario can put
 Phoenix perpetuals into the state your code needs to see: a market moved to a new price, a trader's
 positions ready to be liquidated one after another, several traders liquidatable at once, a paused
 market, throttled withdrawals. The templates only prepare state. Liquidations and trades are sent
@@ -26,9 +26,8 @@ and state constraints: a maintenance factor above the cancel order factor, a wit
 the free margin, or an order the margin cannot carry is refused. A refused template is skipped
 with a warning naming the program's reason.
 
-After the instructions succeed, Play writes back the accounts they changed. These writes are
-applied sequentially by the shared materializer, not as an atomic group: a storage error can leave
-earlier writes applied. Successful preparation in the copy does not guarantee atomic writeback.
+After the instructions succeed, Play writes back the accounts they changed, all or none: when a
+write fails, the accounts written before it are put back.
 
 The stop-loss and permission templates patch one field of one account through the IDL. The
 maintenance described under "Keeping markets usable" also patches the PerpAssetMap directly.
@@ -63,13 +62,16 @@ out or left empty keeps its current value, unless its template says the field is
 ## fetchBeforeUse
 
 `fetchBeforeUse: true` makes Play fetch the override's own account from the upstream datasource
-first, replacing the local copy. Use it on the first Phoenix scenario played on a surfnet: an
-override whose account is not in the local VM yet is skipped.
+first, replacing the local copy. Without it, an override whose account is not in the local VM yet
+is skipped.
 
-Use `false` on every later Phoenix scenario. Phoenix keeps one market across several accounts,
-and a refetch replaces only the override's own account. Refetching the PerpAssetMap, for example,
-puts every market's price back to mainnet's, while the order books, market status and traders keep
-what earlier scenarios prepared, and the two no longer agree.
+Leave it `false` on the templates that change the PerpAssetMap or a Trader. Phoenix keeps one
+market across several accounts, and a refetch replaces only the override's own account:
+refetching the PerpAssetMap puts every market's prices and factors back to mainnet's, while the
+order books and traders keep what earlier scenarios prepared, and the two no longer agree.
+`list_phoenix_markets` and `list_phoenix_trader_positions` load those accounts into the surfnet.
+The GlobalConfig, WithdrawQueue, StopLosses and permission accounts stand alone, so use `true` the
+first time a scenario changes one of them.
 
 Surfnet copies each account from mainnet the first time it is read, while mainnet keeps trading.
 Order books and the ActiveTraderBuffer name traders by their node in the GlobalTraderIndex, so the
@@ -92,9 +94,6 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-market-move`                 | Moves a market's oracle readings, its makers' splines and its book to a price, and uncrosses the book. | oracle keys, makers          |
 | `phoenix-liquidation-ready`           | Leaves one or more positions of one trader liquidatable one after another.                             | trader, oracle keys, makers  |
 | `phoenix-liquidation-cascade`         | Leaves several traders liquidatable at one price in one market.                                        | traders, oracle keys, makers |
-| `phoenix-open-position`               | Sends a market order for the trader.                                                                   | trader                       |
-| `phoenix-cancel-orders`               | Cancels the trader's resting orders in a market.                                                       | trader                       |
-| `phoenix-withdraw`, `phoenix-deposit` | Moves collateral through the global vault; a deposit mints the quote token first.                      | trader                       |
 | `phoenix-market-risk-factors`         | Maintenance, backstop and high-risk factors.                                                           | risk authority               |
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
 | `phoenix-market-max-liquidation-size` | The most base lots one liquidation may close.                                                          | risk authority               |
@@ -120,12 +119,13 @@ Hawkeye reports a position or orders of the trader, before they move the price.
 
 - **One trader:** `phoenix-liquidation-ready` on the trader, with one or more of the markets
   `list_phoenix_trader_positions` lists for it. See below.
-- **Watch traders cross:** `phoenix-cancel-orders` on each trader at slot 0, then
-  `phoenix-market-move` at slot 1. The traders are healthy until the move.
-- **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at the first 24
-  holders of that side, in address order, in Phoenix's active trader index (cold holders are not
-  examined), finds the price inside the most of their bands, and prepares every holder whose band
-  covers it, leaving out any trader whose liquidation would fail once the others have gone first.
+- **Watch traders cross:** `phoenix-market-move` at a later slot. The traders are healthy until
+  the move. A keeper that will then liquidate them needs their resting orders cancelled first.
+- **A cascade:** `phoenix-liquidation-cascade` with the side to liquidate. It looks at the 24
+  holders of that side closest to liquidation in Phoenix's active trader index (cold holders are
+  not examined), finds the smallest move that leaves at least two of them liquidatable, or the
+  nearest one when no two bands meet, and prepares every holder whose band covers that price,
+  leaving out any trader whose liquidation would fail once the others have gone first.
   After dropping a holder, it prepares the remaining holders again from the initial copy at the same
   price. Each unsuccessful round removes at least one holder, so there are at most 24 rounds. An
   empty set is refused. How many traders remain depends on the market. Surfpool's log names the
@@ -169,6 +169,11 @@ records funding updates from after the local time. Phoenix refuses to update fun
 every price, before the last update, so every Phoenix override also moves those funding
 timestamps back to the local clock. Funding then accrues from the local time.
 
+Makers on mainnet re-quote every few slots, and a spline region stops quoting a set number of slots
+after its maker's last update (6 to 60 on SOL). A market move therefore has the market's makers
+re-send their regions with `UpdateSplineParameters` and a lifespan past any session, so the moved
+book keeps its liquidity while the surfnet's clock runs.
+
 ## Finding accounts
 
 | Account           | How to find it                                                                                                                                                    |
@@ -196,7 +201,7 @@ timestamps back to the local clock. Funding then accrues from the local time.
 
 | Warning or error                                              | Meaning                                                                                                                           |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `Account ... not found in SVM for override ...`               | The override's own account is not in the local VM. Set `fetchBeforeUse: true` on it.                                              |
+| `Account ... not found in SVM for override ...`               | The override's own account is not in the local VM. Load it with the listing tools, or set `fetchBeforeUse: true` on a standalone one. |
 | `... accounts are missing locally and there is no datasource` | The template needs Phoenix accounts that are not in the local VM, and surfnet has no upstream datasource to fetch them from.      |
 | `... is offline and missing locally`                          | The account is marked offline, so surfnet will not fetch it.                                                                      |
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |

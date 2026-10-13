@@ -19,21 +19,21 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 
 use crate::{
+    error::SurfpoolResult,
     scenarios::protocols::phoenix_eternal::v1::{
         market::{MarketContext, move_market, phoenix_markets},
         state_builder::{
             Exchange, LIQUIDATION_READY_TEMPLATE_ID, PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP,
-            PHOENIX_PROGRAM_ID, prepare_phoenix_override, run_instructions,
-            tests::template_addresses,
+            PHOENIX_PROGRAM_ID, local_account, log_authority, phoenix_instruction,
+            prepare_phoenix_override, run_instructions, tests::template_addresses,
         },
         trader::{
-            BboView, HAWKEYE_PROGRAM_ID, MarginView, Side, VIEW_BBO, VIEW_MARGIN, deposit,
-            holdings, index_trader_state_ranges, liquidation, place_market_order, prepare_cascade,
-            prepare_cross_margin, tests::index_trader_state_range, trader_positions, withdraw,
+            BboView, HAWKEYE_PROGRAM_ID, MarginView, VIEW_BBO, VIEW_MARGIN, holdings,
+            index_trader_state_ranges, liquidation, prepare_cascade, prepare_cross_margin,
+            tests::index_trader_state_range, trader_positions,
         },
     },
     surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
@@ -669,6 +669,57 @@ fn trail_mainnet_clock(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph) -
     clock
 }
 
+/// A one-lot market buy by `trader` in `symbol`, run on a copy of the test VM; it shows whether
+/// Phoenix lets the trader place market orders there.
+async fn buy_one_lot(
+    locker: &SurfnetSvmLocker,
+    trader: Pubkey,
+    symbol: &str,
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let mut svm = locker.0.write().await;
+    let market = MarketContext::load(&mut svm, &remote, symbol).await?;
+    let header = TraderHeader::try_read_from_account_bytes(&local_account(&svm, &trader)?.data)
+        .expect("a Phoenix Trader");
+    let client_order_id = [0_u8; 16];
+    let order = phoenix_instruction(
+        "PlaceMarketOrder",
+        &[
+            ("phoenixProgram", PHOENIX_PROGRAM_ID),
+            ("phoenixLogAuthority", log_authority()),
+            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+            ("traderWallet", Pubkey::new_from_array(header.authority)),
+            ("traderAccount", trader),
+            ("perpAssetMap", market.exchange.perp_asset_map),
+            ("globalTraderIndex", market.exchange.global_trader_index),
+            ("activeTraderBuffer", market.exchange.active_trader_buffer),
+            ("orderbook", market.market.orderbook),
+            ("splines", market.market.splines),
+        ],
+        &serde_json::json!({
+            "orderPacket": {
+                "kind": {
+                    "ImmediateOrCancel": {
+                        "side": { "Bid": null },
+                        "priceInTicks": null,
+                        "numBaseLots": { "inner": 1 },
+                        "numQuoteLots": null,
+                        "minBaseLotsToFill": { "inner": 0 },
+                        "minQuoteLotsToFill": { "inner": 0 },
+                        "selfTradeBehavior": { "DecrementTake": null },
+                        "matchLimit": null,
+                        "clientOrderId": client_order_id,
+                        "lastValidSlot": null,
+                        "orderFlags": { "flags": 0 },
+                        "cancelExisting": false,
+                    }
+                }
+            }
+        }),
+    )?;
+    run_instructions(&svm, &[order])
+}
+
 /// Plays a one-override scenario at `slot` through the materializer.
 async fn play(
     locker: &SurfnetSvmLocker,
@@ -706,18 +757,10 @@ async fn a_trader_crosses_into_liquidatable_between_two_slots() {
         ..graph.clone()
     };
 
-    play(
-        &locker,
-        graph.clock.slot,
-        "phoenix-cancel-orders",
-        trader,
-        &[("symbol", "SOL")],
-    )
-    .await;
     assert_eq!(
         hawkeye_margin(&locker, &traded).is_liquidatable,
         0,
-        "{trader}: still healthy after slot 0"
+        "{trader}: healthy before the move"
     );
     play(
         &locker,
@@ -976,19 +1019,8 @@ async fn market_and_exchange_configuration_reaches_the_accounts_phoenix_reads() 
         &[("symbol", "SOL"), ("nextMarketStatus", "Paused")],
     )
     .await;
-    let paused = {
-        let mut svm = locker.0.write().await;
-        place_market_order(
-            &mut svm,
-            &Some((client(), CommitmentConfig::confirmed())),
-            graph.trader,
-            "SOL",
-            Side::Bid,
-            1,
-        )
+    let refused = buy_one_lot(&locker, graph.trader, "SOL")
         .await
-    };
-    let refused = paused
         .expect_err("a paused SOL market refuses a market order")
         .to_string();
     assert!(
@@ -1134,6 +1166,11 @@ async fn a_liquidation_ready_scenario_plays_through_the_materializer() {
             "{trader}: not underwater"
         );
 
+        // A keeper liquidates some time after Play, longer than any SOL maker's quotes last on
+        // their own.
+        clock.slot += 70;
+        clock.unix_timestamp += 20;
+        locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
         let mark = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline).mark_price_ticks;
         let instruction = {
             let mut svm = locker.0.write().await;
@@ -1154,33 +1191,34 @@ async fn a_liquidation_ready_scenario_plays_through_the_materializer() {
     panic!("no eligible mainnet candidate: {skipped:#?}");
 }
 
-fn token_amount(locker: &SurfnetSvmLocker, account: &Pubkey) -> u64 {
-    locker
-        .with_svm_reader(|svm| svm.get_account(account))
-        .unwrap()
-        .map(|account| u64::from_le_bytes(account.data[64..72].try_into().unwrap()))
-        .unwrap_or(0)
-}
-
-fn mint_supply(locker: &SurfnetSvmLocker, mint: &Pubkey) -> u64 {
-    let account = locker
-        .with_svm_reader(|svm| svm.get_account(mint))
-        .unwrap()
-        .unwrap();
-    u64::from_le_bytes(account.data[36..44].try_into().unwrap())
-}
-
-/// Sends a keeper's liquidation on the test VM. Its liquidator wallet has no key, so it runs
-/// unsigned on a copy and the copy's writes are applied.
+/// Sends a keeper's liquidation as a real transaction: signed by a funded keeper in place of the
+/// placeholder liquidator, with signatures checked as on any surfnet.
 async fn send_liquidation(
     locker: &SurfnetSvmLocker,
-    liquidation: Instruction,
+    mut liquidation: Instruction,
 ) -> Result<(), String> {
-    let writes = locker
-        .with_svm_reader(|svm| run_instructions(svm, &[liquidation]))
-        .map_err(|e| e.to_string())?;
-    apply(locker, writes).await;
-    Ok(())
+    let keeper = Keypair::new();
+    let liquidator = liquidation
+        .accounts
+        .iter_mut()
+        .find(|meta| meta.is_signer)
+        .expect("a liquidation has a liquidator");
+    liquidator.pubkey = keeper.pubkey();
+    locker.with_svm_writer(|svm| {
+        svm.inner.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                liquidation,
+            ],
+            Some(&keeper.pubkey()),
+            &[&keeper],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(transaction.into(), false, true)
+            .map(|_| ())
+            .map_err(|failed| format!("{:?}, logs: {:?}", failed.err, failed.meta.logs))
+    })
 }
 
 async fn apply(locker: &SurfnetSvmLocker, writes: Vec<(Pubkey, Account)>) {
@@ -1189,136 +1227,6 @@ async fn apply(locker: &SurfnetSvmLocker, writes: Vec<(Pubkey, Account)>) {
             svm.set_account(&pubkey, account).unwrap();
         }
     });
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn collateral_moves_through_real_withdrawals_and_deposits() {
-    let (locker, graph) = phoenix_behavior_locker().await;
-    let remote = Some((client(), CommitmentConfig::confirmed()));
-    let global =
-        GlobalConfig::try_from_account_bytes(&graph.account(&PHOENIX_GLOBAL_CONFIG).data).unwrap();
-    let vault = Pubkey::new_from_array(global.global_vault_key());
-    let mint = Pubkey::new_from_array(global.canonical_token_mint_key());
-    let authority = Pubkey::new_from_array(
-        TraderHeader::try_read_from_account_bytes(&graph.account(&graph.trader).data)
-            .unwrap()
-            .authority,
-    );
-    let before = hawkeye_margin(&locker, &graph);
-    assert!(
-        before.withdrawable_collateral_quote_lots > 0,
-        "no eligible mainnet candidate: the discovered trader has nothing to withdraw"
-    );
-    let amount = before.withdrawable_collateral_quote_lots.min(1_000_000);
-
-    let writes = {
-        let mut svm = locker.0.write().await;
-        withdraw(&mut svm, &remote, graph.trader, amount)
-            .await
-            .unwrap()
-    };
-    let token_program = locker
-        .with_svm_reader(|svm| svm.get_account(&mint))
-        .unwrap()
-        .expect("withdraw put the quote mint in the local VM")
-        .owner;
-    let wallet = get_associated_token_address_with_program_id(&authority, &mint, &token_program);
-    let (vault_before, mint_before) = (token_amount(&locker, &vault), mint_supply(&locker, &mint));
-    let wallet_before = token_amount(&locker, &wallet);
-    apply(&locker, writes).await;
-    let withdrawn = hawkeye_margin(&locker, &graph);
-    // Phoenix settles accrued funding into collateral before it pays a withdrawal out.
-    assert_eq!(
-        withdrawn.collateral_quote_lots,
-        before.collateral_quote_lots + before.unsettled_funding_quote_lots - amount as i64,
-        "the withdrawal took exactly {amount} quote lots"
-    );
-    assert_eq!(
-        token_amount(&locker, &vault),
-        vault_before - amount,
-        "the vault paid it out"
-    );
-    assert_eq!(
-        token_amount(&locker, &wallet),
-        wallet_before + amount,
-        "the wallet {authority} received it"
-    );
-
-    let writes = {
-        let mut svm = locker.0.write().await;
-        deposit(&mut svm, &remote, graph.trader, amount)
-            .await
-            .unwrap()
-    };
-    apply(&locker, writes).await;
-    let deposited = hawkeye_margin(&locker, &graph);
-    assert_eq!(
-        deposited.collateral_quote_lots,
-        withdrawn.collateral_quote_lots + amount as i64,
-        "the deposit added exactly {amount} quote lots"
-    );
-    assert_eq!(
-        token_amount(&locker, &vault),
-        vault_before,
-        "the vault holds the deposit"
-    );
-    assert_eq!(
-        mint_supply(&locker, &mint),
-        mint_before + amount,
-        "the deposited tokens were minted, not conjured into the vault"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_market_order_opens_a_position() {
-    let (locker, graph) = phoenix_behavior_locker().await;
-    let remote = Some((client(), CommitmentConfig::confirmed()));
-    let markets = phoenix_markets(graph.perp_asset_map, graph.account(&graph.perp_asset_map))
-        .expect("mainnet PerpAssetMap decodes");
-    let candidates =
-        indexed_traders(&graph, |view| view.header().trader_subaccount_index == 0).await;
-    let mut chosen = None;
-    for trader in candidates.into_iter().take(12) {
-        let account = fetch(&[trader]).await.remove(0);
-        let max_positions = Trader::try_from_account_bytes(&account.data)
-            .unwrap()
-            .max_positions() as usize;
-        locker.with_svm_writer(|svm| svm.set_account(&trader, account).unwrap());
-        let traded = PhoenixMainnetGraph {
-            trader,
-            ..graph.clone()
-        };
-        if !try_hawkeye_margin(&locker, &traded).is_ok_and(|m| m.free_collateral_quote_lots > 0) {
-            continue;
-        }
-        // A hot trader's account copy lags, so Hawkeye decides what it holds and the room left.
-        let held = held_positions(&locker, &remote, &trader).await;
-        let unheld = markets
-            .iter()
-            .find(|market| held.iter().all(|(symbol, _)| *symbol != market.symbol));
-        if let Some(market) = unheld.filter(|_| held.len() < max_positions) {
-            chosen = Some((traded, market.symbol.clone()));
-            break;
-        }
-    }
-    let (graph, symbol) =
-        chosen.expect("no eligible mainnet candidate: no trader with room and free collateral");
-
-    let before = hawkeye_margin(&locker, &graph);
-    let writes = {
-        let mut svm = locker.0.write().await;
-        place_market_order(&mut svm, &remote, graph.trader, &symbol, Side::Bid, 1)
-            .await
-            .unwrap_or_else(|e| panic!("{symbol}: {e}"))
-    };
-    apply(&locker, writes).await;
-    let after = hawkeye_margin(&locker, &graph);
-    assert_eq!(
-        after.position_count,
-        before.position_count + 1,
-        "buying 1 {symbol} base lot opened a position"
-    );
-    assert!(after.initial_margin_quote_lots > before.initial_margin_quote_lots);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1721,39 +1629,52 @@ async fn a_liquidation_ready_run_refuses_a_market_the_trader_does_not_hold() {
 #[tokio::test(flavor = "multi_thread")]
 async fn trader_configuration_reaches_what_phoenix_reads() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    let remote = Some((client(), CommitmentConfig::confirmed()));
-    let withdraw_one = || async {
+    // A trader's account can be full, so the orders go to a market it already holds.
+    let symbol = {
         let mut svm = locker.0.write().await;
-        withdraw(&mut svm, &remote, graph.trader, 1).await
+        let exchange = Exchange::load(&mut svm, &Some((client(), CommitmentConfig::confirmed())))
+            .await
+            .unwrap();
+        holdings(&svm, &exchange, &graph.trader)
+            .unwrap()
+            .first()
+            .expect("the graph's trader holds a position or orders")
+            .market
+            .symbol
+            .clone()
     };
-    assert!(
-        withdraw_one().await.is_ok(),
-        "the trader may withdraw on mainnet"
-    );
-
-    // A capability, signed by the risk authority: a blocked withdrawal is refused.
-    configure(
-        &locker,
-        "phoenix-trader-capabilities",
-        graph.trader,
-        &[("WithdrawCollateral", "false".to_string())],
-    )
-    .await
-    .unwrap();
-    let refused = withdraw_one()
+    buy_one_lot(&locker, graph.trader, &symbol)
         .await
-        .expect_err("WithdrawCollateral false blocks withdrawals")
-        .to_string();
-    assert!(refused.contains("Trader cannot withdraw"), "{refused}");
+        .unwrap_or_else(|e| panic!("the trader may place market orders on mainnet: {e}"));
+
+    // A capability, signed by the risk authority: a blocked market order is refused.
     configure(
         &locker,
         "phoenix-trader-capabilities",
         graph.trader,
-        &[("WithdrawCollateral", "true".to_string())],
+        &[("PlaceMarketOrder", "false".to_string())],
     )
     .await
     .unwrap();
-    assert!(withdraw_one().await.is_ok(), "true allows them again");
+    let refused = buy_one_lot(&locker, graph.trader, &symbol)
+        .await
+        .expect_err("PlaceMarketOrder false blocks market orders")
+        .to_string();
+    assert!(
+        refused.contains("disallows place market orders"),
+        "{refused}"
+    );
+    configure(
+        &locker,
+        "phoenix-trader-capabilities",
+        graph.trader,
+        &[("PlaceMarketOrder", "true".to_string())],
+    )
+    .await
+    .unwrap();
+    buy_one_lot(&locker, graph.trader, &symbol)
+        .await
+        .unwrap_or_else(|e| panic!("true allows them again: {e}"));
 
     // Fee multipliers, signed by the market authority, land in the record Phoenix reads.
     configure(

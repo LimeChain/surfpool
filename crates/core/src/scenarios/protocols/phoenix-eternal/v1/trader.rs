@@ -6,19 +6,13 @@ use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_instruction::{AccountMeta, Instruction};
-use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
-use spl_associated_token_account_interface::{
-    address::get_associated_token_address_with_program_id,
-    instruction::create_associated_token_account_idempotent,
-};
-use spl_token_interface::state::Mint;
 
 use super::{
     market::{Market, MarketContext, explain_move_failure, phoenix_markets},
     state_builder::{
         Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, keep_markets_usable,
-        local_account, log_authority, phoenix_instruction, run_instructions,
+        local_account, log_authority, phoenix_instruction,
     },
 };
 use crate::{
@@ -28,265 +22,6 @@ use crate::{
         svm::{SurfnetSvm, SurfnetSvmConfig},
     },
 };
-
-/// Which way an order trades: a bid buys, an ask sells.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    Bid,
-    Ask,
-}
-
-impl Side {
-    fn idl_name(self) -> &'static str {
-        match self {
-            Side::Bid => "Bid",
-            Side::Ask => "Ask",
-        }
-    }
-}
-
-/// One trader and the wallet that signs for it.
-pub struct TraderContext {
-    pub exchange: Exchange,
-    pub trader: Pubkey,
-    pub authority: Pubkey,
-}
-
-impl TraderContext {
-    pub async fn load(
-        svm: &mut SurfnetSvm,
-        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-        trader: Pubkey,
-    ) -> SurfpoolResult<Self> {
-        let exchange = Exchange::load(svm, remote_ctx).await?;
-        hydrate(
-            svm,
-            remote_ctx,
-            &[
-                trader,
-                exchange.perp_asset_map,
-                exchange.global_trader_index,
-                exchange.active_trader_buffer,
-            ],
-        )
-        .await?;
-        let account = local_account(svm, &trader)?;
-        let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
-            SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
-        })?;
-        let authority = Pubkey::new_from_array(header.authority);
-        hydrate(svm, remote_ctx, &[authority]).await?;
-        Ok(Self {
-            exchange,
-            trader,
-            authority,
-        })
-    }
-}
-
-/// The writes of a market order the trader sends itself: `base_lots` on `side`, filled against
-/// the book at whatever price it offers.
-pub async fn place_market_order(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    trader: Pubkey,
-    symbol: &str,
-    side: Side,
-    base_lots: u64,
-) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    if base_lots == 0 {
-        return Err(SurfpoolError::internal(
-            "a market order needs at least 1 base lot",
-        ));
-    }
-    let context = TraderContext::load(svm, remote_ctx, trader).await?;
-    let market = MarketContext::load(svm, remote_ctx, symbol).await?;
-    let client_order_id = [0_u8; 16];
-    let order = phoenix_instruction(
-        "PlaceMarketOrder",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("traderWallet", context.authority),
-            ("traderAccount", trader),
-            ("perpAssetMap", context.exchange.perp_asset_map),
-            ("globalTraderIndex", context.exchange.global_trader_index),
-            ("activeTraderBuffer", context.exchange.active_trader_buffer),
-            ("orderbook", market.market.orderbook),
-            ("splines", market.market.splines),
-        ],
-        &serde_json::json!({
-            "orderPacket": {
-                "kind": {
-                    "ImmediateOrCancel": {
-                        "side": { side.idl_name(): null },
-                        "priceInTicks": null,
-                        "numBaseLots": { "inner": base_lots },
-                        "numQuoteLots": null,
-                        "minBaseLotsToFill": { "inner": 0 },
-                        "minQuoteLotsToFill": { "inner": 0 },
-                        "selfTradeBehavior": { "DecrementTake": null },
-                        "matchLimit": null,
-                        "clientOrderId": client_order_id,
-                        "lastValidSlot": null,
-                        "orderFlags": { "flags": 0 },
-                        "cancelExisting": false,
-                    }
-                }
-            }
-        }),
-    )?;
-    run_instructions(svm, &[order])
-}
-
-/// The writes of the trader cancelling all of its resting orders in `symbol`, as Phoenix requires
-/// before it liquidates anyone.
-pub async fn cancel_orders(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    trader: Pubkey,
-    symbol: &str,
-) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    let context = TraderContext::load(svm, remote_ctx, trader).await?;
-    let market = MarketContext::load(svm, remote_ctx, symbol).await?;
-    run_instructions(
-        svm,
-        &[cancel_all(
-            &market.exchange,
-            context.authority,
-            trader,
-            (market.market.orderbook, market.market.splines),
-        )?],
-    )
-}
-
-/// The writes of the trader withdrawing `quote_lots` to its wallet's token account, paid out of
-/// the global vault so what remains stays backed. Phoenix refuses more than the margin leaves.
-pub async fn withdraw(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    trader: Pubkey,
-    quote_lots: u64,
-) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    let context = TraderContext::load(svm, remote_ctx, trader).await?;
-    let tokens = QuoteTokens::load(svm, remote_ctx, &context).await?;
-    let withdrawal = phoenix_instruction(
-        "WithdrawFunds",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("traderWallet", context.authority),
-            ("traderAccount", trader),
-            ("perpAssetMap", context.exchange.perp_asset_map),
-            ("globalVault", tokens.vault),
-            ("destinationTokenAccount", tokens.wallet_account),
-            ("tokenProgram", tokens.program),
-            ("globalTraderIndex", context.exchange.global_trader_index),
-            ("activeTraderBuffer", context.exchange.active_trader_buffer),
-            ("withdrawQueue", tokens.withdraw_queue),
-        ],
-        &serde_json::json!({ "params": { "amount": quote_lots } }),
-    )?;
-    run_instructions(svm, &[tokens.open_wallet_account(&context), withdrawal])
-}
-
-/// The writes of a deposit of `quote_lots`: the quote mint's authority mints them to the trader's
-/// wallet, and the trader deposits them, so the vault holds real tokens for the new collateral.
-pub async fn deposit(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    trader: Pubkey,
-    quote_lots: u64,
-) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    let context = TraderContext::load(svm, remote_ctx, trader).await?;
-    let tokens = QuoteTokens::load(svm, remote_ctx, &context).await?;
-    let mint_authority = tokens.mint_authority.ok_or_else(|| {
-        SurfpoolError::internal(format!("the quote mint {} can no longer mint", tokens.mint))
-    })?;
-    // Token-2022's builder takes either token program and encodes the same instruction.
-    let mint = spl_token_2022_interface::instruction::mint_to(
-        &tokens.program,
-        &tokens.mint,
-        &tokens.wallet_account,
-        &mint_authority,
-        &[],
-        quote_lots,
-    )
-    .map_err(|e| SurfpoolError::internal(format!("minting the quote token: {e}")))?;
-    let deposit = phoenix_instruction(
-        "DepositFunds",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("traderWallet", context.authority),
-            ("traderTokenAccount", tokens.wallet_account),
-            ("traderAccount", trader),
-            ("globalVault", tokens.vault),
-            ("tokenProgram", tokens.program),
-            ("globalTraderIndex", context.exchange.global_trader_index),
-            ("activeTraderBuffer", context.exchange.active_trader_buffer),
-        ],
-        &serde_json::json!({ "params": { "amount": quote_lots } }),
-    )?;
-    run_instructions(svm, &[tokens.open_wallet_account(&context), mint, deposit])
-}
-
-/// The quote token accounts a deposit or withdrawal moves funds between.
-struct QuoteTokens {
-    mint: Pubkey,
-    mint_authority: Option<Pubkey>,
-    program: Pubkey,
-    vault: Pubkey,
-    withdraw_queue: Pubkey,
-    wallet_account: Pubkey,
-}
-
-impl QuoteTokens {
-    async fn load(
-        svm: &mut SurfnetSvm,
-        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-        context: &TraderContext,
-    ) -> SurfpoolResult<Self> {
-        let config = &context.exchange.config;
-        let mint = Pubkey::new_from_array(config.canonical_token_mint_key());
-        let vault = Pubkey::new_from_array(config.global_vault_key());
-        let withdraw_queue = Pubkey::new_from_array(config.withdraw_queue_key());
-        hydrate(svm, remote_ctx, &[mint, vault, withdraw_queue]).await?;
-        let mint_account = local_account(svm, &mint)?;
-        let program = mint_account.owner;
-        // A Token-2022 mint keeps the classic layout ahead of its extensions.
-        let base = mint_account.data.get(..Mint::LEN).ok_or_else(|| {
-            SurfpoolError::invalid_account_data(mint, "Expected the quote mint", None::<String>)
-        })?;
-        let mint_state = Mint::unpack_from_slice(base).map_err(|e| {
-            SurfpoolError::invalid_account_data(mint, "Expected the quote mint", Some(e))
-        })?;
-        let wallet_account =
-            get_associated_token_address_with_program_id(&context.authority, &mint, &program);
-        hydrate(svm, remote_ctx, &[wallet_account]).await?;
-        Ok(Self {
-            mint,
-            mint_authority: mint_state.mint_authority.into(),
-            program,
-            vault,
-            withdraw_queue,
-            wallet_account,
-        })
-    }
-
-    /// Opens the wallet's token account if it has none, paid by the wallet.
-    fn open_wallet_account(&self, context: &TraderContext) -> Instruction {
-        create_associated_token_account_idempotent(
-            &context.authority,
-            &context.authority,
-            &self.mint,
-            &self.program,
-        )
-    }
-}
 
 pub const HAWKEYE_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("RiSeVw3ZjNfsaXPRb4mgaqYaEEt41pNNJoDvVh7pgQj");
@@ -474,8 +209,9 @@ pub struct CascadeReady {
     pub liquidations: Vec<(Pubkey, Instruction)>,
 }
 
-/// The writes that move `symbol` inside the most liquidation bands of holders in Phoenix's active
-/// trader index, so a keeper can liquidate them in turn; one failing on a copy is left out.
+/// The writes that move `symbol` by the smallest step that leaves at least two of the holders
+/// closest to liquidation in Phoenix's active trader index liquidatable, so a keeper can liquidate
+/// them in turn; one failing on a copy is left out.
 pub async fn prepare_cascade(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -494,7 +230,7 @@ pub async fn prepare_cascade(
     hydrate(svm, remote_ctx, &listed).await?;
     let map = local_account(svm, &context.exchange.perp_asset_map)?;
     let markets = phoenix_markets(context.exchange.perp_asset_map, &map)?;
-    let mut candidates = Vec::new();
+    let mut ranked = Vec::new();
     let mut views = Sandbox::new(svm);
     for trader in listed {
         // Hawkeye, not the Trader account's copy, which can miss a hot trader's positions.
@@ -514,15 +250,24 @@ pub async fn prepare_cascade(
             let Ok(header) = TraderHeader::try_read_from_account_bytes(&account.data) else {
                 continue;
             };
-            let authority = Pubkey::new_from_array(header.authority);
-            let Ok(held) = holdings_in(&mut views, &context.exchange, &trader, &markets) else {
+            let Ok(now) = margin(&mut views, &context.exchange, &trader) else {
                 continue;
             };
-            candidates.push((trader, authority, held));
+            // The share of the position's value the mark can move against it before the account
+            // reaches its maintenance margin.
+            let buffer = now.effective_collateral_quote_lots as f64
+                - now.maintenance_margin_quote_lots as f64;
+            let distance = buffer / position.position_value_quote_lots.unsigned_abs().max(1) as f64;
+            ranked.push((distance, trader, Pubkey::new_from_array(header.authority)));
         }
-        if candidates.len() == MAX_CASCADE_CANDIDATES {
-            break;
-        }
+    }
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut candidates = Vec::new();
+    for (_, trader, authority) in ranked.into_iter().take(MAX_CASCADE_CANDIDATES) {
+        let Ok(held) = holdings_in(&mut views, &context.exchange, &trader, &markets) else {
+            continue;
+        };
+        candidates.push((trader, authority, held));
     }
     drop(views);
     let books: Vec<Pubkey> = candidates
@@ -596,23 +341,12 @@ pub async fn prepare_cascade(
         }
     }
 
-    // The price inside the most bands, the smallest move among equals.
-    let target = bands
-        .iter()
-        .flat_map(|(_, low, high)| [*low, *high])
-        .max_by_key(|price| {
-            let inside = bands
-                .iter()
-                .filter(|(_, low, high)| (low..=high).contains(&price))
-                .count();
-            (inside, std::cmp::Reverse(price.abs_diff(mark)))
-        })
-        .ok_or_else(|| {
-            SurfpoolError::internal(format!(
-                "no {} {symbol} holder becomes liquidatable before it goes underwater",
-                if long { "long" } else { "short" }
-            ))
-        })?;
+    let target = cascade_price(&bands, mark).ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "no {} {symbol} holder becomes liquidatable before it goes underwater",
+            if long { "long" } else { "short" }
+        ))
+    })?;
     let mut chosen: Vec<Pubkey> = bands
         .iter()
         .filter(|(_, low, high)| (low..=high).contains(&&target))
@@ -651,6 +385,21 @@ pub async fn prepare_cascade(
     Err(SurfpoolError::internal(format!(
         "no liquidation of a {symbol} holder goes through at {target} ticks"
     )))
+}
+
+/// The smallest move from `mark` that lands inside at least two of the `bands`, or inside the
+/// nearest one when no two meet.
+fn cascade_price(bands: &[(Pubkey, u64, u64)], mark: u64) -> Option<u64> {
+    bands
+        .iter()
+        .flat_map(|(_, low, high)| [*low, *high])
+        .max_by_key(|price| {
+            let inside = bands
+                .iter()
+                .filter(|(_, low, high)| (low..=high).contains(&price))
+                .count();
+            (inside.min(2), std::cmp::Reverse(price.abs_diff(mark)))
+        })
 }
 
 /// A cross-margin move is in millionths of each market's mark.
@@ -1302,6 +1051,29 @@ pub(crate) mod tests {
     use phoenix_rise_accounts::trader::TRADER_CAPABILITY_HOT;
 
     use super::*;
+
+    #[test]
+    fn a_cascade_takes_the_smallest_move_that_leaves_two_liquidatable() {
+        let band = |low, high| (Pubkey::new_unique(), low, high);
+        let near_pair_and_deep_three = [
+            band(95, 98),
+            band(96, 99),
+            band(50, 60),
+            band(52, 58),
+            band(51, 59),
+        ];
+        assert_eq!(cascade_price(&near_pair_and_deep_three, 100), Some(98));
+        assert_eq!(
+            cascade_price(&[band(102, 105), band(104, 108)], 100),
+            Some(104)
+        );
+        assert_eq!(
+            cascade_price(&[band(90, 92), band(80, 85)], 100),
+            Some(92),
+            "no two meet"
+        );
+        assert_eq!(cascade_price(&[], 100), None);
+    }
 
     pub(crate) fn index_trader_state_range(
         index: &Account,
