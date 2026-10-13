@@ -47,10 +47,14 @@ tick_current_index: <floor(2 x log(new_sqrt_price / 2^64) / log(1.0001))>
 liquidity:          "<live liquidity +/- liquidity_net of every initialized tick crossed>"
 ```
 
+The shock reads the pool when the scenario is created and stores these as absolute values, so if the
+pool's liquidity changes before Play, create the scenario again.
+
 **Never move the price without `liquidity`.** The pool keeps the old range's depth at the new
-price, and swaps succeed with wrong amounts: a +10% move on the SOL/USDC 64 pool left it about 4.4x
-too deep. Going up, a tick `t` is crossed when `old < t <= new` and its `liquidity_net` is added;
-going down, when `new < t <= old` and it is subtracted.
+price, and swaps succeed with wrong amounts: a +10% move on the SOL/USDC pool with tick spacing 64
+(`HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ`) left it about 4.4x too deep. Going up, a tick `t`
+is crossed when `old < t <= new` and its `liquidity_net` is added; going down, when
+`new < t <= old` and it is subtracted.
 
 **The destination tick array must exist.** A swap resumes from the array covering the new tick,
 PDA `["tick_array", pool, start_index.to_string()]` with 88 ticks of `tick_spacing` each. Studio
@@ -82,4 +86,3 @@ Only pools created after the override copy it. For an existing pool set `protoco
 | The swap succeeds but the amounts look wrong after a price change | `liquidity` was not moved with the price. Use the Studio price shock |
 | The swap fails right after a price change | The new tick has no tick array, or `sqrt_price` and `tick_current_index` disagree |
 | The swap fails on the token transfer | The paying vault (`token_vault_a` / `token_vault_b`) holds less than the output. Fund it with `spl-token-account-balance` |
-| Studio refuses a pool's tick arrays | The pool uses variable-length `DynamicTickArray` accounts, which the price shock does not read yet |

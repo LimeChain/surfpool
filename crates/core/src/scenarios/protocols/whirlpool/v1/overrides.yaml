@@ -11,13 +11,6 @@ tags:
 llm_context: |
   Orca Whirlpools, program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc.
 
-  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
-  program with filters dataSize 653 and memcmp of the two mints at offsets 101 and 181, once in each
-  order (only one returns pools). Read each pool's token_vault_a with dataSlice {offset 133, length
-  32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
-  whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
-  ask for the pool address. A pool address the user gives is used as is.
-
   Set fetchBeforeUse: true.
 
 templates:
@@ -44,12 +37,18 @@ templates:
     address:
       type: pubkey
     llm_context: |
+      FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+      program with filters dataSize 653 and memcmp of the two mints at offsets 101 and 181, once in each
+      order (only one returns pools). Read each pool's token_vault_a with dataSlice {offset 133, length
+      32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
+      whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
+      ask for the pool address. A pool address the user gives is used as is.
+
       Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
 
-      PRICE: sqrt_price = sqrt(price_raw) x 2^64, where price_raw is token B per token A in raw units,
-      and tick_current_index = floor(log(price_raw) / log(1.0001)); set both together. A price move
-      must also set liquidity to the active liquidity at the new tick, and the tick array covering the
-      new tick must exist. The Studio price shock computes all three; prefer it to hand-computed values.
+      PRICE: do not move a pool's price by hand. sqrt_price, tick_current_index and liquidity must change
+      together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
+      price shock instead.
 
   - id: whirlpools-config
     name: Override Whirlpools Config

@@ -80,10 +80,10 @@ Crash the price in Scope but leave the DEX pools at their real price - the gap b
 profit. Add depth so the exit does not slip:
 
 ```
-whirlpool-pool-state   on Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE (SOL/USDC, tick spacing 4)
+whirlpool-pool-state   on AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj (POPCAT/SOL)
   liquidity: 5000000000000000     # sell the seized collateral
-whirlpool-pool-state   on HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ (SOL/USDC)
-  liquidity: 50000000000000000    # route back to the debt token
+whirlpool-pool-state   on Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE (SOL/USDC, tick spacing 4)
+  liquidity: 5000000000000000     # route back to the debt token
 ```
 
 ## Age a loan instantly
