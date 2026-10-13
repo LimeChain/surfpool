@@ -1,8 +1,8 @@
-# Meteora DLMM
+# Meteora
 
-Meteora's bin-based AMM. Liquidity sits in discrete price bins, 70 to a `BinArray`, and the pair
-account records which bin is active. One template sets that active bin, the pair's status and its
-fees.
+Meteora DLMM is a bin-based AMM. Liquidity sits in discrete price bins, 70 to a `BinArray`, and
+the pair account records which bin is active. One template sets that active bin, the pair's status
+and its fees.
 
 # Template index
 
@@ -11,6 +11,13 @@ fees.
 | Template | Overrides |
 |---|---|
 | `meteora-dlmm-pool-state` | a pair's active bin, status and fees |
+
+**Meteora DAMM v2** &middot; `cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG`
+
+| Template | Overrides |
+|---|---|
+| `meteora-damm-v2-pool-state` | a pool's price, reserves, liquidity and status; see [DAMM v2](damm-v2/v1/README.md) |
+| `meteora-damm-v2-pool-fees` | a pool's base fee, held flat; see [DAMM v2](damm-v2/v1/README.md) |
 
 ## Number formats
 

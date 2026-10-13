@@ -58,3 +58,28 @@ templates:
       token_a_amount and sqrt_price follows from them. A swap that pays out more than a stale tracked
       reserve fails with MathOverflow, so never move sqrt_price alone. The Studio price shock writes
       all of it; prefer it to hand-computed values.
+
+  - id: meteora-damm-v2-pool-fees
+    name: Override DAMM v2 Pool Fees
+    description: Set a flat base fee on a Meteora DAMM v2 pool found by pair or by address
+    idl_account_name: Pool
+    properties:
+      - path: pool_fees.base_fee.base_fee_info.cliff_fee_numerator
+        label: Base Fee Numerator
+        description: Base fee out of 1,000,000,000 (10000000 = 1%); flat when the reduction is 0
+      - path: pool_fees.base_fee.base_fee_info.reduction_factor
+        label: Fee Reduction Factor
+        description: How fast the scheduled fee falls from the base fee; 0 keeps it flat
+    address:
+      type: pubkey
+    llm_context: |
+      FEE SPIKE: set cliff_fee_numerator to the fee out of 1,000,000,000 (2% is 20000000) and
+      reduction_factor to 0, so the pool's time or market-cap fee schedule stays at that fee. Read
+      the pool first with getAccountInfo, encoding jsonParsed, and refuse a pool whose
+      pool_fees.base_fee.base_fee_info.base_fee_mode is 2: that deprecated rate limiter uses these
+      bytes for other fields. The variable fee still adds on top, and the program caps the total at
+      50% (fee_version 0) or 99% (fee_version 1).
+
+      EXAMPLE - "trading on this pool costs 5%":
+      pool_fees.base_fee.base_fee_info.cliff_fee_numerator: 50000000
+      pool_fees.base_fee.base_fee_info.reduction_factor: 0

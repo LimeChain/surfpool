@@ -20,6 +20,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const POOL_STATE_TEMPLATE: &str = "meteora-damm-v2-pool-state";
+const POOL_FEES_TEMPLATE: &str = "meteora-damm-v2-pool-fees";
 
 const PROGRAM_ID: Pubkey = Pubkey::from_str_const("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
 /// SOL/USDC, one concentrated range.
@@ -30,6 +31,8 @@ const COMPOUNDING_POOL: Pubkey =
     Pubkey::from_str_const("7g1ecbk6gtFdpJbq5vRA2Fu2JmNxPLB6Mbzv7PhK5WEp");
 
 const POOL_LEN: usize = 1112;
+const CLIFF_FEE_NUMERATOR_RANGE: std::ops::Range<usize> = 8..16;
+const REDUCTION_FACTOR_RANGE: std::ops::Range<usize> = 32..40;
 const MINT_A_RANGE: std::ops::Range<usize> = 168..200;
 const MINT_B_RANGE: std::ops::Range<usize> = 200..232;
 const VAULT_A_RANGE: std::ops::Range<usize> = 232..264;
@@ -142,6 +145,8 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     let new_liquidity = u128_at(&before.data, LIQUIDITY_RANGE) ^ 1;
     let new_token_a = u64_at(&before.data, TOKEN_A_AMOUNT_RANGE) + 1;
     let new_token_b = u64_at(&before.data, TOKEN_B_AMOUNT_RANGE) + 1;
+    let new_cliff_fee_numerator = u64_at(&before.data, CLIFF_FEE_NUMERATOR_RANGE) + 1;
+    let new_reduction_factor = u64_at(&before.data, REDUCTION_FACTOR_RANGE) ^ 1;
 
     let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     surfnet_svm
@@ -151,7 +156,7 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
 
     let mut scenario = Scenario::new(
         "Meteora DAMM v2 Pool Override".to_string(),
-        "Change a live Pool's status, price, liquidity and tracked reserves through the materializer."
+        "Change a live Pool's status, price, liquidity, tracked reserves and base fee through the materializer."
             .to_string(),
     );
     scenario.add_override(
@@ -179,6 +184,24 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         ]))
         .with_label("Meteora DAMM v2 pool override".to_string()),
     );
+    scenario.add_override(
+        OverrideInstance::new(
+            POOL_FEES_TEMPLATE.to_string(),
+            1,
+            AccountAddress::Pubkey(CONCENTRATED_POOL.to_string()),
+        )
+        .with_values(HashMap::from([
+            (
+                "pool_fees.base_fee.base_fee_info.cliff_fee_numerator".to_string(),
+                serde_json::json!(new_cliff_fee_numerator),
+            ),
+            (
+                "pool_fees.base_fee.base_fee_info.reduction_factor".to_string(),
+                serde_json::json!(new_reduction_factor),
+            ),
+        ]))
+        .with_label("Meteora DAMM v2 fee override".to_string()),
+    );
     locker.register_scenario(scenario, Some(0)).unwrap();
     locker
         .materialize_overrides_for_slot(&None, 1)
@@ -200,6 +223,8 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
                 && !TOKEN_A_AMOUNT_RANGE.contains(i)
                 && !TOKEN_B_AMOUNT_RANGE.contains(i)
                 && !SQRT_PRICE_REFERENCE_RANGE.contains(i)
+                && !CLIFF_FEE_NUMERATOR_RANGE.contains(i)
+                && !REDUCTION_FACTOR_RANGE.contains(i)
         })
         .collect();
     assert!(
@@ -214,5 +239,13 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     assert_eq!(
         u128_at(&after.data, SQRT_PRICE_REFERENCE_RANGE),
         new_sqrt_price
+    );
+    assert_eq!(
+        u64_at(&after.data, CLIFF_FEE_NUMERATOR_RANGE),
+        new_cliff_fee_numerator
+    );
+    assert_eq!(
+        u64_at(&after.data, REDUCTION_FACTOR_RANGE),
+        new_reduction_factor
     );
 }

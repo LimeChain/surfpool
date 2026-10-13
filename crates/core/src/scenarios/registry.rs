@@ -651,13 +651,13 @@ templates:
         let registry = TemplateRegistry::new();
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4)
-        // + Meteora (DLMM 1, DAMM v2 1)
+        // + Meteora (DLMM 1, DAMM v2 2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 71
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            71,
+            "Registry should load 71 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -673,6 +673,7 @@ templates:
 
         assert!(registry.contains("meteora-dlmm-pool-state"));
         assert!(registry.contains("meteora-damm-v2-pool-state"));
+        assert!(registry.contains("meteora-damm-v2-pool-fees"));
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
@@ -978,8 +979,8 @@ templates: []
         let meteora_templates = registry.by_protocol("Meteora");
         assert_eq!(
             meteora_templates.len(),
-            2,
-            "Should have 2 Meteora templates (DLMM + DAMM v2)"
+            3,
+            "Should have 3 Meteora templates (1 DLMM + 2 DAMM v2)"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
@@ -1827,7 +1828,27 @@ templates: []
             .expect("meteora-damm-v2-pool-state should exist");
         assert_eq!(damm.account_type, "Pool");
 
-        for property in template.properties.iter().chain(&damm.properties) {
+        let damm_fees = registry
+            .get("meteora-damm-v2-pool-fees")
+            .expect("meteora-damm-v2-pool-fees should exist");
+        assert_eq!(damm_fees.account_type, "Pool");
+        // Both fields sit inside the base-fee blob, which the bundled IDL types.
+        for path in [
+            "pool_fees.base_fee.base_fee_info.cliff_fee_numerator",
+            "pool_fees.base_fee.base_fee_info.reduction_factor",
+        ] {
+            let resolved =
+                surfpool_types::resolve_idl_type(damm_fees.idl(), &damm_fees.account_type, path)
+                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+            assert_eq!(*resolved, anchor_lang_idl::types::IdlType::U64);
+        }
+
+        for property in template
+            .properties
+            .iter()
+            .chain(&damm.properties)
+            .chain(&damm_fees.properties)
+        {
             assert!(
                 property
                     .label
