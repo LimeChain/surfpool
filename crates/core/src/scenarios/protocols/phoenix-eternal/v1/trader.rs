@@ -246,7 +246,9 @@ pub async fn prepare_cascade(
         };
         let lots = position.base_lots;
         if (long && lots > 0) || (!long && lots < 0) {
-            let account = local_account(svm, &trader)?;
+            let Ok(account) = local_account(svm, &trader) else {
+                continue;
+            };
             let Ok(header) = TraderHeader::try_read_from_account_bytes(&account.data) else {
                 continue;
             };

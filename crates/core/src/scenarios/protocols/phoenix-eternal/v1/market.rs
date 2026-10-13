@@ -5,7 +5,7 @@ use phoenix_rise_accounts::{
     orderbook::{ORDERBOOK_CAPACITY, Orderbook},
     pda::{derive_permission_address, derive_spline_collection_address},
     perp_asset_map::{PerpAssetMap, PerpAssetMetadataEntry},
-    spline_collection::{SplineCollection, TickRegion},
+    spline_collection::{Spline, SplineCollection, TickRegion},
     trader::TraderHeader,
 };
 use solana_account::Account;
@@ -420,26 +420,15 @@ impl MarketContext {
                 Some(e),
             )
         })?;
-        let regions = |regions: &[TickRegion]| -> Vec<serde_json::Value> {
-            regions
-                .iter()
-                .map(|region| {
-                    serde_json::json!({
-                        "startOffset": { "inner": region.start_offset().as_inner() },
-                        "endOffset": { "inner": region.end_offset().as_inner() },
-                        "density": { "inner": region.density().as_inner() },
-                        "lifespan": QUOTE_LIFESPAN_SLOTS,
-                    })
-                })
-                .collect()
-        };
         let mut requotes = Vec::with_capacity(self.makers.len());
         for spline in collection.splines().flatten() {
             let trader = Pubkey::new_from_array(spline.trader());
             let Some(maker) = self.makers.iter().find(|maker| maker.trader == trader) else {
                 continue;
             };
-            let client_order_id = [0_u8; 16];
+            let Some(params) = requote_params(&spline) else {
+                continue;
+            };
             requotes.push(phoenix_instruction(
                 "UpdateSplineParameters",
                 &[
@@ -450,16 +439,7 @@ impl MarketContext {
                     ("splineAccount", self.market.splines),
                     ("orderbook", self.market.orderbook),
                 ],
-                &serde_json::json!({
-                    "params": {
-                        "bidRegions": regions(spline.active_bid_regions()),
-                        "askRegions": regions(spline.active_ask_regions()),
-                        "refreshRegions": true,
-                        "userSequenceNumber": spline.user_parameter_sequence_number() + 1,
-                        "clientOrderId": client_order_id,
-                        "overrideSequenceNumber": false,
-                    }
-                }),
+                &params,
             )?);
         }
         Ok(requotes)
@@ -478,6 +458,39 @@ impl MarketContext {
         let resting = book.num_bids() + book.num_asks();
         Ok((bbo(sandbox, &self.exchange, &self.market)?, resting))
     }
+}
+
+/// A maker's active regions re-sent with [`QUOTE_LIFESPAN_SLOTS`], or `None` for an enabled maker
+/// that quotes nothing: Phoenix refuses an update without regions.
+fn requote_params(spline: &Spline) -> Option<serde_json::Value> {
+    let (bids, asks) = (spline.active_bid_regions(), spline.active_ask_regions());
+    if bids.is_empty() && asks.is_empty() {
+        return None;
+    }
+    let regions = |regions: &[TickRegion]| -> Vec<serde_json::Value> {
+        regions
+            .iter()
+            .map(|region| {
+                serde_json::json!({
+                    "startOffset": { "inner": region.start_offset().as_inner() },
+                    "endOffset": { "inner": region.end_offset().as_inner() },
+                    "density": { "inner": region.density().as_inner() },
+                    "lifespan": QUOTE_LIFESPAN_SLOTS,
+                })
+            })
+            .collect()
+    };
+    let client_order_id = [0_u8; 16];
+    Some(serde_json::json!({
+        "params": {
+            "bidRegions": regions(bids),
+            "askRegions": regions(asks),
+            "refreshRegions": true,
+            "userSequenceNumber": spline.user_parameter_sequence_number() + 1,
+            "clientOrderId": client_order_id,
+            "overrideSequenceNumber": false,
+        }
+    }))
 }
 
 /// Whether a crank that took the book from `before` to `after` was the last: the book is uncrossed,
@@ -658,5 +671,10 @@ pub(crate) mod tests {
         assert!(uncross_done(&crossed, &book_at(0, 100, 200)), "no bids");
         assert!(uncross_done(&crossed, &book_at(120, 0, 200)), "no asks");
         assert!(uncross_done(&crossed, &crossed), "no progress");
+    }
+
+    #[test]
+    fn a_maker_quoting_nothing_is_not_requoted() {
+        assert!(requote_params(&bytemuck::Zeroable::zeroed()).is_none());
     }
 }

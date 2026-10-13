@@ -462,9 +462,17 @@ pub(crate) fn write_all_or_none(
         let before = svm.inner.get_account(&pubkey)?;
         if let Err(error) = svm.set_scenario_override_account(&pubkey, account, slot) {
             for (pubkey, before) in written.into_iter().rev() {
-                let Some(before) = before else { continue };
-                if let Err(e) = svm.set_scenario_override_account(&pubkey, before, slot) {
+                let created = before.is_none();
+                // An empty account deletes one the write created.
+                if let Err(e) =
+                    svm.set_scenario_override_account(&pubkey, before.unwrap_or_default(), slot)
+                {
                     warn!("Could not put back {pubkey} after a failed Phoenix write: {e}");
+                }
+                // A delete also marks the account offline, but before the write it could still be
+                // fetched upstream.
+                if created && let Err(e) = svm.offline_accounts.take(&pubkey.to_string()) {
+                    warn!("Could not put {pubkey} back online after a failed Phoenix write: {e}");
                 }
             }
             return Err(error);
@@ -1019,6 +1027,39 @@ pub(crate) mod tests {
 
         assert!(write_all_or_none(&mut svm, writes, 1).is_err());
         assert_eq!(svm.inner.get_account(&first).unwrap(), Some(before));
+    }
+
+    #[test]
+    fn a_failed_write_deletes_the_accounts_written_before_it_created() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (created, unloadable) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let broken_program = Account {
+            lamports: 1_000_000,
+            data: vec![0xff; 64],
+            owner: Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
+            executable: true,
+            rent_epoch: 0,
+        };
+        let writes = vec![
+            (
+                created,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![2; 8],
+                    owner: PHOENIX_PROGRAM_ID,
+                    ..Account::default()
+                },
+            ),
+            (unloadable, broken_program),
+        ];
+
+        assert!(write_all_or_none(&mut svm, writes, 1).is_err());
+        assert!(svm.get_account(&created).unwrap().is_none());
+        assert!(
+            !svm.offline_accounts
+                .contains_key(&created.to_string())
+                .unwrap()
+        );
     }
 
     /// Every Phoenix template that carries a fixed address: its id, account type and address.
