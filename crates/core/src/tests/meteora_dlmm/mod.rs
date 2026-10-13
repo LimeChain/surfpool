@@ -14,6 +14,7 @@ use crate::{
     surfnet::{
         GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
     },
+    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -48,15 +49,6 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
                 panic!("{address} does not exist on mainnet; the test needs a new address")
             }
         })
-        .collect()
-}
-
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b.iter())
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
         .collect()
 }
 
