@@ -1,8 +1,8 @@
 # PancakeSwap CLMM
 
 PancakeSwap's concentrated-liquidity AMM on Solana, a fork of Raydium CLMM with the same account
-layouts. Two templates: a pool, and the fee tier a pool points to. Units and rules match
-[Raydium CLMM](../raydium/v3/README.md); only the program, pools and fee tiers differ.
+layouts. Two templates: a pool, and the fee tier a pool points to. Units and rules match Raydium
+CLMM; only the program, pools and fee tiers differ.
 
 # Template index
 
