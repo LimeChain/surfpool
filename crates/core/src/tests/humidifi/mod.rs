@@ -31,7 +31,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: Pubkey = Pubkey::from_str_const("9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp");
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("G9S64i58RRWJA28vZiNhnP56Ux4Ef7hfMgHNREnZZSom");
-const DEPLOYED_SLOT: u64 = 449592669;
+const DEPLOYED_SLOT: u64 = 454767105;
 
 const MARKET_SIZE: usize = 1728;
 const LAYOUT_TAG: [u8; 8] = [44, 90, 19, 124, 56, 111, 47, 150];
