@@ -25,6 +25,8 @@ const USDT_SOL: Pubkey = Pubkey::from_str_const("HToiT8XK8GHgAT4N3oGXadc7opdApPw
 
 const LB_PAIR_SIZE: usize = 904;
 const BASE_FACTOR_OFFSET: usize = 8;
+const VOLATILITY_ACCUMULATOR_OFFSET: usize = 40;
+const INDEX_REFERENCE_OFFSET: usize = 48;
 const ACTIVE_ID_OFFSET: usize = 76;
 const STATUS_OFFSET: usize = 82;
 
@@ -98,6 +100,10 @@ fn read_u16(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(data[offset..offset + 2].try_into().expect("2 bytes"))
 }
 
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().expect("4 bytes"))
+}
+
 #[tokio::test]
 async fn live_lb_pair_matches_the_bundled_layout() {
     let accounts = fetch(&[SOL_USDC, USDT_SOL]).await;
@@ -163,6 +169,8 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     let data = &before.data;
 
     let new_active_id = read_i32(data, ACTIVE_ID_OFFSET) + 1;
+    let new_index_reference = read_i32(data, INDEX_REFERENCE_OFFSET) + 1;
+    let new_volatility_accumulator = read_u32(data, VOLATILITY_ACCUMULATOR_OFFSET).wrapping_add(1);
     let new_base_factor = read_u16(data, BASE_FACTOR_OFFSET).wrapping_add(1);
     let new_status: u8 = if data[STATUS_OFFSET] == 0 { 1 } else { 0 };
 
@@ -177,6 +185,14 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     )
     .with_values(HashMap::from([
         ("active_id".to_string(), serde_json::json!(new_active_id)),
+        (
+            "v_parameters.index_reference".to_string(),
+            serde_json::json!(new_index_reference),
+        ),
+        (
+            "v_parameters.volatility_accumulator".to_string(),
+            serde_json::json!(new_volatility_accumulator),
+        ),
         (
             "parameters.base_factor".to_string(),
             serde_json::json!(new_base_factor),
@@ -206,6 +222,8 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
 
     let allowed = [
         BASE_FACTOR_OFFSET..BASE_FACTOR_OFFSET + 2,
+        VOLATILITY_ACCUMULATOR_OFFSET..VOLATILITY_ACCUMULATOR_OFFSET + 4,
+        INDEX_REFERENCE_OFFSET..INDEX_REFERENCE_OFFSET + 4,
         ACTIVE_ID_OFFSET..ACTIVE_ID_OFFSET + 4,
         STATUS_OFFSET..STATUS_OFFSET + 1,
     ];
@@ -214,9 +232,17 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         diffs
             .iter()
             .all(|i| allowed.iter().any(|range| range.contains(i))),
-        "bytes outside active_id, base_factor and status changed: {diffs:?}"
+        "bytes outside the overridden fields changed: {diffs:?}"
     );
     assert_eq!(read_i32(&after.data, ACTIVE_ID_OFFSET), new_active_id);
+    assert_eq!(
+        read_i32(&after.data, INDEX_REFERENCE_OFFSET),
+        new_index_reference
+    );
+    assert_eq!(
+        read_u32(&after.data, VOLATILITY_ACCUMULATOR_OFFSET),
+        new_volatility_accumulator
+    );
     assert_eq!(read_u16(&after.data, BASE_FACTOR_OFFSET), new_base_factor);
     assert_eq!(after.data[STATUS_OFFSET], new_status);
 }

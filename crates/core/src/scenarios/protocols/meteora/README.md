@@ -43,7 +43,12 @@ array it lands on:
 ```
 template: meteora-dlmm-pool-state
 active_id: <live active_id + round(ln(factor) / ln(1 + bin_step / 10000))>
+v_parameters.index_reference: <the same new active_id>
 ```
+
+`v_parameters.index_reference` follows the new `active_id`, so the shock itself does not count as
+volatility for the next swap. Studio reads the pair when the scenario is created and stores
+absolute values, so if the pair's price or liquidity changes before Play, create the scenario again.
 
 **Only one side sees the shock.** Bins above the active bin hold token X and bins below hold token
 Y, and the override does not move them. After a rise, buys of X fill at the new price while sells

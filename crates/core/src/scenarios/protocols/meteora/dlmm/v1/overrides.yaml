@@ -32,6 +32,9 @@ templates:
       - path: active_id
         label: Active Bin ID
         description: Bin the pool trades in, a raw signed i32 bin index (often negative).
+      - path: v_parameters.index_reference
+        label: Variable Fee Bin Reference
+        description: Bin the variable fee measures moves from, a raw signed i32 bin index; follows active_id after a price move.
       - path: status
         label: Pool Status
         description: PairStatus, raw u8 - 0 enabled, 1 disabled (swaps rejected).
@@ -47,8 +50,10 @@ templates:
       PRICE: price = (1 + bin_step / 10000) ^ active_id x 10 ^ (decimals_x - decimals_y), token Y per
       token X; active_id is signed. Moving it moves one side only: bins above the active bin hold X
       and bins below hold Y, so after a rise buys fill at the new price and sells at the old one, and
-      the reverse after a drop. The bin array covering the new active bin must exist. The Studio
-      price shock picks a valid bin; prefer it to hand-computed values.
+      the reverse after a drop. The bin array covering the new active bin must exist. A price move
+      also sets v_parameters.index_reference to the new active_id; left on the old bin, the next
+      swaps count the whole move as volatility and pay up to the maximum variable fee. The Studio
+      price shock picks a valid bin and sets both; prefer it to hand-computed values.
 
       FEES: the base fee is base_factor x bin_step x 1e-8 while parameters.base_fee_power_factor is 0.
       The program recomputes v_parameters.volatility_accumulator on every swap, so base_factor is the

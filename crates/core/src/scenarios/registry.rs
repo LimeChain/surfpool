@@ -1810,6 +1810,17 @@ templates: []
             !template.properties.iter().any(|p| p.path == "bin_step"),
             "bin_step must not be exposed as a property"
         );
+        // A price shock writes the same bin id into both, so they must share a type.
+        for path in ["active_id", "v_parameters.index_reference"] {
+            assert!(
+                template.properties.iter().any(|p| p.path == path),
+                "{path} must be exposed as a property"
+            );
+            let resolved =
+                surfpool_types::resolve_idl_type(template.idl(), &template.account_type, path)
+                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+            assert_eq!(*resolved, anchor_lang_idl::types::IdlType::I32);
+        }
 
         let damm = registry
             .get("meteora-damm-v2-pool-state")

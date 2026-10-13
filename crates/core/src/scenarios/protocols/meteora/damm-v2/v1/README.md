@@ -51,7 +51,9 @@ Use **Scenario presets → Meteora state → DAMM v2 price shock** in Studio. Th
   their product, and `sqrt_price = isqrt((token_b_amount << 128) / token_a_amount)`.
 
 `pool_fees.dynamic_fee.sqrt_price_reference` follows the new `sqrt_price`, so the shock itself does
-not count as volatility for the next swap.
+not count as volatility for the next swap. Studio reads the pool when the scenario is created and
+stores absolute values, so if the pool's price or liquidity changes before Play, create the
+scenario again.
 
 **Never move `sqrt_price` alone.** A swap pays out of the tracked reserves, and one that takes more
 than a stale reserve holds fails with `MathOverflow`.
