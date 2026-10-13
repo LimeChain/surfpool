@@ -532,9 +532,11 @@ const FEATURED_MARKETS: [(&str, Pubkey, Pubkey, Pubkey); 4] = [
 ];
 
 /// Every market account the program owns, priced or not.
-const ALL_MARKETS: [&str; 27] = [
+const ALL_MARKETS: [&str; 30] = [
     "2qHQyHwugThrRBYAFxV3ANuRWEWHskSjGhwr73Ua6heb",
+    "3GZwrHYdQBuRVNBtXpM6EkbkQwQzp3WZPdEEfo8LHX2C",
     "5X9A6PpFQEsc9D5VdTGfgVyfVn8HnsArQpMMUZZfFg1a",
+    "6MB55x2nYPimx7ReTUhwHxeqntLFxdJVxtpjUw9ZQYZV",
     "7sJf1SmKDDAFtBmMtg253rTbjG7zVFm3zTNounSgSNc9",
     "8B8KYcFPMjZyDtJ1BENsqhW3fEmMrB4ekoEQJiM6z3SC",
     "8G6QssZGNGpc54bH59pWn621xgCP1GzWmWV39NpvrhAH",
@@ -549,6 +551,7 @@ const ALL_MARKETS: [&str; 27] = [
     "DNhfyh75AApg1L1Yig3fErvERKutYRqfWLGb496iViSZ",
     "DoKKUBzWcv6TYg3vr6kvVzvadnibieYctse6oD6d7Hxs",
     "Drx7X5bUajSPY6m5f2QhD2CK8c3RBMKgueSpZgCgUzkP",
+    "Dv66A7xGyN6Q4mk9ougsaDeSrKtUKUteLfGmtUgxcXUu",
     "E5Zmb4JQbHd4ThBXj1Fix9dMGsdszEGQ17txAHLWPwvS",
     "ESaTtQcbtqk3eLNUQvND9uuMKjqfEtgmzwCspr5EbALo",
     "ETZYG4pXscxNchSobJHnN4aDrVNL45gscnzcxM7sEDKe",
