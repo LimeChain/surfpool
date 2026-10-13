@@ -57,7 +57,7 @@ templates:
     properties:
       - path: default_protocol_fee_rate
         label: Default protocol fee rate for new pools
-        description: Basis points of the swap fee a newly created pool copies into its protocol_fee_rate (1300 = 13%, max 2500).
+        description: Basis points of the collected fee, not of the swap, that a newly created pool copies into its protocol_fee_rate (1300 = 13%, max 2500).
     address:
       type: pubkey
       value: 2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ
