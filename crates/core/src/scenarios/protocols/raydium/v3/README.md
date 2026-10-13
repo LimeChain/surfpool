@@ -12,7 +12,7 @@ found by its address, and a fee tier. For how scenarios work in general see the
 |---|---|
 | `raydium-clmm-custom` | a pool's price, active liquidity and status, selected by fee tier and mints |
 | `raydium-clmm-pool-state` | the same fields, selected by the pool address |
-| `raydium-clmm-amm-config` | a fee tier, shared by every pool created on it |
+| `raydium-clmm-amm-config` | the fee tier a pool points to, shared by every pool on it |
 
 ## Number formats
 
@@ -56,6 +56,9 @@ tick_current:   <floor(2 x ln(new_sqrt_price_x64 / 2^64) / ln(1.0001))>
 liquidity:      "<live liquidity +/- liquidity_net of every initialized tick crossed>"
 ```
 
+The shock reads the pool when the scenario is created and stores absolute values, so if the pool's
+liquidity changes before Play, create the scenario again.
+
 **Never move the price without `liquidity`.** The pool keeps the old range's depth at the new
 price, and swaps succeed with wrong amounts: a +2% move on the SOL/USDC pool left it about 1.4x too
 deep. Going up, a tick `t` is crossed when `old < t <= new` and its `liquidity_net` is added; going
@@ -75,13 +78,15 @@ status: 16      # bit 4: swaps off, liquidity still moves
 
 ## Change a fee tier
 
+A pool's tier is the AmmConfig account at its `amm_config` field; read it with `getAccountInfo`,
+dataSlice `{offset 9, length 32}` and encoding base58, and override that account by pubkey:
+
 ```
-template: raydium-clmm-amm-config
-config_index:   8          # the SOL/USDC pool's tier
-trade_fee_rate: 10000      # 1%
+template: raydium-clmm-amm-config     # on the pool's amm_config
+trade_fee_rate: 10000                 # 1%
 ```
 
-Every pool created with that index shares the account, so the change reaches all of them.
+Every pool on that tier shares the account, so the change reaches all of them.
 
 # Troubleshooting
 

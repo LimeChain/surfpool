@@ -63,6 +63,10 @@ amount: <reserve_1 x sqrt(f) + owed fees of token 1>
 
 Writing one vault alone also moves the price, but changes how deep the pool is.
 
+**Scenario presets → Raydium state → CPMM price shock** in Studio reads the pool when the scenario
+is created and stores absolute values, so if the pool's liquidity changes before Play, create the
+scenario again.
+
 ## Halt swaps
 
 ```

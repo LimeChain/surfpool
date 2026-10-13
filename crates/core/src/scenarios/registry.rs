@@ -408,19 +408,16 @@ templates:
     fn account_data_values_exclude_constant_ref_selectors() {
         let registry = TemplateRegistry::new();
         let template = registry
-            .get("raydium-clmm-amm-config")
-            .expect("template with a non-PDA constant_ref");
+            .get("pyth-price-feed-v2")
+            .expect("template with a constant_ref");
         let instance = OverrideInstance::new(
             template.id.clone(),
             0,
             AccountAddress::Pubkey(Pubkey::default().to_string()),
         )
         .with_values(HashMap::from([
-            (
-                "config_index".to_string(),
-                serde_json::json!("selected-config"),
-            ),
-            ("trade_fee_rate".to_string(), serde_json::json!(1)),
+            ("feed_id".to_string(), serde_json::json!("selected-feed")),
+            ("posted_slot".to_string(), serde_json::json!(1)),
         ]));
 
         let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
@@ -428,7 +425,7 @@ templates:
         assert_eq!(constant_refs, 1);
         assert_eq!(
             values,
-            HashMap::from([("trade_fee_rate".to_string(), serde_json::json!(1))])
+            HashMap::from([("posted_slot".to_string(), serde_json::json!(1))])
         );
     }
 
@@ -436,7 +433,6 @@ templates:
     fn raydium_config_index_options_derive_their_documented_address() {
         let registry = TemplateRegistry::new();
         let template = registry.get("raydium-clmm-custom").expect("template");
-        let config_template = registry.get("raydium-clmm-amm-config").expect("template");
 
         let AccountAddress::Pda { seeds, .. } = &template.address else {
             panic!("the pool address is a PDA");
@@ -473,16 +469,6 @@ templates:
                 Pubkey::try_from(bytes.as_slice()).expect("32 bytes"),
                 expected,
                 "option {}",
-                option.id
-            );
-
-            assert_eq!(
-                config_template
-                    .address
-                    .resolve(Some(&values))
-                    .unwrap_or_else(|| panic!("option {} did not resolve", option.id)),
-                expected,
-                "raydium-clmm-amm-config option {}",
                 option.id
             );
         }

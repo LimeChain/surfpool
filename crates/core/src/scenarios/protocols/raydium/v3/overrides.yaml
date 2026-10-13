@@ -77,10 +77,9 @@ llm_context: |
 
   Set fetchBeforeUse: true.
 
-  PRICE: sqrt_price_x64 = sqrt(price_raw) x 2^64, where price_raw is token_1 per token_0 in raw units,
-  and tick_current = floor(log(price_raw) / log(1.0001)); set both together. A price move must also
-  set liquidity to the active liquidity at the new tick, and the tick array covering the new tick must
-  exist. The Studio price shock computes all three; prefer it to hand-computed values.
+  PRICE: do not move a pool's price by hand. sqrt_price_x64, tick_current and liquidity must change
+  together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
+  price shock instead.
 
 templates:
   - id: raydium-clmm-custom
@@ -170,9 +169,8 @@ templates:
   - id: raydium-clmm-amm-config
     name: Override CLMM Fee Tier (AmmConfig)
     description: |
-      Override an AmmConfig fee tier for Raydium CLMM. The address is a PDA derived
-      from ["amm_config", index.to_be_bytes()]. Every pool created with this config
-      index shares these fee rates.
+      Override the fee tier (AmmConfig) a Raydium CLMM pool points to. Every pool on the
+      tier shares the account, so the change reaches all of them.
     idl_account_name: AmmConfig
     properties:
       - path: trade_fee_rate
@@ -184,23 +182,12 @@ templates:
       - path: fund_fee_rate
         label: Fund Fee Rate
         description: Fund owner's share of the collected trade fee, parts per million
-      - path: config_index
-        type: constant_ref
-        label: Fee Tier Index
-        constant: amm_config_index
-        description: Fee tier whose AmmConfig account is overridden. The address derives from this index.
     llm_context: |
-      To change the fees of a pool's tier, read the pool's amm_config with getAccountInfo, dataSlice
-      {offset 9, length 32} and encoding base58, and pick the config_index option whose derived_address
-      matches. Every pool on the tier shares the account.
+      Put the tier's AmmConfig in the override's account as {"pubkey":"<config>"}: read a pool's
+      amm_config with getAccountInfo, dataSlice {offset 9, length 32} and encoding base58. Every pool
+      on the tier shares the account.
 
       Rates are parts per million: trade_fee_rate of the input (2500 = 0.25%, below 1,000,000);
       protocol_fee_rate and fund_fee_rate of the collected fee, together at most 1,000,000.
     address:
-      type: pda
-      program_id: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
-      seeds:
-        - type: string
-          value: amm_config
-        - type: u16_be_ref
-          value: config_index
+      type: pubkey

@@ -19,15 +19,19 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const POOL_STATE_TEMPLATE: &str = "raydium-clmm-pool-state";
+const AMM_CONFIG_TEMPLATE: &str = "raydium-clmm-amm-config";
 
 const SOL_USDC_POOL: Pubkey =
     Pubkey::from_str_const("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv");
 
+const POOL_AMM_CONFIG_RANGE: std::ops::Range<usize> = 9..41;
 const LIQUIDITY_RANGE: std::ops::Range<usize> = 237..253;
 const TICK_CURRENT_RANGE: std::ops::Range<usize> = 269..273;
 const STATUS_OFFSET: usize = 389;
 
 const TRADE_FEE_RATE_OFFSET: usize = 47;
+const TRADE_FEE_RATE_RANGE: std::ops::Range<usize> =
+    TRADE_FEE_RATE_OFFSET..TRADE_FEE_RATE_OFFSET + 4;
 const TICK_SPACING_OFFSET: usize = 51;
 const AMM_CONFIG_LEN: usize = 117;
 
@@ -89,8 +93,8 @@ async fn real_mainnet_pool_round_trips_unchanged() {
 async fn every_amm_config_index_option_is_a_live_amm_config_account() {
     let registry = TemplateRegistry::new();
     let template = registry
-        .get("raydium-clmm-amm-config")
-        .expect("template raydium-clmm-amm-config should exist");
+        .get("raydium-clmm-custom")
+        .expect("template raydium-clmm-custom should exist");
     let amm_config_index = template
         .constants
         .get("amm_config_index")
@@ -248,5 +252,71 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     assert_eq!(
         i32::from_le_bytes(after.data[TICK_CURRENT_RANGE].try_into().unwrap()),
         new_tick
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_tier_override_on_the_pools_amm_config_touches_only_the_trade_fee() {
+    let pool = fetch(&[SOL_USDC_POOL]).await.remove(0);
+    let amm_config = Pubkey::try_from(&pool.data[POOL_AMM_CONFIG_RANGE]).unwrap();
+    let before = fetch(&[amm_config]).await.remove(0);
+    assert_eq!(
+        before.data.len(),
+        AMM_CONFIG_LEN,
+        "{amm_config} is not an AmmConfig"
+    );
+
+    let new_trade_fee_rate =
+        u32::from_le_bytes(before.data[TRADE_FEE_RATE_RANGE].try_into().unwrap()) + 1;
+
+    let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    surfnet_svm
+        .set_account(&amm_config, before.clone())
+        .unwrap();
+    let locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let registry = TemplateRegistry::new();
+    let template = registry
+        .get(AMM_CONFIG_TEMPLATE)
+        .expect("amm config template should exist");
+
+    let fee_override = OverrideInstance::new(
+        template.id.clone(),
+        1,
+        AccountAddress::Pubkey(amm_config.to_string()),
+    )
+    .with_values(HashMap::from([(
+        "trade_fee_rate".to_string(),
+        serde_json::json!(new_trade_fee_rate),
+    )]))
+    .with_label("Raydium CLMM fee tier override".to_string());
+
+    let mut scenario = Scenario::new(
+        "Raydium CLMM Fee Tier Override".to_string(),
+        "Change the trade fee of the AmmConfig a live pool points to.".to_string(),
+    );
+    scenario.add_override(fee_override);
+    locker.register_scenario(scenario, Some(0)).unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, 1)
+        .await
+        .unwrap();
+
+    let after = locker
+        .with_svm_reader(|svm| svm.get_account(&amm_config))
+        .unwrap()
+        .expect("account should still exist after materialization");
+
+    let outside: Vec<usize> = diff_indices(&before.data, &after.data)
+        .into_iter()
+        .filter(|i| !TRADE_FEE_RATE_RANGE.contains(i))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "bytes outside trade_fee_rate changed: {outside:?}"
+    );
+    assert_eq!(
+        u32::from_le_bytes(after.data[TRADE_FEE_RATE_RANGE].try_into().unwrap()),
+        new_trade_fee_rate
     );
 }
