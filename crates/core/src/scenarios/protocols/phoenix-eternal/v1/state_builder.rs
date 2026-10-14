@@ -4,10 +4,13 @@ use std::{collections::HashMap, str::FromStr, sync::OnceLock};
 use anchor_lang_idl::types::{
     IdlDefinedFields, IdlInstruction, IdlInstructionAccountItem, IdlType, IdlTypeDef, IdlTypeDefTy,
 };
-use log::{info, warn};
+use log::warn;
 use phoenix_rise_accounts::{
     global_config::GlobalConfig,
     perp_asset_map::{FundingAccumulator, PerpAssetMetadata, PriceComponent},
+    spline_collection::{
+        GTC_LIFESPAN, SPLINE_REGION_CAPACITY, Spline, SplineCollection, TickRegion,
+    },
 };
 use solana_account::Account;
 use solana_clock::Clock;
@@ -22,8 +25,8 @@ use surfpool_types::Idl;
 use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 
 use super::{
-    market::{Market, invalid_perp_asset_map, map_entries, move_market},
-    trader::{prepare_cascade, prepare_cross_margin},
+    market::{Market, invalid_perp_asset_map, map_entries, move_market, phoenix_markets},
+    trader::collateral_writes,
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -402,17 +405,6 @@ impl<'a> Sandbox<'a> {
         self.svm.inner.set_sysvar(&clock);
     }
 
-    /// A further copy, for a trial that must leave this one as it is.
-    pub fn trial(&self) -> Sandbox<'a> {
-        let mut svm = self.svm.clone_for_profiling();
-        svm.inner.set_sigverify(false);
-        Sandbox {
-            live: self.live,
-            svm,
-            written: self.written.clone(),
-        }
-    }
-
     /// Every account the instructions run so far changed, as it now is.
     pub fn writes(self) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
         let mut changed = Vec::new();
@@ -497,7 +489,6 @@ pub fn run_instructions(
 /// limit beyond any session and keeps within a `u64`.
 const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 
-pub const LIQUIDATION_READY_TEMPLATE_ID: &str = "phoenix-liquidation-ready";
 const TRADER_CAPABILITIES_TEMPLATE_ID: &str = "phoenix-trader-capabilities";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const TARGET_TICKS_FIELD: &str = "target_ticks";
@@ -727,55 +718,11 @@ pub async fn prepare_phoenix_override(
                 .await
                 .map(Some)
         }
-        "phoenix-liquidation-cascade" => {
-            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
-            let long = match text_input(values, "side")? {
-                "long" => true,
-                "short" => false,
-                other => {
-                    return Err(SurfpoolError::internal(format!(
-                        "side must be long or short, not {other}"
-                    )));
-                }
-            };
-            prepare_cascade(svm, remote_ctx, symbol, long)
+        "phoenix-trader-collateral" => {
+            let quote_lots = whole_number_input(values, "traderState.quoteLotCollateral")?;
+            collateral_writes(svm, remote_ctx, *account_pubkey, account, quote_lots)
                 .await
-                .map(|ready| {
-                    let traders: Vec<String> = ready
-                        .liquidations
-                        .iter()
-                        .map(|(trader, _)| trader.to_string())
-                        .collect();
-                    info!(
-                        "Phoenix {symbol} moved to {} ticks: liquidatable in turn: {}",
-                        ready.target_ticks,
-                        traders.join(", ")
-                    );
-                    Some(ready.writes)
-                })
-        }
-        LIQUIDATION_READY_TEMPLATE_ID => {
-            let symbols: Vec<&str> = text_input(values, "symbols")?
-                .split(',')
-                .map(str::trim)
-                .filter(|symbol| !symbol.is_empty())
-                .collect();
-            prepare_cross_margin(svm, remote_ctx, *account_pubkey, &symbols)
-                .await
-                .map(|ready| {
-                    let (mut order, mut moves) = (Vec::new(), Vec::new());
-                    for (index, (symbol, ticks)) in ready.moves.iter().enumerate() {
-                        let verb = if index == 0 { " moved" } else { "" };
-                        order.push(symbol.as_str());
-                        moves.push(format!("{symbol}{verb} to {ticks} ticks"));
-                    }
-                    info!(
-                        "Phoenix liquidation-ready: {account_pubkey} liquidatable in turn: {} ({})",
-                        order.join(", "),
-                        moves.join(", ")
-                    );
-                    Some(ready.writes)
-                })
+                .map(Some)
         }
         // Phoenix's other accounts take the generic IDL path.
         _ => Ok(None),
@@ -793,13 +740,13 @@ fn text_input<'a>(
         .ok_or_else(|| SurfpoolError::internal(format!("{field} must be a non-empty string")))
 }
 
-fn whole_number_input(
+fn whole_number_input<T: FromStr>(
     values: &HashMap<String, serde_json::Value>,
     field: &str,
-) -> SurfpoolResult<u64> {
+) -> SurfpoolResult<T> {
     let parsed = match values.get(field) {
         Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
-        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::Number(number)) => number.to_string().parse().ok(),
         _ => None,
     };
     parsed.ok_or_else(|| {
@@ -809,8 +756,9 @@ fn whole_number_input(
     })
 }
 
-/// Nothing refreshes oracle readings locally, so this raises the map's stale thresholds, restamps
-/// old readings and rewinds funding ahead of the Clock. A failure only warns and keeps the map.
+/// Nothing refreshes oracle readings or makers' quotes locally, so this raises the map's stale
+/// thresholds, restamps old readings, rewinds funding ahead of the Clock and keeps every spline
+/// region quoting ([`keep_quoting`]). A failure only warns and keeps the map.
 pub(crate) async fn keep_markets_usable(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -833,19 +781,76 @@ pub(crate) async fn keep_markets_usable(
             patched.as_deref().unwrap_or(&map.data),
             clock.slot,
         )?;
-        let Some(data) = restamped.or(patched) else {
-            return Ok(());
-        };
-        svm.set_scenario_override_account(
-            &PHOENIX_PERP_ASSET_MAP,
-            Account { data, ..map },
-            target_slot,
-        )
+        if let Some(data) = restamped.or(patched) {
+            svm.set_scenario_override_account(
+                &PHOENIX_PERP_ASSET_MAP,
+                Account {
+                    data,
+                    ..map.clone()
+                },
+                target_slot,
+            )?;
+        }
+        let splines: Vec<Pubkey> = phoenix_markets(PHOENIX_PERP_ASSET_MAP, &map)?
+            .iter()
+            .map(|market| market.splines)
+            .collect();
+        if let Err(e) = hydrate(svm, remote_ctx, &splines).await {
+            warn!("Could not load every Phoenix spline collection, keeping the local ones quoting: {e}");
+        }
+        // One collection that cannot be kept quoting must not stop the others.
+        for address in splines {
+            let kept = match svm.inner.get_account(&address) {
+                Ok(Some(account)) => match keep_quoting(&address, &account.data) {
+                    Ok(Some(data)) => svm.set_scenario_override_account(
+                        &address,
+                        Account { data, ..account },
+                        target_slot,
+                    ),
+                    other => other.map(|_| ()),
+                },
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = kept {
+                warn!("Could not keep {address} quoting: {e}");
+            }
+        }
+        Ok::<_, SurfpoolError>(())
     }
     .await;
     if let Err(e) = kept {
         warn!("Could not keep the Phoenix markets usable in the local VM: {e}");
     }
+}
+
+/// The collection with every region's lifespan set to [`GTC_LIFESPAN`], or `None` when nothing
+/// changes: nobody re-quotes on a fork, so mainnet's lifespans of a few slots would empty the book.
+fn keep_quoting(address: &Pubkey, data: &[u8]) -> SurfpoolResult<Option<Vec<u8>>> {
+    // The layout of phoenix-rise-accounts' SplineCollection: a 112-byte header, then each spline's
+    // bid and ask regions back to back from byte 120 of it, with the lifespan last in each region.
+    const HEADER_LEN: usize = 112;
+    const REGIONS_START: usize = 120;
+    const LIFESPAN_START: usize = 40;
+    let collection = SplineCollection::try_from_account_bytes(data).map_err(|e| {
+        SurfpoolError::invalid_account_data(
+            address,
+            "Expected a Phoenix spline collection",
+            Some(e),
+        )
+    })?;
+    let mut patched = data.to_vec();
+    for spline in 0..collection.num_splines() as usize {
+        for region in 0..2 * SPLINE_REGION_CAPACITY {
+            let start = HEADER_LEN
+                + spline * size_of::<Spline>()
+                + REGIONS_START
+                + region * size_of::<TickRegion>()
+                + LIFESPAN_START;
+            patched[start..start + 8].copy_from_slice(&GTC_LIFESPAN.to_le_bytes());
+        }
+    }
+    Ok((patched != data).then_some(patched))
 }
 
 /// Every market's metadata in the map, with the offset it starts at in `data`.
@@ -980,11 +985,9 @@ fn rewind_funding_timestamps(
 pub(crate) mod tests {
     use std::collections::HashSet;
 
-    use bytemuck::Zeroable;
     use phoenix_rise_accounts::{
         PhoenixAccount,
         perp_asset_map::{PerpAssetMap, PerpAssetMetadata},
-        trader::TraderHeader,
     };
     use solana_system_interface::instruction as system_instruction;
     use surfpool_types::AccountAddress;
@@ -1287,6 +1290,41 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn keeps_every_spline_region_quoting_and_writes_nothing_else() {
+        // A header naming two splines, mainnet's short lifespans, and a spare slot after them.
+        let spare = 112 + 2 * size_of::<Spline>();
+        let mut data = vec![6_u8; spare + size_of::<Spline>()];
+        data[..112].fill(0);
+        data[..8].copy_from_slice(&PhoenixAccount::SplineCollection.discriminant());
+        data[40..43].copy_from_slice(b"SOL");
+        data[72..76].copy_from_slice(&2_u32.to_le_bytes());
+        let address = Pubkey::new_unique();
+
+        let patched = keep_quoting(&address, &data).unwrap().unwrap();
+
+        for spline in SplineCollection::try_from_account_bytes(&patched)
+            .unwrap()
+            .splines()
+        {
+            let spline = spline.unwrap();
+            for region in spline.bid_regions().iter().chain(spline.ask_regions()) {
+                assert_eq!(region.lifespan(), GTC_LIFESPAN);
+            }
+        }
+        let changed = (0..data.len()).filter(|i| patched[*i] != data[*i]).count();
+        assert_eq!(
+            changed,
+            2 * 2 * SPLINE_REGION_CAPACITY * 8,
+            "only the lifespans change"
+        );
+        assert_eq!(
+            keep_quoting(&address, &patched).unwrap(),
+            None,
+            "written once"
+        );
+    }
+
     #[tokio::test]
     async fn keeps_every_local_market_usable_and_never_fails_an_override() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -1325,8 +1363,8 @@ pub(crate) mod tests {
             ("as_number".to_string(), serde_json::json!(10750)),
         ]);
         assert_eq!(text_input(&values, "symbol").unwrap(), "SOL");
-        assert_eq!(whole_number_input(&values, "target_ticks").unwrap(), 10750);
-        assert_eq!(whole_number_input(&values, "as_number").unwrap(), 10750);
+        let ticks = |field| whole_number_input::<u64>(&values, field).unwrap();
+        assert_eq!((ticks("target_ticks"), ticks("as_number")), (10750, 10750));
 
         let bad = HashMap::from([
             ("symbol".to_string(), serde_json::json!("")),
@@ -1335,67 +1373,23 @@ pub(crate) mod tests {
         ]);
         assert!(text_input(&bad, "symbol").is_err());
         assert!(text_input(&bad, "missing").is_err());
-        assert!(whole_number_input(&bad, "target_ticks").is_err());
-        assert!(whole_number_input(&bad, "as_number").is_err());
+        assert!(whole_number_input::<u64>(&bad, "target_ticks").is_err());
+        assert!(whole_number_input::<u64>(&bad, "as_number").is_err());
     }
 
-    #[tokio::test]
-    async fn a_liquidation_ready_run_takes_one_or_more_different_symbols() {
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        let trader = Pubkey::new_unique();
-        for (symbols, refusal) in [
-            (" , ", "list at least one market symbol"),
-            ("SOL, ETH, SOL", "SOL is listed twice"),
-        ] {
-            let error = prepare_phoenix_override(
-                &mut svm,
-                LIQUIDATION_READY_TEMPLATE_ID,
-                &trader,
-                &Account::default(),
-                &HashMap::from([("symbols".to_string(), serde_json::json!(symbols))]),
-                &None,
-                0,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains(refusal), "{symbols:?}: {error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_spline_market_maker_is_refused_before_anything_is_fetched() {
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        let trader = Pubkey::new_unique();
-        let mut header = TraderHeader::zeroed();
-        header.discriminant = u64::from_le_bytes(PhoenixAccount::Trader.discriminant());
-        header.num_markets_with_splines = 2;
-        let account = Account {
-            lamports: 1,
-            data: bytemuck::bytes_of(&header).to_vec(),
-            owner: PHOENIX_PROGRAM_ID,
-            ..Account::default()
+    #[test]
+    fn reads_collateral_as_a_signed_string_or_number() {
+        let collateral = |value| {
+            let values = HashMap::from([("collateral".to_string(), value)]);
+            whole_number_input::<i64>(&values, "collateral")
         };
-        svm.inner.set_account(trader, account.clone()).unwrap();
-        let error = prepare_phoenix_override(
-            &mut svm,
-            LIQUIDATION_READY_TEMPLATE_ID,
-            &trader,
-            &account,
-            &HashMap::from([("symbols".to_string(), serde_json::json!("SOL"))]),
-            &None,
-            0,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains(&format!(
-                "{trader} quotes splines on 2 markets; liquidating a spline market maker is not \
-                 supported"
-            )),
-            "{error}"
+        assert_eq!(
+            collateral(serde_json::json!(" -5030916850 ")).unwrap(),
+            -5_030_916_850
         );
+        assert_eq!(collateral(serde_json::json!(8_191_788)).unwrap(), 8_191_788);
+        assert!(collateral(serde_json::json!("12.5")).is_err());
+        assert!(collateral(serde_json::json!(1.5)).is_err());
     }
 
     const LIQUIDATOR: Pubkey =

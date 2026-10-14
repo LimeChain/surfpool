@@ -39,74 +39,36 @@ templates:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
 
-  - id: phoenix-liquidation-ready
-    name: Phoenix Liquidation-Ready Positions
+  - id: phoenix-trader-collateral
+    name: Phoenix Trader Collateral
     description: >-
-      Leave one or more positions of one Phoenix Eternal trader ready for a keeper to liquidate
-      one after another.
+      Set one Phoenix Eternal trader's USDC collateral, which moves its effective collateral and
+      so its distance from liquidation.
     idl_account_name: Trader
     properties:
-      - path: symbols
-        type: input
-        value_type: string
-        label: Market Symbols
-        description: >-
-          One or more exact symbols of markets the trader holds a position in, comma-separated,
-          such as SOL or SOL,ETH
+      - path: traderState.quoteLotCollateral
+        label: Collateral (quote lots)
+        description: Signed quote lots (1000000 = 1 USDC)
     llm_context: |
-      Phoenix judges liquidation by the whole account: once it is liquidatable, a keeper may
-      liquidate any position it holds, up to the market's max liquidation size at a time. This
-      cancels the trader's resting orders on every market it has a position or orders in, which
-      Phoenix requires before it liquidates anyone, then moves every listed market the way
-      Phoenix Market Move does, by one common share of its mark against the position: longs
-      down, shorts up. Each liquidation releases margin, so the account can recover before the
-      last one. Surfpool tries the liquidations one after another on a copy and prepares the
-      state in the middle of the moves where the whole run goes through; nothing is written
-      otherwise. Every extra position narrows those moves and makes Play slower. Surfpool's log
-      names the order and each market's new price. A trader that quotes splines, a market maker,
-      is refused.
-      It does not send the liquidations; the user's own keeper does, in the logged order.
-      The account is the trader's Trader account. list_phoenix_trader_positions lists the markets
-      it holds a position in; pass one or more of their symbols, comma-separated.
+      Writes the USDC collateral field of the Trader account. Phoenix reads a trader its active
+      trader index lists from the index instead, so for such a trader (hot: true) this first
+      cancels its resting orders on every market, which takes it out; positions stay open.
+      Effective collateral, which Phoenix measures margin against, moves one for one with the
+      field. From list_phoenix_trader_positions: value = quoteLotCollateral -
+      margin.effectiveCollateral + target, where target is the effective collateral wanted;
+      margin.collateral is not the base. Take the middle of a range, as the state can drift a
+      little before the keeper acts: between backstopMargin and maintenanceMargin, one keeper
+      liquidation makes the account healthy again; between highRiskMargin and backstopMargin, a
+      keeper can liquidate every position; below highRiskMargin Phoenix refuses market-order
+      liquidations. To have a trader cross on a phoenix-market-move at a later slot, call the
+      tool with moves and use marginAfterMoves for the target and effectiveCollateral; the
+      result must stay above margin.maintenanceMargin until the move.
+      A spline market maker is refused. The value can be negative.
+      The account is the trader's Trader account.
       Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
       list_phoenix_trader_positions first; it loads the trader into the surfnet.
     address:
       type: pubkey
-
-  - id: phoenix-liquidation-cascade
-    name: Phoenix Liquidation Cascade
-    description: >-
-      Leave every Phoenix Eternal trader that one price can make liquidatable in one market ready
-      for a keeper to liquidate one after another.
-    idl_account_name: PerpAssetMap
-    properties:
-      - path: symbol
-        type: dynamic_ref
-        label: Market Symbol
-        source: list_phoenix_markets
-        description: Exact Phoenix market symbol
-      - path: side
-        type: input
-        value_type: string
-        label: Positions to liquidate
-        description: long liquidates longs after a drop, short liquidates shorts after a rise
-    llm_context: |
-      Each holder of the chosen side becomes liquidatable at one price and underwater, where
-      Phoenix refuses a market-order liquidation, at another. This looks at the 24 holders of that
-      side closest to liquidation in Phoenix's active trader index, so cold holders are not
-      examined, finds the smallest move that leaves at least two of them liquidatable (the nearest
-      one when no two bands meet), cancels the resting orders of every holder whose band covers
-      that price, on every market they hold, and moves the market there the way Phoenix Market
-      Move does.
-      How many traders that is depends on the market, not on an input. Their liquidations are tried
-      one after another on a copy, and a trader whose liquidation would fail is left out.
-      Surfpool's log names the price and the traders.
-      It does not send the liquidations; the user's own keeper does.
-      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
-      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
-    address:
-      type: pubkey
-      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
 
   - id: phoenix-market-risk-factors
     name: Phoenix Market Risk Factors

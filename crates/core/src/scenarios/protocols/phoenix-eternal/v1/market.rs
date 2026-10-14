@@ -5,7 +5,7 @@ use phoenix_rise_accounts::{
     orderbook::{ORDERBOOK_CAPACITY, Orderbook},
     pda::{derive_permission_address, derive_spline_collection_address},
     perp_asset_map::{PerpAssetMap, PerpAssetMetadataEntry},
-    spline_collection::{Spline, SplineCollection, TickRegion},
+    spline_collection::SplineCollection,
     trader::TraderHeader,
 };
 use solana_account::Account;
@@ -29,10 +29,6 @@ use crate::{
 /// Crossed resting orders the uncross crank matches in one call: about 12,000 compute units each,
 /// so 64 stay well inside a transaction's 1.4 million.
 const UNCROSS_MATCH_LIMIT: u64 = 64;
-/// How long the makers' re-sent spline regions keep quoting, past any session. Mainnet makers update
-/// every few slots and their regions lapse a set number of slots later (6 to 60 on SOL); nobody
-/// updates on a fork.
-const QUOTE_LIFESPAN_SLOTS: u64 = u32::MAX as u64;
 /// Each side holds up to `ORDERBOOK_CAPACITY` resting orders and a match between two removes at
 /// least one; spline fills make this a budget, not a guarantee.
 const MAX_UNCROSS_CRANKS: usize = 2 * ORDERBOOK_CAPACITY / UNCROSS_MATCH_LIMIT as usize;
@@ -385,9 +381,8 @@ impl MarketContext {
         )
     }
 
-    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves, the uncross crank
-    /// until [`uncross_done`], then the makers re-quoting ([`MarketContext::requotes`]). Hawkeye
-    /// must be in the local VM.
+    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves and the uncross crank
+    /// until [`uncross_done`]. Hawkeye must be in the local VM.
     pub fn move_in(&mut self, sandbox: &mut Sandbox, ticks: u64) -> SurfpoolResult<()> {
         let mut instructions = self.oracle_reports(ticks)?;
         instructions.extend(self.spline_moves(ticks)?);
@@ -398,8 +393,7 @@ impl MarketContext {
             sandbox.run(std::slice::from_ref(&uncross))?;
             let after = self.book_top(sandbox)?;
             if uncross_done(&before, &after) {
-                let requotes = self.requotes(sandbox)?;
-                return sandbox.run(&requotes);
+                return Ok(());
             }
             before = after;
         }
@@ -407,42 +401,6 @@ impl MarketContext {
             "the {} book stayed crossed after {MAX_UNCROSS_CRANKS} uncross cranks",
             self.market.symbol
         )))
-    }
-
-    /// Every maker's spline regions sent again as they are, quoting for [`QUOTE_LIFESPAN_SLOTS`], so
-    /// the moved book keeps its liquidity while the surfnet's clock runs.
-    fn requotes(&self, sandbox: &Sandbox) -> SurfpoolResult<Vec<Instruction>> {
-        let account = sandbox.account(&self.market.splines)?;
-        let collection = SplineCollection::try_from_account_bytes(&account.data).map_err(|e| {
-            SurfpoolError::invalid_account_data(
-                self.market.splines,
-                "Expected a Phoenix spline collection",
-                Some(e),
-            )
-        })?;
-        let mut requotes = Vec::with_capacity(self.makers.len());
-        for spline in collection.splines().flatten() {
-            let trader = Pubkey::new_from_array(spline.trader());
-            let Some(maker) = self.makers.iter().find(|maker| maker.trader == trader) else {
-                continue;
-            };
-            let Some(params) = requote_params(&spline) else {
-                continue;
-            };
-            requotes.push(phoenix_instruction(
-                "UpdateSplineParameters",
-                &[
-                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
-                    ("phoenixLogAuthority", log_authority()),
-                    ("signerAccount", maker.authority),
-                    ("traderAccount", maker.trader),
-                    ("splineAccount", self.market.splines),
-                    ("orderbook", self.market.orderbook),
-                ],
-                &params,
-            )?);
-        }
-        Ok(requotes)
     }
 
     /// Hawkeye's best bid and ask in `sandbox`, with the number of resting orders in the book.
@@ -458,39 +416,6 @@ impl MarketContext {
         let resting = book.num_bids() + book.num_asks();
         Ok((bbo(sandbox, &self.exchange, &self.market)?, resting))
     }
-}
-
-/// A maker's active regions re-sent with [`QUOTE_LIFESPAN_SLOTS`], or `None` for an enabled maker
-/// that quotes nothing: Phoenix refuses an update without regions.
-fn requote_params(spline: &Spline) -> Option<serde_json::Value> {
-    let (bids, asks) = (spline.active_bid_regions(), spline.active_ask_regions());
-    if bids.is_empty() && asks.is_empty() {
-        return None;
-    }
-    let regions = |regions: &[TickRegion]| -> Vec<serde_json::Value> {
-        regions
-            .iter()
-            .map(|region| {
-                serde_json::json!({
-                    "startOffset": { "inner": region.start_offset().as_inner() },
-                    "endOffset": { "inner": region.end_offset().as_inner() },
-                    "density": { "inner": region.density().as_inner() },
-                    "lifespan": QUOTE_LIFESPAN_SLOTS,
-                })
-            })
-            .collect()
-    };
-    let client_order_id = [0_u8; 16];
-    Some(serde_json::json!({
-        "params": {
-            "bidRegions": regions(bids),
-            "askRegions": regions(asks),
-            "refreshRegions": true,
-            "userSequenceNumber": spline.user_parameter_sequence_number() + 1,
-            "clientOrderId": client_order_id,
-            "overrideSequenceNumber": false,
-        }
-    }))
 }
 
 /// Whether a crank that took the book from `before` to `after` was the last: the book is uncrossed,
@@ -522,7 +447,7 @@ pub async fn move_market(
 
 /// Phoenix's uncross crank breaks on books that do not match the local trader index, which
 /// happens when surfnet fetched the two at different times; the raw program panic says nothing.
-pub fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
+fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
     let text = error.to_string();
     if !text.contains("Uncross Crank") {
         return error;
@@ -671,10 +596,5 @@ pub(crate) mod tests {
         assert!(uncross_done(&crossed, &book_at(0, 100, 200)), "no bids");
         assert!(uncross_done(&crossed, &book_at(120, 0, 200)), "no asks");
         assert!(uncross_done(&crossed, &crossed), "no progress");
-    }
-
-    #[test]
-    fn a_maker_quoting_nothing_is_not_requoted() {
-        assert!(requote_params(&bytemuck::Zeroable::zeroed()).is_none());
     }
 }

@@ -9,7 +9,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 use super::{
-    market::{Market, MarketContext, explain_move_failure, phoenix_markets},
+    market::{Market, MarketContext, phoenix_markets},
     state_builder::{
         Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, keep_markets_usable,
         local_account, log_authority, phoenix_instruction,
@@ -32,7 +32,7 @@ const ASSET_VIEW_MAGIC: u64 = 0xdb58fff8285e1db9;
 
 /// What Hawkeye's `view_margin` returns for one trader.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct MarginView {
     magic: u64,
     pub version: u16,
@@ -168,596 +168,20 @@ pub fn holdings(
     trader: &Pubkey,
 ) -> SurfpoolResult<Vec<Holding>> {
     let map = local_account(svm, &exchange.perp_asset_map)?;
-    let markets = phoenix_markets(exchange.perp_asset_map, &map)?;
-    holdings_in(&mut Sandbox::new(svm), exchange, trader, &markets)
-}
-
-/// [`holdings`] among `markets`, read in `views`, which Hawkeye's read-only views can share.
-fn holdings_in(
-    views: &mut Sandbox,
-    exchange: &Exchange,
-    trader: &Pubkey,
-    markets: &[Market],
-) -> SurfpoolResult<Vec<Holding>> {
+    let mut views = Sandbox::new(svm);
     let mut held = Vec::new();
-    for market in markets {
+    for market in phoenix_markets(exchange.perp_asset_map, &map)? {
         let data = views.view(&asset_view(exchange, trader, market.asset_id)?)?;
         let view = AssetView::from_return_data(&data)?;
         if view.has_position_or_orders != 0 {
             held.push(Holding {
-                market: market.clone(),
+                market,
                 base_lots: view.base_lots,
                 maintenance_margin_quote_lots: view.maintenance_margin_quote_lots,
             });
         }
     }
     Ok(held)
-}
-
-/// The most position holders a cascade examines.
-const MAX_CASCADE_CANDIDATES: usize = 24;
-
-/// Stands in for the user's keeper, which signs the real liquidation.
-const PLACEHOLDER_LIQUIDATOR: Pubkey = Pubkey::new_from_array([1; 32]);
-
-/// Traders a cascade leaves liquidatable at one price, and where the market was moved for them.
-pub struct CascadeReady {
-    pub writes: Vec<(Pubkey, Account)>,
-    pub target_ticks: u64,
-    /// Each trader with the liquidation that went through for it, in this order, on a copy of
-    /// the prepared state.
-    pub liquidations: Vec<(Pubkey, Instruction)>,
-}
-
-/// The writes that move `symbol` by the smallest step that leaves at least two of the holders
-/// closest to liquidation in Phoenix's active trader index liquidatable, so a keeper can liquidate
-/// them in turn; one failing on a copy is left out.
-pub async fn prepare_cascade(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    symbol: &str,
-    long: bool,
-) -> SurfpoolResult<CascadeReady> {
-    let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
-    hydrate(svm, remote_ctx, &[HAWKEYE_PROGRAM_ID]).await?;
-    let index = local_account(svm, &context.exchange.global_trader_index)?;
-    let mut listed: Vec<Pubkey> = index_trader_state_ranges(&index)?
-        .into_iter()
-        .map(|(trader, _)| trader)
-        .collect();
-    listed.sort_unstable();
-    listed.dedup();
-    hydrate(svm, remote_ctx, &listed).await?;
-    let map = local_account(svm, &context.exchange.perp_asset_map)?;
-    let markets = phoenix_markets(context.exchange.perp_asset_map, &map)?;
-    let mut ranked = Vec::new();
-    let mut views = Sandbox::new(svm);
-    for trader in listed {
-        // Hawkeye, not the Trader account's copy, which can miss a hot trader's positions.
-        let Ok(position) = views
-            .view(&asset_view(
-                &context.exchange,
-                &trader,
-                context.market.asset_id,
-            )?)
-            .and_then(|data| AssetView::from_return_data(&data))
-        else {
-            continue;
-        };
-        let lots = position.base_lots;
-        if (long && lots > 0) || (!long && lots < 0) {
-            let Ok(account) = local_account(svm, &trader) else {
-                continue;
-            };
-            let Ok(header) = TraderHeader::try_read_from_account_bytes(&account.data) else {
-                continue;
-            };
-            let Ok(now) = margin(&mut views, &context.exchange, &trader) else {
-                continue;
-            };
-            // The share of the position's value the mark can move against it before the account
-            // reaches its maintenance margin.
-            let buffer = now.effective_collateral_quote_lots as f64
-                - now.maintenance_margin_quote_lots as f64;
-            let distance = buffer / position.position_value_quote_lots.unsigned_abs().max(1) as f64;
-            ranked.push((distance, trader, Pubkey::new_from_array(header.authority)));
-        }
-    }
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut candidates = Vec::new();
-    for (_, trader, authority) in ranked.into_iter().take(MAX_CASCADE_CANDIDATES) {
-        let Ok(held) = holdings_in(&mut views, &context.exchange, &trader, &markets) else {
-            continue;
-        };
-        candidates.push((trader, authority, held));
-    }
-    drop(views);
-    let books: Vec<Pubkey> = candidates
-        .iter()
-        .flat_map(|(_, _, held)| held_books(held))
-        .collect();
-    hydrate(svm, remote_ctx, &books).await?;
-    let holders = candidates
-        .iter()
-        .map(|(trader, authority, held)| {
-            Ok((
-                *trader,
-                cancels(&context.exchange, *authority, *trader, held)?,
-            ))
-        })
-        .collect::<SurfpoolResult<Vec<(Pubkey, Vec<Instruction>)>>>()?;
-
-    let mark = context.market.mark_ticks;
-    let far = if long {
-        1
-    } else {
-        mark.saturating_mul(10).min(u64::from(u32::MAX))
-    };
-    let precision = (mark / 2000).max(1);
-    let base = Sandbox::new(svm);
-    let mut bands = Vec::new();
-    for (trader, cancels) in &holders {
-        let mut search = base.trial();
-        if search.run(cancels).is_err() {
-            continue;
-        }
-        search.next_slot();
-        search.run(&context.oracle_reports(mark)?)?;
-        let Ok(now) = margin(&mut search, &context.exchange, trader) else {
-            continue;
-        };
-        // A holder already liquidatable at the mark has a band that starts there.
-        let liquidatable = if now.is_liquidatable == 1 {
-            if now.effective_collateral_quote_lots <= 0 {
-                continue;
-            }
-            mark
-        } else {
-            let Some(price) =
-                boundary(&mut search, &mut context, trader, far, precision, |view| {
-                    view.is_liquidatable == 1
-                })?
-            else {
-                continue;
-            };
-            price
-        };
-        let underwater = boundary(&mut search, &mut context, trader, far, precision, |view| {
-            view.effective_collateral_quote_lots <= 0
-        })?
-        .unwrap_or(far);
-        // Keep a quarter of the band away from underwater: the fill lands a little through the mark.
-        let (low, high) = if long {
-            (
-                underwater + liquidatable.abs_diff(underwater) / 4 + 1,
-                liquidatable.saturating_sub(precision),
-            )
-        } else {
-            (
-                liquidatable + precision,
-                underwater.saturating_sub(underwater.abs_diff(liquidatable) / 4 + 1),
-            )
-        };
-        if low <= high {
-            bands.push((*trader, low, high));
-        }
-    }
-
-    let target = cascade_price(&bands, mark).ok_or_else(|| {
-        SurfpoolError::internal(format!(
-            "no {} {symbol} holder becomes liquidatable before it goes underwater",
-            if long { "long" } else { "short" }
-        ))
-    })?;
-    let mut chosen: Vec<Pubkey> = bands
-        .iter()
-        .filter(|(_, low, high)| (low..=high).contains(&&target))
-        .map(|(trader, ..)| *trader)
-        .collect();
-
-    // A trader the book cannot absorb in turn is dropped, and the rest are prepared again.
-    while !chosen.is_empty() {
-        let mut prepared = base.trial();
-        for (trader, cancels) in &holders {
-            if chosen.contains(trader) {
-                prepared.run(cancels)?;
-            }
-        }
-        prepared.next_slot();
-        context
-            .move_in(&mut prepared, target)
-            .map_err(explain_move_failure)?;
-        let mut trial = prepared.trial();
-        let mut liquidations = Vec::new();
-        for trader in &chosen {
-            let instruction = liquidation(&context, *trader, long, target)?;
-            if trial.run(std::slice::from_ref(&instruction)).is_ok() {
-                liquidations.push((*trader, instruction));
-            }
-        }
-        if liquidations.len() == chosen.len() {
-            return Ok(CascadeReady {
-                writes: prepared.writes()?,
-                target_ticks: target,
-                liquidations,
-            });
-        }
-        chosen = liquidations.into_iter().map(|(trader, _)| trader).collect();
-    }
-    Err(SurfpoolError::internal(format!(
-        "no liquidation of a {symbol} holder goes through at {target} ticks"
-    )))
-}
-
-/// The smallest move from `mark` that lands inside at least two of the `bands`, or inside the
-/// nearest one when no two meet.
-fn cascade_price(bands: &[(Pubkey, u64, u64)], mark: u64) -> Option<u64> {
-    bands
-        .iter()
-        .flat_map(|(_, low, high)| [*low, *high])
-        .max_by_key(|price| {
-            let inside = bands
-                .iter()
-                .filter(|(_, low, high)| (low..=high).contains(&price))
-                .count();
-            (inside.min(2), std::cmp::Reverse(price.abs_diff(mark)))
-        })
-}
-
-/// A cross-margin move is in millionths of each market's mark.
-const MOVE_SCALE: u64 = 1_000_000;
-/// How finely the cross-margin search places its boundaries, in millionths of each mark.
-const MOVE_PRECISION: u64 = 100;
-
-/// A trader whose positions a keeper can liquidate one after another, and where their markets
-/// were moved for it.
-pub struct CrossMarginReady {
-    pub writes: Vec<(Pubkey, Account)>,
-    /// Each position's market and the ticks it was moved to, in the order they liquidate.
-    pub moves: Vec<(String, u64)>,
-    /// The liquidations that went through one after another on a copy of the prepared state, in
-    /// this order.
-    pub liquidations: Vec<Instruction>,
-}
-
-/// The writes that leave `trader` ready for a keeper to liquidate its `symbols` positions in turn,
-/// largest maintenance margin last, each market moved one share of its mark against them.
-pub async fn prepare_cross_margin(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    trader: Pubkey,
-    symbols: &[&str],
-) -> SurfpoolResult<CrossMarginReady> {
-    if symbols.is_empty() {
-        return Err(SurfpoolError::internal("list at least one market symbol"));
-    }
-    refuse_repeats(symbols)?;
-    hydrate(svm, remote_ctx, &[trader]).await?;
-    let header = TraderHeader::try_read_from_account_bytes(&local_account(svm, &trader)?.data)
-        .map_err(|e| {
-            SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
-        })?;
-    // Phoenix answered "position not liquidatable" for such traders across the whole band.
-    if header.num_markets_with_splines > 0 {
-        return Err(SurfpoolError::internal(format!(
-            "{trader} quotes splines on {} markets; liquidating a spline market maker is not \
-             supported",
-            header.num_markets_with_splines
-        )));
-    }
-    let exchange = Exchange::load(svm, remote_ctx).await?;
-    hydrate(
-        svm,
-        remote_ctx,
-        &[
-            HAWKEYE_PROGRAM_ID,
-            exchange.perp_asset_map,
-            exchange.global_trader_index,
-            exchange.active_trader_buffer,
-        ],
-    )
-    .await?;
-    let map = local_account(svm, &exchange.perp_asset_map)?;
-    for symbol in symbols {
-        Market::find(&exchange.perp_asset_map, &map.data, symbol)?;
-    }
-    refuse_unindexed_hot_trader(
-        trader,
-        &header,
-        &local_account(svm, &exchange.global_trader_index)?,
-    )?;
-    let held = holdings(svm, &exchange, &trader)?;
-    let positions = symbols
-        .iter()
-        .map(|symbol| {
-            held.iter()
-                .find(|held| held.market.symbol == *symbol && held.base_lots != 0)
-                .ok_or_else(|| {
-                    SurfpoolError::internal(format!("{trader} holds no {symbol} position"))
-                })
-        })
-        .collect::<SurfpoolResult<Vec<_>>>()?;
-    let contexts = MarketContext::load_all(svm, remote_ctx, symbols).await?;
-    let mut chosen = Vec::with_capacity(symbols.len());
-    for (holding, context) in positions.into_iter().zip(contexts) {
-        chosen.push((
-            holding.maintenance_margin_quote_lots,
-            Chosen {
-                long: holding.base_lots > 0,
-                mark: context.market.mark_ticks,
-                context,
-            },
-        ));
-    }
-    chosen.sort_by_key(|(maintenance, _)| *maintenance);
-    let authority = Pubkey::new_from_array(header.authority);
-    let cancels = cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &held).await?;
-
-    // The cancels come first so the uncross cannot fill the trader's own orders, and the moves a
-    // slot later; see `Sandbox::next_slot`.
-    let mut base = Sandbox::new(svm);
-    base.run(&cancels)?;
-    base.next_slot();
-    let mut search = CrossMarginSearch {
-        base,
-        exchange,
-        trader,
-        chosen: chosen.into_iter().map(|(_, chosen)| chosen).collect(),
-    };
-    let band = search.band()?;
-    search.ready_in(band)?.ok_or_else(|| {
-        SurfpoolError::internal(format!(
-            "no common move leaves {trader} liquidatable in turn on {}",
-            symbols.join(", ")
-        ))
-    })
-}
-
-/// One position a cross-margin run liquidates, with the market it moves.
-struct Chosen {
-    context: MarketContext,
-    long: bool,
-    mark: u64,
-}
-
-impl Chosen {
-    /// The price `moved` millionths of the mark against the position.
-    fn against(&self, moved: u64) -> u64 {
-        let mark = u128::from(self.mark);
-        let factor = if self.long {
-            MOVE_SCALE.saturating_sub(moved)
-        } else {
-            MOVE_SCALE + moved
-        };
-        let price = mark * u128::from(factor) / u128::from(MOVE_SCALE);
-        u64::try_from(price)
-            .unwrap_or(u64::MAX)
-            .clamp(1, u64::from(u32::MAX))
-    }
-}
-
-struct CrossMarginSearch<'a> {
-    base: Sandbox<'a>,
-    exchange: Exchange,
-    trader: Pubkey,
-    chosen: Vec<Chosen>,
-}
-
-impl<'a> CrossMarginSearch<'a> {
-    /// The moves from liquidatable to underwater, where market-order liquidations stop. The
-    /// margin reads only the marks, so this moves the oracles alone.
-    fn band(&mut self) -> SurfpoolResult<(u64, u64)> {
-        let farthest = if self.chosen.iter().any(|chosen| chosen.long) {
-            MOVE_SCALE - MOVE_SCALE / 100
-        } else {
-            9 * MOVE_SCALE
-        };
-        let mut search = self.base.trial();
-        let mut margin_at = |moved: u64| -> SurfpoolResult<MarginView> {
-            for chosen in &mut self.chosen {
-                let price = chosen.against(moved);
-                search.run(&chosen.context.oracle_reports(price)?)?;
-            }
-            margin(&mut search, &self.exchange, &self.trader)
-        };
-        let liquidatable =
-            first_move(farthest, |moved| Ok(margin_at(moved)?.is_liquidatable == 1))?.ok_or_else(
-                || {
-                    SurfpoolError::internal(format!(
-                        "{} never becomes liquidatable on these markets",
-                        self.trader
-                    ))
-                },
-            )?;
-        let underwater = first_move(farthest, |moved| {
-            Ok(margin_at(moved)?.effective_collateral_quote_lots <= 0)
-        })?
-        .unwrap_or(farthest);
-        if underwater <= liquidatable {
-            return Err(SurfpoolError::internal(format!(
-                "{} goes underwater before it becomes liquidatable",
-                self.trader
-            )));
-        }
-        Ok((liquidatable, underwater))
-    }
-
-    /// Every chosen market moved `moved` against its position, and their liquidations tried in
-    /// turn on a copy. Each closes at most the max liquidation size of its market.
-    fn run_at(&mut self, moved: u64) -> SurfpoolResult<Run<'a>> {
-        let mut prepared = self.base.trial();
-        for chosen in &mut self.chosen {
-            let price = chosen.against(moved);
-            chosen
-                .context
-                .move_in(&mut prepared, price)
-                .map_err(explain_move_failure)?;
-        }
-        let mut trial = prepared.trial();
-        let mut liquidations = Vec::with_capacity(self.chosen.len());
-        for chosen in &self.chosen {
-            let instruction = liquidation(
-                &chosen.context,
-                self.trader,
-                chosen.long,
-                chosen.against(moved),
-            )?;
-            if trial.run(std::slice::from_ref(&instruction)).is_err() {
-                return Ok(
-                    if margin(&mut trial, &self.exchange, &self.trader)?.is_liquidatable == 0 {
-                        Run::Recovered
-                    } else {
-                        Run::Refused
-                    },
-                );
-            }
-            liquidations.push(instruction);
-        }
-        Ok(Run::Through(Box::new(prepared), liquidations))
-    }
-
-    fn goes_through(&mut self, moved: u64) -> SurfpoolResult<bool> {
-        Ok(matches!(self.run_at(moved)?, Run::Through(..)))
-    }
-
-    /// The state mid-way through the moves in `band` where the whole run goes through, if any. A
-    /// recovered account needs a deeper move and a refusal a shallower one, so the band halves.
-    fn ready_in(
-        &mut self,
-        (liquidatable, underwater): (u64, u64),
-    ) -> SurfpoolResult<Option<CrossMarginReady>> {
-        let (mut shallow, mut deep) = (liquidatable, underwater);
-        let (found, found_run) = loop {
-            if deep - shallow <= MOVE_PRECISION {
-                return Ok(None);
-            }
-            let moved = midpoint(shallow, deep);
-            match self.run_at(moved)? {
-                Run::Through(prepared, liquidations) => break (moved, (prepared, liquidations)),
-                Run::Recovered => shallow = moved,
-                Run::Refused => deep = moved,
-            }
-        };
-        let low = bisect(shallow, found, MOVE_PRECISION, |moved| {
-            self.goes_through(moved)
-        })?
-        .1;
-        let high = bisect(deep, found, MOVE_PRECISION, |moved| {
-            self.goes_through(moved)
-        })?
-        .1;
-
-        let middle = midpoint(low, high);
-        let middle_run = (middle != found).then(|| self.run_at(middle)).transpose()?;
-        let (moved, (prepared, liquidations)) = match middle_run {
-            Some(Run::Through(prepared, liquidations)) => (middle, (prepared, liquidations)),
-            _ => (found, found_run),
-        };
-        let moves = self
-            .chosen
-            .iter()
-            .map(|chosen| (chosen.context.market.symbol.clone(), chosen.against(moved)))
-            .collect();
-        Ok(Some(CrossMarginReady {
-            writes: prepared.writes()?,
-            moves,
-            liquidations,
-        }))
-    }
-}
-
-/// How a cross-margin run at one move ended.
-enum Run<'a> {
-    /// Every liquidation went through, on this prepared state.
-    Through(Box<Sandbox<'a>>, Vec<Instruction>),
-    /// A liquidation failed because the account was no longer liquidatable.
-    Recovered,
-    /// A liquidation failed while the account was liquidatable.
-    Refused,
-}
-
-/// The smallest move up to `farthest` where `reached` holds, within [`MOVE_PRECISION`], or
-/// `None` when it does not hold even there.
-fn first_move(
-    farthest: u64,
-    mut reached: impl FnMut(u64) -> SurfpoolResult<bool>,
-) -> SurfpoolResult<Option<u64>> {
-    if reached(0)? {
-        return Ok(Some(0));
-    }
-    if !reached(farthest)? {
-        return Ok(None);
-    }
-    Ok(Some(bisect(0, farthest, MOVE_PRECISION, reached)?.1))
-}
-
-/// Narrows `missed`, where `reached` does not hold, and `hit`, where it does, to within
-/// `precision` of each other.
-fn bisect(
-    mut missed: u64,
-    mut hit: u64,
-    precision: u64,
-    mut reached: impl FnMut(u64) -> SurfpoolResult<bool>,
-) -> SurfpoolResult<(u64, u64)> {
-    while missed.abs_diff(hit) > precision {
-        let candidate = midpoint(missed, hit);
-        if reached(candidate)? {
-            hit = candidate;
-        } else {
-            missed = candidate;
-        }
-    }
-    Ok((missed, hit))
-}
-
-/// The price closest to the mark, on the way to `far`, where `reached` first holds for `trader`,
-/// or `None` when it does not hold even at `far`.
-fn boundary(
-    search: &mut Sandbox,
-    context: &mut MarketContext,
-    trader: &Pubkey,
-    far: u64,
-    precision: u64,
-    reached: impl Fn(&MarginView) -> bool,
-) -> SurfpoolResult<Option<u64>> {
-    let mark = context.market.mark_ticks;
-    let mut reached_at = |price: u64| -> SurfpoolResult<bool> {
-        search.run(&context.oracle_reports(price)?)?;
-        Ok(reached(&margin(search, &context.exchange, trader)?))
-    };
-    if !reached_at(far)? {
-        return Ok(None);
-    }
-    Ok(Some(bisect(mark, far, precision, reached_at)?.1))
-}
-
-/// The price halfway between two, strictly between them whenever they are two or more apart.
-fn midpoint(a: u64, b: u64) -> u64 {
-    a.min(b) + a.abs_diff(b) / 2
-}
-
-fn cancel_all(
-    exchange: &Exchange,
-    authority: Pubkey,
-    trader: Pubkey,
-    (orderbook, splines): (Pubkey, Pubkey),
-) -> SurfpoolResult<Instruction> {
-    phoenix_instruction(
-        "CancelAll",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("traderWallet", authority),
-            ("traderAccount", trader),
-            ("perpAssetMap", exchange.perp_asset_map),
-            ("globalTraderIndex", exchange.global_trader_index),
-            ("activeTraderBuffer", exchange.active_trader_buffer),
-            ("orderbook", orderbook),
-            ("splines", splines),
-        ],
-        &serde_json::json!({}),
-    )
 }
 
 /// The trader cancelling its resting orders on every market in `held`: Phoenix refuses to
@@ -770,72 +194,31 @@ async fn cancel_everywhere(
     authority: Pubkey,
     held: &[Holding],
 ) -> SurfpoolResult<Vec<Instruction>> {
-    hydrate(svm, remote_ctx, &held_books(held)).await?;
-    cancels(exchange, authority, trader, held)
-}
-
-fn held_books(held: &[Holding]) -> Vec<Pubkey> {
-    held.iter()
+    let books: Vec<Pubkey> = held
+        .iter()
         .flat_map(|held| [held.market.orderbook, held.market.splines])
-        .collect()
-}
-
-fn cancels(
-    exchange: &Exchange,
-    authority: Pubkey,
-    trader: Pubkey,
-    held: &[Holding],
-) -> SurfpoolResult<Vec<Instruction>> {
+        .collect();
+    hydrate(svm, remote_ctx, &books).await?;
     held.iter()
         .map(|held| {
-            cancel_all(
-                exchange,
-                authority,
-                trader,
-                (held.market.orderbook, held.market.splines),
+            phoenix_instruction(
+                "CancelAll",
+                &[
+                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                    ("phoenixLogAuthority", log_authority()),
+                    ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+                    ("traderWallet", authority),
+                    ("traderAccount", trader),
+                    ("perpAssetMap", exchange.perp_asset_map),
+                    ("globalTraderIndex", exchange.global_trader_index),
+                    ("activeTraderBuffer", exchange.active_trader_buffer),
+                    ("orderbook", held.market.orderbook),
+                    ("splines", held.market.splines),
+                ],
+                &serde_json::json!({}),
             )
         })
         .collect()
-}
-
-/// A keeper's liquidation of as much of the position as the market allows in one go, priced like
-/// the keepers on mainnet: at most 10% through the mark.
-pub fn liquidation(
-    context: &MarketContext,
-    trader: Pubkey,
-    long: bool,
-    mark_ticks: u64,
-) -> SurfpoolResult<Instruction> {
-    let limit = if long {
-        mark_ticks - mark_ticks / 10
-    } else {
-        mark_ticks + mark_ticks / 10
-    }
-    .clamp(1, u64::from(u32::MAX));
-    phoenix_instruction(
-        "LiquidateViaMarketOrder",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("liquidatorWallet", PLACEHOLDER_LIQUIDATOR),
-            ("liquidatedTrader", trader),
-            ("traderAccount", trader),
-            ("perpAssetMap", context.exchange.perp_asset_map),
-            ("globalTraderIndex", context.exchange.global_trader_index),
-            ("activeTraderBuffer", context.exchange.active_trader_buffer),
-            ("orderbook", context.market.orderbook),
-            ("splines", context.market.splines),
-        ],
-        &serde_json::json!({
-            "params": {
-                "assetMint": Pubkey::new_from_array(context.exchange.config.canonical_token_mint_key()).to_string(),
-                "liquidationSize": { "inner": context.market.max_liquidation_size },
-                "liquidationPrice": { "inner": limit },
-                "fillOrKill": false,
-            }
-        }),
-    )
 }
 
 /// Hawkeye's margin view of `trader`, read inside the sandbox.
@@ -899,12 +282,30 @@ pub struct TraderPosition {
     pub maintenance_margin_quote_lots: u64,
 }
 
+/// One trader as a surfnet reports it.
+pub struct TraderPositions {
+    pub positions: Vec<TraderPosition>,
+    /// Whether the local GlobalTraderIndex lists the trader.
+    pub hot: bool,
+    /// Hawkeye's view as `phoenix-trader-collateral` leaves the trader, a hot trader's orders
+    /// cancelled.
+    pub margin: MarginView,
+    /// The field `phoenix-trader-collateral` writes, which can differ from `margin`'s collateral.
+    pub quote_lot_collateral: i64,
+    /// The same view once oracle reports have moved the given markets; `None` without moves.
+    pub margin_after_moves: Option<MarginView>,
+    /// Why `phoenix-trader-collateral` would refuse the trader, if it would.
+    pub refusal: Option<String>,
+}
+
 /// Every listed market `trader` holds a position in, as Hawkeye reports it on a copy of the
 /// surfnet `client` points at, which loads any account it is missing; nothing is written back.
+/// `moves` are markets and the ticks they move to, for the margin after them.
 pub async fn trader_positions(
     client: SurfnetRemoteClient,
     trader: Pubkey,
-) -> SurfpoolResult<Vec<TraderPosition>> {
+    moves: &[(String, u64)],
+) -> SurfpoolResult<TraderPositions> {
     let (mut svm, _events, _geyser) = SurfnetSvm::new(SurfnetSvmConfig::default())?;
     let commitment = CommitmentConfig::confirmed();
     let clock = client
@@ -916,19 +317,7 @@ pub async fn trader_positions(
     svm.inner.set_sysvar(&clock);
     svm.inner.set_sysvar(&client.get_last_restart_slot().await?);
     let remote = Some((client, commitment));
-    let exchange = Exchange::load(&mut svm, &remote).await?;
-    hydrate(
-        &mut svm,
-        &remote,
-        &[
-            trader,
-            HAWKEYE_PROGRAM_ID,
-            exchange.perp_asset_map,
-            exchange.global_trader_index,
-            exchange.active_trader_buffer,
-        ],
-    )
-    .await?;
+    hydrate(&mut svm, &remote, &[trader]).await?;
     let account = svm.inner.get_account(&trader)?.ok_or_else(|| {
         SurfpoolError::internal(format!("there is no Phoenix Trader at {trader}"))
     })?;
@@ -938,33 +327,176 @@ pub async fn trader_positions(
             Some("Expected a Phoenix Trader"),
         ));
     }
-    TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
-        SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
-    })?;
     keep_markets_usable(&mut svm, &remote, clock.slot).await;
-    Ok(holdings(&svm, &exchange, &trader)?
-        .into_iter()
-        .filter(|held| held.base_lots != 0)
-        .map(|held| TraderPosition {
-            symbol: held.market.symbol,
-            orderbook: held.market.orderbook,
-            base_lots: held.base_lots,
-            maintenance_margin_quote_lots: held.maintenance_margin_quote_lots,
+    let symbols: Vec<&str> = moves.iter().map(|(symbol, _)| symbol.as_str()).collect();
+    let mut moved = MarketContext::load_all(&mut svm, &remote, &symbols).await?;
+    let (mut lever, still_listed) = LeverState::load(&mut svm, &remote, trader).await?;
+    let (margin_now, quote_lot_collateral) = lever.reading(trader)?;
+    let refusal = still_listed
+        .or_else(|| {
+            let left = lever.state.account(&trader).ok()?;
+            with_collateral(trader, &left, quote_lot_collateral).err()
         })
-        .collect())
+        .map(|refusal| refusal.to_string());
+    let LeverState {
+        exchange,
+        hot,
+        held,
+        mut state,
+    } = lever;
+    let margin_after_moves = if moves.is_empty() {
+        None
+    } else {
+        // A cancel freezes the mark for risk in its slot, and the margin reads only the marks, so
+        // oracle reports a slot later stand in for the moves.
+        state.next_slot();
+        for (context, (_, ticks)) in moved.iter_mut().zip(moves) {
+            state.run(&context.oracle_reports(*ticks)?)?;
+        }
+        Some(margin(&mut state, &exchange, &trader)?)
+    };
+    Ok(TraderPositions {
+        positions: held
+            .into_iter()
+            .filter(|held| held.base_lots != 0)
+            .map(|held| TraderPosition {
+                symbol: held.market.symbol,
+                orderbook: held.market.orderbook,
+                base_lots: held.base_lots,
+                maintenance_margin_quote_lots: held.maintenance_margin_quote_lots,
+            })
+            .collect(),
+        hot,
+        margin: margin_now,
+        quote_lot_collateral,
+        margin_after_moves,
+        refusal,
+    })
 }
 
-fn refuse_repeats(symbols: &[&str]) -> SurfpoolResult<()> {
-    match symbols
-        .iter()
-        .enumerate()
-        .find_map(|(index, symbol)| symbols[..index].contains(symbol).then_some(symbol))
-    {
-        Some(repeated) => Err(SurfpoolError::internal(format!(
-            "{repeated} is listed twice"
-        ))),
-        None => Ok(()),
+/// The state the collateral lever writes into and its values are read from: a hot trader's orders
+/// cancelled, a cold trader left as it is, since a cancel changes its margin too.
+pub(crate) struct LeverState<'a> {
+    pub(crate) exchange: Exchange,
+    pub(crate) hot: bool,
+    held: Vec<Holding>,
+    pub(crate) state: Sandbox<'a>,
+}
+
+impl<'a> LeverState<'a> {
+    /// The state, with the refusal when Phoenix still lists the trader after the cancel.
+    pub(crate) async fn load(
+        svm: &'a mut SurfnetSvm,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        trader: Pubkey,
+    ) -> SurfpoolResult<(LeverState<'a>, Option<SurfpoolError>)> {
+        let account = local_account(svm, &trader)?;
+        let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+            SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
+        })?;
+        let exchange = Exchange::load(svm, remote_ctx).await?;
+        hydrate(
+            svm,
+            remote_ctx,
+            &[
+                HAWKEYE_PROGRAM_ID,
+                exchange.perp_asset_map,
+                exchange.active_trader_buffer,
+            ],
+        )
+        .await?;
+        let index = local_account(svm, &exchange.global_trader_index)?;
+        refuse_unindexed_hot_trader(trader, &header, &index)?;
+        let hot = indexed(&index, &trader)?;
+        let held = holdings(svm, &exchange, &trader)?;
+        let cancels = if hot {
+            let authority = Pubkey::new_from_array(header.authority);
+            cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &held).await?
+        } else {
+            Vec::new()
+        };
+        let mut state = Sandbox::new(svm);
+        if !cancels.is_empty() {
+            state.run(&cancels)?;
+        }
+        let still_listed = indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
+        let refusal = still_listed.then(|| {
+            SurfpoolError::internal(format!(
+                "{trader} stays in Phoenix's active trader index after its orders are cancelled, \
+                 so Phoenix would not read collateral written to its account"
+            ))
+        });
+        Ok((
+            LeverState {
+                exchange,
+                hot,
+                held,
+                state,
+            },
+            refusal,
+        ))
     }
+
+    /// Hawkeye's margin of `trader` in this state, and its collateral field.
+    pub(crate) fn reading(&mut self, trader: Pubkey) -> SurfpoolResult<(MarginView, i64)> {
+        let view = margin(&mut self.state, &self.exchange, &trader)?;
+        let account = self.state.account(&trader)?;
+        let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+            SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
+        })?;
+        Ok((
+            view,
+            bytemuck::cast(header.trader_state.quote_lot_collateral),
+        ))
+    }
+}
+
+/// The writes that set `trader`'s collateral to `quote_lots`, on the state [`LeverState`] leaves.
+/// A spline market maker is refused, and so is a trader Phoenix still lists after the cancel.
+pub async fn collateral_writes(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    trader: Pubkey,
+    account: &Account,
+    quote_lots: i64,
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    // Refuses a spline market maker before anything runs.
+    with_collateral(trader, account, quote_lots)?;
+    let (lever, refusal) = LeverState::load(svm, remote_ctx, trader).await?;
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    let left = with_collateral(trader, &lever.state.account(&trader)?, quote_lots)?;
+    let mut writes = lever.state.writes()?;
+    writes.retain(|(address, _)| *address != trader);
+    writes.push((trader, left));
+    Ok(writes)
+}
+
+/// The Trader `account` with its collateral field set to `quote_lots`, or the refusal of a spline
+/// market maker.
+pub(crate) fn with_collateral(
+    trader: Pubkey,
+    account: &Account,
+    quote_lots: i64,
+) -> SurfpoolResult<Account> {
+    let mut header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+        SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
+    })?;
+    if header.num_markets_with_splines > 0 {
+        return Err(SurfpoolError::internal(format!(
+            "{trader} quotes splines on {} markets; liquidating a spline market maker is not \
+             supported",
+            header.num_markets_with_splines
+        )));
+    }
+    header.trader_state.quote_lot_collateral = bytemuck::cast(quote_lots);
+    let mut data = account.data.clone();
+    data[..size_of::<TraderHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    Ok(Account {
+        data,
+        ..account.clone()
+    })
 }
 
 /// Phoenix looks a hot trader up in the index, and fails its cancels and liquidations with
@@ -974,11 +506,7 @@ fn refuse_unindexed_hot_trader(
     header: &TraderHeader,
     index: &Account,
 ) -> SurfpoolResult<()> {
-    if header.trader_state.is_hot()
-        && !index_trader_state_ranges(index)?
-            .iter()
-            .any(|(listed, _)| *listed == trader)
-    {
+    if header.trader_state.is_hot() && !indexed(index, &trader)? {
         return Err(SurfpoolError::internal(format!(
             "{trader} is marked hot, but the local GlobalTraderIndex does not list it, so Phoenix \
              can neither cancel its orders nor liquidate it; the two accounts were fetched at \
@@ -986,6 +514,13 @@ fn refuse_unindexed_hot_trader(
         )));
     }
     Ok(())
+}
+
+/// Whether the GlobalTraderIndex `index` lists `trader`, so Phoenix keeps its state there.
+fn indexed(index: &Account, trader: &Pubkey) -> SurfpoolResult<bool> {
+    Ok(index_trader_state_ranges(index)?
+        .iter()
+        .any(|(listed, _)| listed == trader))
 }
 
 /// Every hot Trader the GlobalTraderIndex tree reaches, with its TraderState byte range. Freed
@@ -1054,29 +589,6 @@ pub(crate) mod tests {
 
     use super::*;
 
-    #[test]
-    fn a_cascade_takes_the_smallest_move_that_leaves_two_liquidatable() {
-        let band = |low, high| (Pubkey::new_unique(), low, high);
-        let near_pair_and_deep_three = [
-            band(95, 98),
-            band(96, 99),
-            band(50, 60),
-            band(52, 58),
-            band(51, 59),
-        ];
-        assert_eq!(cascade_price(&near_pair_and_deep_three, 100), Some(98));
-        assert_eq!(
-            cascade_price(&[band(102, 105), band(104, 108)], 100),
-            Some(104)
-        );
-        assert_eq!(
-            cascade_price(&[band(90, 92), band(80, 85)], 100),
-            Some(92),
-            "no two meet"
-        );
-        assert_eq!(cascade_price(&[], 100), None);
-    }
-
     pub(crate) fn index_trader_state_range(
         index: &Account,
         trader_key: &[u8; 32],
@@ -1090,16 +602,6 @@ pub(crate) mod tests {
                     "Hot Phoenix Trader has no reachable GlobalTraderIndex entry",
                 )
             })
-    }
-
-    #[test]
-    fn a_midpoint_always_narrows_the_search() {
-        // Two odd ends two apart once stalled the halving at one of them.
-        assert_eq!(midpoint(3, 1), 2);
-        assert_eq!(midpoint(1, 3), 2);
-        assert_eq!(midpoint(10_400, 10_402), 10_401);
-        assert_eq!(midpoint(1, u64::from(u32::MAX)), 2_147_483_648);
-        assert_eq!(midpoint(7, 8), 7);
     }
 
     #[test]
@@ -1117,14 +619,6 @@ pub(crate) mod tests {
         let short = &data[..size_of::<MarginView>() - 1];
         assert!(MarginView::from_return_data(short).is_err());
         assert!(AssetView::from_return_data(&data).is_err(), "wrong magic");
-    }
-
-    #[test]
-    fn a_cross_margin_search_finds_the_first_move() {
-        let found = first_move(990_000, |moved| Ok(moved >= 351_088)).unwrap();
-        assert!(found.is_some_and(|moved| (351_088..=351_088 + MOVE_PRECISION).contains(&moved)));
-        assert_eq!(first_move(990_000, |_| Ok(true)).unwrap(), Some(0));
-        assert_eq!(first_move(990_000, |_| Ok(false)).unwrap(), None);
     }
 
     const FIRST_KEY: [u8; 32] = [11; 32];
@@ -1184,6 +678,80 @@ pub(crate) mod tests {
         assert!(
             refuse_unindexed_hot_trader(missing, &header, &index).is_ok(),
             "a cold trader is not looked up"
+        );
+    }
+
+    fn trader_account(header: TraderHeader) -> Account {
+        let mut data = bytemuck::bytes_of(&header).to_vec();
+        // The position map follows the header and must stay as it is.
+        data.extend([7; 48]);
+        Account {
+            lamports: 1,
+            data,
+            owner: PHOENIX_PROGRAM_ID,
+            ..Account::default()
+        }
+    }
+
+    fn cold_trader_header() -> TraderHeader {
+        let mut header = TraderHeader::zeroed();
+        header.discriminant = u64::from_le_bytes(PhoenixAccount::Trader.discriminant());
+        header.trader_state.quote_lot_collateral = bytemuck::cast(123_i64);
+        header
+    }
+
+    #[test]
+    fn collateral_lands_where_the_idl_puts_trader_state_quote_lot_collateral() {
+        let trader = Pubkey::new_unique();
+        let account = trader_account(cold_trader_header());
+        let quote_lots = -5_030_916_850_i64;
+
+        let written = with_collateral(trader, &account, quote_lots).unwrap();
+
+        // Discriminant (8), sequence number (16), key and authority (32 each), then TraderState,
+        // which opens with the collateral.
+        assert_eq!(written.data[88..96], quote_lots.to_le_bytes());
+        let changed: Vec<usize> = (0..account.data.len())
+            .filter(|index| written.data[*index] != account.data[*index])
+            .collect();
+        assert!(
+            changed.iter().all(|index| (88..96).contains(index)),
+            "{changed:?}"
+        );
+        assert_eq!(
+            (written.lamports, written.owner),
+            (account.lamports, account.owner)
+        );
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let through_idl = svm
+            .get_forged_account_data(
+                &trader,
+                &account.data,
+                super::super::state_builder::phoenix_idl(),
+                &std::collections::HashMap::from([(
+                    "traderState.quoteLotCollateral".to_string(),
+                    serde_json::json!(quote_lots),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(written.data, through_idl);
+    }
+
+    #[test]
+    fn collateral_refuses_a_spline_market_maker() {
+        let mut maker = cold_trader_header();
+        maker.num_markets_with_splines = 3;
+        let trader = Pubkey::new_unique();
+        let error = with_collateral(trader, &trader_account(maker), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "{trader} quotes splines on 3 markets; liquidating a spline market maker is not \
+                 supported"
+            )),
+            "{error}"
         );
     }
 
