@@ -211,7 +211,7 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `... accounts are missing locally and there is no datasource` | The template needs Phoenix accounts that are not in the local VM, and surfnet has no upstream datasource to fetch them from.      |
 | `... is offline and missing locally`                          | The account is marked offline, so surfnet will not fetch it.                                                                      |
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |
-| `... stays in Phoenix's active trader index ...`              | The trader's orders were cancelled, but Phoenix still lists it, so it would not read the written collateral.                      |
+| `... is in Phoenix's active trader index and ...`             | Phoenix still lists the trader after its orders are cancelled, or it has none to cancel, so it would not read the written collateral. |
 | `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, which `phoenix-trader-collateral` does not support.                                         |
 | `the ... book stayed crossed after ... uncross cranks`        | The book was still crossed when the execution budget was exhausted. Try a smaller move; this error alone does not establish that the local accounts are inconsistent. |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |

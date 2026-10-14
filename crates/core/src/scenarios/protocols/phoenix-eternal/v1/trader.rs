@@ -405,9 +405,8 @@ impl<'a> LeverState<'a> {
             ],
         )
         .await?;
-        let index = local_account(svm, &exchange.global_trader_index)?;
-        refuse_unindexed_hot_trader(trader, &header, &index)?;
-        let hot = indexed(&index, &trader)?;
+        let hot = indexed(&local_account(svm, &exchange.global_trader_index)?, &trader)?;
+        refuse_unindexed_hot_trader(trader, &header, hot)?;
         let held = holdings(svm, &exchange, &trader)?;
         let cancels = if hot {
             let authority = Pubkey::new_from_array(header.authority);
@@ -419,11 +418,16 @@ impl<'a> LeverState<'a> {
         if !cancels.is_empty() {
             state.run(&cancels)?;
         }
-        let still_listed = indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
+        let still_listed = hot && indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
         let refusal = still_listed.then(|| {
+            let why = if cancels.is_empty() {
+                "has no orders whose cancel would take it out"
+            } else {
+                "stays there after its orders are cancelled"
+            };
             SurfpoolError::internal(format!(
-                "{trader} stays in Phoenix's active trader index after its orders are cancelled, \
-                 so Phoenix would not read collateral written to its account"
+                "{trader} is in Phoenix's active trader index and {why}, so Phoenix would not read \
+                 collateral written to its account"
             ))
         });
         Ok((
@@ -504,9 +508,9 @@ pub(crate) fn with_collateral(
 fn refuse_unindexed_hot_trader(
     trader: Pubkey,
     header: &TraderHeader,
-    index: &Account,
+    listed: bool,
 ) -> SurfpoolResult<()> {
-    if header.trader_state.is_hot() && !indexed(index, &trader)? {
+    if header.trader_state.is_hot() && !listed {
         return Err(SurfpoolError::internal(format!(
             "{trader} is marked hot, but the local GlobalTraderIndex does not list it, so Phoenix \
              can neither cancel its orders nor liquidate it; the two accounts were fetched at \
@@ -664,8 +668,9 @@ pub(crate) mod tests {
         header.trader_state.flags = TRADER_CAPABILITY_HOT;
         let listed = Pubkey::new_from_array(FIRST_KEY);
         let missing = Pubkey::new_unique();
-        assert!(refuse_unindexed_hot_trader(listed, &header, &index).is_ok());
-        let error = refuse_unindexed_hot_trader(missing, &header, &index)
+        let in_index = |trader: &Pubkey| indexed(&index, trader).unwrap();
+        assert!(refuse_unindexed_hot_trader(listed, &header, in_index(&listed)).is_ok());
+        let error = refuse_unindexed_hot_trader(missing, &header, in_index(&missing))
             .unwrap_err()
             .to_string();
         assert!(
@@ -676,7 +681,7 @@ pub(crate) mod tests {
         );
         header.trader_state.flags = 0;
         assert!(
-            refuse_unindexed_hot_trader(missing, &header, &index).is_ok(),
+            refuse_unindexed_hot_trader(missing, &header, in_index(&missing)).is_ok(),
             "a cold trader is not looked up"
         );
     }

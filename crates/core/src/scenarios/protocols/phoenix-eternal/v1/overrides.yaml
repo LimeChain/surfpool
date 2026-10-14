@@ -43,7 +43,8 @@ templates:
     name: Phoenix Trader Collateral
     description: >-
       Set one Phoenix Eternal trader's USDC collateral, which moves its effective collateral and
-      so its distance from liquidation.
+      so its distance from liquidation. A trader in Phoenix's active trader index first has its
+      resting orders cancelled on every market.
     idl_account_name: Trader
     properties:
       - path: traderState.quoteLotCollateral
@@ -63,7 +64,9 @@ templates:
       liquidations. To have a trader cross on a phoenix-market-move at a later slot, call the
       tool with moves and use marginAfterMoves for the target and effectiveCollateral; the
       result must stay above margin.maintenanceMargin until the move.
-      A spline market maker is refused. The value can be negative.
+      A spline market maker is refused. The value can be negative. A value above the current
+      collateral is not backed by the global vault, so a later withdrawal could take funds the
+      vault does not count.
       The account is the trader's Trader account.
       Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
       list_phoenix_trader_positions first; it loads the trader into the surfnet.
