@@ -38,6 +38,7 @@ directly.
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Trader               | A trader's account, with its USDC collateral and capability flags in `traderState`.                                                                                                                                           |
 | GlobalTraderIndex    | Phoenix keeps the state of active traders here instead of in their Trader account, with their positions in the ActiveTraderBuffer. Phoenix reads those, so the templates check traders through Hawkeye, not the account copy. |
+| Hot / cold trader    | A trader the GlobalTraderIndex lists, such as one with resting orders, is hot in Phoenix's SDK; any other trader is cold, with its whole state in its Trader account.                                                         |
 | PerpAssetMap         | The single account that holds every market's oracle readings, mark price and risk parameters.                                                                                                                                 |
 | Spline               | A market maker's liquidity curve around its mid price, in the market's spline collection. Liquidations mostly fill against splines.                                                                                           |
 | Hawkeye              | A Phoenix program that returns margin and risk views, such as `view_margin`.                                                                                                                                                  |
@@ -117,10 +118,9 @@ leaves any trader ready for your keeper, with `quoteLotCollateral - effectiveCol
 from `list_phoenix_trader_positions`, which reads them on a copy where a hot trader's orders are
 already cancelled, as the template does.
 
-- Phoenix keeps an active trader's collateral in its GlobalTraderIndex; its SDK calls such a
-  trader hot, and the tool reports `hot: true`. For such a trader the template first cancels its
-  orders on every market, as the trader, which takes it out of the index; Phoenix then reads the
-  Trader account, where the field is written. Positions stay open.
+- For a hot trader, which the tool reports as `hot: true`, the template first cancels its orders
+  on every market, as the trader, which takes it out of the index; Phoenix then reads the Trader
+  account, where the field is written. Positions stay open.
 - Effective collateral moves one for one with that field, which can be negative. Hawkeye's
   `margin.collateral` can differ from the field, so it is not the base.
 - The tool fails with the reason when it cannot read the trader, and reports in `refusal` why the
@@ -133,8 +133,8 @@ Pick `target` by what the keeper should do:
 - **One liquidation:** between `backstopMargin` and `maintenanceMargin`. The keeper's first
   liquidation releases enough margin that the account is healthy again.
 - **Every position:** between `highRiskMargin` and `backstopMargin`, with the keeper liquidating the
-  smallest maintenance margin first. Below `highRiskMargin` Phoenix refuses market-order
-  liquidations. A trader with many positions can recover before its last one.
+  smallest maintenance margin first. A trader with many positions can recover before its last
+  one.
 - **Watch it cross:** pass `moves` to the tool and compute the collateral from `marginAfterMoves`
   instead, with a target between its backstop and maintenance margin. The same collateral must
   leave `margin` above its maintenance margin; then play those `phoenix-market-move` overrides at
@@ -143,14 +143,10 @@ Pick `target` by what the keeper should do:
 The collateral value is fixed when the scenario is created. It stays right while the local state
 does not change; play another scenario that moves the trader's markets or changes the trader, or
 restart the surfnet, and create it again. Funding is applied when a keeper or another instruction
-touches the market, which moved traders by at most 0.75M quote lots over 20000 slots in our tests.
+touches the market.
 Keep `fetchBeforeUse` false on the template. A refused override is skipped and only logs
 `Skipping override ...`, for example when Phoenix keeps a trader in its index after the cancel;
 check the trader with the tool again after Play.
-
-Market moves run uncross cranks until the book is uncrossed or neither its best prices nor its
-resting-order count changes. They stop with an error after 256 cranks. This is an execution budget,
-not a guarantee that every possible book can be uncrossed within that many calls.
 
 ## Keeping markets usable
 
@@ -214,7 +210,7 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |
 | `... is in Phoenix's active trader index and ...`             | Phoenix still lists the trader after its orders are cancelled, or it has none to cancel, so it would not read the written collateral. |
 | `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, which `phoenix-trader-collateral` does not support.                                         |
-| `the ... book stayed crossed after ... uncross cranks`        | The book was still crossed when the execution budget was exhausted. Try a smaller move; this error alone does not establish that the local accounts are inconsistent. |
+| `the ... book stayed crossed after ... uncross cranks`        | The book was still crossed after the uncross cranks. Try a smaller move.                                                          |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
 | `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
 
