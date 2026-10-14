@@ -39,6 +39,45 @@ templates:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
 
+  - id: phoenix-oracle-price
+    name: Phoenix Oracle Price
+    description: >-
+      Set one Phoenix Eternal market's oracle price, in ticks or as a percentage change. Only the
+      oracles move: the order book and the makers' quotes stay where they are.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: target_ticks
+        type: input
+        value_type: string
+        label: Oracle Price (ticks)
+        description: The new price in ticks, at least 1; leave empty to give a percentage instead
+      - path: change_percent
+        type: input
+        value_type: string
+        label: Change (%)
+        description: >-
+          Change from the current mark in percent, for example -5 or 2.5; leave
+          empty to give ticks instead
+    llm_context: |
+      Every oracle key that reports the market sends the new price through Phoenix's own oracle
+      update, and Phoenix recomputes the mark from it. Nothing else moves: makers keep their
+      quotes and resting orders keep their prices, so a trade or liquidation right after fills
+      against the old book. Use phoenix-market-move when the book should follow the price.
+      Give exactly one of target_ticks and change_percent, as a decimal string. change_percent is
+      applied to the market's mark when the override plays, so moves at later slots add up.
+      USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
+      list_phoenix_markets.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
   - id: phoenix-trader-collateral
     name: Phoenix Trader Collateral
     description: >-

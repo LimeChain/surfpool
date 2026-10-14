@@ -25,7 +25,9 @@ use surfpool_types::Idl;
 use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 
 use super::{
-    market::{Market, invalid_perp_asset_map, map_entries, move_market, phoenix_markets},
+    market::{
+        Market, MarketContext, invalid_perp_asset_map, map_entries, move_market, phoenix_markets,
+    },
     trader::collateral_writes,
 };
 use crate::{
@@ -492,6 +494,7 @@ const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 const TRADER_CAPABILITIES_TEMPLATE_ID: &str = "phoenix-trader-capabilities";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
 const TARGET_TICKS_FIELD: &str = "target_ticks";
+const CHANGE_PERCENT_FIELD: &str = "change_percent";
 
 /// The GlobalConfig role that signs a configuration instruction on mainnet.
 #[derive(Clone, Copy, Debug)]
@@ -718,6 +721,12 @@ pub async fn prepare_phoenix_override(
                 .await
                 .map(Some)
         }
+        "phoenix-oracle-price" => {
+            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
+            let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
+            let target_ticks = oracle_target(values, context.market.mark_ticks)?;
+            run_instructions(svm, &context.oracle_reports(target_ticks)?).map(Some)
+        }
         "phoenix-trader-collateral" => {
             let quote_lots = whole_number_input(values, "traderState.quoteLotCollateral")?;
             collateral_writes(svm, remote_ctx, *account_pubkey, account, quote_lots)
@@ -754,6 +763,45 @@ fn whole_number_input<T: FromStr>(
             "{field} must be a whole number, as a decimal string or a JSON number"
         ))
     })
+}
+
+/// `target_ticks` as given, or `change_percent` applied to the market's mark.
+fn oracle_target(
+    values: &HashMap<String, serde_json::Value>,
+    mark_ticks: u64,
+) -> SurfpoolResult<u64> {
+    match (
+        given(values, TARGET_TICKS_FIELD),
+        given(values, CHANGE_PERCENT_FIELD),
+    ) {
+        (Some(_), None) => whole_number_input(values, TARGET_TICKS_FIELD),
+        (None, Some(percent)) => percent_of(mark_ticks, percent),
+        _ => Err(SurfpoolError::internal(format!(
+            "set exactly one of {TARGET_TICKS_FIELD} and {CHANGE_PERCENT_FIELD}"
+        ))),
+    }
+}
+
+/// `mark_ticks` moved by a percentage such as "-5" or "2.5", rounded to the nearest tick.
+fn percent_of(mark_ticks: u64, percent: &serde_json::Value) -> SurfpoolResult<u64> {
+    let change = match percent {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        serde_json::Value::Number(number) => number.as_f64(),
+        _ => None,
+    }
+    .filter(|change| change.is_finite())
+    .ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "{CHANGE_PERCENT_FIELD} must be a number such as -5 or 2.5, not {percent}"
+        ))
+    })?;
+    let moved = (mark_ticks as f64 * (1.0 + change / 100.0)).round();
+    if moved < 1.0 {
+        return Err(SurfpoolError::internal(format!(
+            "{CHANGE_PERCENT_FIELD} {change} leaves no positive price from {mark_ticks} ticks"
+        )));
+    }
+    Ok(moved as u64)
 }
 
 /// Nothing refreshes oracle readings or makers' quotes locally, so this raises the map's stale
@@ -1375,6 +1423,56 @@ pub(crate) mod tests {
         assert!(text_input(&bad, "missing").is_err());
         assert!(whole_number_input::<u64>(&bad, "target_ticks").is_err());
         assert!(whole_number_input::<u64>(&bad, "as_number").is_err());
+    }
+
+    #[test]
+    fn takes_the_oracle_target_in_ticks_or_as_a_percentage_of_the_mark() {
+        let target = |pairs: &[(&str, serde_json::Value)]| {
+            let values = pairs
+                .iter()
+                .map(|(field, value)| (field.to_string(), value.clone()))
+                .collect();
+            oracle_target(&values, 10_801)
+        };
+        let ticks = serde_json::json!("10261");
+        let percent = |value| (CHANGE_PERCENT_FIELD, value);
+        assert_eq!(
+            target(&[(TARGET_TICKS_FIELD, ticks.clone())]).unwrap(),
+            10_261
+        );
+        assert_eq!(target(&[percent(serde_json::json!("-5"))]).unwrap(), 10_261);
+        assert_eq!(
+            target(&[percent(serde_json::json!("+2.5"))]).unwrap(),
+            11_071
+        );
+        assert_eq!(
+            target(&[percent(serde_json::json!(-0.25))]).unwrap(),
+            10_774
+        );
+        assert_eq!(
+            target(&[
+                (TARGET_TICKS_FIELD, serde_json::json!("")),
+                percent(serde_json::json!("10"))
+            ])
+            .unwrap(),
+            11_881
+        );
+
+        for bad in ["5%", "abc", "inf", "-100", "-150"] {
+            assert!(
+                target(&[percent(serde_json::json!(bad))]).is_err(),
+                "{bad:?} is refused"
+            );
+        }
+        assert!(target(&[]).is_err(), "one of the two is needed");
+        assert!(
+            target(&[
+                (TARGET_TICKS_FIELD, ticks),
+                percent(serde_json::json!("-5"))
+            ])
+            .is_err(),
+            "not both"
+        );
     }
 
     #[test]

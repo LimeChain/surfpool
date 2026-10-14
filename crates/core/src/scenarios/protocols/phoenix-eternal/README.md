@@ -1,6 +1,6 @@
 # Phoenix Eternal
 
-Surfpool bundles the Phoenix Eternal IDL and 16 override templates, so a scenario can put
+Surfpool bundles the Phoenix Eternal IDL and 17 override templates, so a scenario can put
 Phoenix perpetuals into the state your code needs to see: a market moved to a new price, traders
 set a planned distance from liquidation, a paused market, throttled withdrawals. The templates only
 prepare state. Liquidations and trades are sent by your own code.
@@ -92,6 +92,7 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | Template                              | What it does                                                                                           | Signer accounts              |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------- |
 | `phoenix-market-move`                 | Moves a market's oracle readings, its makers' splines and its book to a price, and uncrosses the book. | oracle keys, makers          |
+| `phoenix-oracle-price`                | Moves only a market's oracle readings, in ticks or by a percentage; the book and makers stay.          | oracle keys                  |
 | `phoenix-trader-collateral`           | A trader's USDC collateral, which sets its distance from liquidation.                                  | field write, trader          |
 | `phoenix-market-risk-factors`         | Maintenance, backstop and high-risk factors.                                                           | risk authority               |
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |

@@ -601,6 +601,74 @@ async fn a_market_move_reprices_the_oracles_and_the_book_together() {
     }
 }
 
+/// The oracle price template moves only the oracle readings, to the ticks given or by a percentage
+/// of the mark; the book and the makers' quotes stay as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oracle_price_override_moves_the_oracles_and_leaves_the_book() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    // The maintenance every Phoenix override runs first, so the book and splines compared below
+    // change only through the template.
+    keep_markets_usable(&mut *locker.0.write().await, &remote, graph.clock.slot).await;
+    let account = |address| locker.with_svm_reader(|svm| local_account(svm, &address).unwrap());
+
+    for (symbol, orderbook, spline) in graph.markets.clone() {
+        let before = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+        let (book, splines) = (account(orderbook), account(spline));
+        let target = before.mark_price_ticks * 93 / 100;
+        let ticks = [
+            ("symbol", symbol.clone()),
+            ("target_ticks", target.to_string()),
+        ];
+        configure(
+            &locker,
+            "phoenix-oracle-price",
+            graph.perp_asset_map,
+            &ticks,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{symbol}: {e}"));
+
+        let after = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+        assert_eq!(
+            after.index_price_ticks, target,
+            "{symbol}: the oracles report the target"
+        );
+        assert_eq!(
+            (after.best_bid_ticks, after.best_ask_ticks),
+            (before.best_bid_ticks, before.best_ask_ticks),
+            "{symbol}: the book keeps its prices"
+        );
+        assert!(
+            account(orderbook) == book && account(spline) == splines,
+            "{symbol}: the order book and the makers' splines are not written"
+        );
+
+        let map = account(graph.perp_asset_map);
+        let mark = Market::find(&graph.perp_asset_map, &map.data, &symbol)
+            .unwrap()
+            .mark_ticks;
+        let percent = [
+            ("symbol", symbol.clone()),
+            ("change_percent", "-2.5".to_string()),
+        ];
+        configure(
+            &locker,
+            "phoenix-oracle-price",
+            graph.perp_asset_map,
+            &percent,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{symbol}: {e}"));
+        // Within a tick: the template rounds a float.
+        let index = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline).index_price_ticks;
+        assert!(
+            index.abs_diff(mark * 975 / 1_000) <= 1,
+            "{symbol}: a percentage is taken from the mark, {index} from {mark}"
+        );
+    }
+}
+
 /// One uncross crank matches at most 64 crossed orders, so a move past more resting bids than that
 /// needs several before the book is uncrossed.
 #[tokio::test(flavor = "multi_thread")]
