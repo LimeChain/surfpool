@@ -447,7 +447,7 @@ pub async fn move_market(
 
 /// Phoenix's uncross crank breaks on books that do not match the local trader index, which
 /// happens when surfnet fetched the two at different times; the raw program panic says nothing.
-fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
+pub(crate) fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
     let text = error.to_string();
     if !text.contains("Uncross Crank") {
         return error;

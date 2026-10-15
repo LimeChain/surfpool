@@ -9,7 +9,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 use super::{
-    market::{Market, MarketContext, phoenix_markets},
+    market::{Market, MarketContext, explain_move_failure, phoenix_markets},
     state_builder::{
         Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PROGRAM_ID, Sandbox, hydrate, keep_markets_usable,
         local_account, log_authority, phoenix_instruction,
@@ -292,7 +292,8 @@ pub struct TraderPositions {
     pub margin: MarginView,
     /// The field `phoenix-trader-collateral` writes, which can differ from `margin`'s collateral.
     pub quote_lot_collateral: i64,
-    /// The same view once oracle reports have moved the given markets; `None` without moves.
+    /// The same view once the given markets move the way `phoenix-market-move` moves them; `None`
+    /// without moves.
     pub margin_after_moves: Option<MarginView>,
     /// Why `phoenix-trader-collateral` would refuse the trader, if it would.
     pub refusal: Option<String>,
@@ -316,8 +317,18 @@ pub async fn trader_positions(
         .map_err(|e| SurfpoolError::internal(format!("the surfnet's Clock is invalid: {e}")))?;
     svm.inner.set_sysvar(&clock);
     svm.inner.set_sysvar(&client.get_last_restart_slot().await?);
-    let remote = Some((client, commitment));
-    hydrate(&mut svm, &remote, &[trader]).await?;
+    trader_positions_in(&mut svm, &Some((client, commitment)), trader, moves).await
+}
+
+/// [`trader_positions`] computed in `svm`, which also takes the markets' upkeep and every account
+/// it loads.
+pub(crate) async fn trader_positions_in(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    trader: Pubkey,
+    moves: &[(String, u64)],
+) -> SurfpoolResult<TraderPositions> {
+    hydrate(svm, remote_ctx, &[trader]).await?;
     let account = svm.inner.get_account(&trader)?.ok_or_else(|| {
         SurfpoolError::internal(format!("there is no Phoenix Trader at {trader}"))
     })?;
@@ -327,10 +338,11 @@ pub async fn trader_positions(
             Some("Expected a Phoenix Trader"),
         ));
     }
-    keep_markets_usable(&mut svm, &remote, clock.slot).await;
+    let slot = svm.inner.get_sysvar::<Clock>().slot;
+    keep_markets_usable(svm, remote_ctx, slot).await;
     let symbols: Vec<&str> = moves.iter().map(|(symbol, _)| symbol.as_str()).collect();
-    let mut moved = MarketContext::load_all(&mut svm, &remote, &symbols).await?;
-    let (mut lever, still_listed) = LeverState::load(&mut svm, &remote, trader).await?;
+    let mut moved = MarketContext::load_all(svm, remote_ctx, &symbols).await?;
+    let (mut lever, still_listed) = LeverState::load(svm, remote_ctx, trader).await?;
     let (margin_now, quote_lot_collateral) = lever.reading(trader)?;
     let refusal = still_listed
         .or_else(|| {
@@ -347,11 +359,13 @@ pub async fn trader_positions(
     let margin_after_moves = if moves.is_empty() {
         None
     } else {
-        // A cancel freezes the mark for risk in its slot, and the margin reads only the marks, so
-        // oracle reports a slot later stand in for the moves.
+        // A cancel freezes the mark for risk in its slot, so the moves play a slot later, the way
+        // phoenix-market-move plays them after the lever.
         state.next_slot();
         for (context, (_, ticks)) in moved.iter_mut().zip(moves) {
-            state.run(&context.oracle_reports(*ticks)?)?;
+            context
+                .move_in(&mut state, *ticks)
+                .map_err(explain_move_failure)?;
         }
         Some(margin(&mut state, &exchange, &trader)?)
     };
