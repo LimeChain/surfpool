@@ -9,36 +9,6 @@ tags:
   - risk
 
 templates:
-  - id: phoenix-market-move
-    name: Phoenix Market Move
-    description: >-
-      Move one Phoenix Eternal market to a new price the way mainnet moves it: oracle reports,
-      maker liquidity and the order book together.
-    idl_account_name: PerpAssetMap
-    properties:
-      - path: symbol
-        type: dynamic_ref
-        label: Market Symbol
-        source: list_phoenix_markets
-        description: Exact Phoenix market symbol
-      - path: target_ticks
-        type: input
-        value_type: string
-        label: Target Price (ticks)
-        description: The new price in ticks, at least 1, encoded as a decimal string
-    llm_context: |
-      This runs Phoenix's own instructions: every oracle key that reports the market sends the new
-      price, every active market maker re-centres its spline liquidity on it, and resting orders
-      the move left crossed are matched. The mark, the index and the best bid and ask all end up
-      at the target, so trades and liquidations fill at the new price.
-      USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
-      list_phoenix_markets; compute a relative move from markTicks there.
-      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
-      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
-    address:
-      type: pubkey
-      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
-
   - id: phoenix-oracle-price
     name: Phoenix Oracle Price
     description: >-
@@ -72,6 +42,36 @@ templates:
       applied to the market's mark when the override plays, so moves at later slots add up.
       USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
       list_phoenix_markets.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-move
+    name: Phoenix Market Move
+    description: >-
+      Move one Phoenix Eternal market to a new price the way mainnet moves it: oracle reports,
+      maker liquidity and the order book together.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: target_ticks
+        type: input
+        value_type: string
+        label: Target Price (ticks)
+        description: The new price in ticks, at least 1, encoded as a decimal string
+    llm_context: |
+      This runs Phoenix's own instructions: every oracle key that reports the market sends the new
+      price, every active market maker re-centres its spline liquidity on it, and resting orders
+      the move left crossed are matched. The mark, the index and the best bid and ask all end up
+      at the target, so trades and liquidations fill at the new price.
+      USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
+      list_phoenix_markets; compute a relative move from markTicks there.
       Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
       mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
