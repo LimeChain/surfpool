@@ -451,27 +451,41 @@ pub(crate) fn write_all_or_none(
     writes: Vec<(Pubkey, Account)>,
     slot: u64,
 ) -> SurfpoolResult<Vec<Pubkey>> {
+    // Read before any write: a write can change the local VM and then fail on its indexes.
+    let befores = writes
+        .iter()
+        .map(|(pubkey, _)| svm.inner.get_account(pubkey))
+        .collect::<SurfpoolResult<Vec<_>>>()?;
     let mut written: Vec<(Pubkey, Option<Account>)> = Vec::with_capacity(writes.len());
-    for (pubkey, account) in writes {
-        let before = svm.inner.get_account(&pubkey)?;
+    for ((pubkey, account), before) in writes.into_iter().zip(befores) {
+        written.push((pubkey, before));
         if let Err(error) = svm.set_scenario_override_account(&pubkey, account, slot) {
+            let mut unrestored = Vec::new();
             for (pubkey, before) in written.into_iter().rev() {
+                if matches!(svm.inner.get_account(&pubkey), Ok(now) if now == before) {
+                    continue;
+                }
                 let created = before.is_none();
                 // An empty account deletes one the write created.
                 if let Err(e) =
                     svm.set_scenario_override_account(&pubkey, before.unwrap_or_default(), slot)
                 {
-                    warn!("Could not put back {pubkey} after a failed Phoenix write: {e}");
+                    unrestored.push(format!("{pubkey}: {e}"));
                 }
                 // A delete also marks the account offline, but before the write it could still be
                 // fetched upstream.
                 if created && let Err(e) = svm.offline_accounts.take(&pubkey.to_string()) {
-                    warn!("Could not put {pubkey} back online after a failed Phoenix write: {e}");
+                    unrestored.push(format!("{pubkey} stays offline: {e}"));
                 }
             }
-            return Err(error);
+            if unrestored.is_empty() {
+                return Err(error);
+            }
+            return Err(SurfpoolError::internal(format!(
+                "{error}; putting the accounts back also failed for {}",
+                unrestored.join(", ")
+            )));
         }
-        written.push((pubkey, before));
     }
     Ok(written.into_iter().map(|(pubkey, _)| pubkey).collect())
 }
