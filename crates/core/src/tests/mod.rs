@@ -7,4 +7,6 @@ pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
+#[cfg(feature = "integration-tests")]
+pub mod save;
 pub mod simnet_events;
