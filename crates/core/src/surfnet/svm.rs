@@ -343,6 +343,19 @@ fn json_to_txtx_value_for_idl_type(
                 .collect::<SurfpoolResult<Vec<_>>>()?;
             Ok(Value::Array(Box::new(converted)))
         }
+        // The encoder takes a unit variant as `{"Variant": null}`; editors and clients send its name.
+        (IdlType::Defined { name, .. }, serde_json::Value::String(variant))
+            if idl_types.iter().any(|t| {
+                &t.name == name
+                    && matches!(&t.ty, IdlTypeDefTy::Enum { variants }
+                        if variants.iter().any(|v| &v.name == variant && v.fields.is_none()))
+            }) =>
+        {
+            Ok(Value::Object(IndexMap::from([(
+                variant.clone(),
+                Value::Null,
+            )])))
+        }
         (IdlType::Defined { name, .. }, serde_json::Value::Object(fields)) => {
             let Some(IdlTypeDefTy::Struct {
                 fields: Some(IdlDefinedFields::Named(named_fields)),
@@ -8535,5 +8548,53 @@ mod tests {
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));
+    }
+
+    /// A unit enum variant can be overridden by its name as well as by `{"Variant": null}`.
+    #[test]
+    fn idl_override_takes_a_unit_enum_variant_by_name() {
+        let (svm, _events, _geyser) = SurfnetSvm::default();
+        let idl: Idl = serde_json::from_value(serde_json::json!({
+            "address": Pubkey::new_unique().to_string(),
+            "metadata": { "name": "example", "version": "0.1.0", "spec": "0.1.0" },
+            "instructions": [],
+            "accounts": [{ "name": "State", "discriminator": [1, 2, 3, 4, 5, 6, 7, 8] }],
+            "types": [
+                { "name": "State", "type": { "kind": "struct", "fields": [
+                    { "name": "status", "type": { "defined": { "name": "Status" } } },
+                    { "name": "amount", "type": "u64" }
+                ] } },
+                { "name": "Status", "type": { "kind": "enum", "variants": [
+                    { "name": "Active" },
+                    { "name": "Paused" },
+                    { "name": "Limited", "fields": ["u8"] }
+                ] } }
+            ]
+        }))
+        .expect("example idl");
+        let pubkey = Pubkey::new_unique();
+        let mut data = vec![1, 2, 3, 4, 5, 6, 7, 8, 0];
+        data.extend_from_slice(&5u64.to_le_bytes());
+        let forge = |status: serde_json::Value| {
+            svm.get_forged_account_data(
+                &pubkey,
+                &data,
+                &idl,
+                &HashMap::from([("status".to_string(), status)]),
+            )
+        };
+
+        let by_name = forge(serde_json::json!("Paused")).expect("variant name");
+        let by_object = forge(serde_json::json!({ "Paused": null })).expect("variant object");
+        assert_eq!(by_name, by_object);
+        assert_eq!(by_name.len(), data.len());
+        assert_eq!(by_name[8], 1, "Paused is variant 1");
+        assert_eq!(by_name[9..], data[9..], "amount must not move");
+
+        assert!(forge(serde_json::json!("Unknown")).is_err());
+        assert!(
+            forge(serde_json::json!("Limited")).is_err(),
+            "a variant with fields still needs its data"
+        );
     }
 }
