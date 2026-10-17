@@ -148,8 +148,6 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
     }
 }
 
-/// The vendored IDL retypes `WrappedI80F48.value` from `[u8; 16]` to `i128`. Writing back the
-/// little-endian i128 read from the raw bytes must be a no-op, which pins the byte order.
 /// The bank lookup the llm_context teaches: Bank discriminator, main group, mint and a Pyth push
 /// oracle setup, with the bank's price account sliced from config.oracle_keys.0. It filters on the
 /// discriminator because program upgrades change the Bank's size.
@@ -215,6 +213,8 @@ async fn llm_context_bank_lookup_finds_the_native_sol_and_usdc_banks() {
     }
 }
 
+/// The vendored IDL retypes `WrappedI80F48.value` from `[u8; 16]` to `i128`. Writing back the
+/// little-endian i128 read from the raw bytes must be a no-op, which pins the byte order.
 #[tokio::test]
 async fn fixed_point_fields_read_as_little_endian_i128() {
     let fetched = fetch(&[SOL_BANK, ACCOUNT]).await;
