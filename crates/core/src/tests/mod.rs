@@ -3,6 +3,10 @@ pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
 #[cfg(feature = "integration-tests")]
+pub mod meteora_damm_v2;
+#[cfg(feature = "integration-tests")]
+pub mod meteora_dlmm;
+#[cfg(feature = "integration-tests")]
 pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
