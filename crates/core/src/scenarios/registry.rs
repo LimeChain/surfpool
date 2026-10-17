@@ -7,6 +7,9 @@ use surfpool_types::{OverrideInstance, OverrideTemplate, YamlOverrideTemplateCol
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
+pub const PYTH_PRO_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/pro/v2/idl.json");
+pub const PYTH_PRO_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pyth/pro/v2/overrides.yaml");
 
 pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/idl.json");
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
@@ -46,6 +49,10 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/idl.json");
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
+
+pub const PROJECT0_V1_IDL_CONTENT: &str = include_str!("./protocols/project0/v1/idl.json");
+pub const PROJECT0_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/project0/v1/overrides.yaml");
 
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
@@ -112,6 +119,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_project0_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -122,6 +130,11 @@ impl TemplateRegistry {
 
     pub fn load_pyth_overrides(&mut self) {
         self.load_protocol_overrides(PYTH_V2_IDL_CONTENT, PYTH_V2_OVERRIDES_CONTENT, "pyth");
+        self.load_protocol_overrides(
+            PYTH_PRO_V2_IDL_CONTENT,
+            PYTH_PRO_V2_OVERRIDES_CONTENT,
+            "pyth",
+        );
     }
 
     pub fn load_jupiter_overrides(&mut self) {
@@ -184,6 +197,14 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_IDL_CONTENT,
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
+        );
+    }
+
+    pub fn load_project0_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PROJECT0_V1_IDL_CONTENT,
+            PROJECT0_V1_OVERRIDES_CONTENT,
+            "Project 0",
         );
     }
 
@@ -358,6 +379,42 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -604,16 +661,18 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (2) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Project 0 (Bank 6, MarginfiAccount 2 = 8)
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 79
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            79,
+            "Registry should load 79 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
+        assert!(registry.contains("pyth-pro-price-feed-v2"));
 
         assert!(registry.contains("jupiter-token-ledger-override"));
 
@@ -659,6 +718,15 @@ mod tests {
         assert!(registry.contains("kamino-liquidity-strategy-balances"));
         assert!(registry.contains("kamino-liquidity-strategy-rewards"));
         assert!(registry.contains("kamino-liquidity-strategy-guards"));
+
+        assert!(registry.contains("project0-bank-risk-weights"));
+        assert!(registry.contains("project0-bank-limits"));
+        assert!(registry.contains("project0-bank-status"));
+        assert!(registry.contains("project0-bank-oracle"));
+        assert!(registry.contains("project0-bank-interest-rate"));
+        assert!(registry.contains("project0-bank-shares"));
+        assert!(registry.contains("project0-account-balance"));
+        assert!(registry.contains("project0-account-authority"));
 
         assert!(registry.contains("drift-perp-market"));
         assert!(registry.contains("drift-spot-market"));
@@ -916,7 +984,7 @@ templates: []
         let registry = TemplateRegistry::new();
 
         let pyth_templates = registry.by_protocol("Pyth");
-        assert_eq!(pyth_templates.len(), 1, "Should have 1 Pyth template");
+        assert_eq!(pyth_templates.len(), 2, "Should have 2 Pyth templates");
 
         let jupiter_templates = registry.by_protocol("Jupiter");
         assert_eq!(jupiter_templates.len(), 1, "Should have 1 Jupiter template");
@@ -977,6 +1045,7 @@ templates: []
             ("kamino-swap", vec!["Order", "GlobalConfig"]),
             ("kamino-vault", vec!["VaultState", "ReserveWhitelistEntry"]),
             ("kamino-liquidity", vec!["WhirlpoolStrategy"]),
+            ("Project 0", vec!["Bank", "MarginfiAccount"]),
         ] {
             let account_types: BTreeSet<&str> = registry
                 .by_protocol(protocol)
@@ -992,6 +1061,12 @@ templates: []
                 );
             }
         }
+
+        assert_eq!(
+            registry.by_protocol("Project 0").len(),
+            8,
+            "Should have 8 Project 0 templates"
+        );
 
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
@@ -1025,8 +1100,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            5,
+            "Should find 5 oracle templates (2 Pyth + 3 Kamino Scope)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1074,6 +1149,7 @@ templates: []
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
+        assert!(ids.contains(&"pyth-pro-price-feed-v2".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
@@ -1293,6 +1369,59 @@ templates: []
         assert_eq!(
             direct_pda, expected_address,
             "Direct PDA derivation should match expected SOL/USD address"
+        );
+    }
+
+    #[test]
+    fn project0_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        let templates = registry.by_protocol("Project 0");
+        assert_eq!(templates.len(), 8);
+        for template in templates {
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{} must require an explicit target account",
+                template.id
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{} must not embed a backend account catalog",
+                template.id
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA")
+                ),
+                "{} must say how to find its account on the program",
+                template.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_pyth_pro_price_feed_takes_a_caller_selected_account() {
+        let registry = TemplateRegistry::new();
+        let pro = registry.get("pyth-pro-price-feed-v2").unwrap();
+
+        assert_eq!(
+            pro.idl().address,
+            "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp"
+        );
+        assert_eq!(
+            pro.address,
+            AccountAddress::Pubkey(String::new()),
+            "the price account must be chosen by the caller"
+        );
+        assert!(
+            pro.constants.is_empty(),
+            "the template must not embed a feed catalog"
+        );
+        assert!(
+            pro.llm_context.as_deref().is_some_and(
+                |context| context.contains("rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp")
+            ),
+            "the template must say which receiver owns its accounts"
         );
     }
 
@@ -1712,7 +1841,7 @@ templates: []
     /// Descriptions come from the IDL's own `docs`, or from an explicit `description` in the
     /// YAML. Studio and any LLM reading a template rely on them.
     #[test]
-    fn test_every_kamino_property_has_a_description() {
+    fn test_every_kamino_and_project0_property_has_a_description() {
         let registry = TemplateRegistry::new();
         let mut missing = Vec::new();
         let mut described = 0;
@@ -1724,6 +1853,7 @@ templates: []
             "kamino-swap",
             "kamino-vault",
             "kamino-liquidity",
+            "Project 0",
         ] {
             for template in registry.by_protocol(protocol) {
                 for property in &template.properties {
@@ -1737,7 +1867,7 @@ templates: []
 
         assert!(
             missing.is_empty(),
-            "{} Kamino propert(ies) have no description ({} do):\n  {}",
+            "{} Kamino or Project 0 propert(ies) have no description ({} do):\n  {}",
             missing.len(),
             described,
             missing.join("\n  ")
