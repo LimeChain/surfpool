@@ -21,6 +21,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
+- **Raydium AMM v4 / CLMM / CPMM** - Classic constant-product pools, concentrated-liquidity pools and CP-Swap pools, with pool state, fees, and swap stats override templates. See [protocols/raydium/v4/README.md](./protocols/raydium/v4/README.md), [protocols/raydium/v3/README.md](./protocols/raydium/v3/README.md) and [protocols/raydium/cpmm/v1/README.md](./protocols/raydium/cpmm/v1/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 
