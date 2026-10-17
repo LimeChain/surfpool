@@ -1,0 +1,76 @@
+protocol: PancakeSwap
+version: v1
+account_type: PoolState
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - concentrated-liquidity
+  - defi
+
+llm_context: |
+  PancakeSwap CLMM, program HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq, a fork of Raydium CLMM.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 1544 and memcmp of the two mints at offsets 73 and 105, once in each
+  order (only one returns pools). Read each pool's token_vault_0 with dataSlice {offset 137, length
+  32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
+  whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
+  ask for the pool address. A pool address the user gives is used as is.
+
+  Set fetchBeforeUse: true.
+
+  PRICE: do not move a pool's price by hand. sqrt_price_x64, tick_current and liquidity must change
+  together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
+  price shock instead.
+
+templates:
+  - id: pancakeswap-clmm-pool-state
+    name: Override CLMM Pool State
+    description: Override a PancakeSwap CLMM pool found by pair or by address
+    idl_account_name: PoolState
+    properties:
+      - path: liquidity
+        label: Liquidity
+        description: Total liquidity in the current tick range (raw u128, no decimals)
+      - path: sqrt_price_x64
+        label: Square Root Price (Q64.64)
+        description: sqrt(token_1/token_0) in Q64.64 fixed point (raw u128); must agree with tick_current
+      - path: tick_current
+        label: Current Tick
+        description: Tick index of the current price (i32); must agree with sqrt_price_x64
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
+    llm_context: |
+      Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
+
+      status is a bitmask of disabled operations: 16 disables swaps, 0 enables everything.
+    address:
+      type: pubkey
+
+  - id: pancakeswap-clmm-amm-config
+    name: Override CLMM Fee Tier (AmmConfig)
+    description: |
+      Override the fee tier (AmmConfig) a PancakeSwap CLMM pool points to. Every pool on the
+      tier shares it.
+    idl_account_name: AmmConfig
+    properties:
+      - path: trade_fee_rate
+        label: Trade Fee Rate
+        description: Fee on the input amount, parts per million (2500 = 0.25%); below 1,000,000
+      - path: protocol_fee_rate
+        label: Protocol Fee Rate
+        description: Protocol treasury's share of the collected trade fee, parts per million
+      - path: fund_fee_rate
+        label: Fund Fee Rate
+        description: Fund owner's share of the collected trade fee, parts per million
+    llm_context: |
+      Put the tier's AmmConfig in the override's account as {"pubkey":"<config>"}: read a pool's
+      amm_config with getAccountInfo, dataSlice {offset 9, length 32} and encoding base58. Every pool
+      on the tier shares the account.
+
+      Rates are parts per million: trade_fee_rate of the input (2500 = 0.25%, below 1,000,000);
+      protocol_fee_rate and fund_fee_rate of the collected fee, together at most 1,000,000.
+    address:
+      type: pubkey

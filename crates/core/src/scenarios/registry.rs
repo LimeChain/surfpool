@@ -68,6 +68,10 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const PANCAKESWAP_V1_IDL_CONTENT: &str = include_str!("./protocols/pancakeswap/v1/idl.json");
+pub const PANCAKESWAP_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pancakeswap/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -117,6 +121,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_pancakeswap_overrides();
         default
     }
 
@@ -221,6 +226,14 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_pancakeswap_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PANCAKESWAP_V1_IDL_CONTENT,
+            PANCAKESWAP_V1_OVERRIDES_CONTENT,
+            "pancakeswap",
         );
     }
 
@@ -358,6 +371,42 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -606,11 +655,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8)
+        // + PancakeSwap CLMM (2) = 72
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            72,
+            "Registry should load 72 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -684,6 +734,9 @@ mod tests {
 
         assert!(registry.contains("phoenix-trader-collateral-stress"));
         assert!(registry.contains("phoenix-direct-mark-risk-shock"));
+
+        assert!(registry.contains("pancakeswap-clmm-pool-state"));
+        assert!(registry.contains("pancakeswap-clmm-amm-config"));
     }
 
     #[test]
@@ -1015,6 +1068,13 @@ templates: []
             phoenix_templates.len(),
             8,
             "Should have 8 Phoenix Eternal templates"
+        );
+
+        let pancakeswap_templates = registry.by_protocol("PancakeSwap");
+        assert_eq!(
+            pancakeswap_templates.len(),
+            2,
+            "Should have 2 PancakeSwap templates"
         );
     }
 
