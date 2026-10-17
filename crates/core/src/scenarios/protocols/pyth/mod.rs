@@ -14,7 +14,8 @@ const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 
 /// Marks every `PriceUpdateV2` in the local VM whose `publish_time` is behind the clock as
 /// published now, keeping its price. Nothing posts Pyth updates to the local VM, so a feed loaded
 /// earlier would otherwise fail its readers' age checks once a scenario plays. Overrides applied
-/// afterwards still write their own `publish_time`.
+/// afterwards still write their own `publish_time`. `posted_slot` and `prev_publish_time` keep
+/// their values, so readers that age a feed in slots are not refreshed.
 pub fn refresh_stale_price_updates(svm: &mut SurfnetSvm, slot: Slot) -> SurfpoolResult<usize> {
     let clock = svm.inner.get_sysvar::<Clock>();
     let mut refreshed = 0;
