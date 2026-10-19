@@ -6,6 +6,8 @@ pub mod kamino;
 pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
+pub mod project0;
+#[cfg(feature = "integration-tests")]
 pub mod pump;
 #[cfg(feature = "integration-tests")]
 pub mod pyth;
