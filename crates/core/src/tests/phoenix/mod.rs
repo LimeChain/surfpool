@@ -635,6 +635,20 @@ async fn a_market_move_reprices_the_oracles_and_the_book_together() {
             after.best_bid_ticks + band >= target && after.best_ask_ticks <= target + band,
             "{symbol}: the makers quote around the new price"
         );
+
+        let uncrossed = resting(&orderbook);
+        let writes = {
+            let mut svm = locker.0.write().await;
+            uncross_market(&mut svm, &remote, &symbol)
+                .await
+                .unwrap_or_else(|e| panic!("{symbol}: {e}"))
+        };
+        apply(&locker, writes).await;
+        assert_eq!(
+            resting(&orderbook),
+            uncrossed,
+            "{symbol}: an uncross on a book that is not crossed matches nothing"
+        );
     }
 }
 
