@@ -399,7 +399,10 @@ async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
     let client = SurfnetRemoteClient::new(
         std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
     );
-    let lookup = async |size: u64, memcmps: &[(usize, &str)], slice: UiDataSliceConfig| {
+    let lookup = async |encoding: UiAccountEncoding,
+                        size: u64,
+                        memcmps: &[(usize, &str)],
+                        slice: UiDataSliceConfig| {
         let mut filters = vec![RpcFilterType::DataSize(size)];
         filters.extend(memcmps.iter().map(|(offset, bytes)| {
             RpcFilterType::Memcmp(Memcmp::new(
@@ -408,7 +411,7 @@ async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
             ))
         }));
         let config = RpcAccountInfoConfig {
-            encoding: Some(UiAccountEncoding::Base64),
+            encoding: Some(encoding),
             data_slice: Some(slice),
             commitment: Some(CommitmentConfig::confirmed()),
             ..Default::default()
@@ -441,11 +444,17 @@ async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
             offset: 107,
             length: 32,
         };
-        let found = lookup(619, &[(10, MAIN_MARKET), (42, mint)], slice).await;
+        let found = lookup(
+            UiAccountEncoding::Base58,
+            619,
+            &[(10, MAIN_MARKET), (42, mint)],
+            slice,
+        )
+        .await;
         assert_eq!(found.len(), 1, "expected one main-pool reserve for {mint}");
         let (pubkey, account) = &found[0];
         assert_eq!(pubkey.to_string(), reserve);
-        let price_account = account.data.decode().expect("base64 data slice");
+        let price_account = account.data.decode().expect("base58 data slice");
         assert_eq!(pubkey_at(&price_account, 0).to_string(), oracle);
     }
 
@@ -453,7 +462,13 @@ async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
         offset: 0,
         length: 0,
     };
-    let found = lookup(1300, &[(42, OBLIGATION_1D1B_OWNER)], slice).await;
+    let found = lookup(
+        UiAccountEncoding::Base64,
+        1300,
+        &[(42, OBLIGATION_1D1B_OWNER)],
+        slice,
+    )
+    .await;
     assert!(
         found
             .iter()

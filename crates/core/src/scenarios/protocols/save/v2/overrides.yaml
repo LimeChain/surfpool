@@ -29,8 +29,10 @@ llm_context: |
 
   FINDING AN OBLIGATION: an obligation is not a PDA. Its address is
   createWithSeed(owner, seed, So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo), where seed is the
-  first 32 characters of the market's base58 address. A wallet's obligations are the program's
-  accounts with {"dataSize":1300} and the owner at offset 42.
+  first 32 characters of the market's base58 address. A wallet's obligations come from
+  getProgramAccounts on the program with the config object {"encoding":"base64",
+  "dataSlice":{"offset":0,"length":0},"filters":[{"dataSize":1300},
+  {"memcmp":{"offset":42,"bytes":"<wallet>"}}]}. Each result's pubkey is one obligation.
 
   Put the reserve or obligation in the override's account as {"pubkey":"<address>"}. Set
   fetchBeforeUse: true to pull the account from upstream first; false only for a later override
