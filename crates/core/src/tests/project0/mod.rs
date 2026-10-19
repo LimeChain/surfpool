@@ -148,20 +148,51 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
     }
 }
 
+/// Runs a getProgramAccounts call on the Project 0 program against mainnet, as the llm_context
+/// recipes write it.
+async fn program_accounts(
+    encoding: UiAccountEncoding,
+    data_slice: UiDataSliceConfig,
+    memcmps: &[(usize, &str)],
+) -> Vec<(Pubkey, solana_account_decoder::UiAccount)> {
+    let client = SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+    );
+    let filters = memcmps
+        .iter()
+        .map(|(offset, bytes)| {
+            RpcFilterType::Memcmp(Memcmp::new(
+                *offset,
+                MemcmpEncodedBytes::Base58(bytes.to_string()),
+            ))
+        })
+        .collect();
+    let config = RpcAccountInfoConfig {
+        encoding: Some(encoding),
+        data_slice: Some(data_slice),
+        commitment: Some(CommitmentConfig::confirmed()),
+        ..Default::default()
+    };
+    match client
+        .get_program_accounts(&Pubkey::from_str_const(PROGRAM), config, Some(filters))
+        .await
+        .unwrap_or_else(|e| panic!("getProgramAccounts {memcmps:?} failed: {e}"))
+    {
+        RemoteRpcResult::Ok(found) => found,
+        RemoteRpcResult::MethodNotSupported => panic!("the RPC does not serve getProgramAccounts"),
+    }
+}
+
+const ORACLE_SLICE: UiDataSliceConfig = UiDataSliceConfig {
+    offset: 610,
+    length: 32,
+};
+
 /// The bank lookup the llm_context teaches: Bank discriminator, main group, mint and a Pyth push
 /// oracle setup, with the bank's price account sliced from config.oracle_keys.0. It filters on the
 /// discriminator because program upgrades change the Bank's size.
 #[tokio::test]
 async fn llm_context_bank_lookup_finds_the_native_sol_and_usdc_banks() {
-    let client = SurfnetRemoteClient::new(
-        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
-    );
-    let base58 = |offset: usize, bytes: &str| {
-        RpcFilterType::Memcmp(Memcmp::new(
-            offset,
-            MemcmpEncodedBytes::Base58(bytes.to_string()),
-        ))
-    };
     for (mint, bank, oracle) in [
         (
             "So11111111111111111111111111111111111111112",
@@ -174,36 +205,13 @@ async fn llm_context_bank_lookup_finds_the_native_sol_and_usdc_banks() {
             USDC_BANK_ORACLE,
         ),
     ] {
-        let filters = vec![
-            base58(0, "QnTef4UXSzF"),
-            base58(41, GROUP),
-            base58(8, mint),
-            base58(609, "4"),
-        ];
-        let config = RpcAccountInfoConfig {
-            encoding: Some(UiAccountEncoding::Base64),
-            data_slice: Some(UiDataSliceConfig {
-                offset: 610,
-                length: 32,
-            }),
-            commitment: Some(CommitmentConfig::confirmed()),
-            ..Default::default()
-        };
-        let found = match client
-            .get_program_accounts(&Pubkey::from_str_const(PROGRAM), config, Some(filters))
-            .await
-            .unwrap_or_else(|e| panic!("getProgramAccounts for {mint} failed: {e}"))
-        {
-            RemoteRpcResult::Ok(found) => found,
-            RemoteRpcResult::MethodNotSupported => {
-                panic!("the RPC does not serve getProgramAccounts")
-            }
-        };
+        let filters = [(0, "QnTef4UXSzF"), (41, GROUP), (8, mint), (609, "4")];
+        let found = program_accounts(UiAccountEncoding::Base58, ORACLE_SLICE, &filters).await;
 
         assert_eq!(found.len(), 1, "expected one native bank for {mint}");
         let (pubkey, account) = &found[0];
         assert_eq!(pubkey.to_string(), bank);
-        let price_account = account.data.decode().expect("base64 data slice");
+        let price_account = account.data.decode().expect("base58 data slice");
         assert_eq!(
             Pubkey::try_from(price_account.as_slice())
                 .unwrap()
@@ -211,6 +219,48 @@ async fn llm_context_bank_lookup_finds_the_native_sol_and_usdc_banks() {
             oracle
         );
     }
+}
+
+/// A token whose banks are not priced straight from Pyth (here jitoSOL, a PythLST bank) has no
+/// result with the oracle setup filter; the llm_context's second call, without it, finds the bank.
+#[tokio::test]
+async fn llm_context_bank_lookup_falls_back_for_a_bank_not_priced_by_pyth_push() {
+    const JITOSOL_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
+    const JITOSOL_BANK: &str = "Bohoc1ikHLD7xKJuzTyiTyCwzaL5N7ggJQu75A8mKYM8";
+    let filters = [(0, "QnTef4UXSzF"), (41, GROUP), (8, JITOSOL_MINT)];
+
+    let with_oracle_filter = [filters.as_slice(), &[(609, "4")]].concat();
+    let pyth_push =
+        program_accounts(UiAccountEncoding::Base58, ORACLE_SLICE, &with_oracle_filter).await;
+    assert!(
+        pyth_push.is_empty(),
+        "jitoSOL now has a Pyth push bank: {pyth_push:?}"
+    );
+
+    let found = program_accounts(UiAccountEncoding::Base58, ORACLE_SLICE, &filters).await;
+    let banks: Vec<String> = found.iter().map(|(pubkey, _)| pubkey.to_string()).collect();
+    assert_eq!(banks, [JITOSOL_BANK], "expected the one jitoSOL bank");
+}
+
+/// The wallet lookup the llm_context teaches, sent as written: base58 is refused for accounts this
+/// large, so it asks for base64 with a zero-length slice and reads only the pubkeys.
+#[tokio::test]
+async fn llm_context_wallet_lookup_finds_the_wallets_account() {
+    let account = fetch(&[ACCOUNT]).await.remove(0);
+    let wallet = Pubkey::new_from_array(account.data[40..72].try_into().unwrap()).to_string();
+    let empty = UiDataSliceConfig {
+        offset: 0,
+        length: 0,
+    };
+    let filters = [(0, "CKkRR4La3xu"), (8, GROUP), (40, wallet.as_str())];
+
+    let found = program_accounts(UiAccountEncoding::Base64, empty, &filters).await;
+    assert!(
+        found
+            .iter()
+            .any(|(pubkey, _)| pubkey.to_string() == ACCOUNT),
+        "the wallet's account {ACCOUNT} is missing from {found:?}"
+    );
 }
 
 /// The vendored IDL retypes `WrappedI80F48.value` from `[u8; 16]` to `i128`. Writing back the

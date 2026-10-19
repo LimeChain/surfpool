@@ -111,21 +111,28 @@ The breaker then treats $0.95 as normal and still guards further moves.
 
 ## Build a position from scratch
 
+On an account whose other slots are empty (`active` 0, `bank_pk` `11111111111111111111111111111111`,
+zero shares; clear them first on an account in use):
+
 ```
 project0-account-balance
   lending_account.balances.0.active: 1
   lending_account.balances.0.bank_pk: <the SOL bank>
   lending_account.balances.0.bank_asset_tag: 1
   lending_account.balances.0.asset_shares.value: "2814749767106560000000000"
+  lending_account.balances.0.liability_shares.value: "0"
 project0-account-balance
   lending_account.balances.1.active: 1
   lending_account.balances.1.bank_pk: <the USDC bank>
   lending_account.balances.1.bank_asset_tag: 0
+  lending_account.balances.1.asset_shares.value: "0"
   lending_account.balances.1.liability_shares.value: "140737488355328000000000"
 ```
 
 **Why:** slots stay sorted by `bank_pk`, highest first, so SOL's bank goes before USDC's, and
-`bank_asset_tag` must match the bank's `config.asset_tag`. The template lists the other rules.
+`bank_asset_tag` must match the bank's `config.asset_tag`. The share values above are 10 SOL and
+500 USDC at a share value of 1.0; divide by each bank's current share value. The template lists
+the other rules.
 
 ## Take over a real account
 

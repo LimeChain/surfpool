@@ -21,13 +21,17 @@ llm_context: |
      ("4" in base58) keeps the bank priced straight from a Pyth push oracle and leaves out the
      Kamino-, Drift- and JupLend-wrapped banks of the same mint. The result's pubkey is the bank,
      and its data is the bank's price account (config.oracle_keys.0).
-  3. No result means a mistyped mint or no such bank. Copy the mint again and repeat once, then
-     ask the user for the bank address instead of saying none exists.
-  4. A bank address the user gives is used as is.
+  3. No result: many tokens (staked SOL, LSTs such as jitoSOL or mSOL, PT tokens) have no bank
+     priced straight from Pyth. Repeat the call without the 609 filter; one result is the bank,
+     several are wrapped banks of the same mint, so pick the one the user means or ask.
+  4. Still no result means a mistyped mint or no such bank. Copy the mint again and repeat once,
+     then ask the user for the bank address instead of saying none exists.
+  5. A bank address the user gives is used as is.
 
-  FINDING A WALLET'S ACCOUNT: getProgramAccounts on the same program with the filters
-  {"memcmp":{"offset":0,"bytes":"CKkRR4La3xu"}}, {"memcmp":{"offset":8,"bytes":"<group>"}} and
-  {"memcmp":{"offset":40,"bytes":"<wallet>"}}. Each result is one MarginfiAccount.
+  FINDING A WALLET'S ACCOUNT: getProgramAccounts on the same program with the config object
+  {"encoding":"base64","dataSlice":{"offset":0,"length":0},"filters":[
+  {"memcmp":{"offset":0,"bytes":"CKkRR4La3xu"}},{"memcmp":{"offset":8,"bytes":"<group>"}},
+  {"memcmp":{"offset":40,"bytes":"<wallet>"}}]}. Each result's pubkey is one MarginfiAccount.
 
   Put the bank or account in the override's account as {"pubkey":"<address>"}. Set
   fetchBeforeUse: true to pull the account from upstream first; false only for a later override
@@ -212,7 +216,7 @@ templates:
         label: Total deposit shares
         description: >-
           Sum of every depositor's shares, scaled by 2^48. Tokens = shares x asset_share_value.
-          Example: "2814749767106560000000000" is 10 SOL of shares
+          Example: "2814749767106560000000000" is 10 SOL of shares at a share value of 1.0
       - path: total_liability_shares.value
         label: Total debt shares
         description: >-
@@ -239,8 +243,9 @@ templates:
       All four fields are fixed-point numbers scaled by 2^48, passed as decimal strings. Raising
       liability_share_value ages every loan in the bank at once.
 
-      EXAMPLE - "debt in this bank grew 10%" (from a share value of 1.0):
-      liability_share_value.value: "309622474381722"
+      EXAMPLE - "debt in this bank grew 10%": read the bank's current liability_share_value and
+      write it times 1.1. If it reads "351843720888320" (1.25), write:
+      liability_share_value.value: "387028092977152"
 
   # ==========================================
   # MarginfiAccount
@@ -257,7 +262,7 @@ templates:
         label: Deposit shares
         description: >-
           Deposit shares in the bank, scaled by 2^48. Tokens = shares x the bank's asset_share_value.
-          Example: "2814749767106560000000000" is 10 SOL of shares
+          Example: "2814749767106560000000000" is 10 SOL of shares at a share value of 1.0
       - path: lending_account.balances.0.liability_shares.value
         label: Debt shares
         description: >-
@@ -284,11 +289,12 @@ templates:
       The bank's own totals (total_asset_shares, total_liability_shares) are not updated for you;
       raise them with project0-bank-shares when the scenario depends on bank-wide numbers.
 
-      EXAMPLE - "10 SOL deposited in the native SOL bank" in slot 0 (share value 1.0):
+      EXAMPLE - "10 SOL deposited in the native SOL bank" in slot 0, with the SOL bank's
+      asset_share_value reading "351843720888320" (1.25): 10 SOL / 1.25 = 8 SOL of shares.
       lending_account.balances.0.active: 1
       lending_account.balances.0.bank_pk: <the SOL bank from the lookup above>
       lending_account.balances.0.bank_asset_tag: 1
-      lending_account.balances.0.asset_shares.value: "2814749767106560000000000"
+      lending_account.balances.0.asset_shares.value: "2251799813685248000000000"
       lending_account.balances.0.liability_shares.value: "0"
 
   - id: project0-account-authority
