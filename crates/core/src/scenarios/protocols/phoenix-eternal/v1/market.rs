@@ -381,12 +381,16 @@ impl MarketContext {
         )
     }
 
-    /// The whole move to `ticks` in `sandbox`: oracle reports, spline moves and the uncross crank
-    /// until [`uncross_done`]. Hawkeye must be in the local VM.
+    /// The move to `ticks` in `sandbox`: oracle reports and spline moves. Resting orders the moved
+    /// splines cross stay until [`MarketContext::uncross_in`].
     pub fn move_in(&mut self, sandbox: &mut Sandbox, ticks: u64) -> SurfpoolResult<()> {
         let mut instructions = self.oracle_reports(ticks)?;
         instructions.extend(self.spline_moves(ticks)?);
-        sandbox.run(&instructions)?;
+        sandbox.run(&instructions)
+    }
+
+    /// The uncross crank in `sandbox` until [`uncross_done`]. Hawkeye must be in the local VM.
+    pub fn uncross_in(&mut self, sandbox: &mut Sandbox) -> SurfpoolResult<()> {
         let uncross = self.uncross()?;
         let mut before = self.book_top(sandbox)?;
         for _ in 0..MAX_UNCROSS_CRANKS {
@@ -428,8 +432,8 @@ fn uncross_done(before: &(BboView, usize), after: &(BboView, usize)) -> bool {
             == (before.best_bid_ticks, before.best_ask_ticks, before_orders)
 }
 
-/// The writes that move one market to `target_ticks` the way mainnet does: oracle reports, makers'
-/// splines re-centred and the crank uncrossing the book, so the mark, book and oracles agree.
+/// The writes that move one market to `target_ticks` the way mainnet does: oracle reports and
+/// makers' splines re-centred. Resting orders the new price crosses stay until [`uncross_market`].
 pub async fn move_market(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -437,10 +441,23 @@ pub async fn move_market(
     target_ticks: u64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
+    let mut sandbox = Sandbox::new(svm);
+    context.move_in(&mut sandbox, target_ticks)?;
+    sandbox.writes()
+}
+
+/// The writes of Phoenix's uncross crank matching one market's crossed resting orders, which anyone
+/// can send after a move.
+pub async fn uncross_market(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    symbol: &str,
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
     hydrate(svm, remote_ctx, &[HAWKEYE_PROGRAM_ID]).await?;
     let mut sandbox = Sandbox::new(svm);
     context
-        .move_in(&mut sandbox, target_ticks)
+        .uncross_in(&mut sandbox)
         .map_err(explain_move_failure)?;
     sandbox.writes()
 }
@@ -453,9 +470,9 @@ pub(crate) fn explain_move_failure(error: SurfpoolError) -> SurfpoolError {
         return error;
     }
     SurfpoolError::internal(format!(
-        "moving the market failed in Phoenix's uncross crank, which happens when the local order \
-         books and Phoenix's trader index were fetched at different times; restart the surfnet \
-         (or reset the Phoenix accounts) and play again. {text}"
+        "Phoenix's uncross crank failed, which happens when the local order books and Phoenix's \
+         trader index were fetched at different times; restart the surfnet (or reset the Phoenix \
+         accounts) and play again. {text}"
     ))
 }
 

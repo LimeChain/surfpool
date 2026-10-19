@@ -1,6 +1,6 @@
 # Phoenix Eternal
 
-Surfpool bundles the Phoenix Eternal IDL and 17 override templates, so a scenario can put
+Surfpool bundles the Phoenix Eternal IDL and 19 override templates, so a scenario can put
 Phoenix perpetuals into the state your code needs to see: a market moved to a new price, traders
 set a planned distance from liquidation, a paused market, throttled withdrawals. The templates only
 prepare state. Liquidations and trades are sent by your own code.
@@ -26,7 +26,9 @@ the free margin, or an order the margin cannot carry is refused. A refused templ
 with a warning naming the program's reason.
 
 After the instructions succeed, Play writes back the accounts they changed, all or none: when a
-write fails, the accounts written before it are put back.
+write fails, the accounts written before it are put back. That holds for one template. The
+templates of a scenario run one after another in their slot and are not one unit: a refused
+template is skipped and the ones before it stay applied.
 
 The collateral, stop-loss and permission templates patch one field of one account. The maintenance
 described under "Keeping markets usable" also patches the PerpAssetMap and the spline collections
@@ -41,6 +43,8 @@ directly.
 | Hot / cold trader    | A trader the GlobalTraderIndex lists, such as one with resting orders, is hot in Phoenix's SDK; any other trader is cold, with its whole state in its Trader account.                                                         |
 | PerpAssetMap         | The single account that holds every market's oracle readings, mark price and risk parameters.                                                                                                                                 |
 | Spline               | A market maker's liquidity curve around its mid price, in the market's spline collection. Liquidations mostly fill against splines.                                                                                           |
+| Resting order        | A limit order waiting in a market's book. Resting orders hold margin and keep their trader hot, and a keeper cannot liquidate a trader while any of them add risk.                                                            |
+| Crossed book         | Resting orders left on the wrong side of the makers' quotes after a move, such as bids above the new ask. Phoenix's uncross crank matches them, and anyone can send it.                                                       |
 | Hawkeye              | A Phoenix program that returns margin and risk views, such as `view_margin`.                                                                                                                                                  |
 | Effective collateral | What Phoenix measures margin against: USDC collateral, plus the discounted value of SOL collateral and unrealized gains, minus unrealized losses, plus unsettled funding.                                                     |
 | Ticks                | Phoenix's price unit. USD per base unit = `markTicks * tickSize * 10^(baseLotDecimals - 6)`, all three from `list_phoenix_markets`.                                                                                           |
@@ -92,9 +96,11 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 
 | Template                              | What it does                                                                                           | Signer accounts              |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------- |
-| `phoenix-market-move`                 | Moves a market's oracle readings, its makers' splines and its book to a price, and uncrosses the book. | oracle keys, makers          |
+| `phoenix-market-move`                 | Moves a market's oracle readings and its makers' splines to a price; crossed orders stay crossed.      | oracle keys, makers          |
+| `phoenix-market-uncross`              | Matches the resting orders a move left crossed with Phoenix's uncross crank, which anyone can send.    | none, a permissionless crank |
 | `phoenix-oracle-price`                | Moves only a market's oracle readings, in ticks or by a percentage; the book and makers stay.          | oracle keys                  |
-| `phoenix-trader-collateral`           | A trader's USDC collateral, which sets its distance from liquidation.                                  | field write, trader          |
+| `phoenix-trader-cancel-orders`        | Cancels a trader's resting orders on every market, which takes it out of the active trader index.      | trader                       |
+| `phoenix-trader-collateral`           | A trader's USDC collateral, which sets its distance from liquidation.                                  | field write                  |
 | `phoenix-market-risk-factors`         | Maintenance, backstop and high-risk factors.                                                           | risk authority               |
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
 | `phoenix-market-max-liquidation-size` | The most base lots one liquidation may close.                                                          | risk authority               |
@@ -112,19 +118,29 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 
 ## Recipes
 
-`liquidate_via_market_order` refuses a trader that still has risk-increasing resting orders on any
-market, and one whose effective collateral is already below zero. `phoenix-trader-collateral`
-leaves any trader ready for your keeper, with `quoteLotCollateral - effectiveCollateral + target`
-from `list_phoenix_trader_positions`, which reads them on a copy where a hot trader's orders are
-already cancelled, as the template does.
+Two pairs of templates go together, in the same slot and in this order, and Studio's Phoenix state
+presets build them: `phoenix-market-move` then `phoenix-market-uncross`, and
+`phoenix-trader-cancel-orders` then `phoenix-trader-collateral`.
 
-- For a hot trader, which the tool reports as `hot: true`, the template first cancels its orders
-  on every market, as the trader, which takes it out of the index; Phoenix then reads the Trader
-  account, where the field is written. Positions stay open.
+Without `phoenix-market-uncross`, resting orders on the other side of a moved market's new price
+stay crossed, and trades and liquidations fill against them at their old prices.
+
+`liquidate_via_market_order` refuses a trader that still has risk-increasing resting orders on any
+market, and one whose effective collateral is already below zero. `phoenix-trader-cancel-orders`
+followed by `phoenix-trader-collateral`, in the same slot, leave any trader ready for your keeper,
+with `quoteLotCollateral - effectiveCollateral + target` from `list_phoenix_trader_positions`,
+which reads them on a copy where a hot trader's orders are already cancelled, as the cancel leaves
+them.
+
+- For a hot trader, which the tool reports as `hot: true`, the cancel template, given the trader's
+  account in its `trader` value, cancels its orders on every market, as the trader, which takes it
+  out of the index; Phoenix then reads the Trader account, where the collateral template writes the
+  field. Positions stay open. Without the cancel, the write changes nothing Phoenix reads, and a
+  later cancel overwrites it. A cold trader has no orders to cancel and the cancel changes nothing.
 - Effective collateral moves one for one with that field, which can be negative. Hawkeye's
   `margin.collateral` can differ from the field, so it is not the base.
-- The tool fails with the reason when it cannot read the trader, and reports in `refusal` why the
-  template would refuse it, such as a spline market maker.
+- The tool fails with the reason when it cannot read the trader, and reports in `refusal` why
+  either template would refuse it, such as a spline market maker.
 - Nothing stops a value above the current collateral, which the global vault does not back; a
   "healthy now, liquidatable after a move" target can need one.
 
@@ -137,8 +153,9 @@ Pick `target` by what the keeper should do:
   one.
 - **Watch it cross:** pass `moves` to the tool and compute the collateral from `marginAfterMoves`
   instead, with a target between its backstop and maintenance margin. The same collateral must
-  leave `margin` above its maintenance margin; then play those `phoenix-market-move` overrides at
-  a later slot.
+  leave `margin` above its maintenance margin; then play those `phoenix-market-move` overrides,
+  each followed by its `phoenix-market-uncross`, at a later slot, since a cancel freezes the mark
+  for risk in its own slot.
 
 The collateral value is fixed when the scenario is created. It stays right while the local state
 does not change; play another scenario that moves the trader's markets or changes the trader, or
@@ -192,8 +209,8 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
   `tickSize`, `baseLotDecimals` and risk factors, read from the local VM.
 - `list_phoenix_trader_positions` returns the markets where a trader holds a position, with its
   side, size in base lots and maintenance margin, whether it is `hot`, and its `margin` as
-  `phoenix-trader-collateral` leaves it: a hot trader's orders cancelled. Given `moves`, it also
-  returns `marginAfterMoves`.
+  `phoenix-trader-cancel-orders` leaves it: a hot trader's orders cancelled. Given `moves`, it also
+  returns `marginAfterMoves`, with each market moved and uncrossed.
   Hawkeye's views run on a copy of the surfnet's state, with its markets kept usable the way Play
   keeps them, and write nothing back. The reads go through the surfnet, which loads any account
   it is missing.
@@ -208,9 +225,9 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `... accounts are missing locally and there is no datasource` | The template needs Phoenix accounts that are not in the local VM, and surfnet has no upstream datasource to fetch them from.      |
 | `... is offline and missing locally`                          | The account is marked offline, so surfnet will not fetch it.                                                                      |
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |
-| `... is in Phoenix's active trader index and ...`             | Phoenix still lists the trader after its orders are cancelled, or it has none to cancel, so it would not read the written collateral. |
+| `... is in Phoenix's active trader index and ...`             | `phoenix-trader-cancel-orders` cancelled the trader's orders and Phoenix still lists it, or it has none to cancel.                |
 | `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, which `phoenix-trader-collateral` does not support.                                         |
-| `the ... book stayed crossed after ... uncross cranks`        | The book was still crossed after the uncross cranks. Try a smaller move.                                                          |
+| `the ... book stayed crossed after ... uncross cranks`        | `phoenix-market-uncross` left the book crossed after its cranks. Try a smaller move.                                              |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
 | `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
 

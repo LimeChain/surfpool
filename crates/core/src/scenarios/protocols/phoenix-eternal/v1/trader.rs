@@ -287,15 +287,15 @@ pub struct TraderPositions {
     pub positions: Vec<TraderPosition>,
     /// Whether the local GlobalTraderIndex lists the trader.
     pub hot: bool,
-    /// Hawkeye's view as `phoenix-trader-collateral` leaves the trader, a hot trader's orders
+    /// Hawkeye's view as `phoenix-trader-cancel-orders` leaves the trader, a hot trader's orders
     /// cancelled.
     pub margin: MarginView,
     /// The field `phoenix-trader-collateral` writes, which can differ from `margin`'s collateral.
     pub quote_lot_collateral: i64,
-    /// The same view once the given markets move the way `phoenix-market-move` moves them; `None`
-    /// without moves.
+    /// The same view once the given markets move and uncross the way `phoenix-market-move` and
+    /// `phoenix-market-uncross` play them; `None` without moves.
     pub margin_after_moves: Option<MarginView>,
-    /// Why `phoenix-trader-collateral` would refuse the trader, if it would.
+    /// Why `phoenix-trader-cancel-orders` or `phoenix-trader-collateral` would refuse the trader.
     pub refusal: Option<String>,
 }
 
@@ -359,12 +359,13 @@ pub(crate) async fn trader_positions_in(
     let margin_after_moves = if moves.is_empty() {
         None
     } else {
-        // A cancel freezes the mark for risk in its slot, so the moves play a slot later, the way
-        // phoenix-market-move plays them after the lever.
+        // A cancel freezes the mark for risk in its slot, so the moves play a slot later, each
+        // followed by its uncross, the way the scenarios play them after the cancel.
         state.next_slot();
         for (context, (_, ticks)) in moved.iter_mut().zip(moves) {
+            context.move_in(&mut state, *ticks)?;
             context
-                .move_in(&mut state, *ticks)
+                .uncross_in(&mut state)
                 .map_err(explain_move_failure)?;
         }
         Some(margin(&mut state, &exchange, &trader)?)
@@ -388,8 +389,8 @@ pub(crate) async fn trader_positions_in(
     })
 }
 
-/// The state the collateral lever writes into and its values are read from: a hot trader's orders
-/// cancelled, a cold trader left as it is, since a cancel changes its margin too.
+/// The state `phoenix-trader-cancel-orders` leaves, which the collateral is worked out from: a hot
+/// trader's orders cancelled, a cold trader left as it is, since a cancel changes its margin too.
 pub(crate) struct LeverState<'a> {
     pub(crate) exchange: Exchange,
     pub(crate) hot: bool,
@@ -469,26 +470,35 @@ impl<'a> LeverState<'a> {
     }
 }
 
-/// The writes that set `trader`'s collateral to `quote_lots`, on the state [`LeverState`] leaves.
-/// A spline market maker is refused, and so is a trader Phoenix still lists after the cancel.
-pub async fn collateral_writes(
+/// The writes of `trader` cancelling its resting orders on every market, which takes a hot trader
+/// out of Phoenix's index; a cold trader has none and nothing is written. A trader Phoenix still
+/// lists after the cancel is refused.
+pub async fn cancel_order_writes(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     trader: Pubkey,
-    account: &Account,
-    quote_lots: i64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    // Refuses a spline market maker before anything runs.
-    with_collateral(trader, account, quote_lots)?;
+    // The template's own account is the PerpAssetMap, so the trader may not be local yet.
+    hydrate(svm, remote_ctx, &[trader]).await?;
     let (lever, refusal) = LeverState::load(svm, remote_ctx, trader).await?;
     if let Some(refusal) = refusal {
         return Err(refusal);
     }
-    let left = with_collateral(trader, &lever.state.account(&trader)?, quote_lots)?;
-    let mut writes = lever.state.writes()?;
-    writes.retain(|(address, _)| *address != trader);
-    writes.push((trader, left));
-    Ok(writes)
+    lever.state.writes()
+}
+
+/// The write that sets `trader`'s collateral field to `quote_lots`. Phoenix reads the field only
+/// while its index does not list the trader, so a hot trader's orders are cancelled first, with
+/// [`cancel_order_writes`]. A spline market maker is refused.
+pub fn collateral_writes(
+    trader: Pubkey,
+    account: &Account,
+    quote_lots: i64,
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    Ok(vec![(
+        trader,
+        with_collateral(trader, account, quote_lots)?,
+    )])
 }
 
 /// The Trader `account` with its collateral field set to `quote_lots`, or the refusal of a spline

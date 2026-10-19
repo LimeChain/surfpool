@@ -37,7 +37,8 @@ templates:
       Every oracle key that reports the market sends the new price through Phoenix's own oracle
       update, and Phoenix recomputes the mark from it. Nothing else moves: makers keep their
       quotes and resting orders keep their prices, so a trade or liquidation right after fills
-      against the old book. Use phoenix-market-move when the book should follow the price.
+      against the old book. Use phoenix-market-move and phoenix-market-uncross when the book
+      should follow the price.
       Give exactly one of target_ticks and change_percent, as a decimal string. change_percent is
       applied to the market's mark when the override plays, so moves at later slots add up.
       USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
@@ -51,8 +52,8 @@ templates:
   - id: phoenix-market-move
     name: Phoenix Market Move
     description: >-
-      Move one Phoenix Eternal market to a new price the way mainnet moves it: oracle reports,
-      maker liquidity and the order book together.
+      Move one Phoenix Eternal market to a new price the way mainnet moves it: oracle reports and
+      maker liquidity. Resting orders the new price crosses stay until phoenix-market-uncross.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -67,11 +68,64 @@ templates:
         description: The new price in ticks, at least 1, encoded as a decimal string
     llm_context: |
       This runs Phoenix's own instructions: every oracle key that reports the market sends the new
-      price, every active market maker re-centres its spline liquidity on it, and resting orders
-      the move left crossed are matched. The mark, the index and the best bid and ask all end up
-      at the target, so trades and liquidations fill at the new price.
+      price and every active market maker re-centres its spline liquidity on it. Resting orders on
+      the other side of the new price stay crossed, and trades and liquidations fill against them
+      at their old prices, until phoenix-market-uncross matches them: add it right after this
+      override, in the same slot.
       USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
       list_phoenix_markets; compute a relative move from markTicks there.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-uncross
+    name: Phoenix Market Uncross
+    description: >-
+      Match the resting orders a price move left crossed in one Phoenix Eternal market with
+      Phoenix's uncross crank, which anyone can send.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+    llm_context: |
+      Runs Phoenix's uncross crank on the market until the book is uncrossed or a crank matches
+      nothing more. After phoenix-market-move the makers quote around the new price while resting
+      orders on the other side of it stay crossed; this matches them, so the best bid and ask
+      end up around the target. Add it right after phoenix-market-move, in the same slot.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-trader-cancel-orders
+    name: Phoenix Trader Cancel Orders
+    description: >-
+      Cancel one Phoenix Eternal trader's resting orders on every market, as the trader, which
+      takes it out of Phoenix's active trader index. Positions stay open.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: trader
+        type: input
+        value_type: string
+        label: Trader Account
+        description: The trader's Trader account address, as list_phoenix_trader_positions takes it
+    llm_context: |
+      Runs Phoenix's CancelAll as the trader on every market where it holds a position or resting
+      orders. A trader the active trader index lists (hot: true in list_phoenix_trader_positions)
+      leaves it, and Phoenix reads its state from the Trader account again; a cold trader has no
+      resting orders and nothing changes. A keeper cannot liquidate a trader with
+      risk-increasing resting orders on any market, and the cancel releases the margin those
+      orders held, so put this before phoenix-trader-collateral, in the same slot.
+      A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
+      A trader Phoenix still lists after the cancel, such as a spline market maker, is refused.
+      Set trader to the trader's Trader account; the override's own account is the PerpAssetMap,
+      as for the market templates.
       Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
       mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
@@ -82,8 +136,8 @@ templates:
     name: Phoenix Trader Collateral
     description: >-
       Set one Phoenix Eternal trader's USDC collateral, which moves its effective collateral and
-      so its distance from liquidation. A trader in Phoenix's active trader index first has its
-      resting orders cancelled on every market.
+      so its distance from liquidation. For a trader in Phoenix's active trader index, cancel its
+      orders first with phoenix-trader-cancel-orders.
     idl_account_name: Trader
     properties:
       - path: traderState.quoteLotCollateral
@@ -91,8 +145,9 @@ templates:
         description: Signed quote lots (1000000 = 1 USDC)
     llm_context: |
       Writes the USDC collateral field of the Trader account. Phoenix reads a trader its active
-      trader index lists from the index instead, so for such a trader (hot: true) this first
-      cancels its resting orders on every market, which takes it out; positions stay open.
+      trader index lists (hot: true) from the index instead: for such a trader the write changes
+      nothing Phoenix reads, and a later cancel overwrites it. Put phoenix-trader-cancel-orders
+      before this override, in the same slot, which takes the trader out of the index.
       Effective collateral, which Phoenix measures margin against, moves one for one with the
       field. From list_phoenix_trader_positions: value = quoteLotCollateral -
       margin.effectiveCollateral + target, where target is the effective collateral wanted;
@@ -100,9 +155,9 @@ templates:
       little before the keeper acts: between backstopMargin and maintenanceMargin, one keeper
       liquidation makes the account healthy again; between highRiskMargin and backstopMargin, a
       keeper can liquidate every position; below highRiskMargin Phoenix refuses market-order
-      liquidations. To have a trader cross on a phoenix-market-move at a later slot, call the
-      tool with moves and use marginAfterMoves for the target and effectiveCollateral; the
-      result must stay above margin.maintenanceMargin until the move.
+      liquidations. To have a trader cross on a phoenix-market-move and phoenix-market-uncross
+      at a later slot, call the tool with moves and use marginAfterMoves for the target and
+      effectiveCollateral; the result must stay above margin.maintenanceMargin until the move.
       A spline market maker is refused. The value can be negative. A value above the current
       collateral is not backed by the global vault, so a later withdrawal could take funds the
       vault does not count.

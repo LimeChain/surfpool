@@ -27,8 +27,9 @@ use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 use super::{
     market::{
         Market, MarketContext, invalid_perp_asset_map, map_entries, move_market, phoenix_markets,
+        uncross_market,
     },
-    trader::collateral_writes,
+    trader::{cancel_order_writes, collateral_writes},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -507,6 +508,7 @@ const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 
 const TRADER_CAPABILITIES_TEMPLATE_ID: &str = "phoenix-trader-capabilities";
 const MARKET_SYMBOL_FIELD: &str = "symbol";
+const TRADER_FIELD: &str = "trader";
 const TARGET_TICKS_FIELD: &str = "target_ticks";
 const CHANGE_PERCENT_FIELD: &str = "change_percent";
 
@@ -735,17 +737,26 @@ pub async fn prepare_phoenix_override(
                 .await
                 .map(Some)
         }
+        "phoenix-market-uncross" => {
+            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
+            uncross_market(svm, remote_ctx, symbol).await.map(Some)
+        }
         "phoenix-oracle-price" => {
             let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
             let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
             let target_ticks = oracle_target(values, context.market.mark_ticks)?;
             run_instructions(svm, &context.oracle_reports(target_ticks)?).map(Some)
         }
+        "phoenix-trader-cancel-orders" => {
+            let text = text_input(values, TRADER_FIELD)?;
+            let trader = Pubkey::from_str(text).map_err(|e| {
+                SurfpoolError::internal(format!("{TRADER_FIELD} '{text}' is not an address: {e}"))
+            })?;
+            cancel_order_writes(svm, remote_ctx, trader).await.map(Some)
+        }
         "phoenix-trader-collateral" => {
             let quote_lots = whole_number_input(values, "traderState.quoteLotCollateral")?;
-            collateral_writes(svm, remote_ctx, *account_pubkey, account, quote_lots)
-                .await
-                .map(Some)
+            collateral_writes(*account_pubkey, account, quote_lots).map(Some)
         }
         // Phoenix's other accounts take the generic IDL path.
         _ => Ok(None),
