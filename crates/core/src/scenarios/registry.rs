@@ -128,7 +128,7 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             PYTH_PRO_V2_IDL_CONTENT,
             PYTH_PRO_V2_OVERRIDES_CONTENT,
-            "pyth",
+            "pyth-pro",
         );
     }
 
