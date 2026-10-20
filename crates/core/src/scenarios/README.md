@@ -41,9 +41,10 @@ An override is applied once. Its resulting account state remains in later slots 
 or another override writes that account again.
 
 Nothing posts Pyth price updates to the local VM, so a feed loaded earlier would fail its readers'
-age checks. When a scenario is registered, every Pyth `PriceUpdateV2` in the local VM whose
-`publish_time` is behind the clock is marked as published at that moment, with its price unchanged.
-The scenario's overrides apply afterwards, so a `publish_time` the scenario writes is kept.
+age checks. When a scenario with an enabled override of a template tagged `oracle` or `lending` is
+registered, every Pyth `PriceUpdateV2` in the local VM whose `publish_time` is behind the clock is
+marked as published at that moment, with its price unchanged. Other scenarios leave the feeds
+alone. The scenario's overrides apply afterwards, so a `publish_time` the scenario writes is kept.
 
 ### Kamino integration tests
 

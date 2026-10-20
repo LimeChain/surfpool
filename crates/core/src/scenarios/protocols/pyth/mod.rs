@@ -1,7 +1,13 @@
 use solana_clock::{Clock, Slot};
 use solana_pubkey::Pubkey;
+use surfpool_types::Scenario;
 
-use crate::{error::SurfpoolResult, surfnet::svm::SurfnetSvm};
+use crate::{error::SurfpoolResult, scenarios::template_registry, surfnet::svm::SurfnetSvm};
+
+/// Templates with these tags refresh the loaded Pyth feeds: oracle templates move prices and
+/// lending programs read them. Collections that share a tag without reading Pyth, such as Kamino
+/// farms, refresh them too.
+const PRICE_TAGS: [&str; 2] = ["oracle", "lending"];
 
 /// Pyth's receiver and its Pro-compatible build; both own `PriceUpdateV2` accounts.
 const RECEIVER_PROGRAMS: [Pubkey; 2] = [
@@ -10,6 +16,24 @@ const RECEIVER_PROGRAMS: [Pubkey; 2] = [
 ];
 
 const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+
+/// Whether any enabled override of the scenario uses a template tagged `oracle` or `lending`.
+pub fn scenario_reads_prices(scenario: &Scenario) -> bool {
+    scenario
+        .overrides
+        .iter()
+        .filter(|instance| instance.enabled)
+        .any(|instance| {
+            template_registry()
+                .get(&instance.template_id)
+                .is_some_and(|template| {
+                    template
+                        .tags
+                        .iter()
+                        .any(|tag| PRICE_TAGS.contains(&tag.as_str()))
+                })
+        })
+}
 
 /// Marks every `PriceUpdateV2` in the local VM whose `publish_time` is behind the clock as
 /// published now, keeping its price. Nothing posts Pyth updates to the local VM, so a feed loaded
@@ -169,5 +193,54 @@ mod tests {
         assert_eq!(read(receiver_feed), NOW);
         assert_eq!(read(pro_feed), NOW);
         assert_eq!(read(not_pyth), NOW - 300);
+    }
+
+    #[tokio::test]
+    async fn only_accepted_scenarios_with_an_enabled_price_template_refresh_the_feeds() {
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let mut clock = svm.inner.get_sysvar::<Clock>();
+        clock.unix_timestamp = NOW;
+        svm.inner.set_sysvar(&clock);
+        let feed = Pubkey::new_unique();
+        let account = Account {
+            lamports: 1_000_000,
+            data: price_update(&[1], NOW - 300),
+            owner: RECEIVER_PROGRAMS[0],
+            executable: false,
+            rent_epoch: 0,
+        };
+        svm.set_account(&feed, account).expect("set account");
+        let scenario = |template: &str, relative_slot: u64, enabled: bool| {
+            let mut instance = OverrideInstance::new(
+                template.to_string(),
+                relative_slot,
+                AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+            );
+            instance.enabled = enabled;
+            Scenario {
+                id: template.to_string(),
+                name: template.to_string(),
+                description: String::new(),
+                tags: vec![],
+                overrides: vec![instance],
+            }
+        };
+        let feed_publish_time =
+            |svm: &SurfnetSvm| publish_time(&svm.get_account(&feed).unwrap().unwrap().data);
+
+        svm.register_scenario(scenario("spl-token-account-balance", 0, true), None)
+            .expect("register a token scenario");
+        svm.register_scenario(scenario("save-reserve-risk", 0, false), None)
+            .expect("register a disabled Save override");
+        assert!(
+            svm.register_scenario(scenario("pyth-price-feed-v2", 10, true), Some(u64::MAX - 1))
+                .is_err(),
+            "base slot plus relative slot overflows"
+        );
+        assert_eq!(feed_publish_time(&svm), NOW - 300);
+
+        svm.register_scenario(scenario("save-reserve-risk", 0, true), None)
+            .expect("register a Save scenario");
+        assert_eq!(feed_publish_time(&svm), NOW);
     }
 }

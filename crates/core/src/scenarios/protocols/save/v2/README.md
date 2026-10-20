@@ -158,11 +158,11 @@ Rates are APR in whole percent, compounded per slot on the next `refresh_reserve
 ## Keep the price fresh
 
 Save accepts a Pyth price for **120 seconds** after its `publish_time`, measured against the Surfnet
-clock, not the real one. Playing a scenario marks every Pyth price already loaded as published at
-that moment (see the [scenarios README](../../../README.md#scenario-registration)), so leave
-`publish_time` unset. Prices age again while the clock runs; play the scenario again to refresh
-them. A `publish_time` written into the scenario is kept, which is how to make a price stale on
-purpose.
+clock, not the real one. Playing a scenario with an enabled Save or Pyth override marks every Pyth
+price already loaded as published at that moment (see the
+[scenarios README](../../../README.md#scenario-registration)), so leave `publish_time` unset.
+Prices age again while the clock runs; play the scenario again to refresh them. A `publish_time`
+written into the scenario is kept, which is how to make a price stale on purpose.
 
 # Troubleshooting
 
