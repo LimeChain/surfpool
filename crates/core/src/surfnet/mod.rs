@@ -30,6 +30,7 @@ use crate::{
 };
 
 pub mod locker;
+pub mod market_tick;
 pub mod noop_program;
 pub mod remote;
 pub mod surfnet_lite_svm;

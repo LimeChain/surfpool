@@ -31,8 +31,16 @@ use solana_pubkey::Pubkey;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
 
 use crate::{
-    scenarios::TemplateRegistry,
-    surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    scenarios::{
+        TemplateRegistry,
+        protocols::{bisonfi::BISONFI_PROGRAM_ID, finish_raw_layout_write},
+    },
+    surfnet::{
+        GetAccountResult,
+        market_tick::{MARKET_TICK, MARKET_TICK_PROGRAM, stamp_market_tick},
+        remote::SurfnetRemoteClient,
+        svm::SurfnetSvm,
+    },
     tests::helpers::diff_indices,
 };
 
@@ -944,6 +952,24 @@ const BISONFI_SPREAD_PROPS: [(&str, usize, usize); 8] = [
     ("continuation_source_levels.5.tick_offset", 1288, 5),
 ];
 
+/// The spread template's centre-depth properties: (path, offset, bytes written). Every market fills
+/// a slice at the mid itself before the ladder starts, and the program restores that slice from the
+/// fresh and aged depth tables, so all four places have to be emptied together.
+const BISONFI_CENTRE_DEPTH_PROPS: [(&str, usize, usize); 4] = [
+    ("working_levels.8.depth", 416, 8),
+    ("configured_levels.8.depth", 656, 8),
+    ("fresh_depth_table.0", 1536, 2),
+    ("aged_depth_table.0", 1556, 2),
+];
+
+/// The centre-depth properties all set to 0, which makes the ladder's spread the spread a trade pays.
+fn bisonfi_centre_emptied() -> Vec<(&'static str, serde_json::Value)> {
+    BISONFI_CENTRE_DEPTH_PROPS
+        .iter()
+        .map(|(path, _, _)| (*path, serde_json::json!(0)))
+        .collect()
+}
+
 /// The bid half of the spread template's properties, all set to `v`.
 ///
 /// The bid runs are the ones starting at rung 0 of each region; the ask runs start mid-region. Both
@@ -987,6 +1013,7 @@ fn bisonfi_apply_template(
 }
 
 /// Values setting the whole book to one magnitude: bid properties negative, ask properties positive.
+/// The centre is emptied too, as the template documents for an exact spread.
 fn bisonfi_spread_values(magnitude: i32) -> Vec<(&'static str, serde_json::Value)> {
     BISONFI_SPREAD_PROPS
         .iter()
@@ -1000,6 +1027,7 @@ fn bisonfi_spread_values(magnitude: i32) -> Vec<(&'static str, serde_json::Value
             };
             (*path, serde_json::json!(v))
         })
+        .chain(bisonfi_centre_emptied())
         .collect()
 }
 
@@ -1208,6 +1236,29 @@ async fn bisonfi_spread_template_writes_only_its_tick_fields() {
                     "{path} on {pool}: rung {i} at offset {at} did not receive the value"
                 );
             }
+        }
+    }
+
+    for (path, offset, width) in BISONFI_CENTRE_DEPTH_PROPS {
+        for (pool, data) in BISONFI_ALL_POOLS.iter().zip(all.iter()) {
+            let forged = template
+                .materialize_raw_layout(
+                    data,
+                    &HashMap::from([(path.to_string(), serde_json::json!(0))]),
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("{path} on {pool}: {e}"));
+            for i in diff_indices(&forged, data) {
+                assert!(
+                    (offset..offset + width).contains(&i),
+                    "{path} on {pool}: byte {i} changed, outside {offset}..{}",
+                    offset + width
+                );
+            }
+            assert!(
+                forged[offset..offset + width].iter().all(|b| *b == 0),
+                "{path} on {pool}: the centre depth was not emptied"
+            );
         }
     }
 }
@@ -2063,6 +2114,31 @@ fn bisonfi_replay_min_out(
     direction: u8,
     mutate: impl FnOnce(&mut Vec<u8>),
 ) -> Result<u64, String> {
+    bisonfi_replay_with_state(
+        elf,
+        pool_addr,
+        pool_bytes,
+        token_programs,
+        amount_in,
+        min_out,
+        direction,
+        mutate,
+    )
+    .map(|(out, _)| out)
+}
+
+/// As [`bisonfi_replay_min_out`], also returning the pool account as the swap left it.
+#[allow(clippy::too_many_arguments)]
+fn bisonfi_replay_with_state(
+    elf: &[u8],
+    pool_addr: &str,
+    pool_bytes: &[u8],
+    token_programs: (Pubkey, Pubkey),
+    amount_in: u64,
+    min_out: u64,
+    direction: u8,
+    mutate: impl FnOnce(&mut Vec<u8>),
+) -> Result<(u64, Vec<u8>), String> {
     use litesvm::LiteSVM;
     use solana_account::Account;
     use solana_instruction::{AccountMeta, Instruction};
@@ -2097,10 +2173,12 @@ fn bisonfi_replay_min_out(
         .with_blockhash_check(false);
     svm.add_program(program_id, elf)
         .map_err(|e| format!("add_program: {e:?}"))?;
+    let block_time_ms = publish_millis(pool_bytes);
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = pool_slot;
-    clock.unix_timestamp = 1_787_041_969;
+    clock.unix_timestamp = (block_time_ms / 1_000) as i64;
     svm.set_sysvar(&clock);
+    let tick = install_market_tick(&mut svm, pool_slot, block_time_ms);
     svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
@@ -2189,6 +2267,8 @@ fn bisonfi_replay_min_out(
             data,
         },
     ];
+    let mut ixs = ixs;
+    ixs[1].accounts.extend(tick);
     let mut msg = solana_message::Message::new(&ixs, Some(&taker.pubkey()));
     msg.recent_blockhash = svm.latest_blockhash();
     let nsig = msg.header.num_required_signatures as usize;
@@ -2204,7 +2284,7 @@ fn bisonfi_replay_min_out(
             } else {
                 spl_amount(&svm.get_account(&src_ta).unwrap().data)
             };
-            Ok(out)
+            Ok((out, svm.get_account(&pool_key).unwrap().data))
         }
         Err(e) => Err(format!("{:?}", e.err)),
     }
@@ -2235,16 +2315,73 @@ async fn load_program_elf(cache_name: &str, programdata: &str) -> Vec<u8> {
 }
 
 /// The program ELF, fetched once per process and reused. Delete the file to pick up a redeploy.
+/// Also loads the market tick: anything that runs the program needs both.
 async fn bisonfi_elf() -> Vec<u8> {
     static ELF: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+    load_market_tick().await;
     ELF.get_or_init(|| load_program_elf("surfpool-bisonfi-program.so", BISONFI_PROGRAMDATA))
         .await
         .clone()
 }
 
-/// Offsets of the live quote ladder. `LADDER` is the table the program actually prices from;
-/// `LADDER_INERT` is the mirrored table that writing has no effect on, kept here so the test that
-/// proves the difference cannot drift away from the template.
+/// BisonFi's market tick as upstream holds it, fetched once per process. Every replay restamps it to
+/// its own clock with the production stamper, as Surfpool does whenever it moves the Clock.
+static BISONFI_TICK: std::sync::OnceLock<solana_account::Account> = std::sync::OnceLock::new();
+
+async fn load_market_tick() {
+    if BISONFI_TICK.get().is_some() {
+        return;
+    }
+    let (data, lamports) = fetch_with_lamports(&[&MARKET_TICK.to_string()])
+        .await
+        .remove(0);
+    let _ = BISONFI_TICK.set(solana_account::Account {
+        lamports,
+        data,
+        owner: MARKET_TICK_PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    });
+}
+
+thread_local! {
+    /// Set only by the test that pins what a swap without the tick does.
+    static OMIT_MARKET_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs the market tick stamped to `slot` and `block_time_ms` and returns the account a swap
+/// passes tenth since the 2026-10-14 upgrade, or `None` while a test is omitting it.
+fn install_market_tick(
+    svm: &mut litesvm::LiteSVM,
+    slot: u64,
+    block_time_ms: u64,
+) -> Option<solana_instruction::AccountMeta> {
+    if OMIT_MARKET_TICK.with(|omit| omit.get()) {
+        return None;
+    }
+    let tick = BISONFI_TICK
+        .get()
+        .expect("load the market tick (bisonfi_elf does) before replaying a swap");
+    let stamped = stamp_market_tick(tick, slot, block_time_ms)
+        .expect("the upstream tick should be BisonFi's");
+    svm.set_account(MARKET_TICK, stamped)
+        .expect("tick should install");
+    Some(solana_instruction::AccountMeta::new_readonly(
+        MARKET_TICK,
+        false,
+    ))
+}
+
+/// The pool's publication time in milliseconds. Replays run their clock at it, so a quote is exactly
+/// as fresh as the maker made it.
+fn publish_millis(pool: &[u8]) -> u64 {
+    u64::from_le_bytes(pool[88..96].try_into().unwrap()) / 1_000_000
+}
+
+/// Offsets of the quote ladder. `LADDER` is the source table the maker configures; `LADDER_MIRROR` is
+/// the working copy swaps price from and consume. The program copies the source over the working copy
+/// on the first swap of a slot the pool was published in, so the working copy only differs - and only
+/// matters - within a slot after that copy, or while the quote is one or two slots old.
 const BISONFI_LADDER: usize = 528;
 
 const BISONFI_LADDER_MIRROR: usize = 288;
@@ -2337,10 +2474,12 @@ fn bisonfi_run(
     svm.add_program(program_id, &fork.elf)
         .map_err(|e| format!("add_program: {e:?}"))?;
 
+    let block_time_ms = publish_millis(&fork.pool);
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = pool_slot;
-    clock.unix_timestamp = 1_787_041_969;
+    clock.unix_timestamp = (block_time_ms / 1_000) as i64;
     svm.set_sysvar(&clock);
+    let tick = install_market_tick(&mut svm, pool_slot, block_time_ms);
     // Match Surfpool startup: this local VM begins at the account snapshot's slot.
     svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
@@ -2436,6 +2575,8 @@ fn bisonfi_run(
         data: cu_data,
     };
 
+    let mut ix = ix;
+    ix.accounts.extend(tick);
     let mut msg = solana_message::Message::new(&[cu_ix, ix], Some(&taker.pubkey()));
     msg.recent_blockhash = svm.latest_blockhash();
     let nsig = msg.header.num_required_signatures as usize;
@@ -2609,8 +2750,7 @@ async fn bisonfi_depth_lever_is_direction_specific() {
 
     let buy = sell_base;
     let buy_base = bisonfi_run(&fork, buy, 1, |_| {}).expect("control buy");
-    let buy_deeper_base =
-        bisonfi_run(&fork, buy, 1, scale(48, 10)).expect("buy with deeper base");
+    let buy_deeper_base = bisonfi_run(&fork, buy, 1, scale(48, 10)).expect("buy with deeper base");
     assert!(
         buy_deeper_base > buy_base,
         "the base reserve must affect a buy, which pays out base"
@@ -3388,9 +3528,13 @@ fn bisonfi_orca_atomic_arb(
     // Orca checks the TIMESTAMP against its reward accrual, so the two constraints do not collide.
     let orca_ts = u64::from_le_bytes(orca.data[261..269].try_into().unwrap());
     let mut clock: solana_clock::Clock = svm.get_sysvar();
+    // BisonFi's tick must also agree with the timestamp to the second. Running at the pool's own
+    // publication time, which is later than Orca's last reward update, satisfies both.
+    let bf_block_time_ms = publish_millis(&bf);
     clock.slot = bf_slot;
-    clock.unix_timestamp = orca_ts as i64;
+    clock.unix_timestamp = (orca_ts as i64).max((bf_block_time_ms / 1_000) as i64);
     svm.set_sysvar(&clock);
+    let tick = install_market_tick(&mut svm, bf_slot, clock.unix_timestamp as u64 * 1_000);
     svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
@@ -3502,6 +3646,8 @@ fn bisonfi_orca_atomic_arb(
         ],
         data: bf_data,
     };
+    let mut sell_on_bisonfi = sell_on_bisonfi;
+    sell_on_bisonfi.accounts.extend(tick);
 
     let mut budget = vec![2u8];
     budget.extend_from_slice(&1_800_000u32.to_le_bytes());
@@ -3716,4 +3862,558 @@ async fn bisonfi_staleness_suppresses_the_price_and_spread_levers() {
         checked >= 6,
         "only {checked} markets exercised the precedence of the freshness gate"
     );
+}
+
+/// The 2026-10-14 program upgrade made the market tick a tenth swap account. Without it a gated
+/// market succeeds and pays nothing, which is what every BisonFi swap on a surfnet did until Surfpool
+/// started keeping the tick. Pinned so a later upgrade that changes this is noticed.
+#[tokio::test]
+async fn bisonfi_a_swap_without_the_market_tick_pays_nothing() {
+    let rig = bisonfi_rig().await;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data);
+        let with_tick = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: control failed: {e}"));
+        assert!(with_tick > 0, "{pool}: the control must fill");
+
+        OMIT_MARKET_TICK.with(|omit| omit.set(true));
+        let without = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {});
+        OMIT_MARKET_TICK.with(|omit| omit.set(false));
+        assert_eq!(
+            without,
+            Ok(0),
+            "{pool}: a swap without the tick must succeed and pay nothing"
+        );
+    }
+}
+
+/// How the program uses the market tick: it grades a quote's age - the tick's time minus the pool's
+/// publication time (byte 88) - to the millisecond. Up to 150 ms it prices the full book, older it
+/// falls back to a thinner one, and either way it still fills. So a late quote must never fill
+/// better than a punctual one and must fill worse on most markets.
+#[tokio::test]
+async fn bisonfi_quote_age_grades_the_book() {
+    let rig = bisonfi_rig().await;
+    let mut thinner = 0usize;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data);
+        // Replays run their clock at the pool's own publication time, so moving byte 88 back by
+        // `late_ms` makes the quote exactly that old.
+        let at = |late_ms: u64| {
+            bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |d| {
+                let published = u64::from_le_bytes(d[88..96].try_into().unwrap());
+                d[88..96].copy_from_slice(&(published - late_ms * 1_000_000).to_le_bytes());
+            })
+            .unwrap_or_else(|e| panic!("{pool}: {e}"))
+        };
+        let (fresh, late, aged) = (at(0), at(250), at(500));
+        assert!(
+            fresh > 0 && late > 0 && aged > 0,
+            "{pool}: a late quote must still fill"
+        );
+        assert!(
+            late <= fresh && aged <= fresh,
+            "{pool}: a late quote filled better than a fresh one: {fresh} vs {late} / {aged}"
+        );
+        if late < fresh {
+            thinner += 1;
+        }
+    }
+    assert!(
+        thinner * 2 >= rig.quoting.len(),
+        "only {thinner} of {} markets thinned a 250 ms old quote; the program's quote-age grading \
+         seems to have changed",
+        rig.quoting.len()
+    );
+}
+
+/// A pool fetched while the surfnet is behind mainnet carries mainnet's later rebuild slot (byte
+/// 688), and the program refills a consumed book only while that slot is in the past. Completing the
+/// freshness publication moves it back, so a refreshed slot refills such a pool too - and without that
+/// step it would not.
+#[tokio::test]
+async fn bisonfi_freshness_refills_a_pool_fetched_ahead_of_the_surfnet() {
+    let rig = bisonfi_rig().await;
+    let registry = TemplateRegistry::new();
+    let freshness = registry
+        .get("bisonfi-freshness")
+        .expect("freshness template");
+    let mut refilled_somewhere = false;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data) / 2;
+        let (first, after) =
+            bisonfi_replay_with_state(&rig.elf, pool, data, *tp, size, 0, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: first sell failed: {e}"));
+
+        // The next slot, with the reserves put back so only the book differs, and a rebuild slot
+        // from mainnet's future, as a fetch behind mainnet leaves it.
+        let slot = u64::from_le_bytes(after[72..80].try_into().unwrap()) + 1;
+        let mut next = after.clone();
+        next[48..64].copy_from_slice(&data[48..64]);
+        next[688..696].copy_from_slice(&(slot + 30).to_le_bytes());
+
+        // The freshness override as scenario execution applies it: the template, then the protocol.
+        let refresh = |complete: bool| {
+            let values = HashMap::from([("last_update_slot".to_string(), serde_json::json!(0))]);
+            let mut published = freshness
+                .materialize_raw_layout(&next, &values, slot)
+                .expect("freshness should apply");
+            if complete {
+                let block_time_ms = publish_millis(&next);
+                finish_raw_layout_write(
+                    &BISONFI_PROGRAM_ID,
+                    "bisonfi-freshness",
+                    &mut published,
+                    slot,
+                    block_time_ms,
+                );
+            }
+            published
+        };
+        let sell = |published: Vec<u8>| {
+            bisonfi_replay(&rig.elf, pool, &published, *tp, size, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: refreshed sell failed: {e}"))
+        };
+        let (stuck, refilled) = (sell(refresh(false)), sell(refresh(true)));
+
+        let drift_bps = (refilled as f64 / first as f64 - 1.0).abs() * 1e4;
+        assert!(
+            refilled >= stuck && drift_bps < 5.0,
+            "{pool}: a completed refresh should fill like the first swap: first {first}, without \
+             it {stuck}, with it {refilled} ({drift_bps:.2} bps)"
+        );
+        refilled_somewhere |= refilled > stuck;
+    }
+    assert!(
+        refilled_somewhere,
+        "no market refilled better with the rebuild slot moved back; the program's rebuild gate \
+         seems to have changed"
+    );
+}
+
+/// Swaps consume the working ladder, so a second swap in the same slot fills worse. The program
+/// refills the ladder from its source on the first swap of a slot the pool was published in, which on
+/// a surfnet means a slot carrying a freshness override. This is BisonFi's "change X, then do Y":
+/// nothing refills a market that is not refreshed.
+#[tokio::test]
+async fn bisonfi_a_fresh_slot_refills_what_a_swap_consumed() {
+    let rig = bisonfi_rig().await;
+    let mut consumed_somewhere = false;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data) / 2;
+        let (first, after) =
+            bisonfi_replay_with_state(&rig.elf, pool, data, *tp, size, 0, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: first sell failed: {e}"));
+        assert!(first > 0, "{pool}: the first sell must fill");
+
+        // Put the reserves back so only the ladder state differs from the first swap's.
+        let mut same_slot = after.clone();
+        same_slot[48..64].copy_from_slice(&data[48..64]);
+        let second = bisonfi_replay(&rig.elf, pool, &same_slot, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: second sell failed: {e}"));
+        assert!(
+            second <= first,
+            "{pool}: a second sell in the same slot filled better ({second} > {first})"
+        );
+        consumed_somewhere |= second < first;
+
+        // The next slot, published in: the replay's clock follows last_update_slot.
+        let mut next_slot = same_slot;
+        let slot = u64::from_le_bytes(next_slot[72..80].try_into().unwrap());
+        next_slot[72..80].copy_from_slice(&(slot + 1).to_le_bytes());
+        let refilled = bisonfi_replay(&rig.elf, pool, &next_slot, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: refreshed sell failed: {e}"));
+        let drift_bps = (refilled as f64 / first as f64 - 1.0).abs() * 1e4;
+        assert!(
+            refilled >= second && drift_bps < 5.0,
+            "{pool}: a refreshed slot should fill like the first swap: first {first}, same slot \
+             {second}, refreshed {refilled} ({drift_bps:.2} bps)"
+        );
+    }
+    assert!(
+        consumed_somewhere,
+        "no market filled a second swap worse; the ladder is no longer consumed by swaps"
+    );
+}
+
+// ---------------------------------------------------------------- live surfnet
+
+mod live_surfnet {
+    //! The same swaps, end to end: a surfnet forking mainnet, driven only over JSON-RPC. The
+    //! replay tests above prove what the program does with given bytes; these prove Surfpool
+    //! produces those bytes on its own - the tick on every block and after time travel, the pool's
+    //! freshness from a registered scenario - with nothing written into the fork by hand.
+
+    use std::time::{Duration, Instant};
+
+    use base64::Engine;
+    use crossbeam_channel::unbounded;
+    use solana_client::{nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest};
+    use solana_commitment_config::CommitmentConfig;
+    use solana_compute_budget_interface::ComputeBudgetInstruction;
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_signer::Signer;
+    use solana_transaction::Transaction;
+    use surfpool_types::{
+        AccountAddress, OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig,
+    };
+
+    use super::{BISONFI_NINTH, BISONFI_PROGRAM, DEFAULT_RPC_URL, MARKET_TICK, RPC_URL_ENV};
+    use crate::{
+        storage::tests::TestType,
+        surfnet::locker::SurfnetSvmLocker,
+        tests::{
+            helpers::get_free_port,
+            integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
+        },
+    };
+
+    /// SOL-USDC-Pool2: live, tick-gated, and both mints are plain SPL tokens.
+    const POOL: Pubkey = Pubkey::from_str_const("8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo");
+    const TOKENKEG: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    const ATA_PROGRAM: Pubkey =
+        Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    const CLOCK_SYSVAR: Pubkey =
+        Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+    /// Ten USDC per purchase: small against the pool, so every fill sits on the inner book.
+    const QUOTE_IN: u64 = 10_000_000;
+    /// How many slots each freshness scenario keeps the quote live for.
+    const FRESH_SLOTS: u64 = 40;
+
+    fn start_surfnet() -> (RpcClient, RunloopGuard) {
+        let bind_host = "127.0.0.1";
+        let bind_port = get_free_port().unwrap();
+        let ws_port = get_free_port().unwrap();
+        let config = SurfpoolConfig {
+            simnets: vec![SimnetConfig {
+                remote_rpc_url: Some(
+                    std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+                ),
+                ..SimnetConfig::default()
+            }],
+            rpc: RpcConfig {
+                bind_host: bind_host.to_string(),
+                bind_port,
+                ws_port,
+                ..RpcConfig::default()
+            },
+            ..SurfpoolConfig::default()
+        };
+        let (svm, events_rx, geyser_rx) = TestType::no_db().initialize_svm();
+        let (commands_tx, commands_rx) = unbounded();
+        let runloop = spawn_runloop(
+            SurfnetSvmLocker::new(svm),
+            config,
+            (commands_tx, commands_rx),
+            geyser_rx,
+        )
+        .expect("the runloop should start");
+        wait_for_ready_and_connected(&events_rx)
+            .expect("surfnet should be ready and connected to the datasource");
+        let rpc = RpcClient::new_with_commitment(
+            format!("http://{bind_host}:{bind_port}"),
+            CommitmentConfig::processed(),
+        );
+        (rpc, runloop)
+    }
+
+    async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Value) {
+        rpc.send::<serde_json::Value>(RpcRequest::Custom { method }, params)
+            .await
+            .unwrap_or_else(|e| panic!("{method} failed: {e}"));
+    }
+
+    fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[owner.as_ref(), TOKENKEG.as_ref(), mint.as_ref()],
+            &ATA_PROGRAM,
+        )
+        .0
+    }
+
+    fn u64_at(data: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+    }
+
+    async fn wait_for_slot(rpc: &RpcClient, slot: u64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rpc.get_slot().await.expect("slot") < slot {
+            assert!(
+                Instant::now() < deadline,
+                "the surfnet stopped producing blocks"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Registers a freshness scenario covering the next `FRESH_SLOTS` slots and waits until the pool
+    /// shows it, returning the last slot it covers. This is the workflow the template documents:
+    /// nothing is written into the pool except through a scenario.
+    ///
+    /// No base slot is sent. Surfpool never applies an override scheduled for a slot that has
+    /// already begun, so a base read here and sent in a later request loses its first slot whenever
+    /// a block boundary falls between the two; without one the server uses its own current slot.
+    async fn keep_fresh(rpc: &RpcClient) -> u64 {
+        let before = rpc.get_slot().await.expect("slot");
+        let mut scenario = Scenario::new(
+            "BisonFi keep-alive".to_string(),
+            "Keeps SOL-USDC-Pool2 quoting".to_string(),
+        );
+        scenario.overrides = (1..=FRESH_SLOTS)
+            .map(|relative| {
+                OverrideInstance::new(
+                    "bisonfi-freshness".to_string(),
+                    relative,
+                    AccountAddress::Pubkey(POOL.to_string()),
+                )
+                .with_values([("last_update_slot".to_string(), serde_json::json!(0))].into())
+            })
+            .collect();
+        cheatcode(
+            rpc,
+            "surfnet_registerScenario",
+            serde_json::json!([scenario]),
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pool = rpc.get_account(&POOL).await.expect("pool").data;
+            let refreshed_at = u64_at(&pool, 72);
+            if refreshed_at > before && refreshed_at <= rpc.get_slot().await.expect("slot") {
+                assert_publication_follows_the_clock(rpc).await;
+                return refreshed_at + FRESH_SLOTS - 1;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the freshness scenario never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The freshness override also completed the publication: the pool's publication time follows
+    /// the surfnet clock, and its last book rebuild is in the past, so the next swap refills it.
+    async fn assert_publication_follows_the_clock(rpc: &RpcClient) {
+        let accounts = rpc
+            .get_multiple_accounts(&[POOL, CLOCK_SYSVAR])
+            .await
+            .expect("pool and clock");
+        let pool = accounts[0].as_ref().expect("pool");
+        let clock = accounts[1].as_ref().expect("clock sysvar");
+        assert!(
+            u64_at(&pool.data, 688) < u64_at(&clock.data, 0),
+            "the pool's last book rebuild must be in the past for the next swap to refill it"
+        );
+        let published_seconds = u64_at(&pool.data, 88) / 1_000_000_000;
+        let clock_seconds = i64::from_le_bytes(clock.data[32..40].try_into().unwrap()) as u64;
+        assert!(
+            published_seconds.abs_diff(clock_seconds) <= 1,
+            "the pool reads published at {published_seconds}s, the Clock {clock_seconds}s"
+        );
+    }
+
+    /// The tick and the Clock read in one request, so they describe the same moment.
+    async fn assert_tick_matches_clock(rpc: &RpcClient, when: &str) {
+        let accounts = rpc
+            .get_multiple_accounts(&[MARKET_TICK, CLOCK_SYSVAR])
+            .await
+            .expect("tick and clock");
+        let tick = accounts[0]
+            .as_ref()
+            .unwrap_or_else(|| panic!("{when}: the surfnet holds no market tick"));
+        let clock = accounts[1].as_ref().expect("clock sysvar");
+        let (clock_slot, clock_seconds) = (
+            u64_at(&clock.data, 0),
+            i64::from_le_bytes(clock.data[32..40].try_into().unwrap()),
+        );
+        assert_eq!(
+            u64_at(&tick.data, 40),
+            clock_slot,
+            "{when}: the tick must name the Clock's slot"
+        );
+        let tick_seconds = (u64_at(&tick.data, 56) + 500_000_000) / 1_000_000_000;
+        assert!(
+            tick_seconds.abs_diff(clock_seconds as u64) <= 1,
+            "{when}: the tick reads {tick_seconds}s, the Clock {clock_seconds}s"
+        );
+    }
+
+    struct Taker {
+        keypair: Keypair,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        user_base: Pubkey,
+        user_quote: Pubkey,
+    }
+
+    /// Buys SOL with `QUOTE_IN` USDC through `sendTransaction`, returning the SOL received. The
+    /// ninth account is a signer the program requires and no test holds, so the swap is sent with
+    /// `skipSigVerify` - the surfnet's way of acting for an account without its key.
+    async fn buy(rpc: &RpcClient, taker: &Taker) -> u64 {
+        let before = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+
+        let mut data = vec![0x07];
+        data.extend_from_slice(&QUOTE_IN.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&[1, 0]); // direction 1 buys the base token
+        let swap = Instruction {
+            program_id: Pubkey::from_str_const(BISONFI_PROGRAM),
+            accounts: vec![
+                AccountMeta::new(taker.keypair.pubkey(), true),
+                AccountMeta::new(POOL, false),
+                AccountMeta::new(taker.base_vault, false),
+                AccountMeta::new(taker.quote_vault, false),
+                AccountMeta::new(taker.user_base, false),
+                AccountMeta::new(taker.user_quote, false),
+                AccountMeta::new_readonly(TOKENKEG, false),
+                AccountMeta::new_readonly(TOKENKEG, false),
+                AccountMeta::new_readonly(Pubkey::from_str_const(BISONFI_NINTH), true),
+                AccountMeta::new_readonly(MARKET_TICK, false),
+            ],
+            data,
+        };
+        let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let blockhash = rpc.get_latest_blockhash().await.expect("blockhash");
+        let message = solana_message::Message::new_with_blockhash(
+            &[budget, swap],
+            Some(&taker.keypair.pubkey()),
+            &blockhash,
+        );
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures =
+            vec![Signature::default(); tx.message.header.num_required_signatures as usize];
+        tx.signatures[0] = taker.keypair.sign_message(&tx.message.serialize());
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let signature: String = rpc
+            .send(
+                RpcRequest::SendTransaction,
+                serde_json::json!([encoded, {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "skipSigVerify": true,
+                }]),
+            )
+            .await
+            .expect("the swap should be accepted");
+        let signature: Signature = signature.parse().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = rpc
+                .get_signature_statuses(&[signature])
+                .await
+                .expect("signature status")
+                .value
+                .remove(0);
+            if let Some(status) = status {
+                assert!(status.err.is_none(), "the swap failed: {:?}", status.err);
+                break;
+            }
+            assert!(Instant::now() < deadline, "the swap was never processed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let after = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        after - before
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bisonfi_swaps_on_a_live_surfnet_across_blocks_and_time_travel() {
+        let (rpc, _runloop) = start_surfnet();
+
+        // Reading the pool through the surfnet forks it from mainnet.
+        let pool = rpc.get_account(&POOL).await.expect("pool").data;
+        let base_mint = Pubkey::new_from_array(pool[184..216].try_into().unwrap());
+        let quote_mint = Pubkey::new_from_array(pool[216..248].try_into().unwrap());
+        let keypair = Keypair::new();
+        let owner = keypair.pubkey();
+        cheatcode(
+            &rpc,
+            "surfnet_setAccount",
+            serde_json::json!([owner.to_string(), { "lamports": 10_000_000_000u64 }]),
+        )
+        .await;
+        for (mint, amount) in [(base_mint, 0u64), (quote_mint, 1_000_000_000)] {
+            cheatcode(
+                &rpc,
+                "surfnet_setTokenAccount",
+                serde_json::json!([
+                    owner.to_string(),
+                    mint.to_string(),
+                    { "amount": amount },
+                    TOKENKEG.to_string()
+                ]),
+            )
+            .await;
+        }
+        let taker = Taker {
+            base_vault: Pubkey::new_from_array(pool[120..152].try_into().unwrap()),
+            quote_vault: Pubkey::new_from_array(pool[152..184].try_into().unwrap()),
+            user_base: ata(&owner, &base_mint),
+            user_quote: ata(&owner, &quote_mint),
+            keypair,
+        };
+
+        // 1. A refreshed pool fills. The tick was never loaded before this swap named it, so this
+        //    is also the hydration path.
+        let covered = keep_fresh(&rpc).await;
+        let first = buy(&rpc, &taker).await;
+        assert!(first > 0, "a refreshed pool must fill on a surfnet");
+        assert_tick_matches_clock(&rpc, "after the first swap").await;
+
+        // 2. Control: once the scenario runs out, staleness stops the venue. Freshness is still the
+        //    caller's job; only the tick is automatic.
+        wait_for_slot(&rpc, covered + 4).await;
+        assert_eq!(
+            buy(&rpc, &taker).await,
+            0,
+            "a stale pool must stop filling, or the fills above prove nothing about freshness"
+        );
+        assert_tick_matches_clock(&rpc, "many blocks later").await;
+
+        // 3. Refreshing revives it, with the tick still following the chain.
+        keep_fresh(&rpc).await;
+        let revived = buy(&rpc, &taker).await;
+        assert!(revived > 0, "a refreshed pool must fill again");
+
+        // 4. Time travel: the clock jumps, and the tick jumps with it.
+        let target = rpc.get_slot().await.expect("slot") + 10_000;
+        cheatcode(
+            &rpc,
+            "surfnet_timeTravel",
+            serde_json::json!([{ "absoluteSlot": target }]),
+        )
+        .await;
+        assert!(rpc.get_slot().await.expect("slot") >= target);
+        assert_tick_matches_clock(&rpc, "after time travel").await;
+        keep_fresh(&rpc).await;
+        let travelled = buy(&rpc, &taker).await;
+        assert!(
+            travelled > 0,
+            "a refreshed pool must fill after time travel"
+        );
+
+        // The same purchase against the same price should buy about the same SOL each time.
+        for fill in [revived, travelled] {
+            let drift_bps = (fill as f64 / first as f64 - 1.0).abs() * 1e4;
+            assert!(
+                drift_bps < 50.0,
+                "fills drifted {drift_bps:.1} bps from the first: {first} vs {fill}"
+            );
+        }
+    }
 }

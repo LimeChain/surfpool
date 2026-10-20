@@ -95,11 +95,17 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::{
+            finish_raw_layout_write, phoenix_eternal::v1::state_builder::prepare_phoenix_override,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
+        LogsSubscriptionData,
+        locker::is_supported_token_program,
+        market_tick::{MARKET_TICK, stamp_market_tick},
+        surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -1695,15 +1701,15 @@ impl SurfnetSvm {
         self.inner.set_sysvar(&slot_hashes);
 
         // 3. Reconstruct Clock using absolute slot
-        let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
+        let block_time_ms = self.calculate_block_time_for_slot(current_absolute_slot);
         let clock = Clock {
             slot: current_absolute_slot,
             epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: unix_timestamp as i64,
+            unix_timestamp: (block_time_ms / 1_000) as i64,
             epoch_start_timestamp: 0,
             leader_schedule_epoch: 0,
         };
-        self.inner.set_sysvar(&clock);
+        self.set_clock(&clock, block_time_ms);
     }
 
     /// Generates and sets a new blockhash, updating the RecentBlockhashes sysvar.
@@ -2751,13 +2757,16 @@ impl SurfnetSvm {
         } else {
             account
         };
-
         // Preserve the established behavior for fetched data: an account that
         // LiteSVM rejects (such as an incomplete program upload) is still
         // returned to the caller, with the insertion failure emitted as an
         // event for observability.
         if let Err(error) = self.set_account(&pubkey, account) {
             let _ = self.simnet_events_tx.error(error.to_string());
+        }
+        // The tick arrives as a block builder last wrote it on mainnet; give it this surfnet's clock.
+        if pubkey == MARKET_TICK {
+            self.restamp_market_tick(self.get_latest_absolute_slot(), self.updated_at);
         }
         Ok(())
     }
@@ -2796,6 +2805,32 @@ impl SurfnetSvm {
             },
             AccountUpdatePolicy::HydrateIfAbsent,
         )
+    }
+
+    /// Installs `clock` and restamps the accounts that mirror it, so a program reading both sees
+    /// them agree. `block_time_ms` is the millisecond time `clock.unix_timestamp` was truncated from.
+    pub(crate) fn set_clock(&mut self, clock: &Clock, block_time_ms: u64) {
+        self.inner.set_sysvar(clock);
+        self.restamp_market_tick(clock.slot, block_time_ms);
+    }
+
+    /// Restamps the market tick if this surfnet holds it. An absent tick is left absent: the
+    /// first transaction that names it hydrates it, and hydration stamps it too.
+    fn restamp_market_tick(&mut self, slot: Slot, block_time_ms: u64) {
+        let tick = match self.inner.get_account(&MARKET_TICK) {
+            Ok(Some(tick)) => tick,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("Failed to read the market tick: {}", e);
+                return;
+            }
+        };
+        let Some(stamped) = stamp_market_tick(&tick, slot, block_time_ms) else {
+            return;
+        };
+        if let Err(e) = self.set_account_silently(&MARKET_TICK, stamped) {
+            warn!("Failed to restamp the market tick: {}", e);
+        }
     }
 
     /// Moves the chain to `absolute_slot`, at the epoch, slot index and epoch length the epoch
@@ -2961,7 +2996,7 @@ impl SurfnetSvm {
         };
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
-        self.inner.set_sysvar(&clock);
+        self.set_clock(&clock, self.updated_at);
 
         self.finalize_transactions()?;
 
@@ -3231,7 +3266,14 @@ impl SurfnetSvm {
                         &account_values,
                         target_slot,
                     ) {
-                        Ok(new_data) => {
+                        Ok(mut new_data) => {
+                            finish_raw_layout_write(
+                                account.owner(),
+                                &override_instance.template_id,
+                                &mut new_data,
+                                target_slot,
+                                self.updated_at,
+                            );
                             let modified = Account {
                                 lamports: account.lamports(),
                                 data: new_data,
@@ -8535,5 +8577,103 @@ mod tests {
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));
+    }
+
+    fn market_tick_slot_and_millis(svm: &SurfnetSvm) -> (u64, u64) {
+        let tick = svm
+            .inner
+            .get_account(&MARKET_TICK)
+            .unwrap()
+            .expect("tick should be present");
+        let at = |o: usize| u64::from_le_bytes(tick.data[o..o + 8].try_into().unwrap());
+        (at(40), at(56) / 1_000_000)
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    fn market_tick_follows_the_clock_on_every_block(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        svm.set_account(
+            &MARKET_TICK,
+            crate::surfnet::market_tick::captured_market_tick(),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+            let clock = svm.inner.get_sysvar::<Clock>();
+            let (slot, millis) = market_tick_slot_and_millis(&svm);
+            assert_eq!(slot, clock.slot, "the tick must name the Clock's slot");
+            assert_eq!(millis, svm.updated_at, "the tick must carry the block time");
+            assert_eq!(millis / 1_000, clock.unix_timestamp as u64);
+        }
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    fn market_tick_is_stamped_when_hydrated_from_upstream(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        svm.confirm_current_block().unwrap();
+
+        svm.apply_account_update(
+            GetAccountResult::FoundAccount(
+                MARKET_TICK,
+                crate::surfnet::market_tick::captured_market_tick(),
+                AccountSource::Remote,
+            ),
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
+        .unwrap();
+
+        let (slot, millis) = market_tick_slot_and_millis(&svm);
+        assert_eq!(slot, svm.get_latest_absolute_slot());
+        assert_eq!(millis, svm.updated_at);
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    fn market_tick_stays_absent_until_something_needs_it(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        svm.confirm_current_block().unwrap();
+        assert!(
+            svm.inner.get_account(&MARKET_TICK).unwrap().is_none(),
+            "a surfnet that never touched BisonFi must not grow its accounts"
+        );
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    fn market_tick_follows_a_reconstructed_clock(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        svm.set_account(
+            &MARKET_TICK,
+            crate::surfnet::market_tick::captured_market_tick(),
+        )
+        .unwrap();
+        svm.chain_tip = BlockIdentifier::new(50, "test_hash");
+        svm.genesis_slot = 1000;
+        svm.latest_epoch_info.absolute_slot = 1050;
+        svm.genesis_updated_at = 2_000_000;
+        svm.slot_time = 400;
+
+        svm.reconstruct_sysvars();
+
+        assert_eq!(market_tick_slot_and_millis(&svm), (1050, 2_020_000));
+    }
+
+    /// An account at the tick's address owned by another program is not the tick.
+    #[test_case(TestType::no_db(); "with no db")]
+    fn market_tick_leaves_a_foreign_account_alone(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let mut foreign = crate::surfnet::market_tick::captured_market_tick();
+        foreign.owner = Pubkey::new_unique();
+        svm.set_account(&MARKET_TICK, foreign.clone()).unwrap();
+
+        svm.confirm_current_block().unwrap();
+
+        assert_eq!(
+            svm.inner.get_account(&MARKET_TICK).unwrap().unwrap().data,
+            foreign.data
+        );
     }
 }

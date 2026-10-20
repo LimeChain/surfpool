@@ -229,6 +229,38 @@ templates:
         label: Ask spread, source outer book
         description: >-
           Companion outer ask run. Same value as the working outer ask spread.
+      - path: working_levels.8.depth
+        offset: 416
+        encoding:
+          i32_strided:
+            count: 2
+            stride: 4
+        label: Centre depth, working book
+        description: >-
+          Size the pool fills at the mid itself, before any spread applies. Set 0 for an exact spread.
+      - path: configured_levels.8.depth
+        offset: 656
+        encoding:
+          i32_strided:
+            count: 2
+            stride: 4
+        label: Centre depth, source book
+        description: >-
+          Companion centre run. Same value as the working centre depth.
+      - path: fresh_depth_table.0
+        offset: 1536
+        encoding: u16
+        label: Centre depth, fresh-quote table
+        description: >-
+          The centre size the program restores while the quote is fresh. Same value as the centre
+          depth.
+      - path: aged_depth_table.0
+        offset: 1556
+        encoding: u16
+        label: Centre depth, aged-quote table
+        description: >-
+          The centre size the program restores once the quote has aged. Same value as the centre
+          depth.
     llm_context: |
       PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
       this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
@@ -266,6 +298,13 @@ templates:
       property writes one run of the book and they have to agree; setting only some of them produces a
       spread that varies with timing.
 
+      SET THE FOUR CENTRE DEPTH PROPERTIES TO 0 FOR AN EXACT SPREAD. Every market fills some size at
+      the mid itself before the ladder starts, and that slice pays no spread at all. On SOL markets it
+      is small, so a 1% ladder costs a trade 0.55-0.98% depending on its size; on HYPE-USDC it covers
+      every realistic trade, so without emptying it the spread template has no effect. With the centre
+      emptied, the spread you set is the spread a trade pays: 10 bps pays 10 bps on every live market.
+      Leave the centre properties out only if the scenario wants the venue's own centre liquidity.
+
       SIGNS MATTER. Bid offsets are negative and price SELLS of the base token. Ask offsets are
       positive and price BUYS.
 
@@ -280,6 +319,10 @@ templates:
       configured_levels.0.tick_offset: -25600
       continuation_levels.0.tick_offset: -25600
       continuation_source_levels.0.tick_offset: -25600
+      working_levels.8.depth: 0
+      configured_levels.8.depth: 0
+      fresh_depth_table.0: 0
+      aged_depth_table.0: 0
   - id: bisonfi-freshness
     name: Keep Quote Live
     description: >-
