@@ -1456,7 +1456,8 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
 }
 
 /// `phoenix-trader-cancel-orders` with a market cancels the trader's orders there and leaves its
-/// orders on other markets, and its place in the index, as they were. An unknown market is refused.
+/// orders on other markets, and its place in the index, as they were; with several markets
+/// separated by commas, it cancels on each. An unknown market refuses the whole override.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_orders_on_one_market_leaves_the_others() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
@@ -1478,7 +1479,7 @@ async fn cancelling_orders_on_one_market_leaves_the_others() {
         graph.perp_asset_map,
         &[
             ("trader", graph.trader.to_string()),
-            ("symbol", "NOT-A-MARKET".to_string()),
+            ("symbol", "SOL, NOT-A-MARKET".to_string()),
         ],
     )
     .await;
@@ -1572,6 +1573,35 @@ async fn cancelling_orders_on_one_market_leaves_the_others() {
             listed(&locker, &trader),
             "{trader}: still in the index with orders on other markets"
         );
+
+        // A repeated symbol and an empty entry change nothing.
+        let locker = fresh();
+        let books: Vec<Pubkey> = with_orders
+            .iter()
+            .map(|(market, _)| market.orderbook)
+            .collect();
+        hydrate(&mut *locker.0.write().await, &remote, &books)
+            .await
+            .unwrap();
+        let symbols: Vec<&str> = with_orders
+            .iter()
+            .map(|(market, _)| market.symbol.as_str())
+            .collect();
+        let list = format!("{}, , {}", symbols.join(", "), symbols[0]);
+        play(
+            &locker,
+            graph.clock.slot,
+            vec![cancel_orders(trader, Some(list.as_str()))],
+        )
+        .await;
+        for (market, _) in &with_orders {
+            assert_eq!(
+                orders_of(&locker, &market.orderbook, node),
+                0,
+                "{trader}: no order left on {} after '{list}'",
+                market.symbol
+            );
+        }
         return;
     }
     panic!(

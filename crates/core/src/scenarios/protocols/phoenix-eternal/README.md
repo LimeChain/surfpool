@@ -99,7 +99,7 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-market-move`                 | Moves a market's oracle readings and its makers' splines to a price; crossed orders stay crossed.      | oracle keys, makers          |
 | `phoenix-market-uncross`              | Matches the resting orders a move left crossed with Phoenix's uncross crank, which anyone can send.    | none, a permissionless crank |
 | `phoenix-oracle-price`                | Moves only a market's oracle readings, in ticks or by a percentage; the book and makers stay.          | oracle keys                  |
-| `phoenix-trader-cancel-orders`        | Cancels a trader's resting orders on one market, or on every market to take it out of the index.       | trader                       |
+| `phoenix-trader-cancel-orders`        | Cancels a trader's resting orders on every market, taking it out of the index, or on chosen ones.      | trader                       |
 | `phoenix-trader-collateral`           | Brings a trader's effective collateral to a USDC amount, its distance from liquidation.                | field write                  |
 | `phoenix-market-risk-factors`         | Maintenance, backstop and high-risk factors.                                                           | risk authority               |
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
@@ -136,8 +136,9 @@ market, and one whose effective collateral is already below zero. A keeper force
 orders first with `ForceCancelRiskIncreasing`, which Phoenix allows any signer while the trader is
 liquidatable. A scenario can cancel them instead with `phoenix-trader-cancel-orders`, given the
 trader's account in its `trader` value and no `symbol`, before `phoenix-trader-collateral` in the
-same slot. A cancel on every market takes a hot trader out of the index, and with a `symbol` it
-cancels on that market only. Positions stay open, and a cold trader has no orders to cancel.
+same slot. `symbol` picks the markets: empty for every market, which takes a hot trader out of the
+index, one symbol such as `SOL`, or several separated by commas such as `SOL, BTC, ETH`. An unknown
+symbol refuses the whole override. Positions stay open, and a cold trader has no orders to cancel.
 
 Pick the target from the tool's `margin`, the trader with its orders cancelled, by what the keeper
 should do:
