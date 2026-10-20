@@ -47,6 +47,8 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
 
+pub const SAVE_OVERRIDES_CONTENT: &str = include_str!("./protocols/save/v2/overrides.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -112,6 +114,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_save_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -151,6 +154,10 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_save_overrides(&mut self) {
+        self.load_raw_layout_overrides(SAVE_OVERRIDES_CONTENT, "save");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -358,6 +365,69 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
+
+    #[test]
+    fn save_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        let templates = registry.by_protocol("Save");
+        assert_eq!(templates.len(), 6);
+        for template in templates {
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{} must require an explicit target account",
+                template.id
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{} must not embed a backend account catalog",
+                template.id
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")
+                ),
+                "{} must say how to find its account on the program",
+                template.id
+            );
+        }
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -606,11 +676,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8)
+        // + Save (6) = 76
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            76,
+            "Registry should load 76 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -684,6 +755,13 @@ mod tests {
 
         assert!(registry.contains("phoenix-trader-collateral-stress"));
         assert!(registry.contains("phoenix-direct-mark-risk-shock"));
+
+        assert!(registry.contains("save-reserve-risk"));
+        assert!(registry.contains("save-reserve-rates"));
+        assert!(registry.contains("save-reserve-limits"));
+        assert!(registry.contains("save-reserve-liquidity"));
+        assert!(registry.contains("save-obligation-position"));
+        assert!(registry.contains("save-obligation-owner"));
     }
 
     #[test]
