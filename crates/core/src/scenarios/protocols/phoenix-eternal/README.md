@@ -135,8 +135,9 @@ them.
 - For a hot trader, which the tool reports as `hot: true`, the cancel template, given the trader's
   account in its `trader` value and no `symbol`, cancels its orders on every market, as the
   trader, which takes it out of the index; Phoenix then reads the Trader account, where the
-  collateral template writes the field. With a `symbol` it cancels on that market only. Positions stay open. Without the cancel, the write changes nothing Phoenix reads, and a
-  later cancel overwrites it. A cold trader has no orders to cancel and the cancel changes nothing.
+  collateral template writes the field. With a `symbol` it cancels on that market only. Positions
+  stay open. Without the cancel, the write changes nothing Phoenix reads, and a later cancel
+  overwrites it. A cold trader has no orders to cancel and the cancel changes nothing.
 - Effective collateral moves one for one with that field, which can be negative. Hawkeye's
   `margin.collateral` can differ from the field, so it is not the base.
 - The tool fails with the reason when it cannot read the trader, and reports in `refusal` why

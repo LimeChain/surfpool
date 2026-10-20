@@ -755,6 +755,7 @@ pub async fn prepare_phoenix_override(
             let market = values
                 .get(MARKET_SYMBOL_FIELD)
                 .and_then(serde_json::Value::as_str)
+                .map(str::trim)
                 .filter(|symbol| !symbol.is_empty());
             cancel_order_writes(svm, remote_ctx, trader, market)
                 .await
