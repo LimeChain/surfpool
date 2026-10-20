@@ -128,8 +128,10 @@ templates:
       Phoenix reads its state from the Trader account again; cancelled on one market, it stays in
       the index while it has orders elsewhere. A cold trader has no resting orders and nothing
       changes. A keeper cannot liquidate a trader with risk-increasing resting orders on any
-      market, and the cancel releases the margin those orders held, so put this before
-      phoenix-trader-collateral, in the same slot, with symbol left empty.
+      market until it force-cancels them, which Phoenix allows any signer while the trader is
+      liquidatable. Before a price move that should make a trader liquidatable, put this before
+      phoenix-trader-collateral, in the same slot, with symbol left empty, so the move cannot
+      fill the trader's orders and change its positions.
       A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
       A trader Phoenix still lists after a cancel on every market, such as a spline market maker,
       is refused. An unknown symbol is refused.
@@ -144,32 +146,37 @@ templates:
   - id: phoenix-trader-collateral
     name: Phoenix Trader Collateral
     description: >-
-      Set one Phoenix Eternal trader's USDC collateral, which moves its effective collateral and
-      so its distance from liquidation. For a trader in Phoenix's active trader index, cancel its
-      orders first with phoenix-trader-cancel-orders.
+      Set one Phoenix Eternal trader's effective collateral in USDC, which sets its distance from
+      liquidation, with or without resting orders.
     idl_account_name: Trader
     properties:
-      - path: traderState.quoteLotCollateral
-        label: Collateral (quote lots)
-        description: Signed quote lots (1000000 = 1 USDC)
+      - path: effective_collateral_usdc
+        type: input
+        value_type: string
+        label: Effective Collateral (USDC)
+        description: The effective collateral when the override plays, such as 750.5; it can be negative
     llm_context: |
-      Writes the USDC collateral field of the Trader account. Phoenix reads a trader its active
-      trader index lists (hot: true) from the index instead: for such a trader the write changes
-      nothing Phoenix reads, and a later cancel overwrites it. Put phoenix-trader-cancel-orders
-      before this override, in the same slot, which takes the trader out of the index.
-      Effective collateral, which Phoenix measures margin against, moves one for one with the
-      field. From list_phoenix_trader_positions: value = quoteLotCollateral -
-      margin.effectiveCollateral + target, where target is the effective collateral wanted;
-      margin.collateral is not the base. Take the middle of a range, as the state can drift a
-      little before the keeper acts: between backstopMargin and maintenanceMargin, one keeper
-      liquidation makes the account healthy again; between highRiskMargin and backstopMargin, a
-      keeper can liquidate every position; below highRiskMargin Phoenix refuses market-order
-      liquidations. To have a trader cross on a phoenix-market-move and phoenix-market-uncross
-      at a later slot, call the tool with moves and use marginAfterMoves for the target and
-      effectiveCollateral; the result must stay above margin.maintenanceMargin until the move.
-      A spline market maker is refused. The value can be negative. A value above the current
-      collateral is not backed by the global vault, so a later withdrawal could take funds the
-      vault does not count.
+      Brings the trader's effective collateral, which Phoenix measures margin against, to
+      effective_collateral_usdc when the override plays: it reads Hawkeye's effective collateral
+      then and moves the collateral field by the difference, where Phoenix reads it, the Trader
+      account or, for a trader Phoenix's active trader index lists (hot: true), its record there.
+      Effective collateral moves one for one with that field, so the value lands even with
+      funding pending or resting orders. list_phoenix_trader_positions reports quote lots, and 1
+      USDC is 1000000 quote lots: effective_collateral_usdc = target / 1000000.
+      Take the target from the tool's margin, the trader with its orders cancelled, in the middle
+      of a range, as the state can drift a little before the keeper acts: between backstopMargin
+      and maintenanceMargin, one keeper liquidation makes the account healthy again; between
+      highRiskMargin and backstopMargin, a keeper can liquidate every position. Below
+      highRiskMargin a liquidation can leave the trader underwater and fail, and below 0 Phoenix
+      refuses it. A keeper force-cancels a trader's risk-increasing orders before it liquidates.
+      To have a trader cross on a phoenix-market-move and phoenix-market-uncross at a later slot,
+      call the tool with moves, put phoenix-trader-cancel-orders before this override in the same
+      slot, and set effective_collateral_usdc to wanted / 1000000, where wanted =
+      margin.effectiveCollateral - marginAfterMoves.effectiveCollateral + target in quote lots,
+      with target in a range of marginAfterMoves; wanted must stay above margin.maintenanceMargin
+      so the trader is healthy until the move.
+      A spline market maker is refused. A collateral above the current one is not backed by the
+      global vault, so a later withdrawal could take funds the vault does not count.
       The account is the trader's Trader account.
       Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
       list_phoenix_trader_positions first; it loads the trader into the surfnet.

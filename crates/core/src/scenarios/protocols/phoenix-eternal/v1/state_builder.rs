@@ -511,6 +511,7 @@ const MARKET_SYMBOL_FIELD: &str = "symbol";
 const TRADER_FIELD: &str = "trader";
 const TARGET_TICKS_FIELD: &str = "target_ticks";
 const CHANGE_PERCENT_FIELD: &str = "change_percent";
+const EFFECTIVE_COLLATERAL_FIELD: &str = "effective_collateral_usdc";
 
 /// The GlobalConfig role that signs a configuration instruction on mainnet.
 #[derive(Clone, Copy, Debug)]
@@ -762,8 +763,10 @@ pub async fn prepare_phoenix_override(
                 .map(Some)
         }
         "phoenix-trader-collateral" => {
-            let quote_lots = whole_number_input(values, "traderState.quoteLotCollateral")?;
-            collateral_writes(*account_pubkey, account, quote_lots).map(Some)
+            let wanted = usdc_input(values, EFFECTIVE_COLLATERAL_FIELD)?;
+            collateral_writes(svm, remote_ctx, *account_pubkey, account, wanted)
+                .await
+                .map(Some)
         }
         // Phoenix's other accounts take the generic IDL path.
         _ => Ok(None),
@@ -797,6 +800,22 @@ fn whole_number_input<T: FromStr>(
     })
 }
 
+/// A USDC amount such as "-12.5" in Phoenix's quote lots, a millionth of a USDC each, rounded to
+/// the nearest lot.
+fn usdc_input(values: &HashMap<String, serde_json::Value>, field: &str) -> SurfpoolResult<i64> {
+    values
+        .get(field)
+        .and_then(decimal)
+        .map(|usdc| (usdc * 1_000_000.0).round())
+        .filter(|lots| lots.abs() < i64::MAX as f64)
+        .map(|lots| lots as i64)
+        .ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "{field} must be a USDC amount such as -12.5, as a decimal string or a JSON number"
+            ))
+        })
+}
+
 /// `target_ticks` as given, or `change_percent` applied to the market's mark.
 fn oracle_target(
     values: &HashMap<String, serde_json::Value>,
@@ -816,13 +835,7 @@ fn oracle_target(
 
 /// `mark_ticks` moved by a percentage such as "-5" or "2.5", rounded to the nearest tick.
 fn percent_of(mark_ticks: u64, percent: &serde_json::Value) -> SurfpoolResult<u64> {
-    let change = match percent {
-        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
-        serde_json::Value::Number(number) => number.as_f64(),
-        _ => None,
-    }
-    .filter(|change| change.is_finite())
-    .ok_or_else(|| {
+    let change = decimal(percent).ok_or_else(|| {
         SurfpoolError::internal(format!(
             "{CHANGE_PERCENT_FIELD} must be a number such as -5 or 2.5, not {percent}"
         ))
@@ -834,6 +847,16 @@ fn percent_of(mark_ticks: u64, percent: &serde_json::Value) -> SurfpoolResult<u6
         )));
     }
     Ok(moved as u64)
+}
+
+/// A decimal string or a JSON number, while it is finite.
+fn decimal(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        serde_json::Value::Number(number) => number.as_f64(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
 }
 
 /// Nothing refreshes oracle readings or makers' quotes locally, so this raises the map's stale
@@ -1510,16 +1533,23 @@ pub(crate) mod tests {
     #[test]
     fn reads_collateral_as_a_signed_string_or_number() {
         let collateral = |value| {
-            let values = HashMap::from([("collateral".to_string(), value)]);
-            whole_number_input::<i64>(&values, "collateral")
+            let values = HashMap::from([(EFFECTIVE_COLLATERAL_FIELD.to_string(), value)]);
+            usdc_input(&values, EFFECTIVE_COLLATERAL_FIELD)
         };
         assert_eq!(
-            collateral(serde_json::json!(" -5030916850 ")).unwrap(),
+            collateral(serde_json::json!(" -5030.91685 ")).unwrap(),
             -5_030_916_850
         );
-        assert_eq!(collateral(serde_json::json!(8_191_788)).unwrap(), 8_191_788);
-        assert!(collateral(serde_json::json!("12.5")).is_err());
-        assert!(collateral(serde_json::json!(1.5)).is_err());
+        assert_eq!(collateral(serde_json::json!(8.191788)).unwrap(), 8_191_788);
+        assert_eq!(
+            collateral(serde_json::json!("750.60748")).unwrap(),
+            750_607_480
+        );
+        assert_eq!(collateral(serde_json::json!(12)).unwrap(), 12_000_000);
+        for bad in ["", "12 USDC", "NaN", "inf", "1e13"] {
+            assert!(collateral(serde_json::json!(bad)).is_err(), "{bad}");
+        }
+        assert!(collateral(serde_json::json!(true)).is_err());
     }
 
     const LIQUIDATOR: Pubkey =

@@ -1229,7 +1229,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Lists the markets where one Phoenix Eternal trader holds a position, as Phoenix's Hawkeye program reports them on a copy of the surfnet's state, sorted by symbol. Each position comes with its market symbol, its orderbook address, its side (long or short), its size in base lots (baseLots) and its maintenance margin in quote lots (maintenanceMarginQuoteLots), both decimal strings. Hawkeye reads positions where Phoenix keeps them, so this is right even when the Trader account's own copy is not; never decode the Trader account yourself. hot is true when Phoenix's active trader index lists the trader; phoenix-trader-cancel-orders must then run before phoenix-trader-collateral. margin is Hawkeye's view as phoenix-trader-cancel-orders leaves the trader, a hot trader's orders cancelled: collateral, effectiveCollateral, maintenanceMargin, backstopMargin and highRiskMargin in quote lots as decimal strings, and liquidatable. quoteLotCollateral is the Trader account's collateral field in that state, which can differ from margin.collateral; refusal is why phoenix-trader-cancel-orders or phoenix-trader-collateral would refuse the trader, or null; phoenix-trader-collateral takes quoteLotCollateral - effectiveCollateral + the effective collateral wanted. Given moves, marginAfterMoves is the same view once those markets move to targetTicks and uncross the way phoenix-market-move and phoenix-market-uncross play them, for a trader that should cross into liquidation at a later slot."
+        description = "Lists the markets where one Phoenix Eternal trader holds a position, as Phoenix's Hawkeye program reports them on a copy of the surfnet's state, sorted by symbol. Each position comes with its market symbol, its orderbook address, its side (long or short), its size in base lots (baseLots) and its maintenance margin in quote lots (maintenanceMarginQuoteLots), both decimal strings. Hawkeye reads positions where Phoenix keeps them, so this is right even when the Trader account's own copy is not; never decode the Trader account yourself. hot is true when Phoenix's active trader index lists the trader, such as one with resting orders. margin is Hawkeye's view as phoenix-trader-cancel-orders leaves the trader, a hot trader's orders cancelled: collateral, effectiveCollateral, maintenanceMargin, backstopMargin and highRiskMargin in quote lots as decimal strings, and liquidatable. refusal is why phoenix-trader-cancel-orders or phoenix-trader-collateral would refuse the trader, or null. phoenix-trader-collateral takes the effective collateral wanted in USDC, a quote lot being a millionth of a USDC. Given moves, marginAfterMoves is the same view once those markets move to targetTicks and uncross the way phoenix-market-move and phoenix-market-uncross play them, for a trader that should cross into liquidation at a later slot."
     )]
     async fn list_phoenix_trader_positions(
         &self,
@@ -1559,7 +1559,6 @@ fn trader_positions_json(trader: &Pubkey, held: &TraderPositions) -> serde_json:
             .collect::<Vec<_>>(),
         "hot": held.hot,
         "margin": margin(&held.margin),
-        "quoteLotCollateral": held.quote_lot_collateral.to_string(),
         "marginAfterMoves": held.margin_after_moves.as_ref().map(margin),
         "refusal": held.refusal,
     })
@@ -2021,7 +2020,6 @@ mod tests {
             positions: vec![position("ETH", 250), position("SOL", -1_000)],
             hot: true,
             margin: view,
-            quote_lot_collateral: -5_016_306_052,
             margin_after_moves: None,
             refusal: None,
         };
@@ -2055,7 +2053,6 @@ mod tests {
                     "highRiskMargin": "2294761",
                     "liquidatable": true,
                 },
-                "quoteLotCollateral": "-5016306052",
                 "marginAfterMoves": null,
                 "refusal": null,
             })

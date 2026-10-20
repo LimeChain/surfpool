@@ -1,7 +1,12 @@
 use std::{collections::HashSet, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
-use phoenix_rise_accounts::{PhoenixAccount, multi_arena::MultiArenaHeader, trader::TraderHeader};
+use log::warn;
+use phoenix_rise_accounts::{
+    PhoenixAccount,
+    multi_arena::MultiArenaHeader,
+    trader::{TraderHeader, TraderState},
+};
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
@@ -291,8 +296,6 @@ pub struct TraderPositions {
     /// Hawkeye's view as `phoenix-trader-cancel-orders` leaves the trader, a hot trader's orders
     /// cancelled.
     pub margin: MarginView,
-    /// The field `phoenix-trader-collateral` writes, which can differ from `margin`'s collateral.
-    pub quote_lot_collateral: i64,
     /// The same view once the given markets move and uncross the way `phoenix-market-move` and
     /// `phoenix-market-uncross` play them; `None` without moves.
     pub margin_after_moves: Option<MarginView>,
@@ -384,7 +387,6 @@ pub(crate) async fn trader_positions_in(
             .collect(),
         hot,
         margin: margin_now,
-        quote_lot_collateral,
         margin_after_moves,
         refusal,
     })
@@ -457,8 +459,7 @@ impl<'a> LeverState<'a> {
                 "stays there after its orders are cancelled"
             };
             SurfpoolError::internal(format!(
-                "{trader} is in Phoenix's active trader index and {why}, so Phoenix would not read \
-                 collateral written to its account"
+                "{trader} is in Phoenix's active trader index and {why}"
             ))
         });
         Ok((
@@ -504,17 +505,73 @@ pub async fn cancel_order_writes(
     lever.state.writes()
 }
 
-/// The write that sets `trader`'s collateral field to `quote_lots`. Phoenix reads the field only
-/// while its index does not list the trader, so a hot trader's orders are cancelled first, with
-/// [`cancel_order_writes`]. A spline market maker is refused.
-pub fn collateral_writes(
+/// The write that brings `trader`'s effective collateral to `wanted` quote lots from Hawkeye's view
+/// when it plays. Effective collateral moves one for one with the collateral field, which is
+/// written where Phoenix reads it: a hot trader's record in the GlobalTraderIndex, which Phoenix
+/// copies back to the Trader account when the trader leaves the index, or a cold trader's account.
+/// A spline market maker is refused.
+pub async fn collateral_writes(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     trader: Pubkey,
     account: &Account,
-    quote_lots: i64,
+    wanted: i64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+        SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
+    })?;
+    let exchange = Exchange::load(svm, remote_ctx).await?;
+    hydrate(
+        svm,
+        remote_ctx,
+        &[
+            HAWKEYE_PROGRAM_ID,
+            exchange.perp_asset_map,
+            exchange.active_trader_buffer,
+        ],
+    )
+    .await?;
+    let index = local_account(svm, &exchange.global_trader_index)?;
+    let listed = index_record(&index, &trader)?;
+    refuse_unindexed_hot_trader(trader, &header, listed.is_some())?;
+    // An index copied before the trader left it can still list a trader its account marks cold,
+    // and Phoenix reads that trader from the account.
+    let record = listed.filter(|_| header.trader_state.is_hot());
+    let view = margin(&mut Sandbox::new(svm), &exchange, &trader)?;
+    let field: i64 = bytemuck::cast(match &record {
+        Some(range) => {
+            bytemuck::pod_read_unaligned::<TraderState>(&index.data[range.clone()])
+                .quote_lot_collateral
+        }
+        None => header.trader_state.quote_lot_collateral,
+    });
+    let quote_lots = wanted
+        .checked_sub(view.effective_collateral_quote_lots)
+        .and_then(|gap| field.checked_add(gap))
+        .ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "an effective collateral of {wanted} quote lots does not fit {trader}'s collateral"
+            ))
+        })?;
+    if wanted < view.high_risk_margin_quote_lots as i64 {
+        warn!(
+            "{trader}: an effective collateral of {wanted} quote lots is below its high-risk margin \
+             of {}; a keeper's liquidation there can leave it underwater and fail, and below 0 \
+             Phoenix refuses it",
+            view.high_risk_margin_quote_lots
+        );
+    }
+    let left = with_collateral(trader, account, quote_lots)?;
+    let Some(range) = record else {
+        return Ok(vec![(trader, left)]);
+    };
+    let mut data = index.data.clone();
+    let mut state: TraderState = bytemuck::pod_read_unaligned(&data[range.clone()]);
+    state.quote_lot_collateral = bytemuck::cast(quote_lots);
+    data[range].copy_from_slice(bytemuck::bytes_of(&state));
     Ok(vec![(
-        trader,
-        with_collateral(trader, account, quote_lots)?,
+        exchange.global_trader_index,
+        Account { data, ..index },
     )])
 }
 
@@ -563,9 +620,15 @@ fn refuse_unindexed_hot_trader(
 
 /// Whether the GlobalTraderIndex `index` lists `trader`, so Phoenix keeps its state there.
 fn indexed(index: &Account, trader: &Pubkey) -> SurfpoolResult<bool> {
+    Ok(index_record(index, trader)?.is_some())
+}
+
+/// The byte range of `trader`'s TraderState in the GlobalTraderIndex `index`, while it lists the
+/// trader.
+fn index_record(index: &Account, trader: &Pubkey) -> SurfpoolResult<Option<Range<usize>>> {
     Ok(index_trader_state_ranges(index)?
-        .iter()
-        .any(|(listed, _)| listed == trader))
+        .into_iter()
+        .find_map(|(listed, range)| (listed == *trader).then_some(range)))
 }
 
 /// Every hot Trader the GlobalTraderIndex tree reaches, with its TraderState byte range. Freed
@@ -638,15 +701,9 @@ pub(crate) mod tests {
         index: &Account,
         trader_key: &[u8; 32],
     ) -> SurfpoolResult<Range<usize>> {
-        let trader_key = Pubkey::new_from_array(*trader_key);
-        index_trader_state_ranges(index)?
-            .into_iter()
-            .find_map(|(key, range)| (key == trader_key).then_some(range))
-            .ok_or_else(|| {
-                SurfpoolError::internal(
-                    "Hot Phoenix Trader has no reachable GlobalTraderIndex entry",
-                )
-            })
+        index_record(index, &Pubkey::new_from_array(*trader_key))?.ok_or_else(|| {
+            SurfpoolError::internal("Hot Phoenix Trader has no reachable GlobalTraderIndex entry")
+        })
     }
 
     #[test]
