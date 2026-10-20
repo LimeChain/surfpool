@@ -99,7 +99,7 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-market-move`                 | Moves a market's oracle readings and its makers' splines to a price; crossed orders stay crossed.      | oracle keys, makers          |
 | `phoenix-market-uncross`              | Matches the resting orders a move left crossed with Phoenix's uncross crank, which anyone can send.    | none, a permissionless crank |
 | `phoenix-oracle-price`                | Moves only a market's oracle readings, in ticks or by a percentage; the book and makers stay.          | oracle keys                  |
-| `phoenix-trader-cancel-orders`        | Cancels a trader's resting orders on every market, which takes it out of the active trader index.      | trader                       |
+| `phoenix-trader-cancel-orders`        | Cancels a trader's resting orders on one market, or on every market to take it out of the index.       | trader                       |
 | `phoenix-trader-collateral`           | A trader's USDC collateral, which sets its distance from liquidation.                                  | field write                  |
 | `phoenix-market-risk-factors`         | Maintenance, backstop and high-risk factors.                                                           | risk authority               |
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
@@ -133,9 +133,9 @@ which reads them on a copy where a hot trader's orders are already cancelled, as
 them.
 
 - For a hot trader, which the tool reports as `hot: true`, the cancel template, given the trader's
-  account in its `trader` value, cancels its orders on every market, as the trader, which takes it
-  out of the index; Phoenix then reads the Trader account, where the collateral template writes the
-  field. Positions stay open. Without the cancel, the write changes nothing Phoenix reads, and a
+  account in its `trader` value and no `symbol`, cancels its orders on every market, as the
+  trader, which takes it out of the index; Phoenix then reads the Trader account, where the
+  collateral template writes the field. With a `symbol` it cancels on that market only. Positions stay open. Without the cancel, the write changes nothing Phoenix reads, and a
   later cancel overwrites it. A cold trader has no orders to cancel and the cancel changes nothing.
 - Effective collateral moves one for one with that field, which can be negative. Hawkeye's
   `margin.collateral` can differ from the field, so it is not the base.

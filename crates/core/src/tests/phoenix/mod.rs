@@ -20,7 +20,7 @@ use crate::{
     scenarios::protocols::phoenix_eternal::v1::{
         market::{Market, MarketContext, move_market, phoenix_markets, uncross_market},
         state_builder::{
-            Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID,
+            Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID, hydrate,
             keep_markets_usable, local_account, log_authority, phoenix_instruction,
             run_instructions, tests::template_addresses,
         },
@@ -544,14 +544,17 @@ fn phoenix_override(
     )
 }
 
-/// `phoenix-trader-cancel-orders` for `trader`, which the template takes as a value; its own account
-/// is the PerpAssetMap.
-fn cancel_orders(trader: Pubkey) -> surfpool_types::OverrideInstance {
+/// `phoenix-trader-cancel-orders` for `trader` on `symbol`, or on every market, which the template
+/// takes as values; its own account is the PerpAssetMap.
+fn cancel_orders(trader: Pubkey, symbol: Option<&str>) -> surfpool_types::OverrideInstance {
     let trader = trader.to_string();
     phoenix_override(
         "phoenix-trader-cancel-orders",
         PHOENIX_PERP_ASSET_MAP,
-        &[("trader", trader.as_str())],
+        &[
+            ("trader", trader.as_str()),
+            ("symbol", symbol.unwrap_or("")),
+        ],
     )
 }
 
@@ -1248,8 +1251,9 @@ async fn the_reported_collateral_lands_the_lever_on_its_target_hot_and_cold() {
         for (hot, every_position) in [(true, false), (false, true)] {
             let (view, field, listed) = {
                 let mut svm = locker.0.write().await;
-                let (mut state, refusal) =
-                    LeverState::load(&mut svm, &remote, trader).await.unwrap();
+                let (mut state, refusal) = LeverState::load(&mut svm, &remote, trader, None)
+                    .await
+                    .unwrap();
                 assert!(refusal.is_none(), "{trader}: {refusal:?}");
                 let (view, field) = state.reading(trader).unwrap();
                 (view, field, state.hot)
@@ -1289,7 +1293,7 @@ async fn the_reported_collateral_lands_the_lever_on_its_target_hot_and_cold() {
                 play(
                     &locker,
                     graph.clock.slot,
-                    vec![cancel_orders(trader), lever(trader, collateral)],
+                    vec![cancel_orders(trader, None), lever(trader, collateral)],
                 )
                 .await;
             } else {
@@ -1341,7 +1345,7 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
         index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_ok()
     };
     let listed = || listed_trader(trader);
-    let cancel = || vec![cancel_orders(trader)];
+    let cancel = || vec![cancel_orders(trader, None)];
     assert!(listed(), "{trader}: hot at first");
     let positions = held_positions(&locker, &remote, &trader).await;
 
@@ -1394,7 +1398,7 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
             .collect();
     let mut taken_out = None;
     for other in unloaded {
-        play(&locker, graph.clock.slot, vec![cancel_orders(other)]).await;
+        play(&locker, graph.clock.slot, vec![cancel_orders(other, None)]).await;
         if !listed_trader(other) {
             taken_out = Some(other);
             break;
@@ -1403,6 +1407,130 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
     assert!(
         taken_out.is_some(),
         "a hot trader the surfnet had not loaded is fetched and taken out of the index"
+    );
+}
+
+/// `phoenix-trader-cancel-orders` with a market cancels the trader's orders there and leaves its
+/// orders on other markets, and its place in the index, as they were. An unknown market is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_orders_on_one_market_leaves_the_others() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let graph = phoenix_mainnet_graph().await;
+    let eternal = deployed_program(ETERNAL_PROGRAMDATA).await;
+    let hawkeye = deployed_program(HAWKEYE_PROGRAMDATA).await;
+    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
+    let fresh = || {
+        let locker = phoenix_surfnet(&graph, &eternal, &hawkeye);
+        locker.with_svm_writer(|svm| {
+            svm.set_account(&LAST_RESTART_SLOT, restart.clone())
+                .unwrap()
+        });
+        locker
+    };
+    let unknown = configure(
+        &fresh(),
+        "phoenix-trader-cancel-orders",
+        graph.perp_asset_map,
+        &[
+            ("trader", graph.trader.to_string()),
+            ("symbol", "NOT-A-MARKET".to_string()),
+        ],
+    )
+    .await;
+    assert!(
+        unknown
+            .as_ref()
+            .is_err_and(|e| e.contains("Phoenix lists no market NOT-A-MARKET")),
+        "{unknown:?}"
+    );
+
+    // Resting orders name their trader by its node in the index, numbered from 1 after the
+    // index's 96-byte header in 64-byte nodes, the TraderState 48 bytes into its node.
+    let orders_of = |locker: &SurfnetSvmLocker, orderbook: &Pubkey, node: u32| {
+        let book = locker
+            .with_svm_reader(|svm| local_account(svm, orderbook))
+            .unwrap();
+        let book = Orderbook::try_from_account_bytes(&book.data).unwrap();
+        book.bid_orders()
+            .chain(book.ask_orders())
+            .filter(|order| {
+                order
+                    .order()
+                    .trader_position_id()
+                    .trader_id()
+                    .as_u32_checked()
+                    == Some(node)
+            })
+            .count()
+    };
+    let listed = |locker: &SurfnetSvmLocker, trader: &Pubkey| {
+        let index = locker.with_svm_reader(|svm| local_account(svm, &graph.global_trader_index));
+        index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_ok()
+    };
+    let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
+    for (trader, range) in hot.into_iter().take(60) {
+        let node = ((range.start - 96 - 48) / 64 + 1) as u32;
+        let locker = fresh();
+        let held = {
+            let mut svm = locker.0.write().await;
+            let Ok(exchange) = Exchange::load(&mut svm, &remote).await else {
+                continue;
+            };
+            if hydrate(&mut svm, &remote, &[trader]).await.is_err() {
+                continue;
+            }
+            let Ok(held) = holdings(&svm, &exchange, &trader) else {
+                continue;
+            };
+            let books: Vec<Pubkey> = held.iter().map(|held| held.market.orderbook).collect();
+            if hydrate(&mut svm, &remote, &books).await.is_err() {
+                continue;
+            }
+            held
+        };
+        let with_orders: Vec<(Market, usize)> = held
+            .into_iter()
+            .map(|held| {
+                let count = orders_of(&locker, &held.market.orderbook, node);
+                (held.market, count)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let Some(((cancelled, _), kept)) = with_orders.split_first() else {
+            continue;
+        };
+        if kept.is_empty() {
+            continue;
+        }
+
+        play(
+            &locker,
+            graph.clock.slot,
+            vec![cancel_orders(trader, Some(cancelled.symbol.as_str()))],
+        )
+        .await;
+        assert_eq!(
+            orders_of(&locker, &cancelled.orderbook, node),
+            0,
+            "{trader}: no order left on {}",
+            cancelled.symbol
+        );
+        for (market, count) in kept {
+            assert_eq!(
+                orders_of(&locker, &market.orderbook, node),
+                *count,
+                "{trader}: its orders on {} stay",
+                market.symbol
+            );
+        }
+        assert!(
+            listed(&locker, &trader),
+            "{trader}: still in the index with orders on other markets"
+        );
+        return;
+    }
+    panic!(
+        "no eligible mainnet candidate: no hot trader among the first 60 has orders on two markets"
     );
 }
 
@@ -1509,7 +1637,7 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
             play(
                 &locker,
                 graph.clock.slot,
-                vec![cancel_orders(trader), lever],
+                vec![cancel_orders(trader, None), lever],
             )
             .await;
             assert_eq!(

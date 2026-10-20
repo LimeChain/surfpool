@@ -153,6 +153,7 @@ impl BboView {
 }
 
 /// One market a trader has a position or resting orders in, as Hawkeye reports it.
+#[derive(Clone)]
 pub struct Holding {
     pub market: Market,
     /// Positive for a long, negative for a short, 0 for resting orders alone.
@@ -342,7 +343,7 @@ pub(crate) async fn trader_positions_in(
     keep_markets_usable(svm, remote_ctx, slot).await;
     let symbols: Vec<&str> = moves.iter().map(|(symbol, _)| symbol.as_str()).collect();
     let mut moved = MarketContext::load_all(svm, remote_ctx, &symbols).await?;
-    let (mut lever, still_listed) = LeverState::load(svm, remote_ctx, trader).await?;
+    let (mut lever, still_listed) = LeverState::load(svm, remote_ctx, trader, None).await?;
     let (margin_now, quote_lot_collateral) = lever.reading(trader)?;
     let refusal = still_listed
         .or_else(|| {
@@ -399,11 +400,13 @@ pub(crate) struct LeverState<'a> {
 }
 
 impl<'a> LeverState<'a> {
-    /// The state, with the refusal when Phoenix still lists the trader after the cancel.
+    /// The state, with the refusal when Phoenix still lists the trader after the cancel. With a
+    /// `market`, only that market's orders are cancelled and a trader still listed is expected.
     pub(crate) async fn load(
         svm: &'a mut SurfnetSvm,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         trader: Pubkey,
+        market: Option<&str>,
     ) -> SurfpoolResult<(LeverState<'a>, Option<SurfpoolError>)> {
         let account = local_account(svm, &trader)?;
         let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
@@ -423,9 +426,20 @@ impl<'a> LeverState<'a> {
         let hot = indexed(&local_account(svm, &exchange.global_trader_index)?, &trader)?;
         refuse_unindexed_hot_trader(trader, &header, hot)?;
         let held = holdings(svm, &exchange, &trader)?;
+        let cancelled = match market {
+            None => held.clone(),
+            Some(symbol) => {
+                let map = local_account(svm, &exchange.perp_asset_map)?;
+                let symbol = Market::find(&exchange.perp_asset_map, &map.data, symbol)?.symbol;
+                held.iter()
+                    .filter(|held| held.market.symbol == symbol)
+                    .cloned()
+                    .collect()
+            }
+        };
         let cancels = if hot {
             let authority = Pubkey::new_from_array(header.authority);
-            cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &held).await?
+            cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &cancelled).await?
         } else {
             Vec::new()
         };
@@ -433,7 +447,9 @@ impl<'a> LeverState<'a> {
         if !cancels.is_empty() {
             state.run(&cancels)?;
         }
-        let still_listed = hot && indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
+        let still_listed = market.is_none()
+            && hot
+            && indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
         let refusal = still_listed.then(|| {
             let why = if cancels.is_empty() {
                 "has no orders whose cancel would take it out"
@@ -470,17 +486,18 @@ impl<'a> LeverState<'a> {
     }
 }
 
-/// The writes of `trader` cancelling its resting orders on every market, which takes a hot trader
-/// out of Phoenix's index; a cold trader has none and nothing is written. A trader Phoenix still
-/// lists after the cancel is refused.
+/// The writes of `trader` cancelling all its resting orders on `market`, or on every market, which
+/// takes a hot trader out of Phoenix's index; a cold trader has none and nothing is written. A
+/// trader Phoenix still lists after a cancel on every market is refused.
 pub async fn cancel_order_writes(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     trader: Pubkey,
+    market: Option<&str>,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     // The template's own account is the PerpAssetMap, so the trader may not be local yet.
     hydrate(svm, remote_ctx, &[trader]).await?;
-    let (lever, refusal) = LeverState::load(svm, remote_ctx, trader).await?;
+    let (lever, refusal) = LeverState::load(svm, remote_ctx, trader, market).await?;
     if let Some(refusal) = refusal {
         return Err(refusal);
     }

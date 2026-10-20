@@ -106,8 +106,9 @@ templates:
   - id: phoenix-trader-cancel-orders
     name: Phoenix Trader Cancel Orders
     description: >-
-      Cancel one Phoenix Eternal trader's resting orders on every market, as the trader, which
-      takes it out of Phoenix's active trader index. Positions stay open.
+      Cancel all resting orders of a Phoenix Eternal trader, as the trader, on one market or on
+      every market. On every market it takes the trader out of Phoenix's active trader index.
+      Positions stay open.
     idl_account_name: PerpAssetMap
     properties:
       - path: trader
@@ -115,15 +116,23 @@ templates:
         value_type: string
         label: Trader Account
         description: The trader's Trader account address, as list_phoenix_trader_positions takes it
+      - path: symbol
+        type: input
+        value_type: string
+        label: Market Symbol
+        description: Cancel only on this market, a symbol from list_phoenix_markets; leave empty for every market
     llm_context: |
       Runs Phoenix's CancelAll as the trader on every market where it holds a position or resting
-      orders. A trader the active trader index lists (hot: true in list_phoenix_trader_positions)
-      leaves it, and Phoenix reads its state from the Trader account again; a cold trader has no
-      resting orders and nothing changes. A keeper cannot liquidate a trader with
-      risk-increasing resting orders on any market, and the cancel releases the margin those
-      orders held, so put this before phoenix-trader-collateral, in the same slot.
+      orders, or only on the market given in symbol. Cancelled on every market, a trader the
+      active trader index lists (hot: true in list_phoenix_trader_positions) leaves it, and
+      Phoenix reads its state from the Trader account again; cancelled on one market, it stays in
+      the index while it has orders elsewhere. A cold trader has no resting orders and nothing
+      changes. A keeper cannot liquidate a trader with risk-increasing resting orders on any
+      market, and the cancel releases the margin those orders held, so put this before
+      phoenix-trader-collateral, in the same slot, with symbol left empty.
       A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
-      A trader Phoenix still lists after the cancel, such as a spline market maker, is refused.
+      A trader Phoenix still lists after a cancel on every market, such as a spline market maker,
+      is refused. An unknown symbol is refused.
       Set trader to the trader's Trader account; the override's own account is the PerpAssetMap,
       as for the market templates.
       Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to

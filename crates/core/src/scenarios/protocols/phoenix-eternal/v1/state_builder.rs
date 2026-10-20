@@ -752,7 +752,13 @@ pub async fn prepare_phoenix_override(
             let trader = Pubkey::from_str(text).map_err(|e| {
                 SurfpoolError::internal(format!("{TRADER_FIELD} '{text}' is not an address: {e}"))
             })?;
-            cancel_order_writes(svm, remote_ctx, trader).await.map(Some)
+            let market = values
+                .get(MARKET_SYMBOL_FIELD)
+                .and_then(serde_json::Value::as_str)
+                .filter(|symbol| !symbol.is_empty());
+            cancel_order_writes(svm, remote_ctx, trader, market)
+                .await
+                .map(Some)
         }
         "phoenix-trader-collateral" => {
             let quote_lots = whole_number_input(values, "traderState.quoteLotCollateral")?;
