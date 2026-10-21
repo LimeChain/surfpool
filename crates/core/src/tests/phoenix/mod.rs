@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use phoenix_rise_accounts::{
     global_config::GlobalConfig, orderbook::Orderbook, pda::derive_spline_collection_address,
@@ -10,9 +10,11 @@ use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
+use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use spl_associated_token_account_interface::address::get_associated_token_address;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
 
 use crate::{
@@ -20,7 +22,7 @@ use crate::{
     scenarios::protocols::phoenix_eternal::v1::{
         market::{Market, MarketContext, move_market, phoenix_markets, uncross_market},
         state_builder::{
-            Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID, hydrate,
+            Exchange, PHOENIX_GLOBAL_CONFIG, PHOENIX_PERP_ASSET_MAP, PHOENIX_PROGRAM_ID,
             keep_markets_usable, local_account, log_authority, phoenix_instruction,
             run_instructions, tests::template_addresses,
         },
@@ -56,35 +58,6 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
             })
         })
         .collect()
-}
-
-/// Hawkeye checks it, because it reads a hot Trader's collateral from the GlobalTraderIndex and
-/// its positions from the ActiveTraderBuffer, and the Trader account's copies of both can lag.
-/// A margin view that fails rejects the trader, and its error is returned.
-fn trader_is_eligible(
-    locker: &SurfnetSvmLocker,
-    graph: &PhoenixMainnetGraph,
-) -> Result<bool, String> {
-    let header = TraderHeader::try_read_from_account_bytes(&graph.account(&graph.trader).data)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{} is in the GlobalTraderIndex but is not a valid Trader: {e}",
-                graph.trader
-            )
-        });
-    if !header.trader_state.is_hot() || header.num_markets_with_splines > 0 {
-        return Ok(false);
-    }
-    let margin = try_hawkeye_margin(locker, graph)?;
-    // Hawkeye's position count includes markets with resting orders alone.
-    let exchange = Exchange::from_config(graph.account(&PHOENIX_GLOBAL_CONFIG)).unwrap();
-    let held = locker
-        .with_svm_reader(|svm| holdings(svm, &exchange, &graph.trader))
-        .map_err(|e| e.to_string())?;
-    Ok(margin.collateral_quote_lots > 0
-        && held.iter().any(|held| held.base_lots != 0)
-        && margin.maintenance_margin_quote_lots > 0
-        && margin.is_liquidatable == 0)
 }
 
 /// A zero-copy layout cannot be round-tripped against itself, so drift shows up as an
@@ -176,11 +149,9 @@ async fn deployed_program(programdata: Pubkey) -> Vec<u8> {
     bytes
 }
 
-fn mainnet_graph_cache() -> &'static tokio::sync::Mutex<Option<Result<PhoenixMainnetGraph, String>>>
-{
-    static CACHE: std::sync::OnceLock<
-        tokio::sync::Mutex<Option<Result<PhoenixMainnetGraph, String>>>,
-    > = std::sync::OnceLock::new();
+fn mainnet_graph_cache() -> &'static tokio::sync::Mutex<Option<PhoenixMainnetGraph>> {
+    static CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<PhoenixMainnetGraph>>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
@@ -252,23 +223,66 @@ async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
     );
 }
 
+/// A fresh surfnet whose trader a new wallet opened locally: long SOL and short BTC, with bids
+/// resting on SOL, BTC and ETH that make it hot.
 async fn phoenix_behavior_locker() -> (SurfnetSvmLocker, PhoenixMainnetGraph) {
-    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
-    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
-    let graph = phoenix_mainnet_graph().await;
-    let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
-    // A surfnet loads this sysvar from its datasource; the bare test VM has none.
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    locker.with_svm_writer(|svm| svm.set_account(&LAST_RESTART_SLOT, restart).unwrap());
+    let mut graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    let trader = LocalTrader::open(&locker, 10_000).await.unwrap();
+    trader.trade(&locker, "SOL", 1_000).await.unwrap();
+    trader.trade(&locker, "BTC", -100).await.unwrap();
+    for symbol in ["SOL", "BTC", "ETH"] {
+        trader.rest(&locker, symbol, 100, 5).await.unwrap();
+    }
+    graph.trader = trader.account;
     (locker, graph)
 }
 
+/// The behaviour tests start from a trader a new wallet opens locally, as a user does on mainnet:
+/// hot, as its resting orders make it, healthy, with collateral, positions on SOL and BTC and orders
+/// alone on ETH.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_local_trader_is_hot_and_healthy_with_positions_on_sol_and_btc() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader = graph.trader;
+    let index = locker.with_svm_reader(|svm| local_account(svm, &graph.global_trader_index));
+    assert!(
+        index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_ok(),
+        "{trader}: hot"
+    );
+    let margin = hawkeye_margin(&locker, &graph);
+    assert!(
+        margin.collateral_quote_lots > 0
+            && margin.maintenance_margin_quote_lots > 0
+            && margin.is_liquidatable == 0,
+        "{trader}: healthy, with collateral and margin: {margin:?}"
+    );
+    let mut held: Vec<(String, i64)> = {
+        let mut svm = locker.0.write().await;
+        let exchange = Exchange::load(&mut svm, &remote).await.unwrap();
+        holdings(&svm, &exchange, &trader)
+            .unwrap()
+            .into_iter()
+            .map(|held| (held.market.symbol, held.base_lots))
+            .collect()
+    };
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            ("BTC".to_string(), -100),
+            ("ETH".to_string(), 0),
+            ("SOL".to_string(), 1_000)
+        ],
+        "{trader}: its positions, and orders alone on ETH"
+    );
+}
+
 /// A local VM holding the deployed programs and every graph account, at the graph's clock.
-fn phoenix_surfnet(
-    graph: &PhoenixMainnetGraph,
-    eternal_program: &[u8],
-    hawkeye_program: &[u8],
-) -> SurfnetSvmLocker {
+async fn phoenix_surfnet(graph: &PhoenixMainnetGraph) -> SurfnetSvmLocker {
+    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
+    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
@@ -276,12 +290,12 @@ fn phoenix_surfnet(
         svm_writer
             .inner
             .svm
-            .add_program(PHOENIX_PROGRAM_ID, eternal_program)
+            .add_program(PHOENIX_PROGRAM_ID, &eternal_program)
             .unwrap();
         svm_writer
             .inner
             .svm
-            .add_program(HAWKEYE_PROGRAM_ID, hawkeye_program)
+            .add_program(HAWKEYE_PROGRAM_ID, &hawkeye_program)
             .unwrap();
         for (address, account) in &graph.accounts {
             svm_writer.set_account(address, account.clone()).unwrap();
@@ -292,10 +306,8 @@ fn phoenix_surfnet(
 
 async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
     let mut cache = mainnet_graph_cache().lock().await;
-    match cache.as_ref() {
-        Some(Ok(graph)) => return graph.clone(),
-        Some(Err(reason)) => panic!("{reason}"),
-        None => {}
+    if let Some(graph) = cache.as_ref() {
+        return graph.clone();
     }
 
     let global_account = fetch(&[PHOENIX_GLOBAL_CONFIG]).await.remove(0);
@@ -305,18 +317,20 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
     let global_trader_index = Pubkey::new_from_array(global.global_trader_index_header_key());
     let active_trader_buffer = Pubkey::new_from_array(global.active_trader_buffer_header_key());
 
-    // One request carries both the market list and the trader index discovery walks.
-    let mut discovery = fetch(&[perp_asset_map, global_trader_index]).await;
-    let map_account = discovery.remove(0);
-    let index_account = discovery.remove(0);
+    let map_account = fetch(&[perp_asset_map]).await.remove(0);
     let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
         .expect("mainnet PerpAssetMap decodes");
     let mut markets = Vec::new();
+    // A surfnet loads the restart sysvar from its datasource; the bare test VM has none. A local
+    // trader deposits the collateral mint into the global vault.
     let mut addresses = vec![
         PHOENIX_GLOBAL_CONFIG,
         perp_asset_map,
         global_trader_index,
         active_trader_buffer,
+        LAST_RESTART_SLOT,
+        Pubkey::new_from_array(global.canonical_token_mint_key()),
+        Pubkey::new_from_array(global.global_vault_key()),
     ];
     for symbol in ["SOL", "BTC"] {
         let entry = map
@@ -330,107 +344,26 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
         markets.push((symbol.to_string(), orderbook, spline));
     }
 
-    let eternal_program = deployed_program(ETERNAL_PROGRAMDATA).await;
-    let hawkeye_program = deployed_program(HAWKEYE_PROGRAMDATA).await;
+    // The clock and every account from one bank, so the programs accept them together.
     let clock_address = Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
-    // Every hot Trader is a candidate, in address order, so the pick moves only when it or a
-    // trader ahead of it changes.
-    let mut candidates: Vec<Pubkey> = index_trader_state_ranges(&index_account)
-        .expect("mainnet GlobalTraderIndex should walk")
-        .into_iter()
-        .map(|(trader, _)| trader)
-        .collect();
-    candidates.sort_unstable();
-    // Every batch re-reads the dependencies and the clock, so each fills a request to the
-    // 100-account cap.
-    let batch_len = 100 - addresses.len() - 1;
-    let mut last_error = None;
-    for batch in candidates.chunks(batch_len) {
-        // Read the clock, every dependency and this batch of traders from one bank, so a trader
-        // is checked, and then tested, on state the programs accept together.
-        let keys: Vec<Pubkey> = addresses
-            .iter()
-            .chain(batch)
-            .chain([&clock_address])
-            .copied()
-            .collect();
-        let mut fetched = client()
-            .get_multiple_accounts(&keys, CommitmentConfig::confirmed())
-            .await
-            .unwrap_or_else(|e| panic!("failed to fetch {keys:?} from mainnet: {e}"))
-            .into_iter();
-        let dependencies: Vec<(Pubkey, Account)> = addresses
-            .iter()
-            .zip(fetched.by_ref())
-            .map(|(address, result)| {
-                let account = result.map_account().unwrap_or_else(|_| {
-                    panic!("{address} no longer exists on mainnet; the test needs a new address")
-                });
-                (*address, account)
-            })
-            .collect();
-        // A trader closed since the index was read is skipped, not an error.
-        let traders: Vec<(Pubkey, Account)> = batch
-            .iter()
-            .zip(fetched.by_ref())
-            .filter_map(|(trader, result)| Some((*trader, result.map_account().ok()?)))
-            .collect();
-        let clock_account = fetched
-            .next()
-            .and_then(|result| result.map_account().ok())
-            .expect("the clock is read with the graph");
-        let clock: Clock = bincode::deserialize(&clock_account.data).unwrap();
-        assert!(clock.slot > 0);
+    let keys: Vec<Pubkey> = addresses.iter().copied().chain([clock_address]).collect();
+    let mut fetched = fetch(&keys).await;
+    let clock: Clock = bincode::deserialize(&fetched.pop().unwrap().data).unwrap();
+    assert!(clock.slot > 0);
 
-        let mut graph = PhoenixMainnetGraph {
-            clock,
-            accounts: dependencies.iter().chain(&traders).cloned().collect(),
-            global_trader_index,
-            active_trader_buffer,
-            perp_asset_map,
-            trader: Pubkey::default(),
-            markets: markets.clone(),
-        };
-        // A trader that left the index since it was listed is no longer hot.
-        let indexed: HashSet<Pubkey> =
-            index_trader_state_ranges(graph.account(&global_trader_index))
-                .expect("mainnet GlobalTraderIndex should walk")
-                .into_iter()
-                .map(|(trader, _)| trader)
-                .collect();
-        let locker = phoenix_surfnet(&graph, &eternal_program, &hawkeye_program);
-        for (trader, account) in traders
-            .iter()
-            .filter(|(trader, _)| indexed.contains(trader))
-        {
-            graph.trader = *trader;
-            match trader_is_eligible(&locker, &graph) {
-                Ok(false) => {}
-                Err(error) => last_error = Some(format!("{trader}: {error}")),
-                Ok(true) => {
-                    // The rest of the batch was read only to be checked.
-                    graph.accounts = dependencies
-                        .into_iter()
-                        .chain([(*trader, account.clone())])
-                        .collect();
-                    let books = every_book(&map_account, perp_asset_map, &addresses).await;
-                    graph.accounts.extend(books);
-                    *cache = Some(Ok(graph.clone()));
-                    return graph;
-                }
-            }
-        }
-    }
-
-    let reason = format!(
-        "no eligible mainnet candidate: no hot Phoenix Trader in the GlobalTraderIndex has \
-         collateral, a position Hawkeye margins and a healthy account{}",
-        last_error
-            .map(|error| format!("; the last margin view that failed was {error}"))
-            .unwrap_or_default()
-    );
-    *cache = Some(Err(reason.clone()));
-    panic!("{reason}")
+    let mut graph = PhoenixMainnetGraph {
+        clock,
+        accounts: addresses.iter().copied().zip(fetched).collect(),
+        global_trader_index,
+        active_trader_buffer,
+        perp_asset_map,
+        trader: Pubkey::default(),
+        markets,
+    };
+    let books = every_book(&map_account, perp_asset_map, &addresses).await;
+    graph.accounts.extend(books);
+    *cache = Some(graph.clone());
+    graph
 }
 
 /// Every market's book and splines not in `held`, read seconds after the trader index, as a
@@ -470,6 +403,7 @@ struct PhoenixMainnetGraph {
     global_trader_index: Pubkey,
     active_trader_buffer: Pubkey,
     perp_asset_map: Pubkey,
+    /// The local trader [`phoenix_behavior_locker`] opens; the mainnet graph alone has none.
     trader: Pubkey,
     /// Symbol, orderbook and spline for each market the Hawkeye BBO view reads.
     markets: Vec<(String, Pubkey, Pubkey)>,
@@ -601,6 +535,24 @@ fn set_collateral(trader: Pubkey, quote_lots: i64) -> surfpool_types::OverrideIn
         trader,
         &[("effective_collateral_usdc", usdc.as_str())],
     )
+}
+
+/// `phoenix-market-move` of `symbol` to `ticks`, then the `phoenix-market-uncross` that matches the
+/// resting orders the move crossed.
+fn market_move(symbol: &str, ticks: u64) -> [surfpool_types::OverrideInstance; 2] {
+    let ticks = ticks.to_string();
+    [
+        phoenix_override(
+            "phoenix-market-move",
+            PHOENIX_PERP_ASSET_MAP,
+            &[("symbol", symbol), ("target_ticks", ticks.as_str())],
+        ),
+        phoenix_override(
+            "phoenix-market-uncross",
+            PHOENIX_PERP_ASSET_MAP,
+            &[("symbol", symbol)],
+        ),
+    ]
 }
 
 /// A market move reprices the oracle readings and the makers' quotes and leaves the resting orders
@@ -850,30 +802,51 @@ async fn buy_one_lot(
     let market = MarketContext::load(&mut svm, &remote, symbol).await?;
     let header = TraderHeader::try_read_from_account_bytes(&local_account(&svm, &trader)?.data)
         .expect("a Phoenix Trader");
+    let wallet = Pubkey::new_from_array(header.authority);
+    run_instructions(&svm, &[market_order(&market, wallet, trader, 1)?])
+}
+
+/// The accounts of an order `trader` places in the market of `context`, signed by its `wallet`.
+fn order_accounts(
+    context: &MarketContext,
+    wallet: Pubkey,
+    trader: Pubkey,
+) -> [(&'static str, Pubkey); 10] {
+    [
+        ("phoenixProgram", PHOENIX_PROGRAM_ID),
+        ("phoenixLogAuthority", log_authority()),
+        ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+        ("traderWallet", wallet),
+        ("traderAccount", trader),
+        ("perpAssetMap", context.exchange.perp_asset_map),
+        ("globalTraderIndex", context.exchange.global_trader_index),
+        ("activeTraderBuffer", context.exchange.active_trader_buffer),
+        ("orderbook", context.market.orderbook),
+        ("splines", context.market.splines),
+    ]
+}
+
+/// A market order of `lots`, a buy when positive and a sell when negative, which fills at once.
+fn market_order(
+    context: &MarketContext,
+    wallet: Pubkey,
+    trader: Pubkey,
+    lots: i64,
+) -> SurfpoolResult<Instruction> {
+    let side = if lots > 0 { "Bid" } else { "Ask" };
     let client_order_id = [0_u8; 16];
-    let order = phoenix_instruction(
+    phoenix_instruction(
         "PlaceMarketOrder",
-        &[
-            ("phoenixProgram", PHOENIX_PROGRAM_ID),
-            ("phoenixLogAuthority", log_authority()),
-            ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
-            ("traderWallet", Pubkey::new_from_array(header.authority)),
-            ("traderAccount", trader),
-            ("perpAssetMap", market.exchange.perp_asset_map),
-            ("globalTraderIndex", market.exchange.global_trader_index),
-            ("activeTraderBuffer", market.exchange.active_trader_buffer),
-            ("orderbook", market.market.orderbook),
-            ("splines", market.market.splines),
-        ],
+        &order_accounts(context, wallet, trader),
         &serde_json::json!({
             "orderPacket": {
                 "kind": {
                     "ImmediateOrCancel": {
-                        "side": { "Bid": null },
+                        "side": { side: null },
                         "priceInTicks": null,
-                        "numBaseLots": { "inner": 1 },
+                        "numBaseLots": { "inner": lots.unsigned_abs() },
                         "numQuoteLots": null,
-                        "minBaseLotsToFill": { "inner": 0 },
+                        "minBaseLotsToFill": { "inner": lots.unsigned_abs() },
                         "minQuoteLotsToFill": { "inner": 0 },
                         "selfTradeBehavior": { "DecrementTake": null },
                         "matchLimit": null,
@@ -885,8 +858,185 @@ async fn buy_one_lot(
                 }
             }
         }),
-    )?;
-    run_instructions(&svm, &[order])
+    )
+}
+
+/// A Trader a new wallet opens in the local VM, as a user opens one on mainnet: registered, then
+/// granted every capability by the risk authority, which unfreezes it, and funded with a deposit.
+#[derive(Clone, Copy)]
+struct LocalTrader {
+    wallet: Pubkey,
+    account: Pubkey,
+}
+
+impl LocalTrader {
+    /// A trader with `usdc` of collateral, no positions and no orders.
+    async fn open(locker: &SurfnetSvmLocker, usdc: u64) -> SurfpoolResult<Self> {
+        let wallet = Keypair::new().pubkey();
+        let account = Pubkey::find_program_address(
+            &[b"trader", wallet.as_ref(), &[0, 0]],
+            &PHOENIX_PROGRAM_ID,
+        )
+        .0;
+        let remote = Some((client(), CommitmentConfig::confirmed()));
+        let exchange = Exchange::load(&mut *locker.0.write().await, &remote).await?;
+        let mint = Pubkey::new_from_array(exchange.config.canonical_token_mint_key());
+        let token_account = get_associated_token_address(&wallet, &mint);
+        // A USDC token unit is a quote lot.
+        let amount = usdc * 1_000_000;
+        let mut data = vec![0; spl_token_interface::state::Account::LEN];
+        spl_token_interface::state::Account {
+            mint,
+            owner: wallet,
+            amount,
+            state: spl_token_interface::state::AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        locker.with_svm_writer(|svm| {
+            svm.inner.airdrop(&wallet, 10_000_000_000).unwrap();
+            let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
+            svm.set_account(
+                &token_account,
+                Account {
+                    lamports,
+                    data,
+                    owner: spl_token_interface::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+        })?;
+
+        let risk = Pubkey::new_from_array(exchange.config.risk_authority());
+        let toggles = [
+            "PlaceLimitOrder",
+            "PlaceMarketOrder",
+            "RiskIncreasingTrade",
+            "RiskReducingTrade",
+            "DepositCollateral",
+            "WithdrawCollateral",
+        ]
+        .map(|target| serde_json::json!({ "target": { target: null }, "enable": true }));
+        let instructions = [
+            phoenix_instruction(
+                "RegisterTrader",
+                &[
+                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                    ("phoenixLogAuthority", log_authority()),
+                    ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+                    ("payer", wallet),
+                    ("traderWallet", wallet),
+                    ("traderAccount", account),
+                    ("systemProgram", solana_sdk_ids::system_program::id()),
+                ],
+                &serde_json::json!({
+                    "params": {
+                        "maxPositions": 32,
+                        "traderPreferenceBits": 0,
+                        "traderPdaIndex": 0,
+                        "traderSubaccountIndex": 0,
+                    }
+                }),
+            )?,
+            phoenix_instruction(
+                "SetTraderCapability",
+                &[
+                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                    ("phoenixLogAuthority", log_authority()),
+                    ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+                    ("authority", risk),
+                    ("maybePermissionAccount", risk),
+                    ("traderAccount", account),
+                    ("globalTraderIndex", exchange.global_trader_index),
+                    ("activeTraderBuffer", exchange.active_trader_buffer),
+                ],
+                &serde_json::json!({ "params": { "toggles": toggles } }),
+            )?,
+            phoenix_instruction(
+                "DepositFunds",
+                &[
+                    ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                    ("phoenixLogAuthority", log_authority()),
+                    ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+                    ("traderWallet", wallet),
+                    ("traderTokenAccount", token_account),
+                    ("traderAccount", account),
+                    (
+                        "globalVault",
+                        Pubkey::new_from_array(exchange.config.global_vault_key()),
+                    ),
+                    ("tokenProgram", spl_token_interface::ID),
+                    ("globalTraderIndex", exchange.global_trader_index),
+                    ("activeTraderBuffer", exchange.active_trader_buffer),
+                ],
+                &serde_json::json!({ "params": { "amount": amount } }),
+            )?,
+        ];
+        let writes = locker.with_svm_reader(|svm| run_instructions(svm, &instructions))?;
+        apply(locker, writes).await;
+        Ok(Self { wallet, account })
+    }
+
+    /// A market order of `lots` in `symbol`, a buy when positive and a sell when negative, which
+    /// opens or changes the trader's position there.
+    async fn trade(
+        &self,
+        locker: &SurfnetSvmLocker,
+        symbol: &str,
+        lots: i64,
+    ) -> SurfpoolResult<()> {
+        let remote = Some((client(), CommitmentConfig::confirmed()));
+        let context = MarketContext::load(&mut *locker.0.write().await, &remote, symbol).await?;
+        let order = market_order(&context, self.wallet, self.account, lots)?;
+        let writes = locker.with_svm_reader(|svm| run_instructions(svm, &[order]))?;
+        apply(locker, writes).await;
+        Ok(())
+    }
+
+    /// A PostOnly order of `lots` in `symbol`, which rests `away_percent` from the mark: a bid below
+    /// it when positive, an ask above it when negative. The first resting order makes the trader
+    /// hot, in Phoenix's index.
+    async fn rest(
+        &self,
+        locker: &SurfnetSvmLocker,
+        symbol: &str,
+        lots: i64,
+        away_percent: u64,
+    ) -> SurfpoolResult<()> {
+        let remote = Some((client(), CommitmentConfig::confirmed()));
+        let context = MarketContext::load(&mut *locker.0.write().await, &remote, symbol).await?;
+        let mark = context.market.mark_ticks;
+        let (side, price) = if lots > 0 {
+            ("Bid", mark - mark * away_percent / 100)
+        } else {
+            ("Ask", mark + mark * away_percent / 100)
+        };
+        let client_order_id = [0_u8; 16];
+        let order = phoenix_instruction(
+            "PlaceLimitOrder",
+            &order_accounts(&context, self.wallet, self.account),
+            &serde_json::json!({
+                "orderPacket": {
+                    "kind": {
+                        "PostOnly": {
+                            "side": { side: null },
+                            "priceInTicks": { "inner": price },
+                            "numBaseLots": { "inner": lots.unsigned_abs() },
+                            "clientOrderId": client_order_id,
+                            "slide": false,
+                            "lastValidSlot": null,
+                            "orderFlags": { "flags": 0 },
+                            "cancelExisting": false,
+                        }
+                    }
+                }
+            }),
+        )?;
+        let writes = locker.with_svm_reader(|svm| run_instructions(svm, &[order]))?;
+        apply(locker, writes).await;
+        Ok(())
+    }
 }
 
 /// Plays a scenario of `overrides`, in this order, at `slot` through the materializer.
@@ -1179,15 +1329,19 @@ async fn market_and_exchange_configuration_reaches_the_accounts_phoenix_reads() 
     );
 }
 
-/// Sends a keeper's liquidation of `trader`'s position in the market of `context`, as much as the
-/// market allows in one go and at most 10% through the mark, like the keepers on mainnet. It is a
-/// real transaction, signed by a funded keeper, with signatures checked as on any surfnet.
+/// Sends a keeper's liquidation of `trader`'s position in `symbol`, as much as the market allows in
+/// one go and at most 10% through the mark, like the keepers on mainnet. It is a real transaction,
+/// signed by a funded keeper, with signatures checked as on any surfnet.
 async fn send_liquidation(
     locker: &SurfnetSvmLocker,
-    context: &MarketContext,
     trader: Pubkey,
+    symbol: &str,
     long: bool,
 ) -> Result<(), String> {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let context = MarketContext::load(&mut *locker.0.write().await, &remote, symbol)
+        .await
+        .map_err(|e| format!("{symbol}: {e}"))?;
     let keeper = Keypair::new();
     let mark = context.market.mark_ticks;
     let limit = if long {
@@ -1312,6 +1466,28 @@ async fn position_lots(
         .unwrap_or(0)
 }
 
+/// A keeper's liquidation of `trader`'s position of `lots` in `symbol` (see [`send_liquidation`]),
+/// which must land and leave a smaller position; `case` names the case in the failures.
+async fn keeper_liquidates(locker: &SurfnetSvmLocker, trader: Pubkey, symbol: &str, case: &str) {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let held = position_lots(locker, &remote, &trader, symbol).await;
+    assert_ne!(held, 0, "{case}: no {symbol} position to liquidate");
+    send_liquidation(locker, trader, symbol, held > 0)
+        .await
+        .unwrap_or_else(|e| panic!("{case}: the keeper's liquidation failed: {e}"));
+    let left = position_lots(locker, &remote, &trader, symbol).await;
+    assert!(left.abs() < held.abs(), "{case}: {symbol} {held} -> {left}");
+}
+
+/// Sets the locker's Clock `slots` past the graph's, its time with it, and returns the new slot.
+fn slots_later(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph, slots: u64) -> u64 {
+    let mut clock = graph.clock.clone();
+    clock.slot += slots;
+    clock.unix_timestamp += (slots * 2 / 5) as i64;
+    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+    clock.slot
+}
+
 /// `phoenix-trader-collateral` lands the effective collateral exactly on its target: for a hot
 /// trader in its index record, with its orders resting, and kept when a cancel later takes it out of
 /// the index; and again once it is cold. The target comes from the tool's margin, the trader with its
@@ -1390,22 +1566,9 @@ async fn the_collateral_lands_on_its_target_hot_and_cold() {
         let index = locker.with_svm_reader(|svm| local_account(svm, &graph.global_trader_index));
         assert!(index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_err());
 
-        let mut clock = graph.clock.clone();
-        clock.slot += delay;
-        clock.unix_timestamp += (delay * 2 / 5) as i64;
-        locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
-        let (symbol, lots) = held_positions(&locker, &remote, &trader).await.remove(0);
-        let context = MarketContext::load(&mut *locker.0.write().await, &remote, &symbol)
-            .await
-            .unwrap();
-        send_liquidation(&locker, &context, trader, lots > 0)
-            .await
-            .unwrap_or_else(|e| panic!("{trader} +{delay}: the keeper's liquidation failed: {e}"));
-        let left = position_lots(&locker, &remote, &trader, &symbol).await;
-        assert!(
-            left.abs() < lots.abs(),
-            "{trader} +{delay}: {symbol} {lots} -> {left}"
-        );
+        slots_later(&locker, &graph, delay);
+        let (symbol, _) = held_positions(&locker, &remote, &trader).await.remove(0);
+        keeper_liquidates(&locker, trader, &symbol, &format!("{trader} +{delay}")).await;
     }
 }
 
@@ -1487,30 +1650,67 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
     );
 }
 
-/// `phoenix-trader-cancel-orders` with a market cancels the trader's orders there and leaves its
-/// orders on other markets, and its place in the index, as they were; with several markets
-/// separated by commas, it cancels on each. An unknown market refuses the whole override.
+/// `phoenix-trader-cancel-orders` with one market cancels the trader's orders there and leaves its
+/// orders on the other markets, and its place in the index, as they were; with several markets
+/// separated by commas, it cancels on each, and a repeated or empty entry changes nothing. An
+/// unknown market refuses the whole override, so nothing is cancelled. An empty symbol cancels the
+/// rest and takes the trader out of the index.
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelling_orders_on_one_market_leaves_the_others() {
-    let remote = Some((client(), CommitmentConfig::confirmed()));
+async fn cancelling_orders_on_named_markets_leaves_the_others() {
     let graph = phoenix_mainnet_graph().await;
-    let eternal = deployed_program(ETERNAL_PROGRAMDATA).await;
-    let hawkeye = deployed_program(HAWKEYE_PROGRAMDATA).await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    let fresh = || {
-        let locker = phoenix_surfnet(&graph, &eternal, &hawkeye);
-        locker.with_svm_writer(|svm| {
-            svm.set_account(&LAST_RESTART_SLOT, restart.clone())
-                .unwrap()
-        });
+    let locker = phoenix_surfnet(&graph).await;
+    let local = LocalTrader::open(&locker, 10_000).await.unwrap();
+    let symbols = ["SOL", "BTC", "ETH", "HYPE"];
+    for symbol in symbols {
+        local.rest(&locker, symbol, 100, 5).await.unwrap();
+        local.rest(&locker, symbol, -100, 5).await.unwrap();
+    }
+    let trader = local.account;
+    let index = || {
         locker
+            .with_svm_reader(|svm| local_account(svm, &graph.global_trader_index))
+            .unwrap()
     };
+    let listed = || index_trader_state_range(&index(), &trader.to_bytes()).is_ok();
+
+    // Resting orders name their trader by its node in the index, numbered from 1 after the
+    // index's 96-byte header in 64-byte nodes, the TraderState 48 bytes into its node.
+    let range = index_trader_state_range(&index(), &trader.to_bytes()).unwrap();
+    let node = ((range.start - 96 - 48) / 64 + 1) as u32;
+    let map = graph.account(&graph.perp_asset_map);
+    let orders_of = || {
+        symbols.map(|symbol| {
+            let orderbook = Market::find(&graph.perp_asset_map, &map.data, symbol)
+                .unwrap()
+                .orderbook;
+            let book = locker
+                .with_svm_reader(|svm| local_account(svm, &orderbook))
+                .unwrap();
+            let book = Orderbook::try_from_account_bytes(&book.data).unwrap();
+            let count = book
+                .bid_orders()
+                .chain(book.ask_orders())
+                .filter(|order| {
+                    order
+                        .order()
+                        .trader_position_id()
+                        .trader_id()
+                        .as_u32_checked()
+                        == Some(node)
+                })
+                .count();
+            (symbol, count)
+        })
+    };
+    let placed = [("SOL", 2), ("BTC", 2), ("ETH", 2), ("HYPE", 2)];
+    assert_eq!(orders_of(), placed, "{trader}: a bid and an ask on each");
+
     let unknown = configure(
-        &fresh(),
+        &locker,
         "phoenix-trader-cancel-orders",
         graph.perp_asset_map,
         &[
-            ("trader", graph.trader.to_string()),
+            ("trader", trader.to_string()),
             ("symbol", "SOL, NOT-A-MARKET".to_string()),
         ],
     )
@@ -1521,123 +1721,57 @@ async fn cancelling_orders_on_one_market_leaves_the_others() {
             .is_err_and(|e| e.contains("Phoenix lists no market NOT-A-MARKET")),
         "{unknown:?}"
     );
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![cancel_orders(trader, Some("SOL, NOT-A-MARKET"))],
+    )
+    .await;
+    assert_eq!(
+        orders_of(),
+        placed,
+        "{trader}: Play cancels nothing, SOL included"
+    );
 
-    // Resting orders name their trader by its node in the index, numbered from 1 after the
-    // index's 96-byte header in 64-byte nodes, the TraderState 48 bytes into its node.
-    let orders_of = |locker: &SurfnetSvmLocker, orderbook: &Pubkey, node: u32| {
-        let book = locker
-            .with_svm_reader(|svm| local_account(svm, orderbook))
-            .unwrap();
-        let book = Orderbook::try_from_account_bytes(&book.data).unwrap();
-        book.bid_orders()
-            .chain(book.ask_orders())
-            .filter(|order| {
-                order
-                    .order()
-                    .trader_position_id()
-                    .trader_id()
-                    .as_u32_checked()
-                    == Some(node)
-            })
-            .count()
-    };
-    let listed = |locker: &SurfnetSvmLocker, trader: &Pubkey| {
-        let index = locker.with_svm_reader(|svm| local_account(svm, &graph.global_trader_index));
-        index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_ok()
-    };
-    let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
-    for (trader, range) in hot.into_iter().take(60) {
-        let node = ((range.start - 96 - 48) / 64 + 1) as u32;
-        let locker = fresh();
-        let held = {
-            let mut svm = locker.0.write().await;
-            let Ok(exchange) = Exchange::load(&mut svm, &remote).await else {
-                continue;
-            };
-            if hydrate(&mut svm, &remote, &[trader]).await.is_err() {
-                continue;
-            }
-            let Ok(held) = holdings(&svm, &exchange, &trader) else {
-                continue;
-            };
-            let books: Vec<Pubkey> = held.iter().map(|held| held.market.orderbook).collect();
-            if hydrate(&mut svm, &remote, &books).await.is_err() {
-                continue;
-            }
-            held
-        };
-        let with_orders: Vec<(Market, usize)> = held
-            .into_iter()
-            .map(|held| {
-                let count = orders_of(&locker, &held.market.orderbook, node);
-                (held.market, count)
-            })
-            .filter(|(_, count)| *count > 0)
-            .collect();
-        let Some(((cancelled, _), kept)) = with_orders.split_first() else {
-            continue;
-        };
-        if kept.is_empty() {
-            continue;
-        }
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![cancel_orders(trader, Some("BTC"))],
+    )
+    .await;
+    assert_eq!(
+        orders_of(),
+        [("SOL", 2), ("BTC", 0), ("ETH", 2), ("HYPE", 2)],
+        "{trader}: BTC's orders go, the others stay"
+    );
+    assert!(
+        listed(),
+        "{trader}: still in the index with orders on other markets"
+    );
 
-        play(
-            &locker,
-            graph.clock.slot,
-            vec![cancel_orders(trader, Some(cancelled.symbol.as_str()))],
-        )
-        .await;
-        assert_eq!(
-            orders_of(&locker, &cancelled.orderbook, node),
-            0,
-            "{trader}: no order left on {}",
-            cancelled.symbol
-        );
-        for (market, count) in kept {
-            assert_eq!(
-                orders_of(&locker, &market.orderbook, node),
-                *count,
-                "{trader}: its orders on {} stay",
-                market.symbol
-            );
-        }
-        assert!(
-            listed(&locker, &trader),
-            "{trader}: still in the index with orders on other markets"
-        );
+    let list = "SOL, , ETH, SOL";
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![cancel_orders(trader, Some(list))],
+    )
+    .await;
+    assert_eq!(
+        orders_of(),
+        [("SOL", 0), ("BTC", 0), ("ETH", 0), ("HYPE", 2)],
+        "{trader}: '{list}' cancels on SOL and ETH only"
+    );
+    assert!(listed(), "{trader}: still in the index with orders on HYPE");
 
-        // A repeated symbol and an empty entry change nothing.
-        let locker = fresh();
-        let books: Vec<Pubkey> = with_orders
-            .iter()
-            .map(|(market, _)| market.orderbook)
-            .collect();
-        hydrate(&mut *locker.0.write().await, &remote, &books)
-            .await
-            .unwrap();
-        let symbols: Vec<&str> = with_orders
-            .iter()
-            .map(|(market, _)| market.symbol.as_str())
-            .collect();
-        let list = format!("{}, , {}", symbols.join(", "), symbols[0]);
-        play(
-            &locker,
-            graph.clock.slot,
-            vec![cancel_orders(trader, Some(list.as_str()))],
-        )
-        .await;
-        for (market, _) in &with_orders {
-            assert_eq!(
-                orders_of(&locker, &market.orderbook, node),
-                0,
-                "{trader}: no order left on {} after '{list}'",
-                market.symbol
-            );
-        }
-        return;
-    }
-    panic!(
-        "no eligible mainnet candidate: no hot trader among the first 60 has orders on two markets"
+    play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+    assert_eq!(
+        orders_of(),
+        [("SOL", 0), ("BTC", 0), ("ETH", 0), ("HYPE", 0)],
+        "{trader}: an empty symbol cancels the rest"
+    );
+    assert!(
+        !listed(),
+        "{trader}: with no orders left it leaves the index"
     );
 }
 
@@ -1649,244 +1783,136 @@ async fn cancelling_orders_on_one_market_leaves_the_others() {
 async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let graph = phoenix_mainnet_graph().await;
-    let eternal = deployed_program(ETERNAL_PROGRAMDATA).await;
-    let hawkeye = deployed_program(HAWKEYE_PROGRAMDATA).await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    let fresh = || {
-        let locker = phoenix_surfnet(&graph, &eternal, &hawkeye);
-        locker.with_svm_writer(|svm| {
-            svm.set_account(&LAST_RESTART_SLOT, restart.clone())
-                .unwrap()
-        });
-        locker
-    };
     let margin_of = |locker: &SurfnetSvmLocker, trader: Pubkey| {
         MarginView::from_return_data(&hawkeye_view(locker, &graph, VIEW_MARGIN, &[trader])).unwrap()
     };
-    let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
-
-    // Two landed liquidations for each move size, or at least one when the index runs out, and for
-    // the big moves a trader the move alone leaves below zero.
-    let percents = [2_u64, 10, 20, 35];
-    let big = |percent: u64| percent >= 20;
-    let mut landed = [0_usize; 4];
-    let mut sunk = [false; 4];
-    for (trader, _) in hot.into_iter().take(40) {
-        for (size, percent) in percents.into_iter().enumerate() {
-            let wants_landing = landed[size] < 2;
-            let wants_sunk = big(percent) && !sunk[size];
-            if !wants_landing && !wants_sunk {
-                continue;
+    let mark = |locker: &SurfnetSvmLocker, symbol: &str| {
+        let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
+        Market::find(&graph.perp_asset_map, &map.unwrap().data, symbol)
+            .unwrap()
+            .mark_ticks
+    };
+    // About 10x: 1,000 USDC against some 10,000 USDC of SOL long and BTC short, within the 25x and
+    // 40x Phoenix opens, so a 20% move against both takes more than the deposit. The bid makes the
+    // trader hot.
+    let positions = [("SOL", 8_000_i64), ("BTC", -200)];
+    let leveraged = {
+        let graph = &graph;
+        move || async move {
+            let locker = phoenix_surfnet(graph).await;
+            let trader = LocalTrader::open(&locker, 1_000).await.unwrap();
+            for (symbol, lots) in positions {
+                trader.trade(&locker, symbol, lots).await.unwrap();
             }
-            let locker = fresh();
-            let held = {
-                let mut svm = locker.0.write().await;
-                trader_positions_in(&mut svm, &remote, trader, &[]).await
-            };
-            // Traders outside the graph load later than its trader index and can disagree with it.
-            let held = match held {
-                Ok(held) => held,
-                Err(e) => {
-                    eprintln!("{trader}: skipped, {e}");
-                    continue;
-                }
-            };
-            if !held.hot
-                || held.refusal.is_some()
-                || held.positions.is_empty()
-                || held.margin.is_liquidatable != 0
-            {
-                continue;
-            }
-            let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
-            let markets = phoenix_markets(graph.perp_asset_map, &map.unwrap()).unwrap();
-            // Every market moves against the trader's position there.
-            let moves: Vec<(String, u64)> = held
-                .positions
-                .iter()
-                .map(|position| {
-                    let mark = markets
-                        .iter()
-                        .find(|market| market.symbol == position.symbol)
-                        .unwrap()
-                        .mark_ticks;
-                    let factor = if position.base_lots > 0 {
-                        100 - percent
-                    } else {
-                        100 + percent
-                    };
-                    (position.symbol.clone(), mark * factor / 100)
-                })
-                .collect();
-            let predicted = {
-                let mut svm = locker.0.write().await;
-                trader_positions_in(&mut svm, &remote, trader, &moves).await
-            };
-            // A deep move can need more uncross cranks than Play allows, and Play refuses it too.
-            let predicted = match predicted {
-                Ok(predicted) => predicted,
-                Err(e) if big(percent) => {
-                    eprintln!("{trader} {percent}% against: skipped, {e}");
-                    continue;
-                }
-                Err(e) => panic!("{trader} {percent}% against: {e}"),
-            };
-            let now = predicted.margin;
-            let after = predicted.margin_after_moves.unwrap();
-            let band = after.maintenance_margin_quote_lots - after.backstop_margin_quote_lots;
-            let target = ((after.backstop_margin_quote_lots + after.maintenance_margin_quote_lots)
-                / 2) as i64;
-            let mut next = graph.clock.clone();
-            next.slot += 1;
-            let market_moves: Vec<_> = moves
-                .iter()
-                .flat_map(|(symbol, ticks)| {
-                    let ticks = ticks.to_string();
-                    let values = [
-                        ("symbol", symbol.as_str()),
-                        ("target_ticks", ticks.as_str()),
-                    ];
-                    [
-                        phoenix_override("phoenix-market-move", graph.perp_asset_map, &values),
-                        phoenix_override(
-                            "phoenix-market-uncross",
-                            graph.perp_asset_map,
-                            &[("symbol", symbol.as_str())],
-                        ),
-                    ]
-                })
-                .collect();
-            let biggest = held
-                .positions
-                .iter()
-                .max_by_key(|position| position.base_lots.unsigned_abs())
-                .unwrap();
-            if wants_sunk && after.effective_collateral_quote_lots < -(band as i64) {
-                let bare = fresh();
-                play(&bare, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
-                bare.with_svm_writer(|svm| svm.inner.set_sysvar(&next));
-                play(&bare, next.slot, market_moves.clone()).await;
-                let left = margin_of(&bare, trader).effective_collateral_quote_lots;
-                assert!(
-                    left < 0,
-                    "{trader} {percent}% against, without the collateral: {left} is below zero"
-                );
-                let context =
-                    MarketContext::load(&mut *bare.0.write().await, &remote, &biggest.symbol)
-                        .await
-                        .unwrap();
-                let refused =
-                    send_liquidation(&bare, &context, trader, biggest.base_lots > 0).await;
-                assert!(
-                    refused
-                        .as_ref()
-                        .is_err_and(|e| e.to_lowercase().contains("underwater")),
-                    "{trader} {percent}% against, without the collateral: refused as underwater: \
-                     {refused:?}"
-                );
-                sunk[size] = true;
-            }
-            if !wants_landing {
-                continue;
-            }
-            // The collateral lands a slot before the move, which changes it by what the tool
-            // predicts.
-            let wanted = now.effective_collateral_quote_lots
-                - after.effective_collateral_quote_lots
-                + target;
-            // Studio's checks: the move pushes the trader toward liquidation, and the collateral
-            // keeps it healthy until then.
-            let cushion = |view: &MarginView| {
-                view.effective_collateral_quote_lots - view.maintenance_margin_quote_lots as i64
-            };
-            let healthy_until_the_move = wanted > now.maintenance_margin_quote_lots as i64;
-            if cushion(&after) >= cushion(&now) || !healthy_until_the_move {
-                continue;
-            }
-
-            play(
-                &locker,
-                graph.clock.slot,
-                vec![cancel_orders(trader, None), set_collateral(trader, wanted)],
-            )
-            .await;
-            assert_eq!(
-                margin_of(&locker, trader).is_liquidatable,
-                0,
-                "{trader} {percent}% against: healthy until the move"
-            );
-            locker.with_svm_writer(|svm| svm.inner.set_sysvar(&next));
-            play(&locker, next.slot, market_moves).await;
-            // Phoenix can stop a mark short of a big target; such a move does not count for its size.
-            let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
-            let moved = phoenix_markets(graph.perp_asset_map, &map.unwrap()).unwrap();
-            let short = moves.iter().find(|(symbol, ticks)| {
-                let mark = |markets: &[Market]| {
-                    markets
-                        .iter()
-                        .find(|market| &market.symbol == symbol)
-                        .unwrap()
-                        .mark_ticks
-                };
-                // More than a tenth of the way left.
-                mark(&moved).abs_diff(*ticks) > mark(&markets).abs_diff(*ticks) / 10
-            });
-            if let Some((symbol, ticks)) = short {
-                eprintln!("{trader} {percent}% against: {symbol} stopped short of {ticks} ticks");
-                continue;
-            }
-
-            let played = margin_of(&locker, trader);
-            let effective = played.effective_collateral_quote_lots;
-            assert_eq!(
-                played.is_liquidatable, 1,
-                "{trader} {percent}% against: liquidatable after the move"
-            );
-            assert!(
-                effective > played.backstop_margin_quote_lots as i64
-                    && effective < played.maintenance_margin_quote_lots as i64,
-                "{trader} {percent}% against: {effective} is between backstop and maintenance"
-            );
-            assert!(
-                effective.abs_diff(target) <= band / 20,
-                "{trader} {percent}% against: {effective} is within 5% of the band from {target}"
-            );
-            let context =
-                MarketContext::load(&mut *locker.0.write().await, &remote, &biggest.symbol)
-                    .await
-                    .unwrap();
-            send_liquidation(&locker, &context, trader, biggest.base_lots > 0)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("{trader} {percent}% against: the keeper's liquidation failed: {e}")
-                });
-            let left = position_lots(&locker, &remote, &trader, &biggest.symbol).await;
-            assert!(
-                left.abs() < biggest.base_lots.abs(),
-                "{trader}: {} {left}",
-                biggest.symbol
-            );
-            landed[size] += 1;
+            trader.rest(&locker, "SOL", 1_000, 5).await.unwrap();
+            (locker, trader.account)
         }
-        let all_sunk = percents
+    };
+    let (biggest, biggest_lots) = positions[0];
+
+    for percent in [2_u64, 10, 20, 35] {
+        let case = format!("{percent}% against");
+        let (locker, trader) = leveraged().await;
+        // Every market moves against the trader's position there.
+        let moves: Vec<(String, u64)> = positions
             .iter()
-            .zip(sunk)
-            .all(|(percent, sunk)| sunk || !big(*percent));
-        if landed.iter().all(|count| *count >= 2) && all_sunk {
-            break;
+            .map(|(symbol, lots)| {
+                let factor = if *lots > 0 {
+                    100 - percent
+                } else {
+                    100 + percent
+                };
+                (symbol.to_string(), mark(&locker, symbol) * factor / 100)
+            })
+            .collect();
+        let predicted = {
+            let mut svm = locker.0.write().await;
+            trader_positions_in(&mut svm, &remote, trader, &moves)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e}"))
+        };
+        assert!(
+            predicted.hot && predicted.refusal.is_none(),
+            "{case}: hot, and the templates take it: {:?}",
+            predicted.refusal
+        );
+        let now = predicted.margin;
+        let after = predicted.margin_after_moves.unwrap();
+        let band = after.maintenance_margin_quote_lots - after.backstop_margin_quote_lots;
+        let target =
+            ((after.backstop_margin_quote_lots + after.maintenance_margin_quote_lots) / 2) as i64;
+        let cushion = |view: &MarginView| {
+            view.effective_collateral_quote_lots - view.maintenance_margin_quote_lots as i64
+        };
+        assert!(
+            cushion(&after) < cushion(&now),
+            "{case}: the move pushes the trader toward liquidation"
+        );
+        let market_moves: Vec<_> = moves
+            .iter()
+            .flat_map(|(symbol, ticks)| market_move(symbol, *ticks))
+            .collect();
+
+        // The collateral lands a slot before the move, which changes it by what the tool predicts.
+        let wanted =
+            now.effective_collateral_quote_lots - after.effective_collateral_quote_lots + target;
+        play(
+            &locker,
+            graph.clock.slot,
+            vec![cancel_orders(trader, None), set_collateral(trader, wanted)],
+        )
+        .await;
+        assert_eq!(
+            margin_of(&locker, trader).is_liquidatable,
+            0,
+            "{case}: healthy until the move"
+        );
+        let next = slots_later(&locker, &graph, 1);
+        play(&locker, next, market_moves.clone()).await;
+        for (symbol, ticks) in &moves {
+            let reached = mark(&locker, symbol);
+            assert!(
+                reached.abs_diff(*ticks) <= ticks / 1_000,
+                "{case}: {symbol}'s mark reached {reached}, not {ticks} ticks"
+            );
+        }
+
+        let played = margin_of(&locker, trader);
+        let effective = played.effective_collateral_quote_lots;
+        assert_eq!(
+            played.is_liquidatable, 1,
+            "{case}: liquidatable after the move"
+        );
+        assert!(
+            effective > played.backstop_margin_quote_lots as i64
+                && effective < played.maintenance_margin_quote_lots as i64,
+            "{case}: {effective} is between backstop and maintenance"
+        );
+        assert!(
+            effective.abs_diff(target) <= band / 20,
+            "{case}: {effective} is within 5% of the band from {target}"
+        );
+        keeper_liquidates(&locker, trader, biggest, &case).await;
+
+        if percent >= 20 {
+            let (bare, trader) = leveraged().await;
+            play(&bare, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+            let next = slots_later(&bare, &graph, 1);
+            play(&bare, next, market_moves).await;
+            let left = margin_of(&bare, trader).effective_collateral_quote_lots;
+            assert!(
+                left < 0,
+                "{case}, without the collateral: {left} is below zero"
+            );
+            let refused = send_liquidation(&bare, trader, biggest, biggest_lots > 0).await;
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.to_lowercase().contains("underwater")),
+                "{case}, without the collateral: refused as underwater: {refused:?}"
+            );
         }
     }
-    assert!(
-        landed.iter().all(|count| *count >= 1),
-        "no eligible live candidate: liquidations landed per move size {percents:?}: {landed:?}"
-    );
-    assert!(
-        percents
-            .iter()
-            .zip(sunk)
-            .all(|(percent, sunk)| sunk || !big(*percent)),
-        "no live candidate the big moves alone leave below zero, per size {percents:?}: {sunk:?}"
-    );
 }
 
 /// An oracle-only move against a trader's position moves its margin while the order book stays where
@@ -1899,9 +1925,7 @@ async fn an_oracle_only_move_leaves_a_trader_liquidatable_for_a_keeper() {
     let trader = graph.trader;
     play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
     // A cancel freezes the mark for risk in its slot, so the move plays a slot later.
-    let mut clock = graph.clock.clone();
-    clock.slot += 1;
-    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+    let slot = slots_later(&locker, &graph, 1);
     let (symbol, lots) = held_positions(&locker, &remote, &trader)
         .await
         .into_iter()
@@ -1925,7 +1949,7 @@ async fn an_oracle_only_move_leaves_a_trader_liquidatable_for_a_keeper() {
         graph.perp_asset_map,
         &[("symbol", symbol.as_str()), ("change_percent", change)],
     );
-    play(&locker, clock.slot, vec![oracle_move]).await;
+    play(&locker, slot, vec![oracle_move]).await;
     assert_eq!(
         quotes(),
         book,
@@ -1942,7 +1966,7 @@ async fn an_oracle_only_move_leaves_a_trader_liquidatable_for_a_keeper() {
 
     let target =
         ((moved.backstop_margin_quote_lots + moved.maintenance_margin_quote_lots) / 2) as i64;
-    play(&locker, clock.slot, vec![set_collateral(trader, target)]).await;
+    play(&locker, slot, vec![set_collateral(trader, target)]).await;
     let prepared = hawkeye_margin(&locker, &graph);
     assert_eq!(
         (
@@ -1952,17 +1976,7 @@ async fn an_oracle_only_move_leaves_a_trader_liquidatable_for_a_keeper() {
         (target, 1),
         "{trader}: liquidatable in the band the oracle move leaves"
     );
-    let context = MarketContext::load(&mut *locker.0.write().await, &remote, &symbol)
-        .await
-        .unwrap();
-    send_liquidation(&locker, &context, trader, lots > 0)
-        .await
-        .unwrap_or_else(|e| panic!("{trader}: the keeper's liquidation failed: {e}"));
-    let left = position_lots(&locker, &remote, &trader, &symbol).await;
-    assert!(
-        left.abs() < lots.abs(),
-        "{trader}: {symbol} {lots} -> {left}"
-    );
+    keeper_liquidates(&locker, trader, &symbol, &trader.to_string()).await;
 }
 
 /// A higher maintenance factor on a trader's biggest market makes a trader just above its old
@@ -2046,18 +2060,7 @@ async fn a_higher_maintenance_factor_leaves_a_trader_liquidatable_for_a_keeper()
                 > raised_margin.backstop_margin_quote_lots as i64,
         "{trader}: liquidatable for one keeper liquidation under the raised factor: {raised_margin:?}"
     );
-    let context = MarketContext::load(&mut *locker.0.write().await, &remote, symbol)
-        .await
-        .unwrap();
-    send_liquidation(&locker, &context, trader, biggest.base_lots > 0)
-        .await
-        .unwrap_or_else(|e| panic!("{trader}: the keeper's liquidation failed: {e}"));
-    let left = position_lots(&locker, &remote, &trader, symbol).await;
-    assert!(
-        left.abs() < biggest.base_lots.abs(),
-        "{trader}: {symbol} {} -> {left}",
-        biggest.base_lots
-    );
+    keeper_liquidates(&locker, trader, symbol, &trader.to_string()).await;
 }
 
 /// Phoenix refuses to liquidate a hot trader with risk-increasing orders, but once the trader is
@@ -2066,120 +2069,63 @@ async fn a_higher_maintenance_factor_leaves_a_trader_liquidatable_for_a_keeper()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keeper_force_cancels_a_liquidatable_hot_traders_orders_and_liquidates_it() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
-    let graph = phoenix_mainnet_graph().await;
-    let eternal = deployed_program(ETERNAL_PROGRAMDATA).await;
-    let hawkeye = deployed_program(HAWKEYE_PROGRAMDATA).await;
-    let restart = fetch(&[LAST_RESTART_SLOT]).await.remove(0);
-    let fresh = || {
-        let locker = phoenix_surfnet(&graph, &eternal, &hawkeye);
-        locker.with_svm_writer(|svm| {
-            svm.set_account(&LAST_RESTART_SLOT, restart.clone())
-                .unwrap()
-        });
-        locker
-    };
-    let margin_of = |locker: &SurfnetSvmLocker, trader: Pubkey| {
-        MarginView::from_return_data(&hawkeye_view(locker, &graph, VIEW_MARGIN, &[trader])).unwrap()
-    };
-    let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
-    let mut other_failure = None;
-    for (trader, _) in hot.into_iter().take(60) {
-        let locker = fresh();
-        let held = {
-            let mut svm = locker.0.write().await;
-            trader_positions_in(&mut svm, &remote, trader, &[]).await
-        };
-        let Ok(held) = held else { continue };
-        if !held.hot
-            || held.refusal.is_some()
-            || held.positions.is_empty()
-            || held.margin.is_liquidatable != 0
-        {
-            continue;
-        }
-        // The middle of the band the orders' cancel leaves, so the trader stays liquidatable for one
-        // keeper liquidation once its orders are gone.
-        let target = ((held.margin.backstop_margin_quote_lots
-            + held.margin.maintenance_margin_quote_lots)
-            / 2) as i64;
-        play(
-            &locker,
-            graph.clock.slot,
-            vec![set_collateral(trader, target)],
-        )
-        .await;
-        assert_eq!(
-            margin_of(&locker, trader).is_liquidatable,
-            1,
-            "{trader}: liquidatable without a cancel"
-        );
-        let biggest = held
-            .positions
-            .iter()
-            .max_by_key(|position| position.base_lots.unsigned_abs())
-            .unwrap();
-        let context = MarketContext::load(&mut *locker.0.write().await, &remote, &biggest.symbol)
+    let mut graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    // Long SOL, with a bid on SOL that would add to the long.
+    let opened = LocalTrader::open(&locker, 10_000).await.unwrap();
+    opened.trade(&locker, "SOL", 1_000).await.unwrap();
+    opened.rest(&locker, "SOL", 1_000, 5).await.unwrap();
+    let trader = opened.account;
+    graph.trader = trader;
+    let held = {
+        let mut svm = locker.0.write().await;
+        trader_positions_in(&mut svm, &remote, trader, &[])
             .await
-            .unwrap();
-        match send_liquidation(&locker, &context, trader, biggest.base_lots > 0).await {
-            // Its orders add no risk, so nothing stops the keeper: not the case under test.
-            Ok(()) => continue,
-            // Any other failure is not the refusal this test is about, so the next trader is tried.
-            Err(e) if !e.contains("risk-increasing") => {
-                other_failure = Some(format!("{trader}: {e}"));
-                continue;
-            }
-            Err(_) => {}
-        }
+            .unwrap()
+    };
+    assert!(held.hot, "{trader}: hot, as its bid makes it");
 
-        let keeper = Keypair::new();
-        let (exchange, markets) = {
-            let mut svm = locker.0.write().await;
-            let exchange = Exchange::load(&mut svm, &remote).await.unwrap();
-            let markets: Vec<Market> = holdings(&svm, &exchange, &trader)
-                .unwrap()
-                .into_iter()
-                .map(|held| held.market)
-                .collect();
-            (exchange, markets)
-        };
-        for market in &markets {
-            send_signed(
-                &locker,
-                &keeper,
-                force_cancel(&exchange, keeper.pubkey(), trader, market),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{trader} {}: the keeper's force cancel failed: {e}",
-                    market.symbol
-                )
-            });
-        }
-        let context = MarketContext::load(&mut *locker.0.write().await, &remote, &biggest.symbol)
-            .await
-            .unwrap();
-        send_liquidation(&locker, &context, trader, biggest.base_lots > 0)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("{trader}: the liquidation after the force cancels failed: {e}")
-            });
-        let left = position_lots(&locker, &remote, &trader, &biggest.symbol).await;
-        assert!(
-            left.abs() < biggest.base_lots.abs(),
-            "{trader}: {} {} -> {left}",
-            biggest.symbol,
-            biggest.base_lots
-        );
-        return;
-    }
-    panic!(
-        "no eligible mainnet candidate: no hot trader among the first 60 has risk-increasing \
-         orders{}",
-        other_failure
-            .map(|failure| format!("; the last liquidation that failed otherwise was {failure}"))
-            .unwrap_or_default()
+    // The middle of the band the orders' cancel leaves, so the trader stays liquidatable for one
+    // keeper liquidation once its orders are gone.
+    let target = ((held.margin.backstop_margin_quote_lots
+        + held.margin.maintenance_margin_quote_lots)
+        / 2) as i64;
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![set_collateral(trader, target)],
+    )
+    .await;
+    assert_eq!(
+        hawkeye_margin(&locker, &graph).is_liquidatable,
+        1,
+        "{trader}: liquidatable without a cancel"
     );
+    let refused = send_liquidation(&locker, trader, "SOL", true).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("risk-increasing")),
+        "{trader}: the keeper is refused while the bid rests: {refused:?}"
+    );
+
+    let keeper = Keypair::new();
+    let sol = MarketContext::load(&mut *locker.0.write().await, &remote, "SOL")
+        .await
+        .unwrap();
+    send_signed(
+        &locker,
+        &keeper,
+        force_cancel(&sol.exchange, keeper.pubkey(), trader, &sol.market),
+    )
+    .unwrap_or_else(|e| panic!("{trader}: the keeper's force cancel failed: {e}"));
+    keeper_liquidates(
+        &locker,
+        trader,
+        "SOL",
+        &format!("{trader} after the force cancel"),
+    )
+    .await;
 }
 
 /// Keeping the markets usable, which every Phoenix override does first, keeps every maker's spline
@@ -2212,19 +2158,12 @@ async fn a_thin_book_still_quotes_500_slots_later() {
         let view = hawkeye_bbo_for_market(graph, locker, market.orderbook, market.splines);
         (view.best_bid_ticks, view.best_ask_ticks)
     };
-    let later = |locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph, slots: u64| {
-        let mut clock = graph.clock.clone();
-        clock.slot += slots;
-        clock.unix_timestamp += (slots * 2 / 5) as i64;
-        locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
-        clock.slot
-    };
 
     let (kept, graph, market) = usable(false).await;
     let (lapsing, _, _) = usable(true).await;
     let now = top(&kept, &graph, &market);
-    let slot = later(&kept, &graph, 500);
-    later(&lapsing, &graph, 500);
+    let slot = slots_later(&kept, &graph, 500);
+    slots_later(&lapsing, &graph, 500);
     let lapsed = top(&lapsing, &graph, &market);
     assert_eq!(
         top(&kept, &graph, &market),
@@ -2239,17 +2178,9 @@ async fn a_thin_book_still_quotes_500_slots_later() {
     );
 
     let target = (now.0 + now.1) / 2 * 98 / 100;
-    let ticks = target.to_string();
-    let values = [("symbol", market.symbol.as_str()), ("target_ticks", &ticks)];
-    let moving = phoenix_override("phoenix-market-move", graph.perp_asset_map, &values);
-    let uncross = phoenix_override(
-        "phoenix-market-uncross",
-        graph.perp_asset_map,
-        &[("symbol", market.symbol.as_str())],
-    );
-    play(&kept, slot, vec![moving, uncross]).await;
+    play(&kept, slot, market_move(&market.symbol, target).to_vec()).await;
     let moved = top(&kept, &graph, &market);
-    later(&kept, &graph, 1_000);
+    slots_later(&kept, &graph, 1_000);
     println!(
         "{}: {now:?}, mainnet's lifespans +500 {lapsed:?}, moved to {target} {moved:?}",
         market.symbol
@@ -2313,23 +2244,10 @@ async fn positions_of_an_address_without_a_trader_say_so() {
 #[tokio::test(flavor = "multi_thread")]
 async fn trader_configuration_reaches_what_phoenix_reads() {
     let (locker, graph) = phoenix_behavior_locker().await;
-    // A trader's account can be full, so the orders go to a market it already holds.
-    let symbol = {
-        let mut svm = locker.0.write().await;
-        let exchange = Exchange::load(&mut svm, &Some((client(), CommitmentConfig::confirmed())))
-            .await
-            .unwrap();
-        holdings(&svm, &exchange, &graph.trader)
-            .unwrap()
-            .first()
-            .expect("the graph's trader holds a position or orders")
-            .market
-            .symbol
-            .clone()
-    };
-    buy_one_lot(&locker, graph.trader, &symbol)
+    let symbol = "SOL";
+    buy_one_lot(&locker, graph.trader, symbol)
         .await
-        .unwrap_or_else(|e| panic!("the trader may place market orders on mainnet: {e}"));
+        .unwrap_or_else(|e| panic!("the trader may place market orders: {e}"));
 
     // A capability, signed by the risk authority: a blocked market order is refused.
     configure(
@@ -2340,7 +2258,7 @@ async fn trader_configuration_reaches_what_phoenix_reads() {
     )
     .await
     .unwrap();
-    let refused = buy_one_lot(&locker, graph.trader, &symbol)
+    let refused = buy_one_lot(&locker, graph.trader, symbol)
         .await
         .expect_err("PlaceMarketOrder false blocks market orders")
         .to_string();
@@ -2356,7 +2274,7 @@ async fn trader_configuration_reaches_what_phoenix_reads() {
     )
     .await
     .unwrap();
-    buy_one_lot(&locker, graph.trader, &symbol)
+    buy_one_lot(&locker, graph.trader, symbol)
         .await
         .unwrap_or_else(|e| panic!("true allows them again: {e}"));
 

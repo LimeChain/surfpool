@@ -203,9 +203,9 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | Market orderbook  | The `orderbook` of the market in `list_phoenix_markets`.                                                                                                          |
 | StopLosses        | PDA `["stoploss", trader account, asset id as u64 little-endian]`, or `getProgramAccounts` with `dataSize: 328` and a memcmp of the trader account at offset 224. |
 | PermissionAccount | PDA `["permission", authority, delegated key]`, or `getProgramAccounts` with `dataSize: 168` and a memcmp of the authority at offset 8.                           |
-| PerpAssetMap      | Fixed address, carried by its templates.                                                                                                                          |
-| WithdrawQueue     | Fixed address, carried by its templates.                                                                                                                          |
-| GlobalConfig      | Fixed address, carried by its template.                                                                                                                           |
+| PerpAssetMap      | `2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC`: every market's prices and risk factors, which the market templates change.                                        |
+| WithdrawQueue     | `3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K`: the exchange's withdrawal queue and limits, which the withdraw templates change.                                  |
+| GlobalConfig      | `2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ`: the exchange-wide status flags, which `phoenix-exchange-status` changes.                                          |
 
 ## MCP
 
@@ -242,4 +242,10 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 cargo test -p surfpool-core --features integration-tests tests::phoenix
 ```
 
-Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
+Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. CI does not
+build this feature, so run them before a push (about half a minute).
+
+- Each run copies mainnet's exchange accounts and every book once.
+- Each test runs Phoenix's mainnet programs on a fresh local copy and plays templates as Play does.
+- Liquidations are real keeper transactions.
+- Each test opens its own trader locally, with the positions and orders it needs.
