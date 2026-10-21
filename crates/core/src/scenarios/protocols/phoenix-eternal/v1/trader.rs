@@ -190,9 +190,9 @@ pub fn holdings(
     Ok(held)
 }
 
-/// The trader cancelling its resting orders on every market in `held`: Phoenix refuses to
+/// The trader canceling its resting orders on every market in `held`: Phoenix refuses to
 /// liquidate a trader with risk-increasing orders on any market.
-async fn cancel_everywhere(
+async fn cancel_all(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     exchange: &Exchange,
@@ -294,7 +294,7 @@ pub struct TraderPositions {
     /// Whether the local GlobalTraderIndex lists the trader.
     pub hot: bool,
     /// Hawkeye's view as `phoenix-trader-cancel-orders` leaves the trader, a hot trader's orders
-    /// cancelled.
+    /// canceled.
     pub margin: MarginView,
     /// The same view once the given markets move and uncross the way `phoenix-market-move` and
     /// `phoenix-market-uncross` play them; `None` without moves.
@@ -393,7 +393,7 @@ pub(crate) async fn trader_positions_in(
 }
 
 /// The state `phoenix-trader-cancel-orders` leaves, which the collateral is worked out from: a hot
-/// trader's orders cancelled, a cold trader left as it is, since a cancel changes its margin too.
+/// trader's orders canceled, a cold trader left as it is, since a cancel changes its margin too.
 pub(crate) struct LeverState<'a> {
     pub(crate) exchange: Exchange,
     pub(crate) hot: bool,
@@ -403,8 +403,8 @@ pub(crate) struct LeverState<'a> {
 
 impl<'a> LeverState<'a> {
     /// The state, with the refusal when Phoenix still lists the trader after the cancel. With
-    /// `markets`, only their orders are cancelled and a trader still listed is expected; without,
-    /// every market's are.
+    /// `markets`, only their orders are canceled and a trader still listed is expected; without,
+    /// all markets' are.
     pub(crate) async fn load(
         svm: &'a mut SurfnetSvm,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -429,7 +429,7 @@ impl<'a> LeverState<'a> {
         let hot = indexed(&local_account(svm, &exchange.global_trader_index)?, &trader)?;
         refuse_unindexed_hot_trader(trader, &header, hot)?;
         let held = holdings(svm, &exchange, &trader)?;
-        let cancelled = if markets.is_empty() {
+        let canceled = if markets.is_empty() {
             held.clone()
         } else {
             let map = local_account(svm, &exchange.perp_asset_map)?;
@@ -444,7 +444,7 @@ impl<'a> LeverState<'a> {
         };
         let cancels = if hot {
             let authority = Pubkey::new_from_array(header.authority);
-            cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &cancelled).await?
+            cancel_all(svm, remote_ctx, &exchange, trader, authority, &canceled).await?
         } else {
             Vec::new()
         };
@@ -459,7 +459,7 @@ impl<'a> LeverState<'a> {
             let why = if cancels.is_empty() {
                 "has no orders whose cancel would take it out"
             } else {
-                "stays there after its orders are cancelled"
+                "stays there after its orders are canceled"
             };
             SurfpoolError::internal(format!(
                 "{trader} is in Phoenix's active trader index and {why}"
@@ -490,7 +490,7 @@ impl<'a> LeverState<'a> {
     }
 }
 
-/// The writes of `trader` cancelling all its resting orders on `markets`, or on every market when
+/// The writes of `trader` canceling all its resting orders on `markets`, or on every market when
 /// there are none, which takes a hot trader out of Phoenix's index; a cold trader has none and
 /// nothing is written. A trader Phoenix still lists after a cancel on every market is refused.
 pub async fn cancel_order_writes(
@@ -508,7 +508,7 @@ pub async fn cancel_order_writes(
     lever.state.writes()
 }
 
-/// The write that brings `trader`'s effective collateral to `wanted` quote lots from Hawkeye's view
+/// The writes that bring `trader`'s effective collateral to `wanted` quote lots from Hawkeye's view
 /// when it plays. Effective collateral moves one for one with the collateral field, which is
 /// written where Phoenix reads it: a hot trader's record in the GlobalTraderIndex, which Phoenix
 /// copies back to the Trader account when the trader leaves the index, or a cold trader's account.

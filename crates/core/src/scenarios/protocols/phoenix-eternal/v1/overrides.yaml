@@ -124,9 +124,9 @@ templates:
     llm_context: |
       Runs Phoenix's CancelAll as the trader on every market where it holds a position or resting
       orders when symbol is empty, or only on the markets symbol names: one, such as SOL, or
-      several separated by commas, such as SOL, BTC, ETH. Cancelled on every market, a trader the
+      several separated by commas, such as SOL, BTC, ETH. Canceled on every market, a trader the
       active trader index lists (hot: true in list_phoenix_trader_positions) leaves it, and
-      Phoenix reads its state from the Trader account again; cancelled on some markets, it stays
+      Phoenix reads its state from the Trader account again; canceled on some markets, it stays
       in the index while it has orders elsewhere. A cold trader has no resting orders and nothing
       changes. A keeper cannot liquidate a trader with risk-increasing resting orders on any
       market until it force-cancels them, which Phoenix allows any signer while the trader is
@@ -135,7 +135,7 @@ templates:
       fill the trader's orders and change its positions.
       A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
       A trader Phoenix still lists after a cancel on every market, such as a spline market maker,
-      is refused. An unknown symbol refuses the whole override, so nothing is cancelled.
+      is refused. An unknown symbol refuses the whole override, so nothing is canceled.
       Set trader to the trader's Trader account; the override's own account is the PerpAssetMap,
       as for the market templates.
       Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
@@ -164,7 +164,7 @@ templates:
       Effective collateral moves one for one with that field, so the value lands even with
       funding pending or resting orders. list_phoenix_trader_positions reports quote lots, and 1
       USDC is 1000000 quote lots: effective_collateral_usdc = target / 1000000.
-      Take the target from the tool's margin, the trader with its orders cancelled, in the middle
+      Take the target from the tool's margin, the trader with its orders canceled, in the middle
       of a range, as the state can drift a little before the keeper acts: between backstopMargin
       and maintenanceMargin, one keeper liquidation makes the account healthy again; between
       highRiskMargin and backstopMargin, a keeper can liquidate every position. Below

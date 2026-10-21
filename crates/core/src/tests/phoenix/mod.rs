@@ -1510,7 +1510,7 @@ fn advance_slots(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph, slots: 
 /// `phoenix-trader-collateral` lands the effective collateral exactly on its target: for a hot
 /// trader in its index record, with its orders resting, and kept when a cancel later takes it out of
 /// the index; and again once it is cold. The target comes from the tool's margin, the trader with its
-/// orders cancelled.
+/// orders canceled.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_collateral_lands_on_its_target_hot_and_cold() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
@@ -1595,7 +1595,7 @@ async fn the_collateral_lands_on_its_target_hot_and_cold() {
 /// it out of Phoenix's index; its positions stay open. On a cold trader it changes nothing, and a
 /// trader the surfnet has not loaded yet is fetched first.
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_positions() {
+async fn canceling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_positions() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
     let (locker, graph) = phoenix_behavior_locker().await;
     let trader = graph.trader;
@@ -1628,7 +1628,7 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
         order_only, 0,
         "{trader}: no market is left with resting orders alone"
     );
-    let cancelled = hawkeye_margin(&locker, &graph);
+    let canceled = hawkeye_margin(&locker, &graph);
 
     play(&locker, graph.clock.slot, cancel()).await;
     let again = hawkeye_margin(&locker, &graph);
@@ -1638,8 +1638,8 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
             again.maintenance_margin_quote_lots,
         ),
         (
-            cancelled.effective_collateral_quote_lots,
-            cancelled.maintenance_margin_quote_lots,
+            canceled.effective_collateral_quote_lots,
+            canceled.maintenance_margin_quote_lots,
         ),
         "{trader}: cold, a second cancel changes nothing"
     );
@@ -1672,10 +1672,10 @@ async fn cancelling_orders_takes_a_hot_trader_out_of_the_index_and_keeps_its_pos
 /// `phoenix-trader-cancel-orders` with one market cancels the trader's orders there and leaves its
 /// orders on the other markets, and its place in the index, as they were; with several markets
 /// separated by commas, it cancels on each, and a repeated or empty entry changes nothing. An
-/// unknown market refuses the whole override, so nothing is cancelled. An empty symbol cancels the
-/// rest and takes the trader out of the index.
+/// unknown market, or a symbol that is not text, refuses the whole override, so nothing is
+/// canceled. An empty symbol cancels the rest and takes the trader out of the index.
 #[tokio::test(flavor = "multi_thread")]
-async fn cancelling_orders_on_named_markets_leaves_the_others() {
+async fn canceling_orders_on_named_markets_leaves_the_others() {
     let graph = phoenix_mainnet_graph().await;
     let locker = phoenix_surfnet(&graph).await;
     let local = LocalTrader::create(&locker, 10_000).await.unwrap();
@@ -1756,6 +1756,17 @@ async fn cancelling_orders_on_named_markets_leaves_the_others() {
         orders_of(),
         placed,
         "{trader}: Play cancels nothing, SOL included"
+    );
+
+    let mut as_list = cancel_orders(trader, None);
+    as_list
+        .values
+        .insert("symbol".to_string(), serde_json::json!(["SOL"]));
+    play(&locker, graph.clock.slot, vec![as_list]).await;
+    assert_eq!(
+        orders_of(),
+        placed,
+        "{trader}: a symbol that is not text cancels nothing"
     );
 
     play(

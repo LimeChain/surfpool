@@ -140,7 +140,7 @@ same slot. `symbol` picks the markets: empty for every market, which takes a hot
 index, one symbol such as `SOL`, or several separated by commas such as `SOL, BTC, ETH`. An unknown
 symbol refuses the whole override. Positions stay open, and a cold trader has no orders to cancel.
 
-Pick the target from the tool's `margin`, the trader with its orders cancelled, by what the keeper
+Pick the target from the tool's `margin`, the trader with its orders canceled, by what the keeper
 should do:
 
 - **One liquidation:** between `backstopMargin` and `maintenanceMargin`. The keeper's first
@@ -192,7 +192,7 @@ timestamps back to the local clock. Funding then accrues from the local time.
 Makers on mainnet re-quote every few slots, and a spline region stops quoting a set number of slots
 after its maker's last update (6 to 60 on SOL). Nobody re-quotes on a surfnet, so every Phoenix
 override also loads every market's spline collection and sets each region's lifespan to Phoenix's
-good-till-cancelled value, writing only collections that change. The books keep their liquidity
+good-till-canceled value, writing only collections that change. The books keep their liquidity
 while the surfnet's clock runs, so a keeper finds the same quotes long after Play.
 
 ## Finding accounts
@@ -213,7 +213,7 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
   `tickSize`, `baseLotDecimals` and risk factors, read from the local VM.
 - `list_phoenix_trader_positions` returns the markets where a trader holds a position, with its
   side, size in base lots and maintenance margin, whether it is `hot`, and its `margin` as
-  `phoenix-trader-cancel-orders` leaves it: a hot trader's orders cancelled. Given `moves`, it also
+  `phoenix-trader-cancel-orders` leaves it: a hot trader's orders canceled. Given `moves`, it also
   returns `marginAfterMoves`, with each market moved and uncrossed.
   Hawkeye's views run on a copy of the surfnet's state, with its markets kept usable the way Play
   keeps them, and write nothing back. The reads go through the surfnet, which loads any account
@@ -229,7 +229,7 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `... accounts are missing locally and there is no datasource` | The template needs Phoenix accounts that are not in the local VM, and surfnet has no upstream datasource to fetch them from.      |
 | `... is offline and missing locally`                          | The account is marked offline, so surfnet will not fetch it.                                                                      |
 | `instruction N failed: ... logs: [...]`                       | Phoenix refused the template's instruction; the logs carry its reason, such as a factor out of range.                             |
-| `... is in Phoenix's active trader index and ...`             | `phoenix-trader-cancel-orders` cancelled the trader's orders and Phoenix still lists it, or it has none to cancel.                |
+| `... is in Phoenix's active trader index and ...`             | `phoenix-trader-cancel-orders` canceled the trader's orders and Phoenix still lists it, or it has none to cancel.                 |
 | `... quotes splines on ... markets; ...`                      | The trader is a spline market maker, which `phoenix-trader-collateral` does not support.                                         |
 | `... is below its high-risk margin ...`                       | The collateral target is below the trader's high-risk margin; a liquidation can leave it underwater and fail.                    |
 | `the ... book stayed crossed after ... uncross cranks`        | `phoenix-market-uncross` left the book crossed after its cranks. Try a smaller move.                                              |

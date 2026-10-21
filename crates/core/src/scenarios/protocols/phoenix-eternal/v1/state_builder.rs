@@ -753,10 +753,17 @@ pub async fn prepare_phoenix_override(
             let trader = Pubkey::from_str(text).map_err(|e| {
                 SurfpoolError::internal(format!("{TRADER_FIELD} '{text}' is not an address: {e}"))
             })?;
-            let markets: Vec<&str> = values
-                .get(MARKET_SYMBOL_FIELD)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
+            let symbols = match values.get(MARKET_SYMBOL_FIELD) {
+                None | Some(serde_json::Value::Null) => "",
+                Some(serde_json::Value::String(text)) => text.as_str(),
+                Some(_) => {
+                    return Err(SurfpoolError::internal(format!(
+                        "{MARKET_SYMBOL_FIELD} must be a string such as SOL, BTC, or empty for \
+                         every market"
+                    )));
+                }
+            };
+            let markets: Vec<&str> = symbols
                 .split(',')
                 .map(str::trim)
                 .filter(|symbol| !symbol.is_empty())
