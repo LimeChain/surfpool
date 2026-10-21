@@ -413,6 +413,8 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
                         .into_iter()
                         .chain([(*trader, account.clone())])
                         .collect();
+                    let books = every_book(&map_account, perp_asset_map, &addresses).await;
+                    graph.accounts.extend(books);
                     *cache = Some(Ok(graph.clone()));
                     return graph;
                 }
@@ -429,6 +431,36 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
     );
     *cache = Some(Err(reason.clone()));
     panic!("{reason}")
+}
+
+/// Every market's book and splines not in `held`, read seconds after the trader index, as a
+/// surfnet's first load reads them. A book read minutes later names traders by index nodes that
+/// moved, and Phoenix then panics or fails with InvalidAccountData.
+async fn every_book(
+    map: &Account,
+    perp_asset_map: Pubkey,
+    held: &[Pubkey],
+) -> Vec<(Pubkey, Account)> {
+    let missing: Vec<Pubkey> = phoenix_markets(perp_asset_map, map)
+        .unwrap()
+        .into_iter()
+        .flat_map(|market| [market.orderbook, market.splines])
+        .filter(|address| !held.contains(address))
+        .collect();
+    let mut books = Vec::new();
+    for chunk in missing.chunks(100) {
+        let fetched = client()
+            .get_multiple_accounts(chunk, CommitmentConfig::confirmed())
+            .await
+            .unwrap_or_else(|e| panic!("failed to fetch the Phoenix books from mainnet: {e}"));
+        books.extend(
+            chunk
+                .iter()
+                .zip(fetched)
+                .filter_map(|(address, result)| Some((*address, result.map_account().ok()?))),
+        );
+    }
+    books
 }
 
 #[derive(Clone)]
@@ -1609,7 +1641,10 @@ async fn cancelling_orders_on_one_market_leaves_the_others() {
     );
 }
 
-/// The margin the tool predicts after a move is the margin Phoenix computes once the move plays.
+/// The margin the tool predicts after a move is the margin Phoenix computes once the move plays,
+/// and the collateral set from it leaves the trader for a keeper after moves up to 35%. Without that
+/// collateral a big move takes a trader straight past the band below zero, where Phoenix refuses to
+/// liquidate it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
     let remote = Some((client(), CommitmentConfig::confirmed()));
@@ -1630,12 +1665,17 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
     };
     let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
 
-    // Two landed liquidations for each move size, or at least one when the index runs out.
-    let percents = [2_u64, 10];
-    let mut landed = [0_usize; 2];
+    // Two landed liquidations for each move size, or at least one when the index runs out, and for
+    // the big moves a trader the move alone leaves below zero.
+    let percents = [2_u64, 10, 20, 35];
+    let big = |percent: u64| percent >= 20;
+    let mut landed = [0_usize; 4];
+    let mut sunk = [false; 4];
     for (trader, _) in hot.into_iter().take(40) {
         for (size, percent) in percents.into_iter().enumerate() {
-            if landed[size] >= 2 {
+            let wants_landing = landed[size] < 2;
+            let wants_sunk = big(percent) && !sunk[size];
+            if !wants_landing && !wants_sunk {
                 continue;
             }
             let locker = fresh();
@@ -1643,8 +1683,7 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
                 let mut svm = locker.0.write().await;
                 trader_positions_in(&mut svm, &remote, trader, &[]).await
             };
-            // Traders and books outside the graph load later than its trader index and can
-            // disagree with it.
+            // Traders outside the graph load later than its trader index and can disagree with it.
             let held = match held {
                 Ok(held) => held,
                 Err(e) => {
@@ -1681,14 +1720,75 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
                 .collect();
             let predicted = {
                 let mut svm = locker.0.write().await;
-                trader_positions_in(&mut svm, &remote, trader, &moves)
-                    .await
-                    .unwrap()
+                trader_positions_in(&mut svm, &remote, trader, &moves).await
+            };
+            // A deep move can need more uncross cranks than Play allows, and Play refuses it too.
+            let predicted = match predicted {
+                Ok(predicted) => predicted,
+                Err(e) if big(percent) => {
+                    eprintln!("{trader} {percent}% against: skipped, {e}");
+                    continue;
+                }
+                Err(e) => panic!("{trader} {percent}% against: {e}"),
             };
             let now = predicted.margin;
             let after = predicted.margin_after_moves.unwrap();
+            let band = after.maintenance_margin_quote_lots - after.backstop_margin_quote_lots;
             let target = ((after.backstop_margin_quote_lots + after.maintenance_margin_quote_lots)
                 / 2) as i64;
+            let mut next = graph.clock.clone();
+            next.slot += 1;
+            let market_moves: Vec<_> = moves
+                .iter()
+                .flat_map(|(symbol, ticks)| {
+                    let ticks = ticks.to_string();
+                    let values = [
+                        ("symbol", symbol.as_str()),
+                        ("target_ticks", ticks.as_str()),
+                    ];
+                    [
+                        phoenix_override("phoenix-market-move", graph.perp_asset_map, &values),
+                        phoenix_override(
+                            "phoenix-market-uncross",
+                            graph.perp_asset_map,
+                            &[("symbol", symbol.as_str())],
+                        ),
+                    ]
+                })
+                .collect();
+            let biggest = held
+                .positions
+                .iter()
+                .max_by_key(|position| position.base_lots.unsigned_abs())
+                .unwrap();
+            if wants_sunk && after.effective_collateral_quote_lots < -(band as i64) {
+                let bare = fresh();
+                play(&bare, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+                bare.with_svm_writer(|svm| svm.inner.set_sysvar(&next));
+                play(&bare, next.slot, market_moves.clone()).await;
+                let left = margin_of(&bare, trader).effective_collateral_quote_lots;
+                assert!(
+                    left < 0,
+                    "{trader} {percent}% against, without the collateral: {left} is below zero"
+                );
+                let context =
+                    MarketContext::load(&mut *bare.0.write().await, &remote, &biggest.symbol)
+                        .await
+                        .unwrap();
+                let refused =
+                    send_liquidation(&bare, &context, trader, biggest.base_lots > 0).await;
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|e| e.to_lowercase().contains("underwater")),
+                    "{trader} {percent}% against, without the collateral: refused as underwater: \
+                     {refused:?}"
+                );
+                sunk[size] = true;
+            }
+            if !wants_landing {
+                continue;
+            }
             // The collateral lands a slot before the move, which changes it by what the tool
             // predicts.
             let wanted = now.effective_collateral_quote_lots
@@ -1715,32 +1815,29 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
                 0,
                 "{trader} {percent}% against: healthy until the move"
             );
-            let mut clock = graph.clock.clone();
-            clock.slot += 1;
-            locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
-            let market_moves = moves
-                .iter()
-                .flat_map(|(symbol, ticks)| {
-                    let ticks = ticks.to_string();
-                    let values = [
-                        ("symbol", symbol.as_str()),
-                        ("target_ticks", ticks.as_str()),
-                    ];
-                    [
-                        phoenix_override("phoenix-market-move", graph.perp_asset_map, &values),
-                        phoenix_override(
-                            "phoenix-market-uncross",
-                            graph.perp_asset_map,
-                            &[("symbol", symbol.as_str())],
-                        ),
-                    ]
-                })
-                .collect();
-            play(&locker, clock.slot, market_moves).await;
+            locker.with_svm_writer(|svm| svm.inner.set_sysvar(&next));
+            play(&locker, next.slot, market_moves).await;
+            // Phoenix can stop a mark short of a big target; such a move does not count for its size.
+            let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
+            let moved = phoenix_markets(graph.perp_asset_map, &map.unwrap()).unwrap();
+            let short = moves.iter().find(|(symbol, ticks)| {
+                let mark = |markets: &[Market]| {
+                    markets
+                        .iter()
+                        .find(|market| &market.symbol == symbol)
+                        .unwrap()
+                        .mark_ticks
+                };
+                // More than a tenth of the way left.
+                mark(&moved).abs_diff(*ticks) > mark(&markets).abs_diff(*ticks) / 10
+            });
+            if let Some((symbol, ticks)) = short {
+                eprintln!("{trader} {percent}% against: {symbol} stopped short of {ticks} ticks");
+                continue;
+            }
 
             let played = margin_of(&locker, trader);
             let effective = played.effective_collateral_quote_lots;
-            let band = after.maintenance_margin_quote_lots - after.backstop_margin_quote_lots;
             assert_eq!(
                 played.is_liquidatable, 1,
                 "{trader} {percent}% against: liquidatable after the move"
@@ -1754,11 +1851,6 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
                 effective.abs_diff(target) <= band / 20,
                 "{trader} {percent}% against: {effective} is within 5% of the band from {target}"
             );
-            let biggest = held
-                .positions
-                .iter()
-                .max_by_key(|position| position.base_lots.unsigned_abs())
-                .unwrap();
             let context =
                 MarketContext::load(&mut *locker.0.write().await, &remote, &biggest.symbol)
                     .await
@@ -1776,13 +1868,195 @@ async fn the_margin_after_moves_is_the_margin_once_the_moves_play() {
             );
             landed[size] += 1;
         }
-        if landed.iter().all(|count| *count >= 2) {
+        let all_sunk = percents
+            .iter()
+            .zip(sunk)
+            .all(|(percent, sunk)| sunk || !big(*percent));
+        if landed.iter().all(|count| *count >= 2) && all_sunk {
             break;
         }
     }
     assert!(
         landed.iter().all(|count| *count >= 1),
         "no eligible live candidate: liquidations landed per move size {percents:?}: {landed:?}"
+    );
+    assert!(
+        percents
+            .iter()
+            .zip(sunk)
+            .all(|(percent, sunk)| sunk || !big(*percent)),
+        "no live candidate the big moves alone leave below zero, per size {percents:?}: {sunk:?}"
+    );
+}
+
+/// An oracle-only move against a trader's position moves its margin while the order book stays where
+/// it was; with its collateral then set in the band the move leaves, a keeper's liquidation fills
+/// against that book.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oracle_only_move_leaves_a_trader_liquidatable_for_a_keeper() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader = graph.trader;
+    play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+    // A cancel freezes the mark for risk in its slot, so the move plays a slot later.
+    let mut clock = graph.clock.clone();
+    clock.slot += 1;
+    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+    let (symbol, lots) = held_positions(&locker, &remote, &trader)
+        .await
+        .into_iter()
+        .max_by_key(|(_, lots)| lots.unsigned_abs())
+        .unwrap();
+    let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
+    let market = phoenix_markets(graph.perp_asset_map, &map.unwrap())
+        .unwrap()
+        .into_iter()
+        .find(|market| market.symbol == symbol)
+        .unwrap();
+    let quotes = || {
+        let view = hawkeye_bbo_for_market(&graph, &locker, market.orderbook, market.splines);
+        (view.best_bid_ticks, view.best_ask_ticks)
+    };
+    let book = quotes();
+    let before = hawkeye_margin(&locker, &graph);
+    let change = if lots > 0 { "-5" } else { "5" };
+    let oracle_move = phoenix_override(
+        "phoenix-oracle-price",
+        graph.perp_asset_map,
+        &[("symbol", symbol.as_str()), ("change_percent", change)],
+    );
+    play(&locker, clock.slot, vec![oracle_move]).await;
+    assert_eq!(
+        quotes(),
+        book,
+        "{trader}: the oracle move leaves the {symbol} book's best bid and ask"
+    );
+    let moved = hawkeye_margin(&locker, &graph);
+    assert!(
+        moved.effective_collateral_quote_lots < before.effective_collateral_quote_lots,
+        "{trader}: the oracle move against its {symbol} position lowers its effective collateral: \
+         {} -> {}",
+        before.effective_collateral_quote_lots,
+        moved.effective_collateral_quote_lots
+    );
+
+    let target =
+        ((moved.backstop_margin_quote_lots + moved.maintenance_margin_quote_lots) / 2) as i64;
+    play(&locker, clock.slot, vec![set_collateral(trader, target)]).await;
+    let prepared = hawkeye_margin(&locker, &graph);
+    assert_eq!(
+        (
+            prepared.effective_collateral_quote_lots,
+            prepared.is_liquidatable
+        ),
+        (target, 1),
+        "{trader}: liquidatable in the band the oracle move leaves"
+    );
+    let context = MarketContext::load(&mut *locker.0.write().await, &remote, &symbol)
+        .await
+        .unwrap();
+    send_liquidation(&locker, &context, trader, lots > 0)
+        .await
+        .unwrap_or_else(|e| panic!("{trader}: the keeper's liquidation failed: {e}"));
+    let left = position_lots(&locker, &remote, &trader, &symbol).await;
+    assert!(
+        left.abs() < lots.abs(),
+        "{trader}: {symbol} {lots} -> {left}"
+    );
+}
+
+/// A higher maintenance factor on a trader's biggest market makes a trader just above its old
+/// maintenance margin liquidatable without any price change, and a keeper liquidates it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_higher_maintenance_factor_leaves_a_trader_liquidatable_for_a_keeper() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader = graph.trader;
+    play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+    let biggest = {
+        let mut svm = locker.0.write().await;
+        let exchange = Exchange::load(&mut svm, &remote).await.unwrap();
+        holdings(&svm, &exchange, &trader)
+            .unwrap()
+            .into_iter()
+            .filter(|held| held.base_lots != 0)
+            .max_by_key(|held| held.maintenance_margin_quote_lots)
+            .unwrap()
+    };
+    let symbol = biggest.market.symbol.as_str();
+    let factor = u64::from(biggest.market.risk_factors[0]);
+    let raised = (factor * 3 / 2).min(10_000);
+    assert!(
+        raised > factor,
+        "{trader}: {symbol}'s maintenance factor {factor} is already the highest"
+    );
+    // Half the margin the raise adds to that market above the total, so the raise outgrows it.
+    let added = biggest.maintenance_margin_quote_lots * (raised - factor) / factor;
+    let view = hawkeye_margin(&locker, &graph);
+    let target = (view.maintenance_margin_quote_lots + added / 2) as i64;
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![set_collateral(trader, target)],
+    )
+    .await;
+    assert_eq!(
+        hawkeye_margin(&locker, &graph).is_liquidatable,
+        0,
+        "{trader}: healthy under the old factor"
+    );
+
+    // Phoenix keeps the maintenance factor at or below the cancel order factor, which is raised
+    // only when it is lower.
+    let map = locker.with_svm_reader(|svm| local_account(svm, &graph.perp_asset_map));
+    let cancel_factor = PerpAssetMap::try_from_account_bytes(&map.unwrap().data)
+        .unwrap()
+        .find_by_symbol(symbol)
+        .unwrap()
+        .unwrap()
+        .metadata
+        .risk_params()
+        .cancel_order_risk_factor;
+    let cancel_is_lower = u64::from(cancel_factor) < raised;
+    let raised = raised.to_string();
+    let mut changes = Vec::new();
+    if cancel_is_lower {
+        changes.push(phoenix_override(
+            "phoenix-market-cancel-risk-factor",
+            graph.perp_asset_map,
+            &[
+                ("symbol", symbol),
+                ("cancelOrderRiskFactor", raised.as_str()),
+            ],
+        ));
+    }
+    changes.push(phoenix_override(
+        "phoenix-market-risk-factors",
+        graph.perp_asset_map,
+        &[
+            ("symbol", symbol),
+            ("maintenanceRiskFactor", raised.as_str()),
+        ],
+    ));
+    play(&locker, graph.clock.slot, changes).await;
+    let raised_margin = hawkeye_margin(&locker, &graph);
+    assert!(
+        raised_margin.is_liquidatable == 1
+            && raised_margin.effective_collateral_quote_lots
+                > raised_margin.backstop_margin_quote_lots as i64,
+        "{trader}: liquidatable for one keeper liquidation under the raised factor: {raised_margin:?}"
+    );
+    let context = MarketContext::load(&mut *locker.0.write().await, &remote, symbol)
+        .await
+        .unwrap();
+    send_liquidation(&locker, &context, trader, biggest.base_lots > 0)
+        .await
+        .unwrap_or_else(|e| panic!("{trader}: the keeper's liquidation failed: {e}"));
+    let left = position_lots(&locker, &remote, &trader, symbol).await;
+    assert!(
+        left.abs() < biggest.base_lots.abs(),
+        "{trader}: {symbol} {} -> {left}",
+        biggest.base_lots
     );
 }
 
@@ -1808,6 +2082,7 @@ async fn a_keeper_force_cancels_a_liquidatable_hot_traders_orders_and_liquidates
         MarginView::from_return_data(&hawkeye_view(locker, &graph, VIEW_MARGIN, &[trader])).unwrap()
     };
     let hot = index_trader_state_ranges(graph.account(&graph.global_trader_index)).unwrap();
+    let mut other_failure = None;
     for (trader, _) in hot.into_iter().take(60) {
         let locker = fresh();
         let held = {
@@ -1849,10 +2124,12 @@ async fn a_keeper_force_cancels_a_liquidatable_hot_traders_orders_and_liquidates
         match send_liquidation(&locker, &context, trader, biggest.base_lots > 0).await {
             // Its orders add no risk, so nothing stops the keeper: not the case under test.
             Ok(()) => continue,
-            Err(e) => assert!(
-                e.contains("risk-increasing"),
-                "{trader}: refused for its orders: {e}"
-            ),
+            // Any other failure is not the refusal this test is about, so the next trader is tried.
+            Err(e) if !e.contains("risk-increasing") => {
+                other_failure = Some(format!("{trader}: {e}"));
+                continue;
+            }
+            Err(_) => {}
         }
 
         let keeper = Keypair::new();
@@ -1897,7 +2174,11 @@ async fn a_keeper_force_cancels_a_liquidatable_hot_traders_orders_and_liquidates
         return;
     }
     panic!(
-        "no eligible mainnet candidate: no hot trader among the first 60 has risk-increasing orders"
+        "no eligible mainnet candidate: no hot trader among the first 60 has risk-increasing \
+         orders{}",
+        other_failure
+            .map(|failure| format!("; the last liquidation that failed otherwise was {failure}"))
+            .unwrap_or_default()
     );
 }
 
