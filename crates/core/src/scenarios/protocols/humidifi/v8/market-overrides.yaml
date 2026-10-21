@@ -137,7 +137,7 @@ templates:
         offset: 800
         encoding:
           u64_xor:
-            mask: 5782998650930657500
+            mask: 5782998650930657501
         label: Spread
         description: Thousandths of a basis point added to both sides; 25000 is 25 bps.
       - path: tier_1_spread

@@ -53,7 +53,7 @@ where `price` is quote tokens per base token. SOL/USDC has 9/6 decimals, so 208 
 | 176    | `u64_xor` `0x40f849d0005707ba`       | first tier spread   | bps × 2^48                       | `humidifi-spread`        |
 | 256    | `u64_xor` `0x40f249da005d07b4`       | second tier spread  | bps × 2^48                       | `humidifi-spread`        |
 | 336    | `u64_xor` `0x40e449cc004b07ae`       | third tier spread   | bps × 2^48                       | `humidifi-spread`        |
-| 800    | `u64_xor` `0x504156a22548f8dc`       | spread              | thousandths of a bp              | `humidifi-spread`        |
+| 800    | `u64_xor` `0x504156a22548f8dd`       | spread              | thousandths of a bp              | `humidifi-spread`        |
 | 1720   | `u64`, plaintext                     | schema version      | version                          | read-only                |
 | 64     | `u64` (SPL token account)            | vault amount        | mint's smallest unit             | `humidifi-vault-balance` |
 

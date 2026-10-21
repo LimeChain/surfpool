@@ -31,7 +31,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: Pubkey = Pubkey::from_str_const("9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp");
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("G9S64i58RRWJA28vZiNhnP56Ux4Ef7hfMgHNREnZZSom");
-const DEPLOYED_SLOT: u64 = 454767105;
+const DEPLOYED_SLOT: u64 = 458946555;
 
 const MARKET_SIZE: usize = 1728;
 const LAYOUT_TAG: [u8; 8] = [44, 90, 19, 124, 56, 111, 47, 150];
@@ -51,7 +51,7 @@ const FAIR_VALUE: std::ops::Range<usize> = 576..584;
 const MAX_STALENESS: std::ops::Range<usize> = 608..616;
 const LAST_UPDATE: std::ops::Range<usize> = 616..624;
 const AMOUNT: std::ops::Range<usize> = 64..72;
-const MAKER_SPREAD_MASK: u64 = 0x5041_56a2_2548_f8dc;
+const MAKER_SPREAD_MASK: u64 = 0x5041_56a2_2548_f8dd;
 const TIER_SPREADS: [(usize, u64); 3] = [
     (176, 0x40f8_49d0_0057_07ba),
     (256, 0x40f2_49da_005d_07b4),
@@ -405,22 +405,62 @@ const AUX17: Pubkey = Pubkey::from_str_const("1kUMdzAeH1uEdNch7ZJrtfvSo351p3b2DJ
 const INPUT_QUOTE_AMOUNT: u64 = 2_427_890;
 // Obfuscated by HumidiFi; it encodes the fixed quote input above.
 const SWAP_DATA_HEX: &str = "6f86a350a21ac2b9c9f40bffe3baeac339ff2dffe0bae9c309";
-// Kept verbatim so the Instructions sysvar shows a faithful router instruction.
-const DFLOW_DATA_HEX: &str = "f8c69e91e17587c80600000025af1df3ba698aa144c79fb835e10649c7698eed21f706d1d24eb9a14f7dd0ce4c3fcd6752db35e4c5ec7f9c670b824cf28236bd4ab7af472aa63da2a26212570664597a1a000024bc9a000000323c31020000006a9991000000000006835faa1a00000000091f020000000381878ec3c80af75c0355798caf40a0297af20b25000000000001118e5964010000000000feb4a000000000003c020000";
+
+// Captured from mainnet transaction 4SHLBz1tXdCqCkgg… (slot 459573239), a Jupiter route selling
+// SOL for USDC through HumidiFi's SOL / USDC market. Obfuscated by HumidiFi; it encodes the fixed
+// base input below, so the sale replays on SOL / USDC only.
+const SELL_SWAP_DATA_HEX: &str = "13926b06e3baebc33aff2effe3baeac338ff2dffe0bae9c3876236eff7aee95fc2fcc20c19a3bb3f93711dc2a70e4d9300636b99bf2cc11b78e8bcc46918f44f331e111cd77c1725676f51b26f047b79504ef071faa2b9a9eaf8076446a3b2f907b0e849f2e3bcaf37ff22ffefbae6c335ff21ffecbae5c3c57844e4edbae4c36a775be4f2bafbc319";
+const INPUT_BASE_AMOUNT: u64 = 8_476_978_473;
+const JUPITER: Pubkey = Pubkey::from_str_const("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+// HumidiFi checks the sale's next four accounts by address: a fresh address for any of them fails
+// the sale. The seller's accounts are not bound to the captured data, so the sale reuses SIGNER0,
+// USER_BASE and USER_QUOTE.
+/// The shared account holding the fallback spread a Jupiter route pays (README, Troubleshooting).
+const FALLBACK_SPREAD_STATE: Pubkey =
+    Pubkey::from_str_const("Fnf3RYYN4uHEzUnCNAbeN4LrezyAbSJZ6Digr2ActVXC");
+const SELL_AUX13: Pubkey = Pubkey::from_str_const("CuKh9HUCtz1zbgfrNG4swvj43EoCnrtnQyMNPiGA1NsN");
+const SELL_AUX18: Pubkey = Pubkey::from_str_const("9VF2mzXrdhxa5XtvEC4oYa1UCK4LXadhWjcD2anWQHQF");
+/// Named by the sale, but its contents do not affect it: an empty account fills the same.
+const SELL_AUX19: Pubkey = Pubkey::from_str_const("AG66SJrudMqiRFVrQafq767cjgFjAz1PifDHQ8xTCeK4");
 
 /// How many featured markets the behavioural tests replay.
 const FIXTURES: usize = 3;
 /// A fixture's base vault holds at least this many times the replayed swap's output.
 const VAULT_COVER: u64 = 10;
 
-thread_local! {
-    // The shim is a plain builtin with no arguments, so the replay tells it which market to route to.
-    static ROUTE: std::cell::Cell<MarketDef> = const { std::cell::Cell::new(FEATURED_MARKETS[0]) };
+/// The direction of a replayed swap, each through the router it was captured on.
+#[derive(Clone, Copy)]
+enum Side {
+    Buy,
+    Sell,
 }
 
-// DFlow signs for SIGNER0 and SYS0 as PDAs; sigverify is off, so the replay marks them signers.
-fn humidifi_metas(def: MarketDef) -> Vec<AccountMeta> {
-    [
+impl Side {
+    fn router(self) -> Pubkey {
+        match self {
+            Side::Buy => DFLOW,
+            Side::Sell => JUPITER,
+        }
+    }
+
+    fn swap_data(self) -> Vec<u8> {
+        hex::decode(match self {
+            Side::Buy => SWAP_DATA_HEX,
+            Side::Sell => SELL_SWAP_DATA_HEX,
+        })
+        .unwrap()
+    }
+}
+
+thread_local! {
+    // The shim is a plain builtin with no arguments, so the replay hands it the call to forward.
+    static FORWARD: std::cell::RefCell<Option<Instruction>> = const { std::cell::RefCell::new(None) };
+}
+
+// The routers sign for SIGNER0, and DFlow for SYS0, as PDAs; sigverify is off, so the replay marks
+// them signers.
+fn humidifi_metas(def: MarketDef, side: Side) -> Vec<AccountMeta> {
+    let mut accounts = vec![
         (SIGNER0, true, true),
         (def.market, true, false),
         (def.base_vault, true, false),
@@ -430,37 +470,51 @@ fn humidifi_metas(def: MarketDef) -> Vec<AccountMeta> {
         (CLOCK, false, false),
         (TOKEN, false, false),
         (TOKEN, false, false),
-        (SYS0, false, true),
-        (def.base_mint, false, false),
-        (def.quote_mint, false, false),
-        (AUX12, false, false),
-        (VOTE, false, false),
-        (ROUTE_STATE, false, false),
-        (AUX15, false, false),
-        (AUX16, false, false),
-        (AUX17, false, false),
-    ]
-    .into_iter()
-    .map(|(key, writable, signer)| {
-        if writable {
-            AccountMeta::new(key, signer)
-        } else {
-            AccountMeta::new_readonly(key, signer)
-        }
-    })
-    .collect()
+    ];
+    accounts.extend(match side {
+        Side::Buy => vec![
+            (SYS0, false, true),
+            (def.base_mint, false, false),
+            (def.quote_mint, false, false),
+            (AUX12, false, false),
+            (VOTE, false, false),
+            (ROUTE_STATE, false, false),
+            (AUX15, false, false),
+            (AUX16, false, false),
+            (AUX17, false, false),
+        ],
+        Side::Sell => vec![
+            (solana_sdk_ids::sysvar::instructions::ID, false, false),
+            (def.base_mint, false, false),
+            (def.quote_mint, false, false),
+            (FALLBACK_SPREAD_STATE, false, false),
+            (SELL_AUX13, false, false),
+            (Pubkey::default(), false, false),
+            (VOTE, false, false),
+            (AUX15, false, false),
+            (AUX16, false, false),
+            (SELL_AUX18, false, false),
+            (SELL_AUX19, true, false),
+        ],
+    });
+    accounts
+        .into_iter()
+        .map(|(key, writable, signer)| {
+            if writable {
+                AccountMeta::new(key, signer)
+            } else {
+                AccountMeta::new_readonly(key, signer)
+            }
+        })
+        .collect()
 }
 
-// Registered under DFlow's id so HumidiFi's Instructions-sysvar caller check sees its router.
+// Registered under the router's id so HumidiFi's Instructions-sysvar caller check sees its router.
 declare_process_instruction!(HumidiFiRouteShim, 1, |invoke_context| {
-    invoke_context.native_invoke_signed(
-        Instruction {
-            program_id: PROGRAM,
-            accounts: humidifi_metas(ROUTE.with(std::cell::Cell::get)),
-            data: hex::decode(SWAP_DATA_HEX).unwrap(),
-        },
-        &[],
-    )?;
+    let call = FORWARD
+        .with(|forward| forward.borrow().clone())
+        .expect("the replay sets the call to forward");
+    invoke_context.native_invoke_signed(call, &[])?;
     Ok(())
 });
 
@@ -503,7 +557,14 @@ async fn fixtures() -> Arc<Vec<HumidifiFixture>> {
                 if out.len() == FIXTURES {
                     break;
                 }
-                let shared_keys = [def.base_mint, def.quote_mint, VOTE, ROUTE_STATE];
+                let shared_keys = [
+                    def.base_mint,
+                    def.quote_mint,
+                    VOTE,
+                    ROUTE_STATE,
+                    FALLBACK_SPREAD_STATE,
+                    SELL_AUX18,
+                ];
                 let a = fetch(
                     &[
                         &[def.market, def.base_vault, def.quote_vault][..],
@@ -588,21 +649,24 @@ fn system_account(lamports: u64) -> Account {
     }
 }
 
-/// Swaps the captured quote input for base against the supplied market and vault bytes, returning
-/// the base atoms the user received.
+/// Swaps the captured input on `side` against the supplied market and vault bytes, returning what
+/// the user received: base atoms for a buy, quote atoms for a sale.
 fn replay(
     fixture: &HumidifiFixture,
+    side: Side,
     clock_slot: u64,
     market: Vec<u8>,
     base_vault: Vec<u8>,
     quote_vault: Vec<u8>,
 ) -> Result<u64, TransactionError> {
+    const BASE_HELD: u64 = 100_000_000_000;
+    const QUOTE_HELD: u64 = 1_000_000_000;
     let mut svm = LiteSVM::new()
         .with_sigverify(false)
         .with_blockhash_check(false);
     svm.add_program(PROGRAM, &fixture.elf)
         .expect("load HumidiFi ELF");
-    svm.add_builtin(DFLOW, HumidiFiRouteShim::register);
+    svm.add_builtin(side.router(), HumidiFiRouteShim::register);
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = clock_slot;
     clock.unix_timestamp = 1_788_000_000;
@@ -632,19 +696,25 @@ fn replay(
         svm.set_account(aux, system_account(1_000_000)).unwrap();
     }
     svm.set_account(
-        USER_QUOTE,
-        token_account(fixture.def.quote_mint, SIGNER0, 1_000_000_000),
+        USER_BASE,
+        token_account(fixture.def.base_mint, SIGNER0, BASE_HELD),
     )
     .unwrap();
-    svm.set_account(USER_BASE, token_account(fixture.def.base_mint, SIGNER0, 0))
-        .unwrap();
+    svm.set_account(
+        USER_QUOTE,
+        token_account(fixture.def.quote_mint, SIGNER0, QUOTE_HELD),
+    )
+    .unwrap();
 
+    let metas = humidifi_metas(fixture.def, side);
     let mut accounts = vec![AccountMeta::new_readonly(PROGRAM, false)];
-    accounts.extend(humidifi_metas(fixture.def));
+    accounts.extend(metas.clone());
+    // HumidiFi only checks which router called it: the router's own instruction data does not
+    // change the fill on either side, so the route carries none.
     let route = Instruction {
-        program_id: DFLOW,
+        program_id: side.router(),
         accounts,
-        data: hex::decode(DFLOW_DATA_HEX).unwrap(),
+        data: vec![],
     };
     let compute_limit = Instruction {
         program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
@@ -660,16 +730,29 @@ fn replay(
         signatures: vec![Signature::default(); message.header.num_required_signatures as usize],
         message,
     };
-    ROUTE.with(|route| route.set(fixture.def));
+    FORWARD.with(|forward| {
+        *forward.borrow_mut() = Some(Instruction {
+            program_id: PROGRAM,
+            accounts: metas,
+            data: side.swap_data(),
+        })
+    });
     svm.send_transaction(tx).map_err(|failed| failed.err)?;
+
+    let base = amount(&svm.get_account(&USER_BASE).unwrap().data);
+    let quote = amount(&svm.get_account(&USER_QUOTE).unwrap().data);
+    let (input, captured_input, output) = match side {
+        Side::Buy => (QUOTE_HELD - quote, INPUT_QUOTE_AMOUNT, base - BASE_HELD),
+        Side::Sell => (BASE_HELD - base, INPUT_BASE_AMOUNT, quote - QUOTE_HELD),
+    };
     assert_eq!(
-        1_000_000_000 - amount(&svm.get_account(&USER_QUOTE).unwrap().data),
-        INPUT_QUOTE_AMOUNT,
-        "the captured instruction's quote input changed"
+        input, captured_input,
+        "the captured instruction's input changed"
     );
-    Ok(amount(&svm.get_account(&USER_BASE).unwrap().data))
+    Ok(output)
 }
 
+/// A buy of the captured quote input against the fixture's own vaults.
 fn run(
     fixture: &HumidifiFixture,
     clock_slot: u64,
@@ -677,6 +760,7 @@ fn run(
 ) -> Result<u64, TransactionError> {
     replay(
         fixture,
+        Side::Buy,
         clock_slot,
         market,
         fixture.base_vault.data.clone(),
@@ -1065,6 +1149,7 @@ async fn humidifi_vault_scenario_drains_only_the_selected_side() {
         let base_swap = |base_vault: Vec<u8>| {
             replay(
                 fixture,
+                Side::Buy,
                 fixture.slot,
                 fixture.market.data.clone(),
                 base_vault,
@@ -1116,6 +1201,7 @@ async fn humidifi_vault_scenario_drains_only_the_selected_side() {
         assert_eq!(
             replay(
                 fixture,
+                Side::Buy,
                 fixture.slot,
                 fixture.market.data.clone(),
                 fixture.base_vault.data.clone(),
@@ -1125,4 +1211,82 @@ async fn humidifi_vault_scenario_drains_only_the_selected_side() {
             "{context}"
         );
     }
+}
+
+/// Base atoms of `base_sold` are worth this many quote atoms at `fair_value`, before any spread.
+fn quote_value(base_sold: u64, fair_value: u64) -> f64 {
+    ((u128::from(base_sold) * u128::from(fair_value)) >> 48) as f64
+}
+
+/// The buy route only proves the templates for buyers. Through the Jupiter route mainnet uses today,
+/// a doubled fair value must double the quote a sale receives, and a sale must receive
+/// `fair / (1 + S)`, where S adds the spread template to the fallback spread a Jupiter route pays in
+/// the local VM (README, Troubleshooting).
+#[tokio::test]
+async fn humidifi_price_and_spread_move_a_sale_on_sol_usdc() {
+    let fixture = &fixtures().await[0];
+    assert_eq!(
+        fixture.def.pair, "SOL / USDC",
+        "the sale was captured on SOL / USDC"
+    );
+    let upstream = word(&fixture.market.data, 576) ^ FAIR_VALUE_MASK;
+    let sale = |market: Vec<u8>| {
+        replay(
+            fixture,
+            Side::Sell,
+            fixture.slot,
+            market,
+            fixture.base_vault.data.clone(),
+            fixture.quote_vault.data.clone(),
+        )
+        .unwrap_or_else(|e| panic!("the sale must fill: {e:?}"))
+    };
+
+    let received = sale(priced_market(fixture, upstream));
+    let doubled = sale(priced_market(fixture, upstream * 2));
+    let ratio = doubled as f64 / received as f64;
+    assert!(
+        (ratio - 2.0).abs() < 1e-4,
+        "a doubled fair value must double the quote a sale receives, got {ratio}"
+    );
+
+    let priced = priced_market(fixture, upstream);
+    let spread = |bps: u64| sale(apply_raw("humidifi-spread", &priced, &fixed_spread(bps), 0));
+    let (control, widened) = (spread(0), spread(100));
+    let value = quote_value(INPUT_BASE_AMOUNT, upstream);
+    let fallback = value / control as f64 - 1.0;
+    assert!(
+        (0.0095..0.011).contains(&fallback),
+        "the Jupiter route should pay about the documented 100 bps fallback, got {:.1} bps",
+        fallback * 1e4
+    );
+    let expected = value / (1.0 + fallback + 0.01);
+    assert!(
+        (widened as f64 / expected - 1.0).abs() < 1e-4,
+        "a 100 bps spread must price a sale at fair / (1 + S): got {widened}, expected {expected:.0}"
+    );
+}
+
+/// The spread word is stored XORed with `MAKER_SPREAD_MASK`. A mask one bit off still writes
+/// working spreads, only 0.001 bps wrong, so fills cannot catch it; the live markets can. Most
+/// markets store a zero spread, which the right mask decodes to exactly 0 and a mask with the low
+/// bit flipped decodes to 1.
+#[tokio::test]
+async fn humidifi_spread_mask_decodes_zero_spreads_to_zero() {
+    let markets: Vec<Pubkey> = ALL_MARKETS
+        .iter()
+        .map(|(market, _, _)| Pubkey::from_str_const(market))
+        .collect();
+    let spreads: Vec<u64> = fetch(&markets)
+        .await
+        .iter()
+        .map(|account| word(&account.data, 800) ^ MAKER_SPREAD_MASK)
+        .collect();
+    let zero = spreads.iter().filter(|spread| **spread == 0).count();
+    let one = spreads.iter().filter(|spread| **spread == 1).count();
+    assert!(
+        zero >= 10 && zero > one,
+        "{zero} markets decode to a zero spread and {one} to 1 of 1000 bps; the spread mask looks \
+         one bit off"
+    );
 }
