@@ -1,7 +1,12 @@
 use std::{collections::HashSet, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
-use phoenix_rise_accounts::{PhoenixAccount, multi_arena::MultiArenaHeader, trader::TraderHeader};
+use log::warn;
+use phoenix_rise_accounts::{
+    PhoenixAccount,
+    multi_arena::MultiArenaHeader,
+    trader::{TraderHeader, TraderState},
+};
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
@@ -153,6 +158,7 @@ impl BboView {
 }
 
 /// One market a trader has a position or resting orders in, as Hawkeye reports it.
+#[derive(Clone)]
 pub struct Holding {
     pub market: Market,
     /// Positive for a long, negative for a short, 0 for resting orders alone.
@@ -184,9 +190,9 @@ pub fn holdings(
     Ok(held)
 }
 
-/// The trader cancelling its resting orders on every market in `held`: Phoenix refuses to
+/// The trader canceling its resting orders on every market in `held`: Phoenix refuses to
 /// liquidate a trader with risk-increasing orders on any market.
-async fn cancel_everywhere(
+async fn cancel_all(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     exchange: &Exchange,
@@ -287,15 +293,13 @@ pub struct TraderPositions {
     pub positions: Vec<TraderPosition>,
     /// Whether the local GlobalTraderIndex lists the trader.
     pub hot: bool,
-    /// Hawkeye's view as `phoenix-trader-collateral` leaves the trader, a hot trader's orders
-    /// cancelled.
+    /// Hawkeye's view as `phoenix-trader-cancel-orders` leaves the trader, a hot trader's orders
+    /// canceled.
     pub margin: MarginView,
-    /// The field `phoenix-trader-collateral` writes, which can differ from `margin`'s collateral.
-    pub quote_lot_collateral: i64,
-    /// The same view once the given markets move the way `phoenix-market-move` moves them; `None`
-    /// without moves.
+    /// The same view once the given markets move and uncross the way `phoenix-market-move` and
+    /// `phoenix-market-uncross` play them; `None` without moves.
     pub margin_after_moves: Option<MarginView>,
-    /// Why `phoenix-trader-collateral` would refuse the trader, if it would.
+    /// Why `phoenix-trader-cancel-orders` or `phoenix-trader-collateral` would refuse the trader.
     pub refusal: Option<String>,
 }
 
@@ -342,7 +346,7 @@ pub(crate) async fn trader_positions_in(
     keep_markets_usable(svm, remote_ctx, slot).await;
     let symbols: Vec<&str> = moves.iter().map(|(symbol, _)| symbol.as_str()).collect();
     let mut moved = MarketContext::load_all(svm, remote_ctx, &symbols).await?;
-    let (mut lever, still_listed) = LeverState::load(svm, remote_ctx, trader).await?;
+    let (mut lever, still_listed) = LeverState::load(svm, remote_ctx, trader, &[]).await?;
     let (margin_now, quote_lot_collateral) = lever.reading(trader)?;
     let refusal = still_listed
         .or_else(|| {
@@ -359,12 +363,13 @@ pub(crate) async fn trader_positions_in(
     let margin_after_moves = if moves.is_empty() {
         None
     } else {
-        // A cancel freezes the mark for risk in its slot, so the moves play a slot later, the way
-        // phoenix-market-move plays them after the lever.
+        // A cancel freezes the mark for risk in its slot, so the moves play a slot later, each
+        // followed by its uncross, the way the scenarios play them after the cancel.
         state.next_slot();
         for (context, (_, ticks)) in moved.iter_mut().zip(moves) {
+            context.move_in(&mut state, *ticks)?;
             context
-                .move_in(&mut state, *ticks)
+                .uncross_in(&mut state)
                 .map_err(explain_move_failure)?;
         }
         Some(margin(&mut state, &exchange, &trader)?)
@@ -382,14 +387,13 @@ pub(crate) async fn trader_positions_in(
             .collect(),
         hot,
         margin: margin_now,
-        quote_lot_collateral,
         margin_after_moves,
         refusal,
     })
 }
 
-/// The state the collateral lever writes into and its values are read from: a hot trader's orders
-/// cancelled, a cold trader left as it is, since a cancel changes its margin too.
+/// The state `phoenix-trader-cancel-orders` leaves, which the collateral is worked out from: a hot
+/// trader's orders canceled, a cold trader left as it is, since a cancel changes its margin too.
 pub(crate) struct LeverState<'a> {
     pub(crate) exchange: Exchange,
     pub(crate) hot: bool,
@@ -398,11 +402,14 @@ pub(crate) struct LeverState<'a> {
 }
 
 impl<'a> LeverState<'a> {
-    /// The state, with the refusal when Phoenix still lists the trader after the cancel.
+    /// The state, with the refusal when Phoenix still lists the trader after the cancel. With
+    /// `markets`, only their orders are canceled and a trader still listed is expected; without,
+    /// all markets' are.
     pub(crate) async fn load(
         svm: &'a mut SurfnetSvm,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         trader: Pubkey,
+        markets: &[&str],
     ) -> SurfpoolResult<(LeverState<'a>, Option<SurfpoolError>)> {
         let account = local_account(svm, &trader)?;
         let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
@@ -422,9 +429,22 @@ impl<'a> LeverState<'a> {
         let hot = indexed(&local_account(svm, &exchange.global_trader_index)?, &trader)?;
         refuse_unindexed_hot_trader(trader, &header, hot)?;
         let held = holdings(svm, &exchange, &trader)?;
+        let canceled = if markets.is_empty() {
+            held.clone()
+        } else {
+            let map = local_account(svm, &exchange.perp_asset_map)?;
+            let symbols = markets
+                .iter()
+                .map(|symbol| Ok(Market::find(&exchange.perp_asset_map, &map.data, symbol)?.symbol))
+                .collect::<SurfpoolResult<HashSet<_>>>()?;
+            held.iter()
+                .filter(|held| symbols.contains(&held.market.symbol))
+                .cloned()
+                .collect()
+        };
         let cancels = if hot {
             let authority = Pubkey::new_from_array(header.authority);
-            cancel_everywhere(svm, remote_ctx, &exchange, trader, authority, &held).await?
+            cancel_all(svm, remote_ctx, &exchange, trader, authority, &canceled).await?
         } else {
             Vec::new()
         };
@@ -432,16 +452,17 @@ impl<'a> LeverState<'a> {
         if !cancels.is_empty() {
             state.run(&cancels)?;
         }
-        let still_listed = hot && indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
+        let still_listed = markets.is_empty()
+            && hot
+            && indexed(&state.account(&exchange.global_trader_index)?, &trader)?;
         let refusal = still_listed.then(|| {
             let why = if cancels.is_empty() {
                 "has no orders whose cancel would take it out"
             } else {
-                "stays there after its orders are cancelled"
+                "stays there after its orders are canceled"
             };
             SurfpoolError::internal(format!(
-                "{trader} is in Phoenix's active trader index and {why}, so Phoenix would not read \
-                 collateral written to its account"
+                "{trader} is in Phoenix's active trader index and {why}"
             ))
         });
         Ok((
@@ -469,26 +490,92 @@ impl<'a> LeverState<'a> {
     }
 }
 
-/// The writes that set `trader`'s collateral to `quote_lots`, on the state [`LeverState`] leaves.
-/// A spline market maker is refused, and so is a trader Phoenix still lists after the cancel.
+/// The writes of `trader` canceling all its resting orders on `markets`, or on every market when
+/// there are none, which takes a hot trader out of Phoenix's index; a cold trader has none and
+/// nothing is written. A trader Phoenix still lists after a cancel on every market is refused.
+pub async fn cancel_order_writes(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    trader: Pubkey,
+    markets: &[&str],
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    // The template's own account is the PerpAssetMap, so the trader may not be local yet.
+    hydrate(svm, remote_ctx, &[trader]).await?;
+    let (lever, refusal) = LeverState::load(svm, remote_ctx, trader, markets).await?;
+    if let Some(refusal) = refusal {
+        return Err(refusal);
+    }
+    lever.state.writes()
+}
+
+/// The writes that bring `trader`'s effective collateral to `wanted` quote lots from Hawkeye's view
+/// when it plays. Effective collateral moves one for one with the collateral field, which is
+/// written where Phoenix reads it: a hot trader's record in the GlobalTraderIndex, which Phoenix
+/// copies back to the Trader account when the trader leaves the index, or a cold trader's account.
+/// A spline market maker is refused.
 pub async fn collateral_writes(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     trader: Pubkey,
     account: &Account,
-    quote_lots: i64,
+    wanted: i64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    // Refuses a spline market maker before anything runs.
-    with_collateral(trader, account, quote_lots)?;
-    let (lever, refusal) = LeverState::load(svm, remote_ctx, trader).await?;
-    if let Some(refusal) = refusal {
-        return Err(refusal);
+    let header = TraderHeader::try_read_from_account_bytes(&account.data).map_err(|e| {
+        SurfpoolError::invalid_account_data(trader, "Expected a Phoenix Trader", Some(e))
+    })?;
+    let exchange = Exchange::load(svm, remote_ctx).await?;
+    hydrate(
+        svm,
+        remote_ctx,
+        &[
+            HAWKEYE_PROGRAM_ID,
+            exchange.perp_asset_map,
+            exchange.active_trader_buffer,
+        ],
+    )
+    .await?;
+    let index = local_account(svm, &exchange.global_trader_index)?;
+    let listed = index_record(&index, &trader)?;
+    refuse_unindexed_hot_trader(trader, &header, listed.is_some())?;
+    // An index copied before the trader left it can still list a trader its account marks cold,
+    // and Phoenix reads that trader from the account.
+    let record = listed.filter(|_| header.trader_state.is_hot());
+    let view = margin(&mut Sandbox::new(svm), &exchange, &trader)?;
+    let field: i64 = bytemuck::cast(match &record {
+        Some(range) => {
+            bytemuck::pod_read_unaligned::<TraderState>(&index.data[range.clone()])
+                .quote_lot_collateral
+        }
+        None => header.trader_state.quote_lot_collateral,
+    });
+    let quote_lots = wanted
+        .checked_sub(view.effective_collateral_quote_lots)
+        .and_then(|gap| field.checked_add(gap))
+        .ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "an effective collateral of {wanted} quote lots does not fit {trader}'s collateral"
+            ))
+        })?;
+    if wanted < view.high_risk_margin_quote_lots as i64 {
+        warn!(
+            "{trader}: an effective collateral of {wanted} quote lots is below its high-risk margin \
+             of {}; a keeper's liquidation there can leave it underwater and fail, and below 0 \
+             Phoenix refuses it",
+            view.high_risk_margin_quote_lots
+        );
     }
-    let left = with_collateral(trader, &lever.state.account(&trader)?, quote_lots)?;
-    let mut writes = lever.state.writes()?;
-    writes.retain(|(address, _)| *address != trader);
-    writes.push((trader, left));
-    Ok(writes)
+    let left = with_collateral(trader, account, quote_lots)?;
+    let Some(range) = record else {
+        return Ok(vec![(trader, left)]);
+    };
+    let mut data = index.data.clone();
+    let mut state: TraderState = bytemuck::pod_read_unaligned(&data[range.clone()]);
+    state.quote_lot_collateral = bytemuck::cast(quote_lots);
+    data[range].copy_from_slice(bytemuck::bytes_of(&state));
+    Ok(vec![(
+        exchange.global_trader_index,
+        Account { data, ..index },
+    )])
 }
 
 /// The Trader `account` with its collateral field set to `quote_lots`, or the refusal of a spline
@@ -536,9 +623,15 @@ fn refuse_unindexed_hot_trader(
 
 /// Whether the GlobalTraderIndex `index` lists `trader`, so Phoenix keeps its state there.
 fn indexed(index: &Account, trader: &Pubkey) -> SurfpoolResult<bool> {
+    Ok(index_record(index, trader)?.is_some())
+}
+
+/// The byte range of `trader`'s TraderState in the GlobalTraderIndex `index`, while it lists the
+/// trader.
+fn index_record(index: &Account, trader: &Pubkey) -> SurfpoolResult<Option<Range<usize>>> {
     Ok(index_trader_state_ranges(index)?
-        .iter()
-        .any(|(listed, _)| listed == trader))
+        .into_iter()
+        .find_map(|(listed, range)| (listed == *trader).then_some(range)))
 }
 
 /// Every hot Trader the GlobalTraderIndex tree reaches, with its TraderState byte range. Freed
@@ -611,15 +704,9 @@ pub(crate) mod tests {
         index: &Account,
         trader_key: &[u8; 32],
     ) -> SurfpoolResult<Range<usize>> {
-        let trader_key = Pubkey::new_from_array(*trader_key);
-        index_trader_state_ranges(index)?
-            .into_iter()
-            .find_map(|(key, range)| (key == trader_key).then_some(range))
-            .ok_or_else(|| {
-                SurfpoolError::internal(
-                    "Hot Phoenix Trader has no reachable GlobalTraderIndex entry",
-                )
-            })
+        index_record(index, &Pubkey::new_from_array(*trader_key))?.ok_or_else(|| {
+            SurfpoolError::internal("Hot Phoenix Trader has no reachable GlobalTraderIndex entry")
+        })
     }
 
     #[test]
