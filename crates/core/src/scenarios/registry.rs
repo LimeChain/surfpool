@@ -696,8 +696,8 @@ mod tests {
         assert!(registry.contains("pump-amm-global-config"));
         assert!(registry.contains("solfi-price"));
         assert!(registry.contains("solfi-freshness"));
-        assert!(registry.contains("solfi-spread"));
         assert!(registry.contains("solfi-size-impact"));
+        assert!(registry.contains("solfi-swap-pressure"));
         assert!(registry.contains("solfi-vault-balance"));
 
         assert!(registry.contains("phoenix-trader-collateral-stress"));
@@ -1769,8 +1769,8 @@ templates: []
         for id in [
             "solfi-price",
             "solfi-freshness",
-            "solfi-spread",
             "solfi-size-impact",
+            "solfi-swap-pressure",
             "solfi-vault-balance",
         ] {
             let template = registry
@@ -1796,7 +1796,7 @@ templates: []
                 checked += 1;
             }
         }
-        assert_eq!(checked, 29, "every shipped SolFi property must be checked");
+        assert_eq!(checked, 26, "every shipped SolFi property must be checked");
     }
 
     #[test]
@@ -1805,8 +1805,8 @@ templates: []
         for template_id in [
             "solfi-price",
             "solfi-freshness",
-            "solfi-spread",
             "solfi-size-impact",
+            "solfi-swap-pressure",
             "solfi-vault-balance",
         ] {
             let template = registry.get(template_id).expect("SolFi template");

@@ -101,7 +101,9 @@ templates:
             lead: 200
             mask: 11053579286710561365
         label: Valid-until offset
-        description: Relative validity horizon; 200 keeps the oracle valid for 200 slots.
+        description: >-
+          Relative validity horizon; 200 keeps the oracle valid for 200 slots. The quote still widens
+          as it ages within them.
     llm_context: |
       FINDING THE ORACLE WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Discover the SolFi market with getProgramAccounts for program
@@ -126,6 +128,13 @@ templates:
 
       The boundary is inclusive: validity_horizon 0 is valid in the materialization slot, while -1
       is expired and both swap directions revert with SolFi error 23.
+
+      VALID IS NOT CONSTANT. SolFi widens the quote as the oracle ages within its validity window,
+      through the market's age multiplier curve. On WSOL/USDC the live curve costs about 3.6 bps 5
+      slots after publication, 10 bps after 10, 34 bps after 50 and 44 bps near the end of a 200-slot
+      horizon; USDT/USDC does not drift. For a price that stays the same across a multi-slot
+      scenario, refresh in every slot where a swap executes, or neutralize the curve with
+      solfi-size-impact age_multiplier_curve_y: 1000.
 
       HOW TO USE:
       1. Set publication_slot to 0

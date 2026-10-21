@@ -253,6 +253,28 @@ fn replay(
     base_vault: Vec<u8>,
     quote_vault: Vec<u8>,
 ) -> Result<u64, String> {
+    replay_with_market(
+        fork,
+        amount_in,
+        direction,
+        market,
+        oracle,
+        base_vault,
+        quote_vault,
+    )
+    .map(|(out, _)| out)
+}
+
+/// As [`replay`], also returning the market account as the swap left it.
+fn replay_with_market(
+    fork: &SolfiFork,
+    amount_in: u64,
+    direction: u8,
+    market: Vec<u8>,
+    oracle: Vec<u8>,
+    base_vault: Vec<u8>,
+    quote_vault: Vec<u8>,
+) -> Result<(u64, Vec<u8>), String> {
     use litesvm::LiteSVM;
     use solana_instruction::{AccountMeta, Instruction};
     use solana_keypair::Keypair;
@@ -361,7 +383,14 @@ fn replay(
     } else {
         user_base
     };
-    Ok(amount(&svm.get_account(&dst).expect("destination").data))
+    let market_after = svm
+        .get_account(&Pubkey::from_str_const(fork.def.market))
+        .expect("market")
+        .data;
+    Ok((
+        amount(&svm.get_account(&dst).expect("destination").data),
+        market_after,
+    ))
 }
 
 fn run(
@@ -385,7 +414,7 @@ fn run(
 #[tokio::test]
 async fn solfi_raw_layouts_cover_every_initialized_market() {
     let registry = TemplateRegistry::new();
-    let market_templates = ["solfi-spread", "solfi-size-impact"];
+    let market_templates = ["solfi-size-impact", "solfi-swap-pressure"];
     let oracle_templates = ["solfi-price", "solfi-freshness"];
 
     let initialized_addresses = INITIALIZED_LAYOUTS
@@ -438,12 +467,10 @@ async fn solfi_raw_layouts_cover_every_initialized_market() {
             );
         }
 
-        let changed_market = apply_raw(
-            "solfi-spread",
-            market,
-            &[("quote_to_base_curve_y", serde_json::json!(1234))],
-            0,
-        );
+        let buy_curve: Vec<(String, serde_json::Value)> = (0..8)
+            .map(|i| (format!("quote_to_base_y_{i}"), serde_json::json!(1234)))
+            .collect();
+        let changed_market = apply_raw("solfi-size-impact", market, &borrowed(&buy_curve), 0);
         assert!(
             diff_indices(market, &changed_market)
                 .iter()
@@ -526,7 +553,7 @@ async fn solfi_templates_write_only_proven_bytes_on_both_replay_fixtures() {
             "oracle must round-trip unchanged"
         );
         assert_eq!(
-            apply_raw("solfi-spread", &fork.market.data, &[], fork.slot),
+            apply_raw("solfi-swap-pressure", &fork.market.data, &[], fork.slot),
             fork.market.data,
             "market must round-trip unchanged"
         );
@@ -604,16 +631,26 @@ async fn solfi_templates_write_only_proven_bytes_on_both_replay_fixtures() {
         );
 
         let spread = apply_raw(
-            "solfi-spread",
+            "solfi-size-impact",
+            &fork.market.data,
+            &borrowed(&flat_spread_values(1234, 2345, 100000)),
+            fork.slot,
+        );
+        let pressure = apply_raw(
+            "solfi-swap-pressure",
             &fork.market.data,
             &[
-                ("quote_to_base_curve_y", serde_json::json!(1234)),
-                ("base_to_quote_curve_y", serde_json::json!(2345)),
-                ("age_multiplier_curve_y", serde_json::json!(1000)),
-                ("additional_widening_curve_y", serde_json::json!(0)),
-                ("max_widening", serde_json::json!(100000)),
+                ("consecutive_buys", serde_json::json!(3)),
+                ("consecutive_sells", serde_json::json!(4)),
             ],
             fork.slot,
+        );
+        assert!(
+            diff_indices(&fork.market.data, &pressure)
+                .iter()
+                .all(|i| (1280..1288).contains(i)),
+            "{} swap pressure escaped its counters",
+            fork.def.market
         );
         let allowed = [792..856, 928..992, 1064..1128, 1200..1264, 1328..1336];
         assert!(
@@ -727,7 +764,12 @@ async fn solfi_price_dislocation_scenario_moves_both_directions_reciprocally() {
             equivalent,
         )
         .expect("equivalent exponent/coefficient pair");
-        assert_eq!(same, baseline, "exponent/coefficient formula drifted");
+        // The program prices in integers, so an equal price written as (10c, e - 1) can round to one
+        // atom away from (c, e); on USDT/USDC about one live price in eighteen does.
+        assert!(
+            same.abs_diff(baseline) <= 1,
+            "exponent/coefficient formula drifted: {same} vs {baseline}"
+        );
     }
 }
 
@@ -751,23 +793,55 @@ fn directional_spread(
         final_units * 1000 / scale
     };
     apply_raw(
-        "solfi-spread",
+        "solfi-size-impact",
         &fork.market.data,
-        &[
-            (
-                "quote_to_base_curve_y",
-                serde_json::json!(curve(quote_to_base_units)),
-            ),
-            (
-                "base_to_quote_curve_y",
-                serde_json::json!(curve(base_to_quote_units)),
-            ),
-            ("age_multiplier_curve_y", serde_json::json!(1000)),
-            ("additional_widening_curve_y", serde_json::json!(0)),
-            ("max_widening", serde_json::json!(max_widening)),
-        ],
+        &borrowed(&flat_spread_values(
+            curve(quote_to_base_units),
+            curve(base_to_quote_units),
+            max_widening,
+        )),
         fork.slot,
     )
+}
+
+/// `solfi-size-impact` values for a flat curve in each direction - a constant spread - with the age
+/// and additional widening terms neutral.
+fn flat_spread_values(
+    quote_to_base_y: u64,
+    base_to_quote_y: u64,
+    max_widening: u64,
+) -> Vec<(String, serde_json::Value)> {
+    let mut values: Vec<(String, serde_json::Value)> = (0..8)
+        .flat_map(|i| {
+            [
+                (
+                    format!("quote_to_base_y_{i}"),
+                    serde_json::json!(quote_to_base_y),
+                ),
+                (
+                    format!("base_to_quote_y_{i}"),
+                    serde_json::json!(base_to_quote_y),
+                ),
+            ]
+        })
+        .collect();
+    values.push((
+        "age_multiplier_curve_y".to_string(),
+        serde_json::json!(1000),
+    ));
+    values.push((
+        "additional_widening_curve_y".to_string(),
+        serde_json::json!(0),
+    ));
+    values.push(("max_widening".to_string(), serde_json::json!(max_widening)));
+    values
+}
+
+fn borrowed(values: &[(String, serde_json::Value)]) -> Vec<(&str, serde_json::Value)> {
+    values
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect()
 }
 
 const QUOTE_TO_BASE_Y: [&str; 8] = [
@@ -1003,15 +1077,9 @@ async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
             ]),
         ),
         (
-            "solfi-spread",
+            "solfi-size-impact",
             fork.def.market,
-            values(&[
-                ("quote_to_base_curve_y", serde_json::json!(1_000u64)),
-                ("base_to_quote_curve_y", serde_json::json!(10_000u64)),
-                ("age_multiplier_curve_y", serde_json::json!(1_000u64)),
-                ("additional_widening_curve_y", serde_json::json!(0u64)),
-                ("max_widening", serde_json::json!(100_000u64)),
-            ]),
+            values(&borrowed(&flat_spread_values(1_000, 10_000, 100_000))),
         ),
         (
             "solfi-vault-balance",
@@ -1046,15 +1114,9 @@ async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
     assert_eq!(amount(&limited_quote_vault), PAYOUT_CAPACITY);
 
     let symmetric_control = apply_raw(
-        "solfi-spread",
+        "solfi-size-impact",
         &fork.market.data,
-        &[
-            ("quote_to_base_curve_y", serde_json::json!(1_000u64)),
-            ("base_to_quote_curve_y", serde_json::json!(1_000u64)),
-            ("age_multiplier_curve_y", serde_json::json!(1_000u64)),
-            ("additional_widening_curve_y", serde_json::json!(0u64)),
-            ("max_widening", serde_json::json!(100_000u64)),
-        ],
+        &borrowed(&flat_spread_values(1_000, 1_000, 100_000)),
         fork.slot,
     );
 
@@ -1379,5 +1441,61 @@ fn solfi_swap_wire_format_has_no_fee_or_tier_argument() {
     assert_eq!(
         &data,
         &[7, 123, 0, 0, 0, 0, 0, 0, 0, 200, 1, 0, 0, 0, 0, 0, 0, 1]
+    );
+}
+
+/// SolFi counts consecutive large swaps in each direction and widens that direction with the count;
+/// from the ninth it multiplies the trade-size widening by about ten. Nothing in a surfnet resets the
+/// count, which is what `solfi-swap-pressure` is for: a count set to 0 must price the next swap like
+/// the first.
+#[tokio::test]
+async fn solfi_swap_pressure_resets_consecutive_swaps() {
+    let fork = &forks().await[0];
+    assert_eq!(fork.def.market, MARKETS[0].market, "scenario is WSOL/USDC");
+    let oracle = apply_raw(
+        "solfi-freshness",
+        &fork.oracle.data,
+        &[
+            ("publication_slot", serde_json::json!(0)),
+            ("validity_horizon", serde_json::json!(200)),
+        ],
+        fork.slot,
+    );
+    // Vaults are reloaded for every sale so only the market's own state carries over.
+    let sell = |market: Vec<u8>| {
+        replay_with_market(
+            fork,
+            fork.def.base_trade,
+            0,
+            market,
+            oracle.clone(),
+            fork.base_vault.data.clone(),
+            fork.quote_vault.data.clone(),
+        )
+        .expect("a 1 SOL sale should settle")
+    };
+    let bps_below_first = |first: u64, out: u64| (1.0 - out as f64 / first as f64) * 1e4;
+
+    let (first, mut market) = sell(fork.market.data.clone());
+    for _ in 0..11 {
+        market = sell(market).1;
+    }
+    let pressured = sell(market.clone()).0;
+    assert!(
+        bps_below_first(first, pressured) > 50.0,
+        "twelve 1 SOL sales should widen the next by tens of bps, got {:.1}",
+        bps_below_first(first, pressured)
+    );
+
+    let reset = apply_raw(
+        "solfi-swap-pressure",
+        &market,
+        &[("consecutive_sells", serde_json::json!(0))],
+        fork.slot,
+    );
+    let after_reset = sell(reset).0;
+    assert!(
+        bps_below_first(first, after_reset).abs() < 0.1,
+        "a reset count must price the next sale like the first: {first} vs {after_reset}"
     );
 }

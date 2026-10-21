@@ -1,20 +1,20 @@
 # SolFi V2
 
 A proprietary market maker (PMM), not an AMM. Five templates control its external price, quote
-freshness, directional spread, size impact and vault inventory.
+freshness, spread by trade size, swap pressure and vault inventory.
 
 SolFi does not derive its mid from vault ratios. Its external oracle supplies the price, market
 splines widen around that price, and the vaults provide inventory and settlement capacity.
 
 ## Template index
 
-| Template              | Overrides                                        |
-| --------------------- | ------------------------------------------------ |
-| `solfi-price`         | the price SolFi uses for swaps                   |
-| `solfi-freshness`     | whether SolFi's price is current and usable      |
-| `solfi-spread`        | the extra cost SolFi adds when buying or selling |
-| `solfi-size-impact`   | how much worse the price gets for larger trades  |
-| `solfi-vault-balance` | how many tokens SolFi has available for swaps    |
+| Template              | Overrides                                                              |
+| --------------------- | ---------------------------------------------------------------------- |
+| `solfi-price`         | the price SolFi uses for swaps                                         |
+| `solfi-freshness`     | whether SolFi's price is current and usable                            |
+| `solfi-size-impact`   | the extra cost SolFi adds when buying or selling, at each trade size   |
+| `solfi-swap-pressure` | the count of large swaps in a row that makes SolFi widen, and its reset |
+| `solfi-vault-balance` | how many tokens SolFi has available for swaps                          |
 
 ## Number formats
 
@@ -49,18 +49,25 @@ Do not reuse an oracle or vault merely because the token pair looks similar. Use
 datasource before its bytes are changed. Fetch an account only on its first override. A later fetch
 replaces the full local account and can erase earlier overrides on its other fields.
 
-## Two rules that prevent misleading scenarios
+## Three rules that prevent misleading scenarios
 
 **1. Keep the oracle current while testing price or widening.** A price can be encoded correctly and
 still never reach the quote if the oracle has expired. Apply `solfi-freshness` with
 `publication_slot: 0` and `validity_horizon: 200` when setup spans multiple slots. That keeps the
-quote valid for 200 slots. For a longer scenario, schedule the same freshness override again in each
+quote valid for 200 slots - valid, but not constant: it widens as it ages (see "Keep the quote
+current"). For a longer scenario, schedule the same freshness override again in each
 later slot where a quote is needed with `fetchBeforeUse: false`. If a later upstream fetch is
 required, reapply `solfi-price` after it in that slot.
 
 **2. Do not repeatedly reset transaction-owned inventory.** Price, freshness and spline settings are
 configuration inputs. A vault balance is state that swaps modify. Reapplying a vault override after
 every swap can undo the swap and manufacture or erase inventory.
+
+**3. Reset swap pressure between phases of a multi-swap scenario.** SolFi counts large swaps in a row
+in each direction and widens that direction as the count grows: on WSOL/USDC ten 1 SOL sales in a row
+cost about 95 bps more than the first. Nothing in a surfnet resets the count - not slots, time, price
+changes, swaps in the other direction or freshness - so apply `solfi-swap-pressure` with the count at
+`0` before the swaps you want to measure. See "Reset swap pressure" below.
 
 ## Scenario ideas
 
@@ -73,7 +80,7 @@ USDC.
 1. On **WSOL / USDC**, use `solfi-price` with exponent `-10` and coefficient `500000000`.
 2. Use `solfi-freshness` with publication slot `0` and validity horizon `200` so the new quote is
    usable.
-3. Use `solfi-spread` with buy-base widening `1000`, sell-base widening `10000`, age multiplier
+3. Use `solfi-size-impact` with all eight buy-base knots at `1000`, all eight sell-base knots at `10000`, age multiplier
    `1000`, additional widening `0`, and maximum widening `100000`.
 4. Use `solfi-vault-balance` on the WSOL/USDC **USDC vault** with amount `25000000`. Apply this
    transaction-owned balance once before the swaps being tested.
@@ -111,9 +118,9 @@ valuation.
 Use this to test what happens when SolFi still trades but strongly discourages users from buying one
 asset from it.
 
-1. Choose the market in `solfi-spread`.
-2. Increase **Buy-base widening** to make buying WSOL or USDT more expensive, or increase
-   **Sell-base widening** to make selling it more expensive.
+1. Choose the market in `solfi-size-impact`.
+2. Raise all eight **Buy-base** knots to make buying WSOL or USDT more expensive, or all eight
+   **Sell-base** knots to make selling it more expensive.
 3. Keep the other direction low, set the age multiplier to `1000`, additional widening to `0`, and
    set the maximum high enough to allow the requested spread.
 4. Keep the matching oracle fresh, then compare equal-notional swaps in both directions.
@@ -177,22 +184,33 @@ must fetch the oracle from upstream, reapply `solfi-price` after the fetch.
 
 An expired SolFi oracle rejects the transaction with error 23.
 
+**Valid is not constant.** SolFi widens the quote as the oracle ages within its validity window. On
+WSOL/USDC, measured against the deployed program:
+
+| Slots since the freshness override | 0 | 5 | 10 | 25 | 50 | 199 | 201 |
+| ---------------------------------- | - | - | - | - | - | - | - |
+| Fill compared with a fresh quote | same | −3.6 bps | −10 bps | −21 bps | −34 bps | −44 bps | rejected (error 23) |
+
+USDT/USDC does not drift; the amount depends on each market's age multiplier curve. For a price that
+stays the same across a multi-slot scenario, refresh in every slot where a swap executes, or set
+`age_multiplier_curve_y: 1000` with `solfi-size-impact` to switch the age term off.
+
 ## Quote a constant directional spread
 
-Default WSOL/USDC example, one percent in both directions:
+`solfi-size-impact` sets the widening at each of eight trade sizes; giving all eight the same value
+makes it constant. Default WSOL/USDC example, one percent in both directions:
 
 ```text
-template: solfi-spread
-quote_to_base_curve_y:       10000
-base_to_quote_curve_y:       10000
+template: solfi-size-impact
+quote_to_base_y_0 ... quote_to_base_y_7: 10000     # all eight the same
+base_to_quote_y_0 ... base_to_quote_y_7: 10000
 age_multiplier_curve_y:      1000
 additional_widening_curve_y: 0
 max_widening:                100000
 ```
 
-`quote_to_base_curve_y` makes buying the base asset more expensive. `base_to_quote_curve_y` makes
-selling it more expensive. Set only one directional property for a risk-off scenario, or both for a
-symmetric spread.
+The `quote_to_base` values make buying the base asset more expensive, the `base_to_quote` values
+selling it. Set only one direction for a risk-off scenario, or both for a symmetric spread.
 
 The directional value is market-specific because the oracle contributes a scale:
 
@@ -236,22 +254,43 @@ The template intentionally preserves the `x` positions stored in the selected ma
 - base-to-quote converts the base input to quote notional at the oracle price before lookup.
 
 SolFi linearly interpolates between adjacent points and uses the nearest endpoint outside the
-configured range. The same oracle scale and maximum clamp described under `solfi-spread` still apply.
+configured range. The same oracle scale and maximum clamp described under "Quote a constant
+directional spread" apply.
 
 ## Put the maker into directional risk-off mode
 
-Use either `solfi-spread` for one constant penalty or `solfi-size-impact` for a penalty that grows
-with size:
+Use `solfi-size-impact`, with flat values for one constant penalty or rising values for a penalty
+that grows with size:
 
 ```text
 # Maker does not want to sell more base
-quote_to_base_curve_y: <wide>
-base_to_quote_curve_y: <tight>
+quote_to_base_y_0 ... _7: <wide>
+base_to_quote_y_0 ... _7: <tight>
 ```
 
 Reverse the two values when the maker does not want to buy more base. The deployed-program tests
 require the targeted response to dominate any cross-effect rather than assuming bit-identical output
 on the other side.
+
+## Reset swap pressure
+
+SolFi counts consecutive large swaps in each direction. Small swaps do not count (on WSOL/USDC a
+1 SOL swap counts and a 0.5 SOL swap does not), and a swap the other way does not reset the count.
+The count widens that direction twice over: the `additional_widening_curve_y` term grows with it, and
+from the ninth swap the program multiplies the trade-size widening by about ten, capped by
+`max_widening`.
+
+```text
+template: solfi-swap-pressure
+consecutive_buys:  0
+consecutive_sells: 0
+```
+
+A count of `0` is a complete reset: the next swaps price as if none had happened. The first swap after
+the market is loaded starts a new count; after that nothing in a surfnet resets it - not slots, time,
+price changes, swaps in the other direction or freshness. The counts are state that swaps change,
+like a vault balance - do not reapply them after every swap unless restoring them is the point of the
+test.
 
 ## Reduce inventory or make a direction unfillable
 
@@ -279,3 +318,5 @@ reset a vault unless restoring the same inventory after every transaction is del
 | Size impact appears at the wrong base amount                   | Breakpoints are quote notional. Base input is converted at the oracle price first          |
 | One direction widened instead of the other                     | Quote-to-base is buying base. Base-to-quote is selling base                                |
 | A vault balance returns after a swap                           | Remove the later vault reset; it is undoing transaction-owned state                        |
+| Fills keep getting worse after repeated swaps in one direction | Swap pressure: apply `solfi-swap-pressure` with that direction's count at `0`              |
+| Fills get worse over a few slots with nothing else changing    | The oracle is ageing. Refresh it in the swap's slot, or set `age_multiplier_curve_y: 1000`  |
