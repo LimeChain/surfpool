@@ -103,14 +103,24 @@ templates:
       offset: Surfpool writes the materialization slot plus the offset. The publish timestamp at
       oracle bytes 24..32 is not consulted, and the decay multiplier at 20..24 is left untouched.
 
-      FRESH: set last_update_slot to 0. The quote is undecayed in the materialization slot. The
-      stamp is written once; for a longer scenario, schedule this template again in each later slot
-      where a quote is needed, with fetchBeforeUse: false so the later write keeps earlier overrides.
+      FRESH: set last_update_slot to 0. Swaps one to four slots after the materialization slot get
+      the best fill. A swap in the materialization slot itself pays one decay step (see AGE); use
+      -1 when the swap lands in the same slot as the override. The stamp is written once; for a
+      longer scenario, schedule this template again in each later slot where a quote is needed,
+      with fetchBeforeUse: false so the later write keeps earlier overrides.
 
-      STALE: set last_update_slot to a negative offset. A quote decays with age inside its
-      per-market window and then rejects with custom error 0x15 (21). The window is configured per
-      market: volatile pairs reject after roughly 16 to 21 slots, stablecoin pairs after
-      hundreds. -2000 is past both.
+      AGE: from the fifth slot after the update, each slot costs one per-market decay step until
+      the quote rejects with custom error 0x15 (21). Measured on the featured markets:
+        SOL/USDC  step 8 bp:  -8 bp at 5 slots, -48 at 10, -88 at 15, rejected at 16
+        HYPE/USDC step 30 bp: -30 bp at 5 slots, -180 at 10, -330 at 15, -480 at 20, rejected at 21
+        JUP/USDC  no decay, rejected at 21
+      Stablecoin pairs reject after hundreds of slots.
+
+      SAME SLOT: a swap in the same slot as the quote update, or as the market's previous swap,
+      also pays one decay step. From the next slot the fill is back to normal; nothing builds up.
+
+      STALE: set last_update_slot to a negative offset. -2000 is past every market's window and
+      rejects with 0x15; a smaller negative offset prepares a decayed but still fillable quote.
 
       A decayed fill that drops about 5% below the fresh quote can reject with custom error 0x26 (38)
       before 0x15 is reached.
@@ -122,6 +132,7 @@ templates:
       move applied to the same oracle.
 
       HOW TO USE:
-      1. Set last_update_slot to 0 for a current quote, or -2000 for a rejected one
+      1. Set last_update_slot to 0 for a current quote (-1 if the swap is in the same slot), or
+         -2000 for a rejected one
       2. If a quote is needed later, schedule this template again in that later slot with
          fetchBeforeUse: false

@@ -656,11 +656,11 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + Phoenix Eternal (8) = 74
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (5) + Phoenix Eternal (8) = 75
         assert_eq!(
             registry.count(),
-            74,
-            "Registry should load 74 templates total"
+            75,
+            "Registry should load 75 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -734,6 +734,7 @@ templates:
         assert!(registry.contains("goonfi-price"));
         assert!(registry.contains("goonfi-freshness"));
         assert!(registry.contains("goonfi-reference-band"));
+        assert!(registry.contains("goonfi-size-impact"));
         assert!(registry.contains("goonfi-vault-balance"));
 
         assert!(registry.contains("phoenix-trader-collateral-stress"));
@@ -984,8 +985,8 @@ templates: []
 
         assert_eq!(
             registry.by_protocol("GoonFi").len(),
-            4,
-            "Should have 4 GoonFi templates (price, freshness, band, vault)"
+            5,
+            "Should have 5 GoonFi templates (price, freshness, band, size impact, vault)"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
@@ -1812,6 +1813,7 @@ templates: []
             "goonfi-price",
             "goonfi-freshness",
             "goonfi-reference-band",
+            "goonfi-size-impact",
             "goonfi-vault-balance",
         ] {
             let template = registry
@@ -1838,7 +1840,7 @@ templates: []
                 checked += 1;
             }
         }
-        assert_eq!(checked, 6, "every shipped GoonFi property must be checked");
+        assert_eq!(checked, 26, "every shipped GoonFi property must be checked");
     }
 
     #[test]
@@ -1848,6 +1850,7 @@ templates: []
             "goonfi-price",
             "goonfi-freshness",
             "goonfi-reference-band",
+            "goonfi-size-impact",
             "goonfi-vault-balance",
         ] {
             let template = registry.get(template_id).expect("GoonFi template");

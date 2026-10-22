@@ -16,7 +16,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: &str = "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE";
 const PROGRAMDATA: &str = "124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s";
-const DEPLOYED_SLOT: u64 = 453915006;
+const DEPLOYED_SLOT: u64 = 459591958;
 const ORACLE_PROGRAM: &str = "dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu";
 const GLOBAL: &str = "BNrK9LpEn65QA4TyBLVSMdngW3XHj3xLfFPwGdCBv8wV";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -27,6 +27,7 @@ const MARKET_TAG: [u8; 8] = [48, 188, 47, 53, 52, 88, 50, 154];
 const PRICE_OUT_OF_BAND: &str = "Custom(36)";
 const INSUFFICIENT_LIQUIDITY: &str = "Custom(1)";
 const STALE_ORACLE: &str = "Custom(21)";
+const NO_SIZE_PENALTY: &str = "Custom(13)";
 
 const SELL: u8 = 0;
 const BUY: u8 = 1;
@@ -106,8 +107,8 @@ const FEATURED_MARKETS: [MarketDef; 4] = [
     },
 ];
 
-/// Every market account the program owns, active and stopped, as of the deployment at slot
-/// 453915006. Each template must write only its own bytes on every one of them.
+/// Every market account the program owns, active and stopped. Each template must write only its
+/// own bytes on every one of them.
 const ALL_MARKETS: [&str; 36] = [
     "2GwiLfAEH1LCNPZtF5JzZUS2KvZ9dEhAyoQ8WLxeYNDY",
     "2U5S52n2L9Rr8vjDiEFRmHo5iQjJQg9zAgJ5nY1aWXK1",
@@ -359,6 +360,37 @@ fn scaled(fixture: &GoonfiFixture, numerator: u64, denominator: u64, with_band: 
     state
 }
 
+/// `goonfi-size-impact` values: sale penalty `i` is `value(i)`, purchase penalty `i` is `value(i + 10)`.
+fn penalties(value: impl Fn(usize) -> u64) -> Vec<(&'static str, serde_json::Value)> {
+    const NAMES: [&str; 20] = [
+        "sell_penalty_0",
+        "sell_penalty_1",
+        "sell_penalty_2",
+        "sell_penalty_3",
+        "sell_penalty_4",
+        "sell_penalty_5",
+        "sell_penalty_6",
+        "sell_penalty_7",
+        "sell_penalty_8",
+        "sell_penalty_9",
+        "buy_penalty_0",
+        "buy_penalty_1",
+        "buy_penalty_2",
+        "buy_penalty_3",
+        "buy_penalty_4",
+        "buy_penalty_5",
+        "buy_penalty_6",
+        "buy_penalty_7",
+        "buy_penalty_8",
+        "buy_penalty_9",
+    ];
+    NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (*name, serde_json::json!(value(i))))
+        .collect()
+}
+
 fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Account {
     const RENT: u64 = 2_039_280;
     let native = *mint == Pubkey::from_str_const(NATIVE_MINT);
@@ -544,6 +576,7 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
             ("goonfi-price", &upstream.oracle),
             ("goonfi-freshness", &upstream.oracle),
             ("goonfi-reference-band", &upstream.market),
+            ("goonfi-size-impact", &upstream.market),
             ("goonfi-vault-balance", &upstream.base_vault),
             ("goonfi-vault-balance", &upstream.quote_vault),
         ] {
@@ -589,6 +622,18 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
         );
         assert_writes_within(&upstream.market, &band, 1712..1728, "goonfi-reference-band");
         assert_eq!((u64_at(&band, 1712), u64_at(&band, 1720)), (1, 2));
+
+        let size = apply_raw(
+            "goonfi-size-impact",
+            &upstream.market,
+            &penalties(|i| 1000 + i as u64),
+            slot,
+        );
+        assert_writes_within(&upstream.market, &size, 240..400, "goonfi-size-impact");
+        for i in 0..10 {
+            assert_eq!(u64_at(&size, 240 + 8 * i), 1000 + i as u64);
+            assert_eq!(u64_at(&size, 320 + 8 * i), 1010 + i as u64);
+        }
 
         let vault = apply_raw(
             "goonfi-vault-balance",
@@ -997,5 +1042,98 @@ async fn goonfi_freshness_restamps_a_stale_quote_and_a_negative_lead_rejects_wit
             "{}: restamped {restamped} vs fresh {fresh}",
             fixture.def.pair
         );
+    }
+}
+
+/// Equal penalties make trade size irrelevant, a curve that climbs with size makes a ten times
+/// larger trade fill worse per unit, and a direction without penalties rejects with 0xd.
+#[tokio::test]
+async fn goonfi_size_impact_prices_larger_trades_worse_on_the_fixture_markets() {
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        let clock = fixture.slot + 1;
+        let curve = |value: &dyn Fn(usize) -> u64| State {
+            market: apply_raw(
+                "goonfi-size-impact",
+                &fixture.market.data,
+                &penalties(value),
+                fixture.slot,
+            ),
+            ..fixture.upstream()
+        };
+        // Basis points by which ten times the trade fills worse per unit than the trade itself.
+        let tenfold_cost = |state: &State, side: u8| {
+            let one = run(fixture, state, side, fixture.trade(side), clock)
+                .unwrap_or_else(|e| panic!("{} side {side} trade: {e}", fixture.def.pair));
+            let ten = run(fixture, state, side, fixture.trade(side) * 10, clock)
+                .unwrap_or_else(|e| panic!("{} side {side} tenfold trade: {e}", fixture.def.pair));
+            (1.0 - ten as f64 / (one as f64 * 10.0)) * 10_000.0
+        };
+
+        let flat = curve(&|_| 10_000);
+        let rising = curve(&|i| 10_000 * (i as u64 % 10 + 1));
+        for side in [SELL, BUY] {
+            let flat_cost = tenfold_cost(&flat, side);
+            assert!(
+                flat_cost.abs() < 1.0,
+                "{} side {side}: equal penalties still cost {flat_cost:.2} bp",
+                fixture.def.pair
+            );
+            let rising_cost = tenfold_cost(&rising, side);
+            assert!(
+                rising_cost > 50.0,
+                "{} side {side}: a rising curve cost only {rising_cost:.2} bp",
+                fixture.def.pair
+            );
+        }
+
+        let no_sale_penalties = curve(&|i| if i < 10 { 0 } else { 10_000 });
+        assert_rejects(
+            run(fixture, &no_sale_penalties, SELL, fixture.base_trade, clock),
+            NO_SIZE_PENALTY,
+            &format!("{} sell without penalties", fixture.def.pair),
+        );
+        assert!(
+            run(fixture, &no_sale_penalties, BUY, fixture.quote_trade, clock)
+                .unwrap_or_else(|e| panic!("{} buy keeps its penalties: {e}", fixture.def.pair))
+                > 0
+        );
+    }
+}
+
+/// A swap in the slot the quote was stamped in pays one decay step, so the documented `-1` lead
+/// never fills worse than `0` there.
+#[tokio::test]
+async fn goonfi_a_swap_in_the_update_slot_pays_one_decay_step() {
+    let fixtures = fixtures().await;
+    for fixture in fixtures.iter() {
+        // Well past the market's own last swaps, so only the quote's slot matters.
+        let clock = fixture.slot + 50;
+        let stamped = |lead: i64| State {
+            oracle: apply_raw(
+                "goonfi-freshness",
+                &fixture.oracle.data,
+                &[("last_update_slot", serde_json::json!(lead))],
+                clock,
+            ),
+            ..fixture.upstream()
+        };
+        for side in [SELL, BUY] {
+            let same_slot = run(fixture, &stamped(0), side, fixture.trade(side), clock)
+                .unwrap_or_else(|e| panic!("{} side {side} lead 0: {e}", fixture.def.pair));
+            let one_slot_old = run(fixture, &stamped(-1), side, fixture.trade(side), clock)
+                .unwrap_or_else(|e| panic!("{} side {side} lead -1: {e}", fixture.def.pair));
+            assert!(
+                one_slot_old >= same_slot,
+                "{} side {side}: lead -1 {one_slot_old} vs lead 0 {same_slot}",
+                fixture.def.pair
+            );
+            if fixture.def.pair == "SOL / USDC" {
+                assert!(
+                    one_slot_old as f64 >= same_slot as f64 * 1.0005,
+                    "SOL / USDC side {side}: the update slot should cost about 8 bp"
+                );
+            }
+        }
     }
 }
