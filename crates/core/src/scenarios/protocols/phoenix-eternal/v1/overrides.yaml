@@ -130,9 +130,9 @@ templates:
       in the index while it has orders elsewhere. A cold trader has no resting orders and nothing
       changes. A keeper cannot liquidate a trader with risk-increasing resting orders on any
       market until it force-cancels them, which Phoenix allows any signer while the trader is
-      liquidatable. Before a price move that should make a trader liquidatable, put this before
-      phoenix-trader-collateral, in the same slot, with symbol left empty, so the move cannot
-      fill the trader's orders and change its positions.
+      liquidatable. With phoenix-trader-collateral for the same trader, put this first, in the
+      same slot. Before a price move that should make a trader liquidatable, leave symbol empty,
+      so the move cannot fill the trader's orders and change its positions.
       A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
       A trader Phoenix still lists after a cancel on every market, such as a spline market maker,
       is refused. An unknown symbol refuses the whole override, so nothing is canceled.
@@ -170,6 +170,9 @@ templates:
       highRiskMargin and backstopMargin, a keeper can liquidate every position. Below
       highRiskMargin a liquidation can leave the trader underwater and fail, and below 0 Phoenix
       refuses it. A keeper force-cancels a trader's risk-increasing orders before it liquidates.
+      A scenario that also cancels the trader's orders puts phoenix-trader-cancel-orders before
+      this override, in the same slot: a cancel moves the effective collateral a little, and this
+      override lands on its target after it.
       To have a trader cross on a phoenix-market-move and phoenix-market-uncross at a later slot,
       call the tool with moves, put phoenix-trader-cancel-orders before this override in the same
       slot, and set effective_collateral_usdc to wanted / 1000000, where wanted =

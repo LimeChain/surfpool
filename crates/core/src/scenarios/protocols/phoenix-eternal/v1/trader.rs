@@ -5,7 +5,7 @@ use log::warn;
 use phoenix_rise_accounts::{
     PhoenixAccount,
     multi_arena::MultiArenaHeader,
-    trader::{TraderHeader, TraderState},
+    trader::{TRADER_CAPABILITY_HOT, TraderHeader, TraderState},
 };
 use solana_account::Account;
 use solana_clock::Clock;
@@ -535,11 +535,8 @@ pub async fn collateral_writes(
     )
     .await?;
     let index = local_account(svm, &exchange.global_trader_index)?;
-    let listed = index_record(&index, &trader)?;
-    refuse_unindexed_hot_trader(trader, &header, listed.is_some())?;
-    // An index copied before the trader left it can still list a trader its account marks cold,
-    // and Phoenix reads that trader from the account.
-    let record = listed.filter(|_| header.trader_state.is_hot());
+    let record = index_record(&index, &trader)?;
+    refuse_unindexed_hot_trader(trader, &header, record.is_some())?;
     let view = margin(&mut Sandbox::new(svm), &exchange, &trader)?;
     let field: i64 = bytemuck::cast(match &record {
         Some(range) => {
@@ -572,10 +569,19 @@ pub async fn collateral_writes(
     let mut state: TraderState = bytemuck::pod_read_unaligned(&data[range.clone()]);
     state.quote_lot_collateral = bytemuck::cast(quote_lots);
     data[range].copy_from_slice(bytemuck::bytes_of(&state));
-    Ok(vec![(
-        exchange.global_trader_index,
-        Account { data, ..index },
-    )])
+    let index_write = (exchange.global_trader_index, Account { data, ..index });
+    if header.trader_state.is_hot() {
+        return Ok(vec![index_write]);
+    }
+    // The local index was copied before the trader left it upstream, its account after. Phoenix
+    // reads that account while its HOT flag is clear and copies the stale record over it on a
+    // cancel, so the account goes back to hot, matching the index.
+    let mut hot = header;
+    hot.trader_state.quote_lot_collateral = bytemuck::cast(quote_lots);
+    hot.trader_state.flags |= TRADER_CAPABILITY_HOT;
+    let mut repaired = left;
+    repaired.data[..size_of::<TraderHeader>()].copy_from_slice(bytemuck::bytes_of(&hot));
+    Ok(vec![index_write, (trader, repaired)])
 }
 
 /// The Trader `account` with its collateral field set to `quote_lots`, or the refusal of a spline
@@ -696,8 +702,6 @@ pub fn index_trader_state_ranges(index: &Account) -> SurfpoolResult<Vec<(Pubkey,
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use phoenix_rise_accounts::trader::TRADER_CAPABILITY_HOT;
-
     use super::*;
 
     pub(crate) fn index_trader_state_range(
