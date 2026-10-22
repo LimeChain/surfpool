@@ -83,7 +83,10 @@ Order books and the ActiveTraderBuffer name traders by their node in the GlobalT
 three must come from the same moment. The first Phoenix template or tool that needs the index on a
 surfnet loads it with the buffer and every market's book in one request. Splines, Trader accounts
 and the PerpAssetMap are still copied when first needed, which can leave a collateral or a price
-slightly behind mainnet but breaks no reference.
+slightly behind mainnet. A Trader account copied at another moment than the index can also
+disagree with it on whether the trader is hot: `phoenix-trader-collateral` marks a listed trader's
+cold account hot again, so every Phoenix program reads the trader from the index, and a hot trader
+the index does not list is refused.
 
 **Known limitation:** that does not help when your own code read Phoenix accounts on a fresh
 surfnet before any Phoenix template or tool ran, or once Phoenix lists more than 98 markets and the
@@ -136,9 +139,11 @@ market, and one whose effective collateral is already below zero. A keeper force
 orders first with `ForceCancelRiskIncreasing`, which Phoenix allows any signer while the trader is
 liquidatable. A scenario can cancel them instead with `phoenix-trader-cancel-orders`, given the
 trader's account in its `trader` value and no `symbol`, before `phoenix-trader-collateral` in the
-same slot. `symbol` picks the markets: empty for every market, which takes a hot trader out of the
-index, one symbol such as `SOL`, or several separated by commas such as `SOL, BTC, ETH`. An unknown
-symbol refuses the whole override. Positions stay open, and a cold trader has no orders to cancel.
+same slot. The overrides of a slot play one after another, each on its own, so a refused cancel
+leaves the collateral to play alone. `symbol` picks the markets: empty for every market, which
+takes a hot trader out of the index, one symbol such as `SOL`, or several separated by commas such
+as `SOL, BTC, ETH`. An unknown symbol refuses the whole override. Positions stay open, and a cold
+trader has no orders to cancel.
 
 Pick the target from the tool's `margin`, the trader with its orders canceled, by what the keeper
 should do:

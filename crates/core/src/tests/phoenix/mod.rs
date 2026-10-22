@@ -1591,6 +1591,98 @@ async fn the_collateral_lands_on_its_target_hot_and_cold() {
     }
 }
 
+/// A trader that left Phoenix's index upstream after the local VM copied the index, its account
+/// copied only then, is cold in its account while the local index still lists it.
+/// `phoenix-trader-collateral` lands on its target there, a cancel keeps it, and a keeper
+/// liquidates the trader.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_collateral_lands_on_a_trader_whose_account_went_cold_after_the_index_was_copied() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let trader = graph.trader;
+    let listed = || {
+        let index = locker.with_svm_reader(|svm| local_account(svm, &graph.global_trader_index));
+        index_trader_state_range(&index.unwrap(), &trader.to_bytes()).is_ok()
+    };
+    let hot = || {
+        let account = locker.with_svm_reader(|svm| svm.get_account(&trader));
+        TraderHeader::try_read_from_account_bytes(&account.unwrap().unwrap().data)
+            .unwrap()
+            .trader_state
+            .is_hot()
+    };
+    // Phoenix's own cancel takes the trader out of its index, then every other account goes back
+    // to before it: the account copied after the trader left, the index before.
+    let mut others: Vec<Pubkey> = graph
+        .accounts
+        .iter()
+        .map(|(key, _)| *key)
+        .chain(
+            graph
+                .markets
+                .iter()
+                .flat_map(|(_, book, spline)| [*book, *spline]),
+        )
+        .filter(|key| *key != trader)
+        .collect();
+    others.sort();
+    others.dedup();
+    let before: Vec<(Pubkey, Account)> = locker.with_svm_reader(|svm| {
+        others
+            .iter()
+            .filter_map(|key| svm.get_account(key).unwrap().map(|account| (*key, account)))
+            .collect()
+    });
+    play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+    apply(&locker, before).await;
+    assert!(
+        listed() && !hot(),
+        "{trader}: listed in the index, cold in its account"
+    );
+
+    let held = {
+        let mut svm = locker.0.write().await;
+        trader_positions_in(&mut svm, &remote, trader, &[])
+            .await
+            .unwrap()
+    };
+    assert!(held.refusal.is_none(), "{trader}: {:?}", held.refusal);
+    let view = held.margin;
+    let target =
+        ((view.backstop_margin_quote_lots + view.maintenance_margin_quote_lots) / 2) as i64;
+    play(
+        &locker,
+        graph.clock.slot,
+        vec![set_collateral(trader, target)],
+    )
+    .await;
+    let prepared = hawkeye_margin(&locker, &graph);
+    assert_eq!(
+        prepared.effective_collateral_quote_lots, target,
+        "{trader}: Play lands on the target"
+    );
+    assert_eq!(
+        prepared.is_liquidatable, 1,
+        "{trader}: liquidatable after Play"
+    );
+    assert!(
+        listed() && hot(),
+        "{trader}: hot again, as the index lists it"
+    );
+
+    // The cancel copies the index record, which holds the collateral, to the account.
+    play(&locker, graph.clock.slot, vec![cancel_orders(trader, None)]).await;
+    assert!(!listed(), "{trader}: the cancel takes it out of the index");
+    let kept = hawkeye_margin(&locker, &graph).effective_collateral_quote_lots;
+    let band = view.maintenance_margin_quote_lots - view.backstop_margin_quote_lots;
+    assert!(
+        kept.abs_diff(target) <= band / 20,
+        "{trader}: the cancel keeps the collateral: {kept} from {target}"
+    );
+    let (symbol, _) = held_positions(&locker, &remote, &trader).await.remove(0);
+    liquidate_position(&locker, trader, &symbol, &trader.to_string()).await;
+}
+
 /// `phoenix-trader-cancel-orders` cancels a hot trader's resting orders on every market, which takes
 /// it out of Phoenix's index; its positions stay open. On a cold trader it changes nothing, and a
 /// trader the surfnet has not loaded yet is fetched first.
