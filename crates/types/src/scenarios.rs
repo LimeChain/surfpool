@@ -1031,6 +1031,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// LLM context shared by all templates in this collection, placed before each template's own
+    #[serde(default)]
+    pub llm_context: Option<String>,
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
@@ -1091,6 +1094,11 @@ pub enum RawEncoding {
     Slot {
         lead: i64,
     },
+    /// [`RawEncoding::Slot`] for programs that store the slot as a u32. A slot past `u32::MAX` is
+    /// refused instead of truncated.
+    Slot32 {
+        lead: i64,
+    },
 }
 
 impl RawEncoding {
@@ -1099,7 +1107,10 @@ impl RawEncoding {
         match self {
             RawEncoding::U8 => 1,
             RawEncoding::U16 => 2,
-            RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
+            RawEncoding::U32
+            | RawEncoding::I32
+            | RawEncoding::I32Strided { .. }
+            | RawEncoding::Slot32 { .. } => 4,
             RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
@@ -1117,7 +1128,8 @@ impl RawEncoding {
         }
     }
 
-    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
+    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`] and
+    /// [`RawEncoding::Slot32`].
     pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
         // Read the digits as text so nothing passes through f64, which cannot hold a u128
         // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
@@ -1163,7 +1175,7 @@ impl RawEncoding {
                     .to_bytes()
                     .to_vec()
             }
-            RawEncoding::Slot { lead } => {
+            RawEncoding::Slot { lead } | RawEncoding::Slot32 { lead } => {
                 let lead = match value {
                     serde_json::Value::Null => *lead,
                     _ => {
@@ -1179,7 +1191,14 @@ impl RawEncoding {
                 } else {
                     target_slot.saturating_sub(lead.unsigned_abs())
                 };
-                slot.to_le_bytes().to_vec()
+                if let RawEncoding::Slot32 { .. } = self {
+                    u32::try_from(slot)
+                        .map_err(|_| format!("slot {slot} does not fit a 4-byte slot field"))?
+                        .to_le_bytes()
+                        .to_vec()
+                } else {
+                    slot.to_le_bytes().to_vec()
+                }
             }
         })
     }
@@ -1483,6 +1502,10 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
+                let llm_context = match (&self.llm_context, entry.llm_context) {
+                    (Some(shared), Some(own)) => Some(format!("{}\n\n{own}", shared.trim_end())),
+                    (shared, own) => own.or_else(|| shared.clone()),
+                };
                 let properties =
                     describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type)
                         .map_err(|e| format!("template '{}': {e}", entry.id))?;
@@ -1497,7 +1520,7 @@ impl YamlOverrideTemplateCollection {
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
-                    llm_context: entry.llm_context,
+                    llm_context,
                     raw_layout: self.raw_layout,
                 })
             })
@@ -1738,6 +1761,24 @@ mod tests {
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn slot32_writes_four_bytes_and_refuses_slots_past_u32() {
+        use super::RawEncoding;
+
+        let encoding: RawEncoding =
+            serde_json::from_value(json!({"slot32": {"lead": -2000}})).unwrap();
+        assert_eq!(encoding.width(), 4);
+        let bytes = encoding.encode(&json!(null), 450_000_000).unwrap();
+        assert_eq!(bytes, 449_998_000u32.to_le_bytes());
+        let bytes = encoding.encode(&json!(0), 450_000_000).unwrap();
+        assert_eq!(bytes, 450_000_000u32.to_le_bytes());
+
+        let err = encoding
+            .encode(&json!(1), u64::from(u32::MAX))
+            .expect_err("a 4-byte slot must not truncate");
+        assert!(err.contains("4-byte"), "unexpected error: {err}");
     }
 
     #[test]
