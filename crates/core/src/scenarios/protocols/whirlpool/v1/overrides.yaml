@@ -34,6 +34,9 @@ templates:
       - path: protocol_fee_rate
         label: Protocol's share of the fee
         description: Basis points of the collected fee, not of the swap (1300 = 13%, max 2500).
+      - path: reward_last_updated_timestamp
+        label: Last reward update time
+        description: Unix seconds; swaps fail with InvalidTimestamp (6022) while the Surfnet clock is before it.
     address:
       type: pubkey
     llm_context: |
@@ -49,6 +52,40 @@ templates:
       PRICE: do not move a pool's price by hand. sqrt_price, tick_current_index and liquidity must change
       together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
       price shock instead.
+
+      POOL TIMESTAMPS: Whirlpool refuses swaps with InvalidTimestamp (6022) while the Surfnet
+      clock is before the pool's reward_last_updated_timestamp, and a fetched pool is usually ahead of
+      that clock. On every pool a swap will touch, set reward_last_updated_timestamp to the Surfnet
+      clock's unix_timestamp (call_surfnet_rpc getAccountInfo on the Clock sysvar
+      SysvarC1ock11111111111111111111111111111111 with encoding jsonParsed, unixTimestamp). An
+      adaptive-fee pool, whose tick_spacing (2 bytes at offset 41) differs from its fee_tier_index_seed
+      (2 bytes at offset 43), also needs whirlpool-oracle with both of its timestamps set the same way.
+
+  - id: whirlpool-oracle
+    name: Override Whirlpool Oracle
+    description: Override the Oracle of an adaptive-fee Whirlpool pool
+    idl_account_name: Oracle
+    properties:
+      - path: whirlpool
+        label: Pool
+        description: The pool the Oracle belongs to; the Oracle's address is the PDA ["oracle", pool].
+      - path: adaptive_fee_variables.last_reference_update_timestamp
+        label: Last reference update time
+        description: Unix seconds; swaps fail with InvalidTimestamp (6022) while the Surfnet clock is before it.
+      - path: adaptive_fee_variables.last_major_swap_timestamp
+        label: Last major swap time
+        description: Unix seconds; swaps fail with InvalidTimestamp (6022) while the Surfnet clock is before it.
+    address:
+      type: pda
+      program_id: whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc
+      seeds:
+        - type: string
+          value: oracle
+        - type: property_ref
+          value: whirlpool
+    llm_context: |
+      Put the pool in values as whirlpool; the Oracle's address is derived from it. Set both timestamps
+      to the Surfnet clock's unix_timestamp. Only an adaptive-fee pool has an Oracle.
 
   - id: whirlpools-config
     name: Override Whirlpools Config

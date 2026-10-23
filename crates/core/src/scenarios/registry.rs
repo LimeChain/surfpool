@@ -643,11 +643,11 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (2) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 66
+        // + Whirlpool (3) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 67
         assert_eq!(
             registry.count(),
-            66,
-            "Registry should load 66 templates total"
+            67,
+            "Registry should load 67 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -703,6 +703,7 @@ templates:
         assert!(registry.contains("drift-global-state"));
 
         assert!(registry.contains("whirlpool-pool-state"));
+        assert!(registry.contains("whirlpool-oracle"));
         assert!(registry.contains("whirlpools-config"));
 
         assert!(registry.contains("spl-token-account-balance"));
@@ -1029,8 +1030,8 @@ templates: []
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
             whirlpool_templates.len(),
-            2,
-            "Should have 2 Whirlpool templates (whirlpool-pool-state, whirlpools-config)"
+            3,
+            "Should have 3 Whirlpool templates (whirlpool-pool-state, whirlpool-oracle, whirlpools-config)"
         );
 
         let pump_templates = registry.by_protocol("Pump");
