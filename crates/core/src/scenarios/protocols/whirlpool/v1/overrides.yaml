@@ -1,0 +1,66 @@
+protocol: Whirlpool
+version: v0.7.0
+account_type: Whirlpool
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - concentrated-liquidity
+  - defi
+
+llm_context: |
+  Orca Whirlpools, program whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc.
+
+  Set fetchBeforeUse: true.
+
+templates:
+  - id: whirlpool-pool-state
+    name: Override Whirlpool Pool State
+    description: Override a Whirlpool pool found by pair or by address
+    idl_account_name: Whirlpool
+    properties:
+      - path: sqrt_price
+        label: Sqrt price (Q64.64)
+        description: sqrt(price) * 2^64 as a raw u128; set together with tick_current_index.
+      - path: liquidity
+        label: Active liquidity
+        description: Raw u128 liquidity active at tick_current_index; zero leaves the pool with no depth.
+      - path: tick_current_index
+        label: Current tick index
+        description: Raw i32 tick implied by sqrt_price; set together with sqrt_price.
+      - path: fee_rate
+        label: Swap fee rate
+        description: Hundredths of a basis point of every swap's input (3000 = 0.30%, max 60000).
+      - path: protocol_fee_rate
+        label: Protocol's share of the fee
+        description: Basis points of the collected fee, not of the swap (1300 = 13%, max 2500).
+    address:
+      type: pubkey
+    llm_context: |
+      FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+      program with filters dataSize 653 and memcmp of the two mints at offsets 101 and 181, once in each
+      order (only one returns pools). Read each pool's token_vault_a with dataSlice {offset 133, length
+      32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
+      whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
+      ask for the pool address. A pool address the user gives is used as is.
+
+      Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
+
+      PRICE: do not move a pool's price by hand. sqrt_price, tick_current_index and liquidity must change
+      together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
+      price shock instead.
+
+  - id: whirlpools-config
+    name: Override Whirlpools Config
+    description: Override the Orca Whirlpools protocol-fee default new pools are created with
+    idl_account_name: WhirlpoolsConfig
+    properties:
+      - path: default_protocol_fee_rate
+        label: Default protocol fee rate for new pools
+        description: Basis points of the collected fee, not of the swap, that a newly created pool copies into its protocol_fee_rate (1300 = 13%, max 2500).
+    address:
+      type: pubkey
+      value: 2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ
+    llm_context: |
+      default_protocol_fee_rate only seeds the protocol_fee_rate of pools created later; for an
+      existing pool, override protocol_fee_rate on whirlpool-pool-state.
