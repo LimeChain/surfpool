@@ -27,7 +27,7 @@ Program: `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`.
 | `quote_atoms_per_base_atom_x1e15`   | quote atoms per base atom × 10^15, prices sells   | SOL/USDC $100 → `100000000000000`               |
 | `base_atoms_per_quote_atom_x1e15`   | floor(10^30 / the value above), prices buys       | SOL/USDC $100 → `10000000000000000`             |
 | `*_level_N_amount`                  | capacity in atoms of the swap's input token       | sell side of SOL/USDC: `1000000000` = 1 SOL     |
-| `*_level_N_factor`                  | output factor, `1000000` is neutral               | `990000` pays 1% less                            |
+| `*_level_N_factor`                  | output factor in millionths, below `1000000`      | `990000` pays 1% less than the bare price        |
 | `*_levels_enabled`                  | enabled flag of all twenty levels on one side     | `0` halts that side                              |
 | `last_update_slot`                  | offset from the materialization slot              | `0` = updated now, `-20` = twenty slots old      |
 
@@ -45,9 +45,12 @@ sell output = floor(base_in  × quote_atoms_per_base_atom_x1e15 × sell_level_0_
 buy output  = floor(quote_in × base_atoms_per_quote_atom_x1e15 × buy_level_0_factor  / 10^21)
 ```
 
-As the market's local copy ages, the program can switch to a later one of the five quote-start
-configs at offset 1136. The last one pays 75 ppm less on SOL / USDC, so a fill can land up to that
-much below these formulas.
+The formulas hold for a quote younger than its grace period (see
+[How a quote ages](#how-a-quote-ages)) and with neutral quote-start configs. The five quote-start configs at offset 1136 can lower a fill or make it skip leading levels. Which
+one applies depends on how many slots ago the config account
+`BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK` was updated. A surfnet never updates it, so after
+about 300 slots the last config applies. Configs that each hold `0`, `1000000` and `0` change
+nothing; read them before relying on the formula.
 
 ### Layout
 
@@ -58,19 +61,20 @@ The market account is 1264 bytes. Offsets not listed are not written by any temp
 | 24        | base mint                              | pubkey, read-only | -                        |
 | 56        | quote mint                             | pubkey, read-only | -                        |
 | 88        | freshness limit                        | u64, read-only    | slots                    |
+| 96        | grace period                           | u64, read-only    | slots                    |
 | 120       | last update slot                       | `slot`            | slot offset              |
 | 128       | quote atoms per base atom              | u128              | × 10^15                  |
 | 144       | base atoms per quote atom              | u128              | × 10^15                  |
 | 160 + 24n | sell level n capacity                  | u64               | base atoms               |
-| 168 + 24n | sell level n output factor             | u64               | 10^6 = neutral           |
+| 168 + 24n | sell level n output factor             | u64               | millionths, below 10^6   |
 | 176 + 24n | sell level n enabled                   | `u8_strided`      | 0 or 1                   |
 | 640 + 24n | buy level n capacity                   | u64               | quote atoms              |
-| 648 + 24n | buy level n output factor              | u64               | 10^6 = neutral           |
+| 648 + 24n | buy level n output factor              | u64               | millionths, below 10^6   |
 | 656 + 24n | buy level n enabled                    | `u8_strided`      | 0 or 1                   |
+| 1136 + 12n | quote-start config n (n = 0..4)       | 12 bytes, read-only | -                      |
 
 `n` runs from 0 to 19. The sell ladder and offset 128 serve base-to-quote swaps; the buy ladder and
-offset 144 serve quote-to-base swaps. Five 12-byte quote-start configs at 1136, which can make a
-quote skip leading levels, and two consumed-depth words at 0 and 8 are not exposed.
+offset 144 serve quote-to-base swaps.
 
 ## Picking a market
 
@@ -88,7 +92,7 @@ Studio includes four featured markets:
 | PUMP / USDC  | a long-tail token whose mint is a Token-2022 account  |
 
 For any other pair, each template's LLM guidance finds the market on the program: one
-`getProgramAccounts` call filters the program's accounts by market tag `5` at offset 96 and the two
+`getProgramAccounts` call filters the program's accounts by the market size, 1264 bytes, and the two
 mints at 24 and 56. A market without a price in both directions has every level disabled and
 cannot fill, so the guidance says so instead of preparing it.
 
@@ -100,13 +104,33 @@ scenario uses `false`, or the re-fetch undoes the earlier write.
 
 **1. Keep the quote fresh.** Tessera rejects a quote whose last update is at least the market's
 freshness limit old with custom error 65535, so a correct price or depth change can appear to do
-nothing. Apply
+nothing. Before that, an ageing quote fills worse; see [How a quote ages](#how-a-quote-ages). Apply
 `tessera-freshness` with `last_update_slot: 0` alongside every price, depth or curve change, and
-schedule it again, with `fetchBeforeUse: false`, in each later slot where a quote is needed.
+schedule it again, with `fetchBeforeUse: false`, at least every 4 slots where a quote is needed.
 
 **2. Change a ladder as a whole.** The stored ladder has a different number of enabled levels on
 each market and side, and the maker can pull a side at any moment. Read the selected market account
 first, scale every enabled level on the side you stress by one ratio, and keep factors descending.
+
+## How a quote ages
+
+A quote younger than the market's grace period (offset 96, 5 slots on the featured markets) fills
+at the formula. From then on each slot lowers the fill by a growing amount, in both directions,
+until the quote rejects at its freshness limit. Measured on SOL / USDC:
+
+| Slots since the update | Fill        |
+| ---------------------- | ----------- |
+| 0 to 4                 | the formula |
+| 5                      | -50 ppm     |
+| 6                      | -200 ppm    |
+| 8                      | -800 ppm    |
+| 10                     | -0.18%      |
+| 12                     | -0.32%      |
+| 15 to 19               | -0.5% (cap) |
+| 20                     | rejected (`65535`) |
+
+cbBTC / USDC loses half as much per slot. Schedule `tessera-freshness` at least every 4 slots for a
+stable price.
 
 ## Scenario ideas
 
@@ -189,8 +213,9 @@ template: tessera-freshness
 last_update_slot: 0
 ```
 
-A fresh quote lasts the market's freshness limit. Schedule the template again, with
-`fetchBeforeUse: false`, in each later slot where a quote is needed.
+A fresh quote fills at the formula for its grace period and is rejected at its freshness limit.
+Schedule the template again, with `fetchBeforeUse: false`, at least every 4 slots where a quote is
+needed.
 
 ## Make the quote stale
 
@@ -246,7 +271,7 @@ The instruction data is tag `0x11`, the direction (`1` sells base), the input am
 minimum output as u64, then `0`. The accounts are the global state
 `8ekCy2jHHUbW2yeNGFWYJT9Hm9FW7SvZcZK66dSZCDiF`, the market, the taker, the base and quote vaults,
 the taker's base and quote token accounts, both mints, both token programs, the sentinel, the config
-`BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK` and the market record
+`BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK` and the market tick
 `4cG31VNF9TzFinNc7BmnjhFvGjxkY3sCETVMtMgbrhPs`. The vaults are token accounts of the global state,
 one per mint, and the USDC vault is shared by every USDC market.
 
@@ -257,9 +282,10 @@ one per mint, and the USDC vault is shared by every USDC market.
 | `Custom(65535)` after a price, depth or curve change  | The quote is stale. Add `tessera-freshness` with `last_update_slot: 0` in that slot   |
 | `Custom(65535)` on a market you did not halt          | The maker pulled that side upstream; every level on it is disabled                    |
 | `Custom(8)`                                           | A curve factor is not lower than the level before it; scale all factors by one ratio  |
+| `Custom(7)`                                           | A curve factor is `1000000` or more; factors stay below it                            |
+| A fill lands below the formula without an error       | The quote is past its grace period; refresh it with `tessera-freshness`               |
 | Only one direction repriced                           | Set both price fields; 128 prices sells and 144 prices buys                           |
 | A depth change has no visible effect                  | The fill was smaller than the first level; use a larger swap                          |
 | A price change lands on the wrong account          | No owner or size check exists on raw writes; pick a featured market or check that a typed address is a Tessera market account |
 | `buy_levels_enabled: 1` re-enabled maker-disabled levels | Only 0 is supported; 1 makes the program quote levels the maker had pulled                                   |
-| Price field rejected as out of range                  | The reciprocal exceeds u64; the price is too small for that market's decimals         |
 | A stale override stops rejecting                      | A later `tessera-freshness` with a non-negative offset refreshed it; remove it        |

@@ -45,7 +45,6 @@ const DFLOW_PROGRAM: Pubkey = pubkey("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27Q
 const JUPITER_PROGRAM: Pubkey = pubkey("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
 
 const MARKET_SIZE: usize = 1264;
-const MARKET_TAG: [u8; 8] = [5, 0, 0, 0, 0, 0, 0, 0];
 const LEVELS: usize = 20;
 const LEVEL_SIZE: usize = 24;
 const STALE: &str = "Custom(65535)";
@@ -453,7 +452,8 @@ fn pin_ladder(data: &mut [u8], sell_unit: u64, buy_unit: u64) {
     }
 }
 
-// The program picks one of five quote-start configs by market-record age, so all are neutralized.
+// The program picks one of five quote-start configs by the age of the BAT1N config account, so all
+// are neutralized.
 fn set_quote_start(data: &mut [u8], skipped_levels: u8) {
     write_u64(data, 0, 0);
     write_u64(data, 8, 0);
@@ -532,9 +532,10 @@ const FEATURED_MARKETS: [(&str, Pubkey, Pubkey, Pubkey); 4] = [
 ];
 
 /// Every market account the program owns, priced or not.
-const ALL_MARKETS: [&str; 30] = [
+const ALL_MARKETS: [&str; 31] = [
     "2qHQyHwugThrRBYAFxV3ANuRWEWHskSjGhwr73Ua6heb",
     "3GZwrHYdQBuRVNBtXpM6EkbkQwQzp3WZPdEEfo8LHX2C",
+    "4U2JzGENeMhYuVMGMUeLdzPP9d4PwqnKX9iLxjwPXZU8",
     "5X9A6PpFQEsc9D5VdTGfgVyfVn8HnsArQpMMUZZfFg1a",
     "6MB55x2nYPimx7ReTUhwHxeqntLFxdJVxtpjUw9ZQYZV",
     "7sJf1SmKDDAFtBmMtg253rTbjG7zVFm3zTNounSgSNc9",
@@ -572,7 +573,6 @@ async fn tessera_featured_markets_match_their_market_accounts() {
         let data = &market.data;
         assert_eq!(market.owner, PROGRAM, "{pair}");
         assert_eq!(data.len(), MARKET_SIZE, "{pair}");
-        assert_eq!(&data[96..104], &MARKET_TAG, "{pair}");
         assert_eq!(&data[24..56], base_mint.as_ref(), "{pair} base mint");
         assert_eq!(&data[56..88], quote_mint.as_ref(), "{pair} quote mint");
         assert!(
@@ -594,11 +594,6 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
         let data = &account.data;
         assert_eq!(account.owner, PROGRAM, "{address}");
         assert_eq!(data.len(), MARKET_SIZE, "{address}");
-        assert_eq!(
-            &data[96..104],
-            &MARKET_TAG,
-            "{address} lost the observed market tag"
-        );
         assert!(
             read_u64(data, 88) < 10_000,
             "{address} freshness limit must stay below the -10000 the guidance uses for a stale quote"
@@ -920,6 +915,15 @@ async fn tessera_curve_scales_output_and_rejects_unordered_factors() {
     let err = run(unordered).expect_err("a rising factor must reject");
     assert!(err.contains("Custom(8)"), "{err}");
 
+    let at_bare_price = apply_raw(
+        "tessera-curve",
+        &upstream,
+        &values([("sell_level_0_factor", serde_json::json!(1_000_000))]),
+        0,
+    );
+    let err = run(at_bare_price).expect_err("a factor of 1000000 must reject");
+    assert!(err.contains("Custom(7)"), "{err}");
+
     let with_second_factor = |factor: u64| {
         apply_raw(
             "tessera-curve",
@@ -992,4 +996,55 @@ async fn tessera_halt_rejects_only_halted_directions() {
             run_side(0, CBB_BUY, upstream.clone()).unwrap()
         );
     }
+}
+
+/// A quote younger than its grace period (offset 96) fills at the formula. From there each slot
+/// costs more, up to a 0.5% cap, until the freshness limit rejects it.
+#[tokio::test]
+async fn tessera_quote_ages_past_its_grace_period() {
+    let mut fixture = fixture().await;
+    set_quote_start(&mut fixture.sol.market.data, 0);
+    let sol = &fixture.sol;
+    let upstream = sol.market.data.clone();
+    let clock = clock_slot(sol);
+    let (limit, grace) = (read_u64(&upstream, 88), read_u64(&upstream, 96));
+    let aged = |data: &[u8], age: u64| {
+        let mut data = data.to_vec();
+        write_u64(&mut data, 120, clock - age);
+        data
+    };
+    let sell = |data: Vec<u8>| swap(&fixture, sol, SOL_SELL, 1, Route::DFlow, data);
+
+    let fresh = sell(aged(&upstream, 0)).expect("fresh sale");
+    for age in 1..grace {
+        assert_eq!(
+            sell(aged(&upstream, age)).unwrap(),
+            fresh,
+            "age {age} is inside the grace period"
+        );
+    }
+    let mut loss_ppm = 0.0;
+    for age in grace..limit {
+        let out = sell(aged(&upstream, age)).unwrap_or_else(|e| panic!("age {age}: {e}"));
+        let loss = (1.0 - out as f64 / fresh as f64) * 1e6;
+        assert!(
+            loss > 0.0 && loss >= loss_ppm && loss < 5_002.0,
+            "age {age}: {loss:.0} ppm after {loss_ppm:.0}"
+        );
+        loss_ppm = loss;
+    }
+    assert!(
+        loss_ppm > 4_998.0,
+        "the oldest fillable quote must reach the 0.5% cap, got {loss_ppm:.0} ppm"
+    );
+    let err = sell(aged(&upstream, limit)).expect_err("a quote at its limit must reject");
+    assert!(err.contains(STALE), "{err}");
+
+    let mut longer_grace = upstream.clone();
+    write_u64(&mut longer_grace, 96, grace + 3);
+    assert_eq!(
+        sell(aged(&longer_grace, grace + 2)).unwrap(),
+        fresh,
+        "offset 96 is the grace period"
+    );
 }

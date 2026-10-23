@@ -16,9 +16,9 @@ llm_context: |
   2. Call getProgramAccounts with two positional params: the program id string
      "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", then the config object
      {"encoding":"base58","dataSlice":{"offset":128,"length":16},"filters":[
-     {"memcmp":{"offset":96,"bytes":"qWN536U3Lb"}},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
+     {"dataSize":1264},{"memcmp":{"offset":24,"bytes":"<base mint>"}},
      {"memcmp":{"offset":56,"bytes":"<quote mint>"}}]}.
-     Offset 96 is the market tag. The result's pubkey is the pair's market.
+     Every market account is 1264 bytes. The result's pubkey is the pair's market.
   3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
      market for the pair. Copy both mints again exactly and repeat once; if there is still no
      result, ask the user for the mints or the market address instead of saying none exists.
@@ -73,9 +73,12 @@ templates:
       For a fill that starts and ends in the first ladder level:
         sell output = floor(base_in * quote_atoms_per_base_atom_x1e15 * sell_level_0_factor / 10^21)
         buy output  = floor(quote_in * base_atoms_per_quote_atom_x1e15 * buy_level_0_factor / 10^21)
-      A factor of 1000000 is neutral. As the market's local copy ages the program can switch to a
-      later quote-start config; the last one pays 75 ppm less on SOL / USDC, so a fill can land up
-      to that much below.
+      Factors are in millionths and always below 1000000. The formula holds for a quote younger than
+      its grace period (see tessera-freshness) and with neutral quote-start configs. The five 12-byte quote-start configs
+      at market bytes 1136..1196 can lower a fill or make it skip leading levels. Which one applies
+      depends on how many slots ago the config account BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK
+      was updated; a surfnet never updates it, so after about 300 slots the last config applies.
+      Configs that each hold 0, 1000000 and 0 change nothing.
 
       EXAMPLE - "SOL is worth $100" on SOL / USDC (9/6 decimals):
         quote_atoms_per_base_atom_x1e15: "100000000000000"
@@ -110,13 +113,20 @@ templates:
       materializes, -limit rejects both swap directions with custom error 65535 (0xffff), and every
       later slot ages the quote by one more.
 
+      AGE: a quote younger than the market's grace period, the u64 at market bytes 96..104 (5 slots
+      on the featured markets), fills at the price formula. From the grace period on, each slot
+      lowers the fill by a growing amount, both directions. Measured on SOL / USDC: -50 ppm at 5
+      slots, -200 at 6, -800 at 8, -1800 at 10, -3200 at 12, -5000 (a 0.5% cap) at 15 to 19, and
+      rejected at its 20-slot limit. cbBTC / USDC loses half as much per slot. For a stable price,
+      schedule this template again at least every 4 slots.
+
       HOW TO USE:
       1. For a fresh quote set last_update_slot to 0
       2. For a stale quote set it to -10000, past every market's limit; use minus the limit only to
          land on the boundary, e.g. -20 on a 20-slot market
-      3. A fresh quote lasts its limit; schedule this template again with fetchBeforeUse: false in
-         each later slot where a quote is needed, and never after a stale override you want to keep
-         stale
+      3. A fresh quote fills at the formula for its grace period and is rejected at its limit;
+         schedule this template again with fetchBeforeUse: false at least every 4 slots where a
+         quote is needed, and never after a stale override you want to keep stale
 
   - id: tessera-depth
     name: Override Depth
@@ -195,59 +205,61 @@ templates:
     address:
       type: pubkey
     properties:
-      - { path: sell_level_0_factor, offset: 168, encoding: u64, label: "Sell level 1 output factor", description: "Output factor of the first sell level; 1000000 is neutral, lower pays less quote." }
-      - { path: sell_level_1_factor, offset: 192, encoding: u64, label: "Sell level 2 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_2_factor, offset: 216, encoding: u64, label: "Sell level 3 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_3_factor, offset: 240, encoding: u64, label: "Sell level 4 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_4_factor, offset: 264, encoding: u64, label: "Sell level 5 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_5_factor, offset: 288, encoding: u64, label: "Sell level 6 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_6_factor, offset: 312, encoding: u64, label: "Sell level 7 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_7_factor, offset: 336, encoding: u64, label: "Sell level 8 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_8_factor, offset: 360, encoding: u64, label: "Sell level 9 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_9_factor, offset: 384, encoding: u64, label: "Sell level 10 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_10_factor, offset: 408, encoding: u64, label: "Sell level 11 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_11_factor, offset: 432, encoding: u64, label: "Sell level 12 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_12_factor, offset: 456, encoding: u64, label: "Sell level 13 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_13_factor, offset: 480, encoding: u64, label: "Sell level 14 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_14_factor, offset: 504, encoding: u64, label: "Sell level 15 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_15_factor, offset: 528, encoding: u64, label: "Sell level 16 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_16_factor, offset: 552, encoding: u64, label: "Sell level 17 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_17_factor, offset: 576, encoding: u64, label: "Sell level 18 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_18_factor, offset: 600, encoding: u64, label: "Sell level 19 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: sell_level_19_factor, offset: 624, encoding: u64, label: "Sell level 20 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_0_factor, offset: 648, encoding: u64, label: "Buy level 1 output factor", description: "Output factor of the first buy level; 1000000 is neutral, lower pays less base." }
-      - { path: buy_level_1_factor, offset: 672, encoding: u64, label: "Buy level 2 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_2_factor, offset: 696, encoding: u64, label: "Buy level 3 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_3_factor, offset: 720, encoding: u64, label: "Buy level 4 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_4_factor, offset: 744, encoding: u64, label: "Buy level 5 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_5_factor, offset: 768, encoding: u64, label: "Buy level 6 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_6_factor, offset: 792, encoding: u64, label: "Buy level 7 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_7_factor, offset: 816, encoding: u64, label: "Buy level 8 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_8_factor, offset: 840, encoding: u64, label: "Buy level 9 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_9_factor, offset: 864, encoding: u64, label: "Buy level 10 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_10_factor, offset: 888, encoding: u64, label: "Buy level 11 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_11_factor, offset: 912, encoding: u64, label: "Buy level 12 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_12_factor, offset: 936, encoding: u64, label: "Buy level 13 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_13_factor, offset: 960, encoding: u64, label: "Buy level 14 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_14_factor, offset: 984, encoding: u64, label: "Buy level 15 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_15_factor, offset: 1008, encoding: u64, label: "Buy level 16 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_16_factor, offset: 1032, encoding: u64, label: "Buy level 17 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_17_factor, offset: 1056, encoding: u64, label: "Buy level 18 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_18_factor, offset: 1080, encoding: u64, label: "Buy level 19 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
-      - { path: buy_level_19_factor, offset: 1104, encoding: u64, label: "Buy level 20 output factor", description: "Output factor of this level, 1000000 neutral; must be lower than the previous level's factor." }
+      - { path: sell_level_0_factor, offset: 168, encoding: u64, label: "Sell level 1 output factor", description: "Output factor of the first sell level in millionths, below 1000000; lower pays less quote." }
+      - { path: sell_level_1_factor, offset: 192, encoding: u64, label: "Sell level 2 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_2_factor, offset: 216, encoding: u64, label: "Sell level 3 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_3_factor, offset: 240, encoding: u64, label: "Sell level 4 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_4_factor, offset: 264, encoding: u64, label: "Sell level 5 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_5_factor, offset: 288, encoding: u64, label: "Sell level 6 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_6_factor, offset: 312, encoding: u64, label: "Sell level 7 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_7_factor, offset: 336, encoding: u64, label: "Sell level 8 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_8_factor, offset: 360, encoding: u64, label: "Sell level 9 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_9_factor, offset: 384, encoding: u64, label: "Sell level 10 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_10_factor, offset: 408, encoding: u64, label: "Sell level 11 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_11_factor, offset: 432, encoding: u64, label: "Sell level 12 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_12_factor, offset: 456, encoding: u64, label: "Sell level 13 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_13_factor, offset: 480, encoding: u64, label: "Sell level 14 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_14_factor, offset: 504, encoding: u64, label: "Sell level 15 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_15_factor, offset: 528, encoding: u64, label: "Sell level 16 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_16_factor, offset: 552, encoding: u64, label: "Sell level 17 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_17_factor, offset: 576, encoding: u64, label: "Sell level 18 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_18_factor, offset: 600, encoding: u64, label: "Sell level 19 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: sell_level_19_factor, offset: 624, encoding: u64, label: "Sell level 20 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_0_factor, offset: 648, encoding: u64, label: "Buy level 1 output factor", description: "Output factor of the first buy level in millionths, below 1000000; lower pays less base." }
+      - { path: buy_level_1_factor, offset: 672, encoding: u64, label: "Buy level 2 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_2_factor, offset: 696, encoding: u64, label: "Buy level 3 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_3_factor, offset: 720, encoding: u64, label: "Buy level 4 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_4_factor, offset: 744, encoding: u64, label: "Buy level 5 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_5_factor, offset: 768, encoding: u64, label: "Buy level 6 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_6_factor, offset: 792, encoding: u64, label: "Buy level 7 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_7_factor, offset: 816, encoding: u64, label: "Buy level 8 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_8_factor, offset: 840, encoding: u64, label: "Buy level 9 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_9_factor, offset: 864, encoding: u64, label: "Buy level 10 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_10_factor, offset: 888, encoding: u64, label: "Buy level 11 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_11_factor, offset: 912, encoding: u64, label: "Buy level 12 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_12_factor, offset: 936, encoding: u64, label: "Buy level 13 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_13_factor, offset: 960, encoding: u64, label: "Buy level 14 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_14_factor, offset: 984, encoding: u64, label: "Buy level 15 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_15_factor, offset: 1008, encoding: u64, label: "Buy level 16 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_16_factor, offset: 1032, encoding: u64, label: "Buy level 17 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_17_factor, offset: 1056, encoding: u64, label: "Buy level 18 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_18_factor, offset: 1080, encoding: u64, label: "Buy level 19 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
+      - { path: buy_level_19_factor, offset: 1104, encoding: u64, label: "Buy level 20 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
     llm_context: |
       PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
       otherwise the swap rejects with custom error 65535 and the new curve is never used.
 
-      The factor multiplies the directional price: output = input * price * factor / 10^21, so a
-      factor of 1000000 is neutral and 990000 pays 1% less. The sell factors price base-to-quote
-      sells, the buy factors quote-to-base buys; the other side is untouched.
+      The factor multiplies the directional price: output = input * price * factor / 10^21. Factors
+      are in millionths and must stay below 1000000; 1000000 or more rejects with custom error 7, and
+      990000 pays 1% less than the bare price. The sell factors price base-to-quote sells, the buy
+      factors quote-to-base buys; the other side is untouched.
 
       Factors must strictly descend across a ladder. A level whose factor is equal to or larger than
       the one before it makes the program reject with custom error 8. To widen a side, read all
       twenty stored factors and multiply every nonzero one by the same ratio. Flooring can make two
       neighbours equal, so check that each result stays strictly below the one before it and lower
-      an equal one by 1. A ratio that rounds a nonzero factor to zero disables that level.
+      an equal one by 1. A ratio that rounds a nonzero factor to zero breaks the descent and rejects
+      with custom error 8 as well.
 
       READING THE STORED VALUES: make all twenty reads in one round, twenty getAccountInfo calls on
       the market at once, each with encoding "base64" and dataSlice {"offset":<the property's
@@ -287,5 +299,5 @@ templates:
       both for a full halt. Each writes the enabled flag of all twenty levels on its side, after
       which the program rejects that swap direction with custom error 65535 (0xffff), the same
       code as a stale quote. Clearing only the first level does not halt a quote that the
-      market starts at a later level. Writing 1 would enable levels whose capacity and factor were
+      market starts at a later level. Writing 1 would re-enable levels the maker pulled, or ones it
       never configured, so only 0 is supported.
