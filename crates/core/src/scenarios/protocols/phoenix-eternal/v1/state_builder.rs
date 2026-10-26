@@ -830,7 +830,7 @@ mod tests {
                 (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
             ])),
         );
-        // Registered for an earlier slot, which surfnet_registerScenario allows, and played at once.
+        // Scheduled straight on the SVM for an earlier slot (the RPC would reject it) and played at once.
         svm.register_scenario(scenario, Some(900)).unwrap();
 
         svm.materialize_overrides_for_slot(&None, 900)
