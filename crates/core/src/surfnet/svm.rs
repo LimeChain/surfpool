@@ -4695,17 +4695,22 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Every slot is checked before anything is stored, so a bad override leaves no partial plan.
+        let mut scheduled = Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
             let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
-                SurfpoolError::internal(format!(
+                SurfpoolError::invalid_params(format!(
                     "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+            scheduled.push((absolute_slot, override_instance));
+        }
 
+        for (absolute_slot, override_instance) in scheduled {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
                 absolute_slot, base_slot, scenario_relative_slot
