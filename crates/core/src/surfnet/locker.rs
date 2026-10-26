@@ -2829,6 +2829,17 @@ impl SurfnetSvmLocker {
                     "base slot {base_slot} is already produced; the next slot is {next_slot}"
                 )));
             }
+            for override_instance in &scenario.overrides {
+                if base_slot
+                    .checked_add(override_instance.scenario_relative_slot)
+                    .is_none()
+                {
+                    return Err(SurfpoolError::invalid_params(format!(
+                        "override {} cannot be scheduled: base slot {base_slot} plus relative slot {} overflows",
+                        override_instance.id, override_instance.scenario_relative_slot
+                    )));
+                }
+            }
             svm_writer.register_scenario(scenario, Some(base_slot))
         })
     }

@@ -1430,6 +1430,7 @@ pub trait SurfnetCheatcodes {
     /// A `RpcResponse<()>` indicating whether the Scenario registration was successful.
     ///
     /// Overrides are applied when the surfnet produces their slot; nothing is applied during this call.
+    /// `surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots it skips are never applied; step one slot at a time.
     ///
     /// ## Example Request (with slot)
     /// ```json
@@ -6002,5 +6003,35 @@ mod tests {
             .svm_locker
             .with_svm_reader(|svm_reader| svm_reader.scheduled_overrides.keys().unwrap());
         assert!(scheduled_slots.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_scenario_rejects_a_relative_slot_that_overflows() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let (_, instance) = client
+            .context
+            .svm_locker
+            .with_svm_writer(scheduled_override_fixture);
+        let mut scenario = Scenario::new("overflow".to_string(), String::new());
+        scenario.add_override(instance.clone());
+        let mut far = instance;
+        far.scenario_relative_slot = u64::MAX;
+        scenario.add_override(far);
+
+        let error = client
+            .rpc
+            .register_scenario(Some(client.context.clone()), scenario, None)
+            .await
+            .expect_err("a relative slot that overflows must be rejected");
+
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        let scheduled_slots = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.scheduled_overrides.keys().unwrap());
+        assert!(
+            scheduled_slots.is_empty(),
+            "nothing may be scheduled when one override is rejected"
+        );
     }
 }
