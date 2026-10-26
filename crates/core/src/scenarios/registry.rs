@@ -1052,6 +1052,32 @@ templates: []
     }
 
     #[test]
+    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_template() {
+        let registry = TemplateRegistry::new();
+        let mut tagged: Vec<&str> = registry
+            .by_tags(&["clock-sensitive".to_string()])
+            .iter()
+            .map(|template| template.id.as_str())
+            .collect();
+        tagged.sort_unstable();
+
+        let mut expected: Vec<&str> = registry
+            .all()
+            .iter()
+            .map(|template| template.id.as_str())
+            .filter(|id| *id == "pyth-price-feed-v2" || id.starts_with("phoenix-"))
+            .collect();
+        expected.sort_unstable();
+
+        assert_eq!(
+            expected.len(),
+            9,
+            "Pyth price feed v2 and the eight Phoenix templates"
+        );
+        assert_eq!(tagged, expected);
+    }
+
+    #[test]
     fn test_jupiter_idl_has_token_ledger_account() {
         let registry = TemplateRegistry::new();
         let jupiter_template = registry.get("jupiter-token-ledger-override").unwrap();
