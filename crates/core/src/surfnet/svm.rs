@@ -95,7 +95,11 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::{
+            phoenix_eternal::v1::state_builder::prepare_phoenix_override,
+            pyth::{refresh_stale_price_updates, scenario_reads_prices},
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
@@ -4707,6 +4711,8 @@ impl SurfnetSvm {
             base_slot
         );
 
+        let reads_prices = scenario_reads_prices(&scenario);
+
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
@@ -4730,6 +4736,18 @@ impl SurfnetSvm {
             slot_overrides.push(override_instance);
             self.scheduled_overrides
                 .store(absolute_slot, slot_overrides)?;
+        }
+
+        if reads_prices {
+            let current_slot = self.latest_epoch_info.absolute_slot;
+            match refresh_stale_price_updates(self, current_slot) {
+                Ok(0) => {}
+                Ok(count) => info!(
+                    "Marked {} stale Pyth price update(s) as published now",
+                    count
+                ),
+                Err(e) => warn!("Failed to refresh stale Pyth price updates: {}", e),
+            }
         }
 
         Ok(())

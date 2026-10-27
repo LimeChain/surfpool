@@ -1,0 +1,360 @@
+protocol: Save
+# The program build this layout describes: solend-program 2.0.2, deployed at slot 350614570 from
+# solendprotocol/solana-program-library commit d04ce00b. Reserve 619, Obligation 1300 bytes.
+version: v2.0.2
+account_type: Reserve
+
+# Save publishes no IDL and none is reconstructed here. Its accounts are packed with no
+# discriminator, so properties are written using their byte offsets and encodings.
+raw_layout: true
+
+tags:
+  - lending
+  - risk-engine
+  - defi
+
+llm_context: |
+  FINDING A RESERVE WHEN THE USER NAMES A TOKEN OR STUDIO DOES NOT LIST IT:
+  1. Resolve the token's mint with get_token_address.
+  2. Call getProgramAccounts with two positional params: the program id
+     "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo", then the config object
+     {"encoding":"base58","dataSlice":{"offset":107,"length":32},"filters":[{"dataSize":619},
+     {"memcmp":{"offset":10,"bytes":"4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY"}},
+     {"memcmp":{"offset":42,"bytes":"<mint>"}}]}.
+     Offset 10 is the main pool's market and 42 the reserve's liquidity mint. The result's
+     pubkey is the reserve, and its data is the Pyth price account the reserve reads.
+  3. No result means a mistyped mint or no reserve for it in the main pool. Copy the mint again
+     and repeat once, then ask the user for the reserve address instead of saying none exists.
+  4. A reserve address the user gives is used as is.
+
+  FINDING AN OBLIGATION: an obligation is not a PDA. Its address is
+  createWithSeed(owner, seed, So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo), where seed is the
+  first 32 characters of the market's base58 address. A wallet's obligations come from
+  getProgramAccounts on the program with the config object {"encoding":"base64",
+  "dataSlice":{"offset":0,"length":0},"filters":[{"dataSize":1300},
+  {"memcmp":{"offset":42,"bytes":"<wallet>"}}]}. Each result's pubkey is one obligation.
+
+  Put the reserve or obligation in the override's account as {"pubkey":"<address>"}. Set
+  fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+  that builds on state an earlier override in the same scenario prepared.
+
+templates:
+  - id: save-reserve-risk
+    name: Override Reserve Risk
+    description: >-
+      Override how much a Save reserve lends against its collateral and when positions are
+      liquidated.
+    idl_account_name: Reserve
+    address:
+      type: pubkey
+    properties:
+      - path: config.loan_to_value_ratio
+        offset: 300
+        encoding: u8
+        label: Loan to value
+        description: >-
+          Share of the collateral's value that can be borrowed against, in whole percent.
+          Example: 65
+      - path: config.liquidation_threshold
+        offset: 302
+        encoding: u8
+        label: Liquidation threshold
+        description: >-
+          Share of the collateral's value at which a position becomes liquidatable, in whole
+          percent. Example: 72
+      - path: config.liquidation_bonus
+        offset: 301
+        encoding: u8
+        label: Liquidation bonus
+        description: >-
+          Bonus a liquidator earns at the threshold, in whole percent. Example: 3
+      - path: config.max_liquidation_bonus
+        offset: 479
+        encoding: u8
+        label: Max liquidation bonus
+        description: >-
+          Bonus at the max liquidation threshold, in whole percent. Never below the liquidation
+          bonus. Example: 5
+      - path: config.max_liquidation_threshold
+        offset: 480
+        encoding: u8
+        label: Max liquidation threshold
+        description: >-
+          Share of value at which the bonus reaches its maximum, in whole percent. Never below
+          the liquidation threshold. Example: 74
+      - path: config.added_borrow_weight_bps
+        offset: 445
+        encoding: u64
+        label: Added borrow weight
+        description: >-
+          Extra weight on debt in this asset, in basis points. A borrow counts as
+          (1 + bps / 10000) times its value. Example: 0
+    llm_context: |
+      Risk settings of any Save reserve.
+
+      These are inputs refresh_obligation reads, so they survive it. The obligation's cached health
+      values do not.
+
+      TO MAKE A POSITION LIQUIDATABLE: on the COLLATERAL reserve, lower config.liquidation_threshold
+      below the position's borrowed/deposited ratio. Borrowing capacity comes from
+      config.loan_to_value_ratio on the same reserve.
+
+      THE PRICE LEVER: crash the collateral's price instead with pyth-price-feed-v2 on the feed of
+      the reserve's price account (the lookup above returns it). One feed can price several
+      reserves. Move price and ema_price together and scale conf and ema_conf with them: Save
+      rejects a price whose conf x 10 exceeds it. Save accepts a Pyth price for 120 seconds, so
+      keep fetchBeforeUse: true and leave publish_time unset; upstream's current value arrives when
+      the override plays. The price then stays valid for 120 s of Surfnet clock; play the scenario
+      again before acting later.
+
+      To make one debt asset riskier than others, raise config.added_borrow_weight_bps on the DEBT
+      reserve: 10000 counts every borrowed dollar twice.
+
+      On read, the program raises max_liquidation_threshold to at least liquidation_threshold, and
+      max_liquidation_bonus to at least liquidation_bonus.
+
+      EXAMPLE - "liquidate above 50% LTV":
+      config.liquidation_threshold: 50
+  - id: save-reserve-rates
+    name: Override Reserve Borrow Rates
+    description: >-
+      Override the interest rate curve of a Save reserve.
+    idl_account_name: Reserve
+    address:
+      type: pubkey
+    properties:
+      - path: config.min_borrow_rate
+        offset: 303
+        encoding: u8
+        label: Min borrow rate
+        description: >-
+          Borrow APR at 0% utilisation, in whole percent. Example: 1
+      - path: config.optimal_borrow_rate
+        offset: 304
+        encoding: u8
+        label: Optimal borrow rate
+        description: >-
+          Borrow APR at the optimal utilisation, in whole percent. Example: 3
+      - path: config.max_borrow_rate
+        offset: 305
+        encoding: u8
+        label: Max borrow rate
+        description: >-
+          Borrow APR at the max utilisation, in whole percent. Example: 7
+      - path: config.super_max_borrow_rate
+        offset: 471
+        encoding: u64
+        label: Super max borrow rate
+        description: >-
+          Borrow APR at 100% utilisation, in whole percent. Never below the max borrow rate.
+          Example: 150
+      - path: config.optimal_utilization_rate
+        offset: 299
+        encoding: u8
+        label: Optimal utilisation
+        description: >-
+          Utilisation where the curve reaches the optimal rate, in whole percent. Example: 80
+      - path: config.max_utilization_rate
+        offset: 470
+        encoding: u8
+        label: Max utilisation
+        description: >-
+          Utilisation where the curve reaches the max rate, in whole percent. Never below the
+          optimal utilisation. Example: 90
+    llm_context: |
+      The borrow rate is piecewise linear through (0%, min), (optimal utilisation, optimal rate),
+      (max utilisation, max rate) and (100%, super max). Utilisation is borrowed / (borrowed +
+      available). Interest accrues on the next refresh_reserve, compounded per slot.
+
+      All rates are APR in whole percent; only super_max_borrow_rate is wider than one byte. On
+      read, the program raises max_utilization_rate to at least optimal_utilization_rate, and
+      super_max_borrow_rate to at least max_borrow_rate.
+
+      EXAMPLE - "borrowing costs 50% APR at any utilisation":
+      config.min_borrow_rate: 50
+      config.optimal_borrow_rate: 50
+      config.max_borrow_rate: 50
+      config.super_max_borrow_rate: 50
+  - id: save-reserve-limits
+    name: Override Reserve Limits
+    description: >-
+      Cap or block deposits and borrows on a Save reserve.
+    idl_account_name: Reserve
+    address:
+      type: pubkey
+    properties:
+      - path: config.deposit_limit
+        offset: 323
+        encoding: u64
+        label: Deposit limit
+        description: >-
+          Maximum liquidity the reserve accepts, in the mint's smallest unit. 0 blocks deposits.
+          Example: 1000000000000000
+      - path: config.borrow_limit
+        offset: 331
+        encoding: u64
+        label: Borrow limit
+        description: >-
+          Maximum liquidity that can be borrowed, in the mint's smallest unit. 0 blocks borrows.
+          Example: 800000000000000
+    llm_context: |
+      Use this to test how a caller handles a Save reserve that refuses an action. Both limits
+      compare against the reserve's totals, not against one user's position.
+
+      EXAMPLE - "no new borrows on this reserve":
+      config.borrow_limit: 0
+  - id: save-reserve-liquidity
+    name: Override Reserve Liquidity
+    description: >-
+      Lower the liquidity a Save reserve can lend or pay out.
+    idl_account_name: Reserve
+    address:
+      type: pubkey
+    properties:
+      - path: liquidity.available_amount
+        offset: 171
+        encoding: u64
+        label: Available liquidity
+        description: >-
+          Liquidity the reserve can lend or pay out, in the mint's smallest unit. Only lower it:
+          it must not exceed the balance of the reserve's liquidity vault. Example: 0
+    llm_context: |
+      LOWER, DO NOT RAISE. This field mirrors the token balance of the reserve's liquidity vault
+      (liquidity.supply_pubkey, offset 75), which this template does not touch. Lowering it is
+      safe: borrows and withdrawals larger than the new amount fail. Raising it above the vault's
+      real balance makes the program promise tokens the vault cannot transfer, and the transaction
+      fails when it settles.
+
+      It also moves utilisation, so the borrow rate and the cToken exchange rate change with it.
+
+      EXAMPLE - "the reserve has run dry":
+      liquidity.available_amount: 0
+  - id: save-obligation-position
+    name: Override Obligation Position
+    description: >-
+      Replace a Save obligation with one collateral deposit and one borrow.
+    idl_account_name: Obligation
+    address:
+      type: pubkey
+    properties:
+      - path: owner
+        offset: 42
+        encoding: bytes32
+        label: Owner
+        description: >-
+          Wallet that owns the position and signs its actions, as a base58 pubkey
+      - path: lending_market
+        offset: 10
+        encoding: bytes32
+        label: Lending market
+        description: >-
+          Market the reserves belong to. The main pool is
+          4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY
+      - path: deposits_len
+        offset: 202
+        encoding: u8
+        label: Number of deposits
+        description: >-
+          Always 1. This template writes exactly one deposit entry
+      - path: borrows_len
+        offset: 203
+        encoding: u8
+        label: Number of borrows
+        description: >-
+          Always 1. This template writes exactly one borrow entry
+      - path: deposits.0.deposit_reserve
+        offset: 204
+        encoding: bytes32
+        label: Collateral reserve
+        description: >-
+          Reserve holding the collateral, as a base58 pubkey
+      - path: deposits.0.deposited_amount
+        offset: 236
+        encoding: u64
+        label: Collateral amount
+        description: >-
+          Collateral in cTokens, the reserve's collateral mint, in its smallest unit. Not in the
+          underlying token. Example: 100000000000
+      - path: borrows.0.borrow_reserve
+        offset: 292
+        encoding: bytes32
+        label: Debt reserve
+        description: >-
+          Reserve the debt is owed to, as a base58 pubkey
+      - path: borrows.0.cumulative_borrow_rate_wads
+        offset: 324
+        encoding: u128
+        label: Debt interest index
+        description: >-
+          Copy the debt reserve's liquidity.cumulative_borrow_rate_wads (u128 at offset 195), as a
+          decimal string. Example: "1522068768032123299"
+      - path: borrows.0.borrowed_amount_wads
+        offset: 340
+        encoding: u128
+        label: Debt amount
+        description: >-
+          Debt in the debt token's smallest unit, times 10^18, as a decimal string. Example: 500
+          USDC is "500000000000000000000000000"
+    llm_context: |
+      Builds a position of exactly ONE collateral deposit and ONE borrow. Set every property:
+      the account's old entries are not cleared, so a field left out keeps whatever was there.
+
+      THE ACCOUNT MUST ALREADY EXIST. An obligation is not a PDA. Its address is
+      createWithSeed(owner, seed, So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo), where seed is
+      the first 32 characters of the market's base58 address ("4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtf"
+      for the main pool). Pull a mainnet obligation from upstream, or use one your wallet created
+      on the surfnet with init_obligation.
+
+      HOW TO SET EACH FIELD:
+      1. deposits_len and borrows_len: 1 and 1
+      2. deposits.0.deposited_amount is in cTokens, not the underlying token. cTokens =
+         underlying x collateral.mint_total_supply / (available_amount + borrowed_amount_wads /
+         10^18 - accumulated_protocol_fees_wads / 10^18), all read from the collateral reserve
+      3. borrows.0.cumulative_borrow_rate_wads: copy the debt reserve's current value (u128 at
+         offset 195). A higher value fails with NegativeInterestRate; a lower one charges
+         interest on the next refresh
+      4. Pass u128 values as decimal strings
+
+      Health values are not overridable: refresh_obligation recomputes them, and every borrow,
+      withdraw and liquidation needs that refresh in the same slot. To make this position
+      liquidatable, lower the collateral reserve's config.liquidation_threshold, or crash its price
+      through pyth-price-feed-v2.
+
+      The collateral reserve's cToken vault must hold at least deposited_amount, or a withdrawal
+      or liquidation cannot transfer it.
+
+      EXAMPLE - "100 cSOL collateral against 5000 USDC of debt in the main pool":
+      owner: <your wallet>
+      lending_market: 4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY
+      deposits_len: 1
+      borrows_len: 1
+      deposits.0.deposit_reserve: <the SOL reserve>
+      deposits.0.deposited_amount: 100000000000
+      borrows.0.borrow_reserve: <the USDC reserve>
+      borrows.0.cumulative_borrow_rate_wads: "<USDC reserve's value>"
+      borrows.0.borrowed_amount_wads: "5000000000000000000000000000"
+  - id: save-obligation-owner
+    name: Take Over Obligation
+    description: >-
+      Make your wallet the owner of an existing Save obligation.
+    idl_account_name: Obligation
+    address:
+      type: pubkey
+    properties:
+      - path: owner
+        offset: 42
+        encoding: bytes32
+        label: Owner
+        description: >-
+          Wallet that will own the position and sign its actions, as a base58 pubkey
+    llm_context: |
+      Takes over a real position in the local VM. The deposits, borrows and history stay as they
+      were; only the signer changes, so your wallet can withdraw or borrow against it. Repaying
+      needs no owner signature.
+
+      The address does not move with the owner. A client that derives the address from the wallet
+      will not find this obligation; one that uses getProgramAccounts filtered on dataSize 1300 and
+      the owner at offset 42 will.
+
+      EXAMPLE:
+      owner: <your wallet>
