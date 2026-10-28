@@ -29,6 +29,7 @@ use crate::{
     types::{GeyserAccountUpdate, TransactionWithStatusMeta},
 };
 
+pub mod keep_alive;
 pub mod locker;
 pub mod market_tick;
 pub mod noop_program;
@@ -36,7 +37,10 @@ pub mod remote;
 pub mod surfnet_lite_svm;
 pub mod svm;
 
-pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
+/// Finalization depth when the Alpenglow feature is disabled.
+pub const LEGACY_FINALIZATION_SLOT_THRESHOLD: u64 = 31;
+/// Initial slot for local ledgers, independent of the finalization policy.
+pub const INITIAL_SLOT: u64 = 31;
 pub const SLOTS_PER_EPOCH: u64 = 432000;
 
 pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Send + Sync>;
@@ -186,14 +190,14 @@ pub enum LocalSignatureStatusOrSubscription {
 }
 
 pub type AccountSubscriptionData =
-    HashMap<Pubkey, Vec<(Option<UiAccountEncoding>, Sender<UiAccount>)>>;
+    HashMap<Pubkey, Vec<(Option<UiAccountEncoding>, Sender<(Slot, UiAccount)>)>>;
 
 pub type ProgramSubscriptionData = HashMap<
     Pubkey,
     Vec<(
         Option<UiAccountEncoding>,
         Option<Vec<RpcFilterType>>,
-        Sender<RpcKeyedAccount>,
+        Sender<(Slot, RpcKeyedAccount)>,
     )>,
 >;
 
@@ -417,10 +421,11 @@ impl GetTransactionResult {
     pub fn found_transaction(
         signature: Signature,
         tx: EncodedConfirmedTransactionWithStatusMeta,
-        latest_absolute_slot: u64,
+        blocks_after: u64,
+        finalized_slot: Slot,
     ) -> Self {
-        let is_finalized = latest_absolute_slot >= tx.slot + FINALIZATION_SLOT_THRESHOLD;
-        let is_confirmed = latest_absolute_slot >= tx.slot + 1;
+        let is_finalized = tx.slot <= finalized_slot;
+        let is_confirmed = blocks_after >= 1;
         let (confirmation_status, confirmations) = if is_finalized {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
@@ -429,12 +434,12 @@ impl GetTransactionResult {
         } else if is_confirmed {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed),
-                Some((latest_absolute_slot - tx.slot) as usize),
+                Some(blocks_after as usize),
             )
         } else {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Processed),
-                Some((latest_absolute_slot - tx.slot) as usize),
+                Some(blocks_after as usize),
             )
         };
         let status = TransactionStatus {
