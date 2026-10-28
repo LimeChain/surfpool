@@ -1,6 +1,7 @@
 # BisonFi
 
-A proprietary market maker (PMM), not an AMM. Four templates: price, depth, spread and freshness.
+A proprietary market maker (PMM), not an AMM. Three templates: price, depth and spread. Surfpool
+keeps the quote and the market tick live on its own while a scenario is registered.
 
 Because it is a market maker rather than a curve, it can be put into states no constant-product pool
 can reach - quoting wide with deep inventory, or refusing to quote at all. Those are the scenarios
@@ -13,18 +14,26 @@ worth reaching for this protocol to test.
 | `bisonfi-fair-value` | the mid price BisonFi quotes around |
 | `bisonfi-depth` | how far a trade moves BisonFi's price |
 | `bisonfi-spread` | the spread BisonFi quotes around its mid |
-| `bisonfi-freshness` | keeps the maker quoting in a slot, or models it going offline |
 
-## The market tick (Surfpool handles it)
+## Keep-alive (Surfpool handles it)
 
-Since BisonFi's 2026-10-14 program upgrade, every swap on a live market passes a tenth account, the
-market tick `4cG31VNF9TzFinNc7BmnjhFvGjxkY3sCETVMtMgbrhPs`. It is a clock: on mainnet a block builder
-rewrites its slot and nanosecond timestamp several times per slot, and the program checks both
-against the `Clock` sysvar. Without the account a swap succeeds and pays out zero; with a tick that
-disagrees with the clock it falls back to a thinner book.
+On mainnet the maker republishes every pool's quote and two block builders rewrite a shared market
+tick every slot. Nobody runs them against a surfnet, so while a scenario with a BisonFi override is
+registered, Surfpool does it every slot ([keep-alive](../../README.md#keep-alive)). There is nothing
+to schedule:
 
-Surfpool restamps the tick whenever it moves the clock (each block, time travel, restart) and when it
-first loads it from upstream, so there is nothing to schedule.
+- **The pool's quote.** The publication slot (byte 72) and time (byte 88) follow the surfnet clock,
+  and the last book rebuild (byte 688) moves to the previous slot, so the first swap of every slot
+  refills the book as after a real publication.
+- **The market tick** `4cG31VNF9TzFinNc7BmnjhFvGjxkY3sCETVMtMgbrhPs`. Every swap on a live market
+  passes it as a tenth account, and the program checks its slot and nanosecond timestamp against the
+  `Clock` sysvar. Without the account a swap succeeds and
+  pays out zero; with a tick that disagrees with the clock it falls back to a thinner book. Keep-alive
+  loads it from upstream when the scenario starts.
+
+Keep-alive starts in the slot the scenario's first BisonFi override plays and stops when the scenario
+is unregistered, which Studio's Delete does. After `surfnet_timeTravel` it republishes both in the
+first block after the jump.
 
 ## Number formats
 
@@ -85,38 +94,20 @@ that cannot fill at all.
 
 ## Keep the venue quoting
 
-**A pool loaded into the local VM eventually goes stale by itself.** The local VM does not republish
-the mid. The exact allowed age is maker policy and can vary between markets or deployments. Once
-stale, the price, depth and spread templates are silently ignored. Refresh the timestamp to keep the
-venue alive for as long as your scenario needs.
+A pool loaded into the local VM goes stale by itself: a quote more than two slots old pays nothing,
+and the price, depth and spread overrides are then silently ignored. Keep-alive prevents that for as
+long as the scenario is registered, resuming the price the venue already held. A pool no registered
+scenario overrides is left as fetched and goes stale; unregistering the scenario is how to see a
+stale venue.
 
-```
-template: bisonfi-freshness
-last_update_slot: 0              # relative to the materialization slot
-```
+A later upstream fetch replaces the full pool account. If one is required, reapply the scenario's
+price, depth and spread overrides after it in that slot.
 
-Refreshing also completes the publication the way the maker's own does: it stamps the pool's
-millisecond publication time (byte 88) from the surfnet clock, so the venue quotes its full book as on
-mainnet - the program grades a quote's age against the market tick to the millisecond - and it moves
-the pool's last book rebuild (byte 688) into the past if it is not, so the next swap refills the book
-(see below).
-
-Refreshing resumes the price the venue already held - no new price is needed. The value is a signed
-offset, not an absolute slot: `0` means "published in this slot". If the scenario spans enough slots
-for the quote to become stale again, schedule another freshness override in each slot where the quote
-must be usable with `fetchBeforeUse: false`. A later upstream fetch replaces the full pool account;
-if one is required, reapply the scenario's price, depth and spread overrides after it in that slot.
-
-An immediate scenario may not need this. A scenario that spans multiple slots should keep the quote
-fresh explicitly rather than depending on the venue's current tolerance.
-
-**Refreshing also refills the book.** Each swap consumes the depth it walks through, so a second
+**Every slot also refills the book.** Each swap consumes the depth it walks through, so a second
 swap in the same slot fills worse - by a fraction of a basis point on SOL markets, by about 90 bps on
 whETH-USDC, whose inner levels are thin. The program restores the book on the first swap of a slot
-the pool was published in. On a surfnet that means a slot carrying a freshness override: without
-one, consumed depth stays consumed until the quote goes stale. This holds for a pool fetched while the
-surfnet is still behind mainnet too, whose last rebuild slot arrives from mainnet's future: the
-freshness override moves it back.
+the pool was published in, which keep-alive makes every slot. This holds for a pool fetched while the
+surfnet is still behind mainnet too, whose last rebuild slot arrives from mainnet's future.
 
 ## Quote a wide spread
 
@@ -172,14 +163,13 @@ executable margin - both legs fit in one transaction. Two things to get right:
 
 | Symptom | Fix |
 |---|---|
-| A price, depth or spread override had no effect and nothing errored | The quote is stale, and the freshness gate runs first. Refresh `last_update_slot` - see "Keep the venue quoting" |
+| A price, depth or spread override had no effect and nothing errored | The quote is stale, and the freshness gate runs first. Check the scenario is still registered - see "Keep the venue quoting" |
 | The pool quotes nothing at any size | Probably one of the dormant markets. Check how far `last_update_slot` is behind the chain |
-| Every swap returns 0 even on a fresh live market | The market tick is missing from the swap. Surfpool keeps it current, but a hand-built swap must pass it as the tenth account - see "The market tick" |
+| Every swap returns 0 even on a fresh live market | The market tick is missing from the swap. Surfpool keeps it current, but a hand-built swap must pass it as the tenth account - see "Keep-alive" |
 | A spread override does nothing on HYPE-USDC, or less than you set elsewhere | The centre-depth properties were left out. Set all four to `0` |
-| A second swap in the same slot fills worse than the first | Not a bug: swaps consume the book. A freshness override in the next slot refills it |
+| A second swap in the same slot fills worse than the first | Not a bug: swaps consume the book. Keep-alive refills it in the next slot |
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
-| The quote becomes stale again later in the scenario | Schedule another freshness override with `fetchBeforeUse: false` in each slot where the quote must be usable |
+| The quote went stale after the scenario was deleted | Expected: unregistering a scenario stops its keep-alive |
 | `Custom(60)` | A Token-2022 mint whose token accounts need extension data matching that mint |
 | A large swap exhausts its compute budget | The default 200k compute budget may be too small; request about 1.4M units |
-| A freshness override does not seem to age the pool | If your harness derives its clock from the pool's own `last_update_slot`, aging the account moves the clock with it. Apply the override after the clock is taken |
