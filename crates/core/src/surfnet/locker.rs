@@ -2817,12 +2817,6 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
     }
 
-    /// Unregisters a scenario: its keep-alive stops and its overrides still to play are dropped.
-    /// Returns whether it was registered.
-    pub fn unregister_scenario(&self, scenario_id: &str) -> SurfpoolResult<bool> {
-        self.with_svm_writer(|svm_writer| svm_writer.unregister_scenario(scenario_id))
-    }
-
     /// Materializes overrides for a specific slot (not necessarily the current slot)
     pub async fn materialize_overrides_for_slot(
         &self,
@@ -4013,6 +4007,25 @@ impl SurfnetSvmLocker {
         svm_writer.bump_state_revision();
         svm_writer.confirm_current_block()?;
         svm_writer.materialize_overrides(remote_ctx).await
+    }
+
+    /// Applies a time travel's `clock`, then keep-alive at the slot and time it lands on, so the
+    /// accounts keep-alive rewrites match the new Clock before anything reads them.
+    pub async fn apply_time_travel(
+        &self,
+        clock: Clock,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<EpochInfo> {
+        let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
+        let epoch_info = svm_writer.apply_time_travel(clock)?;
+        // The travel has happened either way, so a keep-alive failure is reported, not returned.
+        if let Err(e) = svm_writer.apply_keep_alive(remote_ctx).await {
+            svm_writer.simnet_events_tx.error(format!(
+                "Failed to keep accounts alive after time travel: {e}"
+            ));
+        }
+        Ok(epoch_info)
     }
 
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
