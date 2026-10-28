@@ -67,7 +67,9 @@ use uuid::Uuid;
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
-    SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    SignatureSubscriptionType, SurfnetSvm,
+    remote::SurfnetRemoteClient,
+    svm::{AccountUpdatePolicy, ReadSlot},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -82,7 +84,6 @@ use crate::{
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
     storage::StorageResult,
-    surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -93,6 +94,7 @@ struct LocalTransactionLookup {
     result: GetTransactionResult,
     is_pending: bool,
     latest_absolute_slot: Slot,
+    finalized_slot: Slot,
 }
 
 pub struct SvmAccessContext<T> {
@@ -186,10 +188,10 @@ impl SurfnetSvmLocker {
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
     pub fn shutdown(&self) {
-        let read_lock = self.0.clone();
+        let write_lock = self.0.clone();
         tokio::task::block_in_place(move || {
-            let read_guard = read_lock.blocking_read();
-            read_guard.shutdown();
+            let mut write_guard = write_lock.blocking_write();
+            write_guard.shutdown();
         });
     }
 
@@ -276,12 +278,11 @@ impl SurfnetSvmLocker {
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
-            svm_writer.initialize(epoch_info, epoch_schedule);
             svm_writer
                 .inner
                 .set_sysvar(&last_restart_slot.unwrap_or_default());
-        });
-        Ok(())
+            svm_writer.initialize(epoch_info, epoch_schedule)
+        })
     }
 }
 
@@ -1240,8 +1241,6 @@ impl SurfnetSvmLocker {
         }
 
         let ctx = self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
-
             let mut records: Vec<Record> = svm_reader
                 .transactions
                 .into_iter()
@@ -1302,13 +1301,7 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = svm_reader.confirmation_status(slot);
 
                         Some(Record {
                             signature: sig,
@@ -1449,8 +1442,6 @@ impl SurfnetSvmLocker {
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
 
         self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
-
             let sigs: Vec<_> = svm_reader
                 .transactions
                 .into_iter()
@@ -1477,13 +1468,7 @@ impl SurfnetSvmLocker {
                         }
 
                         // Determine confirmation status
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = svm_reader.confirmation_status(slot);
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the
@@ -1719,6 +1704,7 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolResult<LocalTransactionLookup> {
         self.with_svm_reader(|svm_reader| {
             let latest_absolute_slot = svm_reader.get_latest_absolute_slot();
+            let finalized_slot = svm_reader.slot_for_commitment(&CommitmentConfig::finalized());
             let is_pending = svm_reader.is_transaction_pending(signature);
 
             let Some(entry) = svm_reader.transactions.get(&signature.to_string())? else {
@@ -1726,6 +1712,7 @@ impl SurfnetSvmLocker {
                     result: GetTransactionResult::None(*signature),
                     is_pending,
                     latest_absolute_slot,
+                    finalized_slot,
                 });
             };
 
@@ -1753,10 +1740,13 @@ impl SurfnetSvmLocker {
                         block_time,
                         transaction_index: None,
                     },
-                    latest_absolute_slot,
+                    // Skipped slots are no confirmations: count the blocks, as finalization does.
+                    svm_reader.blocks_after(slot),
+                    finalized_slot,
                 ),
                 is_pending,
                 latest_absolute_slot,
+                finalized_slot,
             })
         })
     }
@@ -1772,7 +1762,12 @@ impl SurfnetSvmLocker {
 
         if local_lookup.result.is_none() && !local_lookup.is_pending {
             client
-                .try_get_transaction(*signature, config, local_lookup.latest_absolute_slot)
+                .try_get_transaction(
+                    *signature,
+                    config,
+                    local_lookup.latest_absolute_slot,
+                    local_lookup.finalized_slot,
+                )
                 .await
         } else {
             Ok(local_lookup.result)
@@ -2692,7 +2687,9 @@ impl SurfnetSvmLocker {
             )
         } else {
             let epoch_schedule = SurfnetSvm::default_epoch_schedule();
-            let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+            let mut epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+            // The chain opens the slot after this one: offline, `INITIAL_SLOT`, as at startup.
+            epoch_info.absolute_slot -= 1;
             (epoch_info, epoch_schedule)
         };
         epoch_info.transaction_count = None;
@@ -3920,6 +3917,12 @@ impl SurfnetSvmLocker {
             &epoch_schedule,
         )
         .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+        // The block at the largest slot could have no block after it.
+        if clock_update.slot == Slot::MAX {
+            return Err(SurfpoolError::internal(
+                "Cannot time travel to the largest slot",
+            ));
+        }
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
@@ -3939,9 +3942,8 @@ impl SurfnetSvmLocker {
         // Wait for confirmation with timeout
         let updated_epoch_info = response_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| {
-                SurfpoolError::internal(format!("Failed to confirm clock update: {}", e))
-            })?;
+            .map_err(|e| SurfpoolError::internal(format!("Failed to confirm clock update: {}", e)))?
+            .map_err(SurfpoolError::internal)?;
 
         self.simnet_events_tx().info(format!(
             "Time travel to {} successful (epoch {} / slot {})",
@@ -3967,6 +3969,17 @@ impl SurfnetSvmLocker {
 
     pub fn get_slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
         self.with_svm_reader(|svm_reader| svm_reader.slot_for_commitment(commitment))
+    }
+
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it.
+    /// Internally, this function calls [`SurfnetSvm::read_slot`] under a read guard. This
+    /// should be called before subsequent locker reads, so the context slot is valid for those reads.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        self.with_svm_reader(|svm| svm.read_slot(commitment, min_context_slot))
     }
 
     /// Executes an airdrop via the underlying SVM.
@@ -4024,7 +4037,7 @@ impl SurfnetSvmLocker {
         &self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         // Handles the locking/unlocking safely
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_account_updates(account_pubkey, encoding)
@@ -4037,7 +4050,7 @@ impl SurfnetSvmLocker {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_program_updates(program_id, encoding, filters)
         })
@@ -6222,11 +6235,35 @@ mod tests {
         // None value (skipped without remote)
         snapshot.insert(Pubkey::new_unique().to_string(), None);
 
+        // Clock sysvar (rejected: surfpool maintains it)
+        let clock_before = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+        snapshot.insert(
+            solana_sdk_ids::sysvar::clock::ID.to_string(),
+            Some(AccountSnapshot {
+                lamports: 1_169_280,
+                owner: solana_sdk_ids::sysvar::ID.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                data: general_purpose::STANDARD.encode(
+                    bincode::serialize(&Clock {
+                        slot: 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                parsed_data: None,
+            }),
+        );
+
         let loaded = locker
             .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
             .await
             .unwrap();
         assert_eq!(loaded, 1);
+        assert_eq!(
+            locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>()),
+            clock_before
+        );
 
         // Only the valid account should exist
         assert!(
