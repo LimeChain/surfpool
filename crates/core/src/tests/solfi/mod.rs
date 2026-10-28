@@ -10,8 +10,10 @@ use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 
+use surfpool_types::KeepAliveClock;
+
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, template_registry},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient},
 };
 
@@ -223,6 +225,30 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
         .unwrap_or_else(|e| panic!("{id}: {e}"))
 }
 
+/// What the surfnet writes every slot while a scenario on a SolFi market is registered: the oracle's
+/// republication, applied as the shipped templates import it, at `slot` and `unix_time_ms`.
+fn solfi_keep_alive(oracle: &[u8], slot: u64, unix_time_ms: u64) -> Vec<u8> {
+    let registry = template_registry();
+    let import = registry
+        .get("solfi-price")
+        .and_then(|template| template.keep_alive.first())
+        .expect("solfi-price keeps its oracle alive");
+    let values = import
+        .values_at(&KeepAliveClock { slot, unix_time_ms })
+        .expect("keep-alive values");
+    registry
+        .keep_alive_template(&import.template)
+        .expect("keep-alive template")
+        .materialize_raw_layout(oracle, &values, slot)
+        .unwrap_or_else(|e| panic!("{}: {e}", import.template))
+}
+
+/// The time the maker last published the oracle at, in milliseconds. A harness republication keeps
+/// it, so a fill depends only on what the test changes.
+fn published_ms(oracle: &[u8]) -> u64 {
+    u64::from_le_bytes(oracle[24..32].try_into().unwrap())
+}
+
 fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
     a.iter()
         .zip(b)
@@ -415,7 +441,7 @@ fn run(
 async fn solfi_raw_layouts_cover_every_initialized_market() {
     let registry = TemplateRegistry::new();
     let market_templates = ["solfi-size-impact", "solfi-swap-pressure"];
-    let oracle_templates = ["solfi-price", "solfi-freshness"];
+    let oracle_templates = ["solfi-price", "solfi-oracle-publication"];
 
     let initialized_addresses = INITIALIZED_LAYOUTS
         .iter()
@@ -607,24 +633,19 @@ async fn solfi_templates_write_only_proven_bytes_on_both_replay_fixtures() {
             12_345_678
         );
 
-        let fresh = apply_raw(
-            "solfi-freshness",
-            &fork.oracle.data,
-            &[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(200)),
-            ],
-            fork.slot,
-        );
+        let republished_ms = published_ms(&fork.oracle.data) + 400;
+        let fresh = solfi_keep_alive(&fork.oracle.data, fork.slot, republished_ms);
         assert!(
             diff_indices(&fork.oracle.data, &fresh)
                 .iter()
-                .all(|i| (16..24).contains(i) || (40..48).contains(i))
+                .all(|i| (16..32).contains(i) || (40..48).contains(i)),
+            "keep-alive writes only the publication slot, time and validity"
         );
         assert_eq!(
             u64::from_le_bytes(fresh[16..24].try_into().unwrap()) ^ PUBLICATION_MASK,
             fork.slot
         );
+        assert_eq!(published_ms(&fresh), republished_ms);
         assert_eq!(
             u64::from_le_bytes(fresh[40..48].try_into().unwrap()) ^ 0x9966_33cc_00ff_aa55,
             fork.slot + 200
@@ -895,14 +916,10 @@ async fn solfi_spread_template_has_the_derived_absolute_unit_on_both_markets() {
     let forks = forks().await;
     let mut checked = 0;
     for fork in forks.iter() {
-        let oracle = apply_raw(
-            "solfi-freshness",
+        let oracle = solfi_keep_alive(
             &fork.oracle.data,
-            &[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(200)),
-            ],
             fork.slot,
+            published_ms(&fork.oracle.data),
         );
         for (direction, amount_in) in [(0, fork.def.base_trade), (1, fork.def.quote_trade)] {
             let tight = run(
@@ -953,14 +970,10 @@ async fn solfi_directional_risk_off_scenario_is_isolated_to_the_target_side() {
     let forks = forks().await;
     let mut checked = 0;
     for fork in forks.iter() {
-        let oracle = apply_raw(
-            "solfi-freshness",
+        let oracle = solfi_keep_alive(
             &fork.oracle.data,
-            &[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(200)),
-            ],
             fork.slot,
+            published_ms(&fork.oracle.data),
         );
         let tight = directional_spread(fork, 10_000, 10_000, 100_000);
         let controls = [
@@ -1044,6 +1057,8 @@ async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
     let account = |address: &str| AccountAddress::Pubkey(address.to_string());
 
     let (mut scenario_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    // The surfnet starts at the fork's slot, as a surfnet forked at that moment would.
+    scenario_svm.set_latest_absolute_slot(fork.slot);
     for (address, seeded) in [
         (fork.def.oracle, fork.oracle.clone()),
         (fork.def.market, fork.market.clone()),
@@ -1069,22 +1084,23 @@ async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
             ]),
         ),
         (
-            "solfi-freshness",
-            fork.def.oracle,
-            values(&[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(200)),
-            ]),
-        ),
-        (
             "solfi-size-impact",
             fork.def.market,
-            values(&borrowed(&flat_spread_values(1_000, 10_000, 100_000))),
+            values(
+                &[
+                    borrowed(&flat_spread_values(1_000, 10_000, 100_000)),
+                    vec![("oracle", serde_json::json!(fork.def.oracle))],
+                ]
+                .concat(),
+            ),
         ),
         (
             "solfi-vault-balance",
             fork.def.quote_vault,
-            values(&[("amount", serde_json::json!(PAYOUT_CAPACITY))]),
+            values(&[
+                ("amount", serde_json::json!(PAYOUT_CAPACITY)),
+                ("oracle", serde_json::json!(fork.def.oracle)),
+            ]),
         ),
     ] {
         scenario.add_override(
@@ -1109,6 +1125,11 @@ async fn solfi_bento_risk_off_scenario_executes_against_the_deployed_program() {
             .data
     };
     let oracle = materialized(fork.def.oracle);
+    assert_eq!(
+        u64::from_le_bytes(oracle[16..24].try_into().unwrap()) ^ PUBLICATION_MASK,
+        fork.slot,
+        "keep-alive republishes the oracle in the scenario's first slot"
+    );
     let market = materialized(fork.def.market);
     let limited_quote_vault = materialized(fork.def.quote_vault);
     assert_eq!(amount(&limited_quote_vault), PAYOUT_CAPACITY);
@@ -1199,14 +1220,10 @@ async fn solfi_large_trade_deterioration_scenario_interpolates_between_live_knot
     let forks = forks().await;
     let mut checked = 0;
     for fork in forks.iter() {
-        let oracle = apply_raw(
-            "solfi-freshness",
+        let oracle = solfi_keep_alive(
             &fork.oracle.data,
-            &[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(200)),
-            ],
             fork.slot,
+            published_ms(&fork.oracle.data),
         );
         let tight = directional_spread(fork, 10_000, 10_000, 100_000);
         let shaped = size_impact_market(fork, 10_000, 100_000);
@@ -1268,34 +1285,35 @@ async fn solfi_large_trade_deterioration_scenario_interpolates_between_live_knot
     assert_eq!(checked, 4, "both spline directions on both markets");
 }
 
+/// Keep-alive republishes the oracle valid for 200 slots, and the program's boundary is inclusive: a
+/// republication 200 slots back still quotes, one 201 slots back rejects with error 23.
 #[tokio::test]
-async fn solfi_freshness_boundary_is_real_program_behavior_on_both_markets() {
+async fn solfi_keep_alive_validity_boundary_is_real_program_behavior_on_both_markets() {
     let forks = forks().await;
     let mut checked = 0;
     for fork in forks.iter() {
-        let live = apply_raw(
-            "solfi-freshness",
-            &fork.oracle.data,
-            &[
-                ("publication_slot", serde_json::json!(0)),
-                ("validity_horizon", serde_json::json!(0)),
-            ],
-            fork.slot,
-        );
-        let control = run(fork, fork.def.base_trade, 0, fork.market.data.clone(), live)
-            .expect("the validity boundary is inclusive");
+        let republished = |slots_back: u64| {
+            solfi_keep_alive(
+                &fork.oracle.data,
+                fork.slot - slots_back,
+                published_ms(&fork.oracle.data),
+            )
+        };
+        let control = run(
+            fork,
+            fork.def.base_trade,
+            0,
+            fork.market.data.clone(),
+            republished(200),
+        )
+        .expect("the validity boundary is inclusive");
         assert!(
             control > 0,
             "{} must quote at the boundary",
             fork.def.market
         );
 
-        let expired = apply_raw(
-            "solfi-freshness",
-            &fork.oracle.data,
-            &[("validity_horizon", serde_json::json!(-1))],
-            fork.slot,
-        );
+        let expired = republished(201);
         for direction in 0..=1 {
             let amount_in = if direction == 0 {
                 fork.def.base_trade
@@ -1445,21 +1463,17 @@ fn solfi_swap_wire_format_has_no_fee_or_tier_argument() {
 }
 
 /// SolFi counts consecutive large swaps in each direction and widens that direction with the count;
-/// from the ninth it multiplies the trade-size widening by about ten. Nothing in a surfnet resets the
-/// count, which is what `solfi-swap-pressure` is for: a count set to 0 must price the next swap like
-/// the first.
+/// from the ninth it multiplies the trade-size widening by about ten. Within one publication the count
+/// builds up, and `solfi-swap-pressure` resets it: a count set to 0 must price the next swap like the
+/// first.
 #[tokio::test]
 async fn solfi_swap_pressure_resets_consecutive_swaps() {
     let fork = &forks().await[0];
     assert_eq!(fork.def.market, MARKETS[0].market, "scenario is WSOL/USDC");
-    let oracle = apply_raw(
-        "solfi-freshness",
+    let oracle = solfi_keep_alive(
         &fork.oracle.data,
-        &[
-            ("publication_slot", serde_json::json!(0)),
-            ("validity_horizon", serde_json::json!(200)),
-        ],
         fork.slot,
+        published_ms(&fork.oracle.data),
     );
     // Vaults are reloaded for every sale so only the market's own state carries over.
     let sell = |market: Vec<u8>| {
@@ -1497,5 +1511,49 @@ async fn solfi_swap_pressure_resets_consecutive_swaps() {
     assert!(
         bps_below_first(first, after_reset).abs() < 0.1,
         "a reset count must price the next sale like the first: {first} vs {after_reset}"
+    );
+}
+
+/// The maker's republication restarts the count: a swap that sees the oracle published later than at
+/// the previous swap prices like the first. Keep-alive republishes every slot, so pressure built up in
+/// one slot is gone in the next, as on mainnet.
+#[tokio::test]
+async fn solfi_keep_alive_republication_restarts_the_swap_count() {
+    let fork = &forks().await[0];
+    assert_eq!(fork.def.market, MARKETS[0].market, "scenario is WSOL/USDC");
+    let published = published_ms(&fork.oracle.data);
+    let oracle = solfi_keep_alive(&fork.oracle.data, fork.slot, published);
+    // Vaults are reloaded for every sale so only the market's own state carries over.
+    let sell = |market: Vec<u8>, oracle: Vec<u8>| {
+        replay_with_market(
+            fork,
+            fork.def.base_trade,
+            0,
+            market,
+            oracle,
+            fork.base_vault.data.clone(),
+            fork.quote_vault.data.clone(),
+        )
+        .expect("a 1 SOL sale should settle")
+    };
+    let bps_below_first = |first: u64, out: u64| (1.0 - out as f64 / first as f64) * 1e4;
+
+    let (first, mut market) = sell(fork.market.data.clone(), oracle.clone());
+    for _ in 0..11 {
+        market = sell(market, oracle.clone()).1;
+    }
+    let pressured = sell(market.clone(), oracle.clone()).0;
+    assert!(
+        bps_below_first(first, pressured) > 50.0,
+        "twelve 1 SOL sales in one publication should widen the next by tens of bps, got {:.1}",
+        bps_below_first(first, pressured)
+    );
+
+    // The next slot's republication, with nothing else changed.
+    let republished = solfi_keep_alive(&fork.oracle.data, fork.slot, published + 400);
+    let after = sell(market, republished).0;
+    assert!(
+        bps_below_first(first, after).abs() < 0.1,
+        "a republished oracle must price the next sale like the first: {first} vs {after}"
     );
 }

@@ -1,7 +1,8 @@
 # SolFi V2
 
-A proprietary market maker (PMM), not an AMM. Five templates control its external price, quote
-freshness, spread by trade size, swap pressure and vault inventory.
+A proprietary market maker (PMM), not an AMM. Four templates control its external price, spread by
+trade size, swap pressure and vault inventory. Surfpool keeps the oracle current on its own while a
+scenario is registered.
 
 SolFi does not derive its mid from vault ratios. Its external oracle supplies the price, market
 splines widen around that price, and the vaults provide inventory and settlement capacity.
@@ -11,7 +12,6 @@ splines widen around that price, and the vaults provide inventory and settlement
 | Template              | Overrides                                                              |
 | --------------------- | ---------------------------------------------------------------------- |
 | `solfi-price`         | the price SolFi uses for swaps                                         |
-| `solfi-freshness`     | whether SolFi's price is current and usable                            |
 | `solfi-size-impact`   | the extra cost SolFi adds when buying or selling, at each trade size   |
 | `solfi-swap-pressure` | the count of large swaps in a row that makes SolFi widen, and its reset |
 | `solfi-vault-balance` | how many tokens SolFi has available for swaps                          |
@@ -25,7 +25,6 @@ splines widen around that price, and the vaults provide inventory and settlement
 | `max_widening`                        | tenths of a ppm                                        | `100000` = 1%, `10000` = 0.1%                        |
 | size-curve `x`                        | quote-token smallest units                             | `1000000000` = 1,000 USDC                            |
 | vault `amount`                        | that mint's smallest unit                              | `1000000` = 1 USDC                                   |
-| freshness values                      | offsets from the materialization slot                  | `0` = this slot, `200` = 200 slots ahead             |
 
 Price conversion is:
 
@@ -38,8 +37,10 @@ human price does not depend on the exponent already stored in the selected oracl
 
 ## Picking a market
 
-Market templates target the market account, price and freshness templates target its embedded
-oracle, and the vault template targets one of its SPL-token vaults. The backend templates do not
+Market templates target the market account, the price template its embedded oracle, and the vault
+template one of its SPL-token vaults. Market and vault templates also take that market's oracle,
+market bytes 24..56, in their `oracle` input, which is never written: it names the oracle keep-alive
+keeps current. The backend templates do not
 embed a market catalog. Use the template's LLM guidance to discover a market from the SolFi program,
 verify the pair through both vault mints, and select the corresponding target account. Empty markets
 are valid SolFi state, but their presence on chain is not a promise that a swap can currently settle.
@@ -49,25 +50,39 @@ Do not reuse an oracle or vault merely because the token pair looks similar. Use
 datasource before its bytes are changed. Fetch an account only on its first override. A later fetch
 replaces the full local account and can erase earlier overrides on its other fields.
 
+## Keep-alive (Surfpool handles it)
+
+On mainnet SolFi's maker republishes each market's oracle every couple of slots. Nobody runs it
+against a surfnet, so while a scenario with a SolFi override is registered Surfpool republishes the
+oracle every slot ([keep-alive](../../README.md#keep-alive)): the publication slot (byte 16), the
+publication time in milliseconds (byte 24) and a validity horizon of 200 slots (byte 40). The price
+stays as set. There is nothing to schedule:
+
+- `solfi-price` keeps the oracle it writes current.
+- `solfi-size-impact`, `solfi-swap-pressure` and `solfi-vault-balance` keep the oracle in their
+  `oracle` input current. Without it, nothing keeps that oracle current, and an expired one rejects
+  swaps with error 23.
+
+Keep-alive starts in the slot the override plays and runs until the network is reset. After
+`surfnet_timeTravel` it republishes the oracle for the slot the jump lands on.
+
 ## Three rules that prevent misleading scenarios
 
-**1. Keep the oracle current while testing price or widening.** A price can be encoded correctly and
-still never reach the quote if the oracle has expired. Apply `solfi-freshness` with
-`publication_slot: 0` and `validity_horizon: 200` when setup spans multiple slots. That keeps the
-quote valid for 200 slots - valid, but not constant: it widens as it ages (see "Keep the quote
-current"). For a longer scenario, schedule the same freshness override again in each
-later slot where a quote is needed with `fetchBeforeUse: false`. If a later upstream fetch is
-required, reapply `solfi-price` after it in that slot.
+**1. Give market and vault overrides their oracle.** A price or spread can be encoded correctly and
+still never reach the quote if the oracle has expired. Set `oracle` on every market and vault
+override, or override the price, so keep-alive keeps the oracle current. If a later upstream fetch of
+the oracle is required, reapply `solfi-price` after it in that slot.
 
-**2. Do not repeatedly reset transaction-owned inventory.** Price, freshness and spline settings are
+**2. Do not repeatedly reset transaction-owned inventory.** Price and spline settings are
 configuration inputs. A vault balance is state that swaps modify. Reapplying a vault override after
 every swap can undo the swap and manufacture or erase inventory.
 
-**3. Reset swap pressure between phases of a multi-swap scenario.** SolFi counts large swaps in a row
-in each direction and widens that direction as the count grows: on WSOL/USDC ten 1 SOL sales in a row
-cost about 95 bps more than the first. Nothing in a surfnet resets the count - not slots, time, price
-changes, swaps in the other direction or freshness - so apply `solfi-swap-pressure` with the count at
-`0` before the swaps you want to measure. See "Reset swap pressure" below.
+**3. Swap pressure builds up only within a slot.** SolFi counts large swaps in a row in each direction
+and widens that direction as the count grows: on WSOL/USDC ten 1 SOL sales in a row cost about 95 bps
+more than the first. The maker's republication restarts the count, and keep-alive republishes every
+slot, so swaps in a later slot price like the first, as on mainnet. To measure several large swaps
+within one slot from a clean count, apply `solfi-swap-pressure` with the count at `0` first. See
+"Reset swap pressure" below.
 
 ## Scenario ideas
 
@@ -78,11 +93,9 @@ falls: it marks SOL at $50, pays 1% less when buying SOL, and limits its USDC pa
 USDC.
 
 1. On **WSOL / USDC**, use `solfi-price` with exponent `-10` and coefficient `500000000`.
-2. Use `solfi-freshness` with publication slot `0` and validity horizon `200` so the new quote is
-   usable.
-3. Use `solfi-size-impact` with all eight buy-base knots at `1000`, all eight sell-base knots at `10000`, age multiplier
+2. Use `solfi-size-impact` with all eight buy-base knots at `1000`, all eight sell-base knots at `10000`, age multiplier
    `1000`, additional widening `0`, and maximum widening `100000`.
-4. Use `solfi-vault-balance` on the WSOL/USDC **USDC vault** with amount `25000000`. Apply this
+3. Use `solfi-vault-balance` on the WSOL/USDC **USDC vault** with amount `25000000`. Apply this
    transaction-owned balance once before the swaps being tested.
 
 The deployed-program integration test confirms the complete four-template scenario: a 0.1 SOL sale
@@ -97,10 +110,7 @@ price moves suddenly.
 1. Choose **WSOL / USDC** in `solfi-price`.
 2. Set both price fields to the new price. For example, exponent `-10` and coefficient `500000000`
    means $50 per SOL.
-3. Add `solfi-freshness` for **WSOL / USDC** with publication slot `0` and validity horizon `200`.
-4. If the swap executes more than 200 slots later, schedule another freshness override in that slot
-   with `fetchBeforeUse: false`, or reapply `solfi-price` after any required fetch.
-5. Compare a swap before and after the price change. Also keep a run with the original price as a
+3. Compare a swap before and after the price change. Also keep a run with the original price as a
    control.
 
 ### USDT depeg
@@ -110,8 +120,7 @@ valuation.
 
 1. Choose **USDT / USDC** in `solfi-price`.
 2. At exponent `-10`, use coefficient `9500000000` for $0.95 or `10500000000` for $1.05.
-3. Keep the **USDT / USDC** oracle current with `solfi-freshness`.
-4. Compare both swap directions so the test proves the new price is applied reciprocally.
+3. Compare both swap directions so the test proves the new price is applied reciprocally.
 
 ### Maker becomes cautious in one direction
 
@@ -123,7 +132,7 @@ asset from it.
    **Sell-base** knots to make selling it more expensive.
 3. Keep the other direction low, set the age multiplier to `1000`, additional widening to `0`, and
    set the maximum high enough to allow the requested spread.
-4. Keep the matching oracle fresh, then compare equal-notional swaps in both directions.
+4. Set the market's oracle in `oracle`, then compare equal-notional swaps in both directions.
 
 ### Large orders receive a worse price
 
@@ -162,38 +171,26 @@ Set both fields. Doubling the coefficient doubles base-to-quote output and halve
 output, subject to spread and rounding. The price-looking word in the market account is not the
 authoritative input, but changing the external oracle is what reprices a fill.
 
-For a multi-slot scenario, `solfi-freshness` keeps the quote valid for its configured horizon. If a
-swap executes after that horizon, schedule another freshness override in the execution slot with
-`fetchBeforeUse: false`. Fetching the upstream oracle replaces the full local account and erases the
-earlier price override. If a later fetch is required, reapply `solfi-price` after it in that slot.
+Keep-alive keeps the oracle current for the whole scenario. Fetching the upstream oracle replaces the
+full local account and erases the earlier price override. If a later fetch is required, reapply
+`solfi-price` after it in that slot.
 Repricing only SolFi while leaving another venue unchanged creates a real cross-venue dislocation
 suitable for router, arbitrage and liquidation-path testing. Always include an undislocated control leg.
 
-## Keep the quote current
+## How the quote ages
 
-```text
-template: solfi-freshness
-publication_slot: 0
-validity_horizon:  200
-```
+An expired SolFi oracle rejects the transaction with error 23. Valid is not constant either: SolFi
+widens the quote as the oracle ages within its validity window. On WSOL/USDC, measured against the
+deployed program:
 
-Both inputs are relative offsets even though the account stores XOR-obfuscated absolute slots.
-This keeps the quote valid for 200 slots from materialization. For a longer scenario, schedule this
-template again in each later slot where a quote is needed with `fetchBeforeUse: false`. If that slot
-must fetch the oracle from upstream, reapply `solfi-price` after the fetch.
-
-An expired SolFi oracle rejects the transaction with error 23.
-
-**Valid is not constant.** SolFi widens the quote as the oracle ages within its validity window. On
-WSOL/USDC, measured against the deployed program:
-
-| Slots since the freshness override | 0 | 5 | 10 | 25 | 50 | 199 | 201 |
-| ---------------------------------- | - | - | - | - | - | - | - |
+| Slots since the last publication | 0 | 5 | 10 | 25 | 50 | 199 | 201 |
+| -------------------------------- | - | - | - | - | - | - | - |
 | Fill compared with a fresh quote | same | −3.6 bps | −10 bps | −21 bps | −34 bps | −44 bps | rejected (error 23) |
 
-USDT/USDC does not drift; the amount depends on each market's age multiplier curve. For a price that
-stays the same across a multi-slot scenario, refresh in every slot where a swap executes, or set
-`age_multiplier_curve_y: 1000` with `solfi-size-impact` to switch the age term off.
+USDT/USDC does not drift; the amount depends on each market's age multiplier curve. Keep-alive
+republishes every slot, so a scenario's oracle stays at age 0. An oracle no registered scenario keeps
+current ages as in the table; set `age_multiplier_curve_y: 1000` with `solfi-size-impact` to switch
+the age term off.
 
 ## Quote a constant directional spread
 
@@ -286,11 +283,11 @@ consecutive_buys:  0
 consecutive_sells: 0
 ```
 
-A count of `0` is a complete reset: the next swaps price as if none had happened. The first swap after
-the market is loaded starts a new count; after that nothing in a surfnet resets it - not slots, time,
-price changes, swaps in the other direction or freshness. The counts are state that swaps change,
-like a vault balance - do not reapply them after every swap unless restoring them is the point of the
-test.
+A count of `0` is a complete reset: the next swaps price as if none had happened. A swap that sees the
+oracle published later than at the previous swap also starts a new count, and keep-alive republishes
+every slot, so the count builds up only across large swaps within one slot. The counts are state that
+swaps change, like a vault balance - do not reapply them after every swap unless restoring them is the
+point of the test.
 
 ## Reduce inventory or make a direction unfillable
 
@@ -311,12 +308,12 @@ reset a vault unless restoring the same inventory after every transaction is del
 
 | Symptom                                                        | Fix                                                                                        |
 | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Price or spread override writes correctly but the swap rejects | Apply `solfi-freshness` for the scenario window. Expiry is checked before pricing          |
+| Price or spread override writes correctly but the swap rejects | The oracle expired. Set `oracle` on market and vault overrides. Expiry is checked first    |
 | `Custom(23)`                                                   | The oracle validity horizon is behind the executing slot                                   |
 | `Custom(18)` after lowering a vault                            | The payout vault cannot settle the requested output                                        |
 | Constant spread is smaller than requested                      | Account for `oracle_scale`, neutralize the age/additional curves, and raise `max_widening` |
 | Size impact appears at the wrong base amount                   | Breakpoints are quote notional. Base input is converted at the oracle price first          |
 | One direction widened instead of the other                     | Quote-to-base is buying base. Base-to-quote is selling base                                |
 | A vault balance returns after a swap                           | Remove the later vault reset; it is undoing transaction-owned state                        |
-| Fills keep getting worse after repeated swaps in one direction | Swap pressure: apply `solfi-swap-pressure` with that direction's count at `0`              |
-| Fills get worse over a few slots with nothing else changing    | The oracle is ageing. Refresh it in the swap's slot, or set `age_multiplier_curve_y: 1000`  |
+| Fills get worse over repeated swaps in one direction in a slot | Swap pressure: apply `solfi-swap-pressure` with that direction's count at `0`              |
+| Fills get worse over a few slots with nothing else changing    | Nothing keeps the oracle current. Set `oracle` on the override, or the age multiplier to 1000 |

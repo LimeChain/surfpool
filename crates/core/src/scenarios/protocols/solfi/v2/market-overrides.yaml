@@ -9,6 +9,11 @@ tags:
   - prop-amm
   - swap
 
+keep_alive:
+  - template: solfi-oracle-publication
+    address: { type: input, value: oracle }
+    values: { publication_slot: $slot, publication_time_ms: $unix_ms, valid_until_slot: $slot+200 }
+
 templates:
   - id: solfi-size-impact
     name: Override Spread by Trade Size
@@ -146,6 +151,13 @@ templates:
         encoding: u64
         label: Maximum effective widening
         description: Final clamp in tenths of a ppm; 100000 is 1%.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The market's oracle, stored at market bytes 24..56. Surfpool keeps it current while the
+          scenario is registered; it is not written to the market.
     llm_context: |
       FINDING A MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Call Solana JSON-RPC getProgramAccounts for program
@@ -160,11 +172,10 @@ templates:
       4. Put the chosen market account in the override as {"account":{"pubkey":"<market>"}} and
          set fetchBeforeUse: true. The market address is not an override value.
 
-      PRECONDITION - THE ORACLE MUST BE CURRENT. Apply solfi-freshness when setup spans multiple
-      slots, otherwise expiry can hide a correctly materialized size curve. If the scenario runs
-      beyond the configured validity horizon, schedule another freshness override in each later slot
-      where a quote is needed with fetchBeforeUse: false. If a later upstream fetch is required,
-      reapply solfi-price after it in the same slot so the scenario price is preserved.
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 24..56) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as SolFi's maker does on
+      mainnet, so expiry never hides a correctly materialized size curve. If a later upstream fetch
+      of the oracle is required, reapply solfi-price after it in the same slot.
 
       This is SolFi's spread control. It preserves the eight x breakpoints that are stored in the
       selected market account and replaces their y values. The deployed program
@@ -179,9 +190,9 @@ templates:
 
       Set age_multiplier_curve_y to 1000 and additional_widening_curve_y to 0 when the goal is to
       isolate size impact. Set max_widening high enough not to flatten the requested curve. The age
-      multiplier grows as the oracle ages since its last publication - on WSOL/USDC the live curve
-      costs about 10 bps 10 slots after a freshness override and 44 bps near the end of a 200-slot
-      horizon - so 1000 is also how to keep a spread steady across a multi-slot scenario.
+      multiplier grows as the oracle ages since its last publication - on WSOL/USDC about 10 bps 10
+      slots after it and 44 bps near the end of a 200-slot horizon. Keep-alive republishes the oracle
+      every slot, so this matters only for an oracle no registered scenario keeps current.
 
       FINAL UNIT: the effective widening is divided by 10000000, so one final unit is 0.1 ppm;
       max_widening 100000 is 1%. The curve is scaled by decoded oracle offset 32:
@@ -203,7 +214,8 @@ templates:
 
       REPEATED SWAPS: after nine large swaps in one direction the program multiplies this widening
       by about ten, capped by max_widening, and additional_widening_curve_y adds a further term keyed
-      by the same count. Nothing in a surfnet resets that count; use solfi-swap-pressure.
+      by the same count. The oracle's republication restarts the count, so only large swaps within
+      one slot build it up; solfi-swap-pressure sets it directly.
 
       HOW TO USE: set all eight y values for each direction you care about. A conventional
       large-trade deterioration uses non-decreasing values. Do not copy x assumptions between
@@ -232,6 +244,13 @@ templates:
         description: >-
           Consecutive large sales of the base token. Set 0 to reset; from 9 SolFi widens sells up to
           its maximum.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The market's oracle, stored at market bytes 24..56. Surfpool keeps it current while the
+          scenario is registered; it is not written to the market.
     llm_context: |
       FINDING A MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Call Solana JSON-RPC getProgramAccounts for program
@@ -253,16 +272,15 @@ templates:
       size widening by about ten, capped by max_widening. On WSOL/USDC ten 1 SOL sales in a row cost
       about 95 bps more than the first.
 
-      NOTHING IN A SURFNET RESETS THE COUNT once the market has traded. The first swap after the
-      market is loaded starts a new count; from then on it survives any number of slots, wall-clock
-      time, price changes, swaps in the other direction and freshness overrides, so a multi-swap
-      scenario keeps widening for the rest of the run. Setting a count to 0 is a complete reset: the
-      next swaps price as if none had happened.
+      THE MAKER'S REPUBLICATION RESTARTS THE COUNT. A swap that sees the oracle published later than
+      at the previous swap starts a new count. While the scenario is registered Surfpool republishes
+      the oracle every slot, as the maker does on mainnet, so the count builds up only across large
+      swaps in the same slot. Setting a count to 0 is a complete reset: the next swaps price as if
+      none had happened.
 
-      HOW TO USE: reset between phases of a scenario, or before the swaps being measured, with
-      consecutive_buys: 0 and/or consecutive_sells: 0. Do not reapply after every swap unless
-      restoring the count is the point of the test - it is state that swaps change, like a vault
-      balance.
+      HOW TO USE: reset before swaps measured within one slot, with consecutive_buys: 0 and/or
+      consecutive_sells: 0. Do not reapply after every swap unless restoring the count is the point
+      of the test - it is state that swaps change, like a vault balance.
 
       Use fetchBeforeUse: true only on the first override for the market; a later fetch replaces the
       whole market account and erases earlier overrides on it.
