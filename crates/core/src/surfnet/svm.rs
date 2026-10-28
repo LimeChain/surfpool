@@ -71,7 +71,7 @@ use spl_token_2022_interface::extension::{
 };
 use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
-    DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
+    DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl, KeepAliveClock,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
@@ -108,7 +108,10 @@ use crate::{
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
+        LogsSubscriptionData,
+        keep_alive::{KeepAliveSource, KeepAliveTarget, RegisteredScenarios},
+        locker::is_supported_token_program,
+        surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -580,6 +583,9 @@ pub struct SurfnetSvm {
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
+    /// The scenarios registered with `surfnet_registerScenario` and not unregistered since, with
+    /// the accounts their keep-alive templates rewrite every slot.
+    pub scenarios: RegisteredScenarios,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -859,6 +865,7 @@ impl SurfnetSvm {
             registered_idls: OverlayStorage::wrap(self.registered_idls.clone_box()),
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
+            scenarios: self.scenarios.clone(),
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -940,7 +947,8 @@ impl SurfnetSvm {
 
     fn register_builtin_template_idls(&mut self) {
         let registry = TemplateRegistry::new();
-        for (_, template) in registry.templates.into_iter() {
+        let templates = registry.templates.into_values();
+        for template in templates.chain(registry.keep_alive_templates.into_values()) {
             // Templates for programs with no IDL have nothing to register; they write through
             // `raw_layout` instead.
             if let Some(idl) = template.idl {
@@ -1334,6 +1342,7 @@ impl SurfnetSvm {
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
+            scenarios: RegisteredScenarios::default(),
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -2547,6 +2556,7 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        self.scenarios.clear();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -3306,12 +3316,16 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
         let current_slot = self.latest_epoch_info.absolute_slot;
-
+        // Keep-alive goes first, so a scenario's own overrides in this slot have the last word.
+        let keep_alive = self.keep_alive_overrides(self.scenarios.keep_alive_targets());
+        self.apply_overrides(remote_ctx, current_slot, keep_alive, false)
+            .await?;
         self.materialize_overrides_for_slot(remote_ctx, current_slot)
             .await
     }
 
-    /// Materializes scheduled overrides for a specific slot
+    /// Materializes scheduled overrides for a specific slot. Accounts that join keep-alive here are
+    /// kept alive from this slot on, not only from the next.
     pub async fn materialize_overrides_for_slot(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
@@ -3322,7 +3336,29 @@ impl SurfnetSvm {
             // No overrides for this slot
             return Ok(());
         };
+        let touched = self
+            .apply_overrides(remote_ctx, target_slot, overrides, true)
+            .await?;
+        let joined = self.enrol_keep_alive(touched);
+        let keep_alive = self.keep_alive_overrides(joined);
+        self.apply_overrides(remote_ctx, target_slot, keep_alive, false)
+            .await?;
+        Ok(())
+    }
 
+    /// Applies `overrides` in order and returns the ones a registered scenario played whose
+    /// template imports keep-alive. `scheduled` overrides came out of this slot's schedule: when
+    /// one fails, the ones not reached yet go back into it.
+    async fn apply_overrides(
+        &mut self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        target_slot: Slot,
+        overrides: Vec<OverrideInstance>,
+        scheduled: bool,
+    ) -> SurfpoolResult<Vec<KeepAliveSource>> {
+        if overrides.is_empty() {
+            return Ok(Vec::new());
+        }
         debug!(
             "Materializing {} override(s) for slot {}",
             overrides.len(),
@@ -3330,10 +3366,14 @@ impl SurfnetSvm {
         );
 
         let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
+        let mut keep_alive_touched: Vec<KeepAliveSource> = Vec::new();
 
         // `take` already emptied the slot, so bailing out mid-loop would drop every override that
         // has not been reached yet. Put the unprocessed tail back before returning the error.
         let restore_unprocessed = |svm: &mut Self, from: usize| {
+            if !scheduled {
+                return;
+            }
             if let Err(e) = svm
                 .scheduled_overrides
                 .store(target_slot, overrides[from..].to_vec())
@@ -3378,6 +3418,18 @@ impl SurfnetSvm {
                     continue;
                 }
             };
+
+            if let Some(template) = template_registry().get(&override_instance.template_id)
+                && !template.keep_alive.is_empty()
+                && let Some(scenario_id) = self.scenarios.scenario_of(&override_instance.id)
+            {
+                keep_alive_touched.push(KeepAliveSource {
+                    scenario: scenario_id.to_string(),
+                    template: template.id.clone(),
+                    account: account_pubkey,
+                    values: override_instance.values.clone(),
+                });
+            }
 
             debug!(
                 "Processing override {} for account {} (label: {:?})",
@@ -3734,7 +3786,121 @@ impl SurfnetSvm {
             }
         }
 
-        Ok(())
+        Ok(keep_alive_touched)
+    }
+
+    /// Adds the accounts that `touched` makes keep-alive imports rewrite, returning those no
+    /// scenario kept alive before.
+    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) -> Vec<KeepAliveTarget> {
+        let mut joined = Vec::new();
+        for source in touched {
+            let Some(template) = template_registry().get(&source.template) else {
+                continue;
+            };
+            for (index, import) in template.keep_alive.iter().enumerate() {
+                let Some(account) = import.account(source.account, &source.values) else {
+                    warn!(
+                        "Keep-alive '{}' of override template '{}' has no address for {}",
+                        import.template, template.id, source.account
+                    );
+                    continue;
+                };
+                let target = KeepAliveTarget {
+                    template: template.id.clone(),
+                    import: index,
+                    account,
+                };
+                if self.scenarios.keep_alive(&source.scenario, target.clone()) {
+                    info!(
+                        "Keep-alive '{}' rewrites {} every slot for scenario {}",
+                        import.template, account, source.scenario
+                    );
+                    joined.push(target);
+                }
+            }
+        }
+        joined
+    }
+
+    /// The overrides that apply keep-alive imports to `targets` in this slot, with their
+    /// placeholders filled in. An account missing locally is left alone.
+    fn keep_alive_overrides(
+        &self,
+        targets: impl IntoIterator<Item = KeepAliveTarget>,
+    ) -> Vec<OverrideInstance> {
+        let slot = self.get_latest_absolute_slot();
+        let clock = KeepAliveClock {
+            slot,
+            unix_time_ms: self.calculate_block_time_for_slot(slot),
+        };
+        let mut instances = Vec::new();
+        for target in targets {
+            let Some(import) = template_registry()
+                .get(&target.template)
+                .and_then(|template| template.keep_alive.get(target.import))
+            else {
+                continue;
+            };
+            match self.get_account(&target.account) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    debug!("Keep-alive skips {}: not in this surfnet", target.account);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Keep-alive cannot read {}: {}", target.account, e);
+                    continue;
+                }
+            }
+            let values = match import.values_at(&clock) {
+                Ok(values) => values,
+                Err(e) => {
+                    warn!(
+                        "Keep-alive '{}' skips {}: {}",
+                        import.template, target.account, e
+                    );
+                    continue;
+                }
+            };
+            let mut instance = OverrideInstance::new(
+                import.template.clone(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(target.account.to_string()),
+            )
+            .with_values(values)
+            .with_label(format!("keep-alive {}", import.template));
+            instance.id = format!("keep-alive:{}:{}", import.template, target.account);
+            instances.push(instance);
+        }
+        instances
+    }
+
+    /// Unregisters a scenario: its keep-alive stops and its overrides that have not played yet are
+    /// dropped. Returns whether the scenario was registered.
+    pub fn unregister_scenario(&mut self, scenario_id: &str) -> SurfpoolResult<bool> {
+        let Some(override_ids) = self.scenarios.unregister(scenario_id) else {
+            return Ok(false);
+        };
+        for slot in self.scheduled_overrides.keys()? {
+            let Some(overrides) = self.scheduled_overrides.get(&slot)? else {
+                continue;
+            };
+            let scheduled = overrides.len();
+            let kept: Vec<_> = overrides
+                .into_iter()
+                .filter(|instance| !override_ids.contains(&instance.id))
+                .collect();
+            if kept.len() == scheduled {
+                continue;
+            }
+            if kept.is_empty() {
+                self.scheduled_overrides.take(&slot)?;
+            } else {
+                self.scheduled_overrides.store(slot, kept)?;
+            }
+        }
+        info!("Unregistered scenario {}", scenario_id);
+        Ok(true)
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -4986,6 +5152,13 @@ impl SurfnetSvm {
             scenario.id,
             scenario.overrides.len(),
             base_slot
+        );
+        self.scenarios.register(
+            &scenario.id,
+            scenario
+                .overrides
+                .iter()
+                .map(|instance| instance.id.clone()),
         );
 
         // Schedule overrides by adding base slot to their scenario-relative slots
