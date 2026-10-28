@@ -4009,6 +4009,25 @@ impl SurfnetSvmLocker {
         svm_writer.materialize_overrides(remote_ctx).await
     }
 
+    /// Applies a time travel's `clock`, then keep-alive at the slot and time it lands on, so the
+    /// accounts keep-alive rewrites match the new Clock before anything reads them.
+    pub async fn apply_time_travel(
+        &self,
+        clock: Clock,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<EpochInfo> {
+        let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
+        let epoch_info = svm_writer.apply_time_travel(clock)?;
+        // The travel has happened either way, so a keep-alive failure is reported, not returned.
+        if let Err(e) = svm_writer.apply_keep_alive(remote_ctx).await {
+            svm_writer.simnet_events_tx.error(format!(
+                "Failed to keep accounts alive after time travel: {e}"
+            ));
+        }
+        Ok(epoch_info)
+    }
+
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
     pub fn subscribe_for_signature_updates(
         &self,
