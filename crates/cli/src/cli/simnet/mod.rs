@@ -112,7 +112,7 @@ pub async fn handle_start_local_surfnet_command(
             > = serde_json::from_str(&content)
                 .map_err(|e| format!("Failed to parse snapshot JSON '{}': {}", snapshot_path, e))?;
             simnet_events_tx.info(format!(
-                "Loaded {} accounts from snapshot file: {}",
+                "Read {} account entries from snapshot file: {}",
                 snapshot_data.len(),
                 snapshot_path
             ));

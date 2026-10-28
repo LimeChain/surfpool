@@ -674,11 +674,25 @@ impl SurfnetSvmLocker {
         remote_client: Option<&SurfnetRemoteClient>,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolResult<usize> {
+        self.load_snapshot_with_options(snapshot, remote_client, commitment_config, false)
+            .await
+    }
+
+    /// Loads a snapshot, optionally failing if any requested account cannot be installed.
+    /// Strict loading can partially install accounts before returning an error.
+    pub async fn load_snapshot_with_options(
+        &self,
+        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
+        remote_client: Option<&SurfnetRemoteClient>,
+        commitment_config: CommitmentConfig,
+        strict: bool,
+    ) -> SurfpoolResult<usize> {
         use std::str::FromStr;
 
         use base64::{Engine, prelude::BASE64_STANDARD};
 
         let mut loaded_count = 0;
+        let mut errors = Vec::new();
 
         // Separate accounts into those with data and those needing remote fetch
         // The boolean records whether an entry was fetched because a snapshot
@@ -691,6 +705,9 @@ impl SurfnetSvmLocker {
             let pubkey = match Pubkey::from_str(pubkey_str) {
                 Ok(pk) => pk,
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("invalid snapshot pubkey '{}': {}", pubkey_str, e));
+                    }
                     self.with_svm_reader(|svm| {
                         svm.simnet_events_tx.warn(format!(
                             "Skipping invalid pubkey '{}' in snapshot: {}",
@@ -707,6 +724,12 @@ impl SurfnetSvmLocker {
                     let data = match BASE64_STANDARD.decode(&account_snapshot.data) {
                         Ok(d) => d,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid base64 data: {}",
+                                    pubkey_str, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': failed to decode base64 data: {}",
@@ -721,6 +744,12 @@ impl SurfnetSvmLocker {
                     let owner = match Pubkey::from_str(&account_snapshot.owner) {
                         Ok(pk) => pk,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid owner pubkey '{}': {}",
+                                    pubkey_str, account_snapshot.owner, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': invalid owner pubkey: {}",
@@ -746,6 +775,11 @@ impl SurfnetSvmLocker {
                     // Queue for remote fetch if client is available
                     if remote_client.is_some() {
                         pubkeys_to_fetch.push(pubkey);
+                    } else if strict {
+                        errors.push(format!(
+                            "account '{}': no upstream RPC configured for null snapshot entry",
+                            pubkey
+                        ));
                     }
                 }
             }
@@ -766,6 +800,14 @@ impl SurfnetSvmLocker {
                     .await
                 {
                     Ok(remote_results) => {
+                        if strict && remote_results.len() != pubkeys_to_fetch.len() {
+                            errors.push(format!(
+                                "upstream returned {} results for {} requested accounts: {:?}",
+                                remote_results.len(),
+                                pubkeys_to_fetch.len(),
+                                pubkeys_to_fetch
+                            ));
+                        }
                         for (pubkey, result) in pubkeys_to_fetch.iter().zip(remote_results) {
                             match result {
                                 GetAccountResult::FoundAccount(_, account, _) => {
@@ -792,12 +834,23 @@ impl SurfnetSvmLocker {
                                     }
                                 }
                                 GetAccountResult::None(_) => {
-                                    // Account not found on remote, skip
+                                    if strict {
+                                        errors.push(format!(
+                                            "account '{}': absent from upstream RPC",
+                                            pubkey
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => {
+                        if strict {
+                            errors.push(format!(
+                                "upstream fetch failed for accounts {:?}: {}",
+                                pubkeys_to_fetch, e
+                            ));
+                        }
                         self.with_svm_reader(|svm| {
                             svm.simnet_events_tx
                                 .warn(format!("Failed to fetch some accounts from remote: {}", e));
@@ -809,12 +862,45 @@ impl SurfnetSvmLocker {
 
         accounts_to_load.sort_by_key(|(_, account, _)| snapshot_load_priority(account));
 
+        // Validate required upgradeable program dependencies against the live SVM after loading.
+        let programs: Vec<_> = if strict {
+            accounts_to_load
+                .iter()
+                .filter(|(_, account, _)| {
+                    account.executable
+                        && account.owner == solana_sdk_ids::bpf_loader_upgradeable::id()
+                })
+                .map(|(pubkey, account, fetched)| (*pubkey, account.clone(), *fetched))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Load all accounts into the SVM
         self.with_svm_writer(|svm| {
             let slot = svm.get_latest_absolute_slot();
 
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
-                let load_result = if fetched_from_remote {
+                let requested_executable = account.executable;
+                let load_result = if fetched_from_remote && strict {
+                    // Match HydrateIfAbsent while preserving the actual insertion error.
+                    // The general hydration path intentionally logs and suppresses it.
+                    match svm.inner.get_account_result(&pubkey) {
+                        Ok(GetAccountResult::None(_)) => svm.set_account(&pubkey, account.clone()),
+                        Ok(local)
+                            if local
+                                .source()
+                                .and_then(AccountUpdatePolicy::for_source)
+                                .is_some() =>
+                        {
+                            local
+                                .map_account()
+                                .and_then(|local_account| svm.set_account(&pubkey, local_account))
+                        }
+                        Ok(_) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                } else if fetched_from_remote {
                     svm.apply_account_update(
                         GetAccountResult::FoundAccount(
                             pubkey,
@@ -827,6 +913,9 @@ impl SurfnetSvmLocker {
                     svm.set_account(&pubkey, account.clone())
                 };
                 if let Err(e) = load_result {
+                    if strict {
+                        errors.push(format!("account '{}': failed to set account: {}", pubkey, e));
+                    }
                     let _ = svm
                         .simnet_events_tx
                         .warn(format!("Failed to set account '{}': {}", pubkey, e));
@@ -839,12 +928,28 @@ impl SurfnetSvmLocker {
                 // A DB hit alone must not produce a Geyser startup update for an
                 // account that is not actually available in the live SVM.
                 let Some(account) = svm.inner.get_account_no_db(&pubkey) else {
+                    if strict {
+                        errors.push(format!(
+                            "account '{}': absent from live SVM after snapshot load",
+                            pubkey
+                        ));
+                    }
                     let _ = svm.simnet_events_tx.warn(format!(
                         "Account '{}' was not present after snapshot load",
                         pubkey
                     ));
                     continue;
                 };
+
+                // Hydration can retain an existing local account. An executable
+                // requested from upstream still needs a live executable account.
+                // Explicit snapshot entries are checked the same way.
+                if strict && requested_executable && !account.executable {
+                    errors.push(format!(
+                        "account '{}': requested executable is not executable in live SVM",
+                        pubkey
+                    ));
+                }
 
                 // Send startup account update to geyser
                 let write_version = svm.increment_write_version();
@@ -854,8 +959,65 @@ impl SurfnetSvmLocker {
 
                 loaded_count += 1;
             }
+
+            for (program, requested_account, fetched) in programs {
+                // Hydration may retain a newer live account instead of the fetched one.
+                let account = if fetched {
+                    svm.inner
+                        .get_account_no_db(&program)
+                        .unwrap_or(requested_account)
+                } else {
+                    requested_account
+                };
+                if !account.executable
+                    || account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+                {
+                    continue;
+                }
+                let data_address =
+                    match bincode::deserialize::<UpgradeableLoaderState>(&account.data) {
+                        Ok(UpgradeableLoaderState::Program { programdata_address }) => {
+                            programdata_address
+                        }
+                        _ => {
+                            errors.push(format!(
+                                "upgradeable program '{}': invalid Program state",
+                                program
+                            ));
+                            continue;
+                        }
+                    };
+                match svm.inner.get_account_no_db(&data_address) {
+                    Some(data)
+                        if data.owner == solana_sdk_ids::bpf_loader_upgradeable::id()
+                            && !data.executable
+                            && data.data.len()
+                                >= UpgradeableLoaderState::size_of_programdata_metadata()
+                            && matches!(
+                                bincode::deserialize::<UpgradeableLoaderState>(
+                                    &data.data
+                                        [..UpgradeableLoaderState::size_of_programdata_metadata()]
+                                ),
+                                Ok(UpgradeableLoaderState::ProgramData { .. })
+                            ) => {}
+                    Some(_) => errors.push(format!(
+                        "upgradeable program '{}': invalid ProgramData account '{}' in live SVM",
+                        program, data_address
+                    )),
+                    None => errors.push(format!(
+                        "upgradeable program '{}': required ProgramData account '{}' absent from live SVM",
+                        program, data_address
+                    )),
+                }
+            }
         });
 
+        if strict && !errors.is_empty() {
+            return Err(SurfpoolError::invalid_params(format!(
+                "strict snapshot load failed: {}",
+                errors.join("; ")
+            )));
+        }
         Ok(loaded_count)
     }
 
@@ -7312,3 +7474,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
