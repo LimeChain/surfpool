@@ -119,6 +119,8 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-stop-loss-trigger`           | Edits the two legs of a StopLosses account placed with `PlaceStopLoss`.                                | IDL write                    |
 | `phoenix-permission-limits`           | A delegated permission's expiry and remaining actions.                                                 | IDL write                    |
 
+These templates cover Phoenix's perpetual markets. Templates for spot trading are planned.
+
 ## Recipes
 
 `phoenix-market-move` and `phoenix-market-uncross` go together, in the same slot and in this order,
