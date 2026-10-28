@@ -1520,6 +1520,34 @@ pub trait SurfnetCheatcodes {
         scenario: Scenario,
         slot: Option<Slot>,
     ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    /// A cheat code to unregister a scenario registered with `surfnet_registerScenario`.
+    ///
+    /// The accounts the scenario's keep-alive templates rewrite every slot stop being rewritten,
+    /// unless another registered scenario also keeps them alive, and the scenario's overrides that
+    /// have not played yet are dropped. Accounts keep the state the scenario left them in.
+    ///
+    /// ## Parameters
+    /// - `scenarioId`: The `id` the scenario was registered with.
+    ///
+    /// ## Returns
+    /// A `RpcResponse<bool>`: `true` when the scenario was registered, `false` when it was not.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_unregisterScenario",
+    ///   "params": ["scenario-1"]
+    /// }
+    /// ```
+    #[rpc(meta, name = "surfnet_unregisterScenario")]
+    fn unregister_scenario(
+        &self,
+        meta: Self::Metadata,
+        scenario_id: String,
+    ) -> Result<RpcResponse<bool>>;
 }
 
 #[allow(clippy::disallowed_methods)] // cheatcodes accept no minContextSlot; each picks its own slot
@@ -2509,6 +2537,19 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             svm_locker.get_latest_absolute_slot(),
             snapshot,
         ))
+    }
+
+    fn unregister_scenario(
+        &self,
+        meta: Self::Metadata,
+        scenario_id: String,
+    ) -> Result<RpcResponse<bool>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let unregistered = svm_locker.unregister_scenario(&scenario_id)?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: unregistered,
+        })
     }
 
     fn register_scenario(
