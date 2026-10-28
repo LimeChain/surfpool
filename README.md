@@ -130,41 +130,16 @@ surfpool start --help
 
 Is documenting all the options available.
 
-### Strict snapshot loading
-
-Snapshot loading is best effort by default: invalid entries, missing upstream accounts,
-and installation failures can be skipped, sometimes with warnings. For fixtures that must load
-completely before startup succeeds, use:
+To fail startup when a declared snapshot account cannot be loaded, use:
 
 ```console
 surfpool start --snapshot dependencies.json --strict-snapshot
 ```
 
-The JSON format is unchanged: a plain map of account addresses to account data in
-the `surfnet_exportSnapshot` format. A `null` value requests that account from the
-configured upstream RPC. Multiple `--snapshot` files are merged as usual, with later
-files overriding earlier entries. `--strict-snapshot` requires at least one
-`--snapshot`; an empty map is valid.
-
-Strict loading exits unsuccessfully before starting the RPC server or reporting
-readiness if an entry has an invalid address, base64 data, or owner, an upstream
-request fails, an explicitly requested upstream account is absent, or an account
-cannot be installed in the live SVM. Errors identify the affected addresses and
-available reasons. In offline mode, `null` entries fail because no upstream is
-available. Explicit account data still overwrites local state; upstream hydration
-still preserves existing local accounts.
-
-Upgradeable executable programs also require valid program-data accounts in the
-live SVM. These can come from the snapshot, the existing native remote loader, or
-already installed local state. Strict loading does not synthesize missing program
-data or discover protocol dependencies. Legacy executable programs do not require
-an upgradeable program-data account. Implicit token mints remain optional when
-absent; list a mint explicitly to require it. Errors fetching or installing related
-accounts returned by the native loader also fail strict loading.
-
-Loading is not atomic: accounts installed before a failure can remain in a configured
-persistent database. Strict mode checks fixture loading, not whether the fixture
-declares every dependency a later transaction might need.
+The flag requires `--snapshot` and preserves its JSON format (`null` fetches upstream).
+Failures, including missing required program data, abort before RPC startup; default
+loading remains best effort. Strict loading neither discovers protocol dependencies
+nor rolls back partial database writes.
 
 ## Crypto Infrastructure as Code: A New Standard in Web3
 
