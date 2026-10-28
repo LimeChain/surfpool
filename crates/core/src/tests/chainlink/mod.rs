@@ -17,6 +17,7 @@ use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_commitment_config::CommitmentConfig;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
+use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
@@ -200,7 +201,10 @@ async fn store_query_returns_the_overridden_round() {
     locker.with_svm_writer(|svm| {
         svm.inner
             .svm
-            .add_program(STORE_PROGRAM, &programdata.data[45..])
+            .add_program(
+                STORE_PROGRAM,
+                &programdata.data[UpgradeableLoaderState::size_of_programdata_metadata()..],
+            )
             .unwrap();
         svm.set_account(&SOL_USD_FEED, feed.clone()).unwrap();
     });
