@@ -16,12 +16,15 @@
   },
   "docs": [
     "Anchor-compatible IDL for the Phoenix Eternal program.",
+    "Instructions marked optionalTrailingAdditionalFeeConfig accept legacy args followed by a Borsh AdditionalFeeConfig, without a Borsh Option tag. No suffix means zero fees. Rates are u8 tenths of a basis point (0..255 = 0..25.5 bps). MakerAndTaker encodes [0, maker, taker]; MakerOnly encodes [1, maker] and sets taker to zero. MakerTakerAndConditionalTaker encodes [2, maker, taker, conditional_taker] and on PlaceLimitOrderWithConditionals the parent uses taker, supplied triggers use conditional_taker, and all resting fills use maker. Other placements ignore conditional_taker and use the ordinary maker/taker pair. Other variants apply the same pair to the parent and its triggers. Standalone conditional placements retain both rates for execution.",
+    "The additional fee uses the existing trader/position placement authorization and account list; no extra accounts or fee permission are required. The fee applies in addition to the adjusted base trading fee and accrues only on fills.",
     "This IDL is maintained from the native Rust program surface and includes explicit instruction, account, and event discriminators for transaction and account decoding.",
     "PDA metadata is included where the program defines a canonical derivation; accounts without PDA metadata are supplied as explicit accounts or are stored in GlobalConfiguration."
   ],
   "instructions": [
     {
       "name": "PlaceMarketOrder",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places an immediate-or-cancel order that consumes resting liquidity on the specified market."
       ],
@@ -219,6 +222,7 @@
     },
     {
       "name": "PlaceLimitOrder",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places a limit order that may rest on the orderbook or take liquidity depending on matching conditions."
       ],
@@ -416,6 +420,7 @@
     },
     {
       "name": "PlaceMultiLimitOrder",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places multiple post-only limit orders in a single transaction, allowing batch order placement for market making."
       ],
@@ -613,6 +618,7 @@
     },
     {
       "name": "PlaceMultiLimitOrderV2",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places multiple post-only limit orders with scale-set and reduce-only metadata."
       ],
@@ -1669,6 +1675,122 @@
           "type": {
             "defined": {
               "name": "UpdateSplinePriceParamsWithOrdering"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "UpdateSplinePriceWithMetadata",
+      "docs": [
+        "Fixed 32-byte little-endian params followed by a 16-byte client order ID. Flags: bit 0 refreshes regions, bit 1 overrides the sequence number, bit 2 sets updateSlot, bit 3 sets bidWidth, and bit 4 sets askWidth. Unset optional fields are ignored; an explicit zero width resets that side. The processor reads only the fixed params; the client order ID is used off-chain."
+      ],
+      "discriminator": [
+        153,
+        162,
+        192,
+        201,
+        188,
+        88,
+        30,
+        224
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "signerAccount",
+          "signer": true,
+          "docs": [
+            "Authority of the spline trader account authorised to update the spline price."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "docs": [
+            "Spline trader account whose price is being updated."
+          ]
+        },
+        {
+          "name": "splineAccount",
+          "writable": true,
+          "docs": [
+            "Spline collection PDA containing the spline configuration and pricing data."
+          ]
+        },
+        {
+          "name": "orderbook",
+          "optional": true,
+          "docs": [
+            "Optional market orderbook account included by some clients as trailing metadata."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "UpdateSplinePriceWithMetadataParams"
             }
           }
         }
@@ -3332,6 +3454,7 @@
     },
     {
       "name": "PlaceStopLoss",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places a stop-loss order that triggers when the market price reaches the specified trigger price."
       ],
@@ -4320,16 +4443,7 @@
           ]
         }
       ],
-      "args": [
-        {
-          "name": "params",
-          "type": {
-            "defined": {
-              "name": "ForceCancelRiskIncreasingParams"
-            }
-          }
-        }
-      ]
+      "args": []
     },
     {
       "name": "UpdateTraderState",
@@ -7275,6 +7389,7 @@
     },
     {
       "name": "PlacePositionConditionalOrder",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places a position-based conditional order that fires when mark price crosses the configured trigger."
       ],
@@ -7667,6 +7782,7 @@
     },
     {
       "name": "PlaceAttachedConditionalOrder",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Attaches a conditional order to an existing resting limit order so it fires when that order is filled."
       ],
@@ -7870,6 +7986,7 @@
     },
     {
       "name": "PlaceLimitOrderWithConditionals",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
         "Places a limit order and atomically attaches greater/less-than trigger orders to the resulting resting order."
       ],
@@ -10951,16 +11068,7 @@
           "address": "11111111111111111111111111111111"
         }
       ],
-      "args": [
-        {
-          "name": "params",
-          "type": {
-            "defined": {
-              "name": "RegisterSplineParams"
-            }
-          }
-        }
-      ]
+      "args": []
     },
     {
       "name": "UpdateCommodityMarketState",
@@ -16250,6 +16358,2130 @@
       ]
     },
     {
+      "name": "AddSpotCollateral",
+      "docs": [
+        "Risk authority registers a new SPL spot collateral asset in the perp asset map, allocating its encoded SpotAssetIndex; the asset starts inactive."
+      ],
+      "discriminator": [
+        238,
+        15,
+        82,
+        195,
+        85,
+        71,
+        216,
+        137
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA used to validate the risk authority and the perp asset map key."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Risk authority signer."
+          ]
+        },
+        {
+          "name": "maybePermissionAccount",
+          "writable": true,
+          "docs": [
+            "Permission account slot for delegated authority validation; with no delegation this is the authority itself."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map account into which the new spot collateral entry is registered."
+          ]
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "SPL mint of the collateral asset being registered; must be owned by the legacy SPL Token program and match the params mint address."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "AddSpotCollateralParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "ConfigureSpotCollateral",
+      "docs": [
+        "Risk authority applies partial risk-parameter updates to a registered spot collateral asset and optionally activates it. Activation is one-way."
+      ],
+      "discriminator": [
+        112,
+        103,
+        162,
+        63,
+        108,
+        147,
+        62,
+        213
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA used to validate the risk authority, the perp asset map key, and the SpotCollaterals feature flag on activation."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Risk authority signer."
+          ]
+        },
+        {
+          "name": "maybePermissionAccount",
+          "writable": true,
+          "docs": [
+            "Permission account slot for delegated authority validation; with no delegation this is the authority itself."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map account whose spot collateral entry is updated."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "ConfigureSpotCollateralParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "SyncSpot",
+      "docs": [
+        "Permissionlessly reconciles the balance of the trader wallet PDA's associated token account into the trader account's spot collateral balance for one asset."
+      ],
+      "discriminator": [
+        248,
+        53,
+        128,
+        214,
+        54,
+        165,
+        13,
+        2
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Read-only global configuration PDA used to verify the perp asset map and active trader buffer keys."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map providing the asset's metadata and tracking its global collateral balance."
+          ]
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader state PDA whose spot collateral balance is reconciled."
+          ]
+        },
+        {
+          "name": "traderPhoenixWalletAta",
+          "docs": [
+            "Associated token account of the trader's wallet PDA for the asset's mint; the custody account whose balance is reconciled."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "TransferSpot",
+      "docs": [
+        "Transfers SPL spot collateral between two trader accounts (margin-validated debit on the source), moving the backing tokens between the traders' wallet-PDA custody ATAs."
+      ],
+      "discriminator": [
+        255,
+        127,
+        0,
+        119,
+        77,
+        53,
+        77,
+        58
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "srcTraderPhoenixWallet",
+          "docs": [
+            "Source trader's wallet PDA; CPI authority for the custody token movement."
+          ]
+        },
+        {
+          "name": "srcCustodyTokenAccount",
+          "writable": true,
+          "docs": [
+            "Source trader's custody ATA (owned by srcWallet) debited by the token transfer."
+          ]
+        },
+        {
+          "name": "dstCustodyTokenAccount",
+          "writable": true,
+          "docs": [
+            "Destination trader's custody ATA (owned by the destination trader's wallet PDA); must already exist."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the custody token transfer."
+          ]
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "traderWallet",
+          "signer": true,
+          "docs": [
+            "Signing authority for the transfer (trader wallet, or a position authority via the optional trailing permission account)."
+          ]
+        },
+        {
+          "name": "srcTraderAccount",
+          "writable": true,
+          "docs": [
+            "Source trader account whose spot collateral is debited."
+          ]
+        },
+        {
+          "name": "dstTraderAccount",
+          "writable": true,
+          "docs": [
+            "Destination trader account whose spot collateral is credited."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "docs": [
+            "Perp asset map for margin calculations and spot asset metadata."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "TransferSpotParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "TransferSpotFromChildToParent",
+      "docs": [
+        "Sweeps a flat child trader's full balance of one SPL spot collateral asset into its cross-margin parent, moving the backing tokens between the custody ATAs (idempotent no-op if the child is not flat)."
+      ],
+      "discriminator": [
+        49,
+        4,
+        0,
+        150,
+        126,
+        152,
+        163,
+        226
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "childTraderPhoenixWallet",
+          "docs": [
+            "Child trader's wallet PDA; CPI authority for the custody token movement."
+          ]
+        },
+        {
+          "name": "childCustodyTokenAccount",
+          "writable": true,
+          "docs": [
+            "Child trader's custody ATA (owned by childWallet) debited by the sweep."
+          ]
+        },
+        {
+          "name": "parentCustodyTokenAccount",
+          "writable": true,
+          "docs": [
+            "Parent trader's custody ATA (owned by the parent's wallet PDA); must already exist."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the custody token transfer."
+          ]
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "traderWallet",
+          "docs": [
+            "Trader wallet owning both accounts; signature only required when the child has disabled collateral sweep."
+          ]
+        },
+        {
+          "name": "childTraderAccount",
+          "writable": true,
+          "docs": [
+            "Child (isolated margin) trader account being swept."
+          ]
+        },
+        {
+          "name": "parentTraderAccount",
+          "writable": true,
+          "docs": [
+            "Parent (cross margin) trader account receiving the collateral."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "docs": [
+            "Perp asset map for spot asset metadata."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "SwapSpotWithSpot",
+      "docs": [
+        "Swaps between two SPL spot collateral assets through a caller-supplied external venue: debits the source asset from the trader, executes packed venue instructions, and credits the trader with the output received on the signer's destination token account, moved into the destination custody ATA."
+      ],
+      "discriminator": [
+        70,
+        110,
+        253,
+        51,
+        88,
+        242,
+        231,
+        26
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "writable": true,
+          "docs": [
+            "Global configuration PDA; must be active, gates position-authority swaps and spot-collateral activity."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map holding spot asset registrations, prices, and global tallies."
+          ]
+        },
+        {
+          "name": "srcMint",
+          "docs": [
+            "SPL mint account selecting the source spot asset."
+          ]
+        },
+        {
+          "name": "dstMint",
+          "docs": [
+            "SPL mint account selecting the destination spot asset."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the custody transfers."
+          ]
+        },
+        {
+          "name": "traderPhoenixWallet",
+          "docs": [
+            "Trader's wallet PDA; owner of both custody ATAs and CPI authority for the source custody debit."
+          ]
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "The trader wallet or the trader's position authority; the only key allowed to sign inside the packed venue instructions."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader state PDA whose spot collateral balances are debited and credited."
+          ]
+        },
+        {
+          "name": "withdrawQueue",
+          "writable": true,
+          "docs": [
+            "Withdraw queue PDA; the swap's collateral-value decrease is consumed from the contract-wide withdrawal throttle."
+          ]
+        },
+        {
+          "name": "srcTraderPhoenixWalletAta",
+          "writable": true,
+          "docs": [
+            "Wallet PDA's custody associated token account for the source mint; debited by amountIn."
+          ]
+        },
+        {
+          "name": "signerSrcTokenAccount",
+          "writable": true,
+          "docs": [
+            "Signer-owned token account for the source mint; the external venue spends the withdrawn tokens from here."
+          ]
+        },
+        {
+          "name": "signerDstTokenAccount",
+          "writable": true,
+          "docs": [
+            "Signer-owned token account for the destination mint; the external venue pays the output here, and its balance increase is moved into the destination custody account and credited."
+          ]
+        },
+        {
+          "name": "dstTraderPhoenixWalletAta",
+          "writable": true,
+          "docs": [
+            "Wallet PDA's custody associated token account for the destination mint; receives the swept output."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account. Remaining accounts follow: caller-supplied venue accounts referenced by the packed instructions."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "SwapSpotWithSpotInstruction"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "SwapSpotWithUsdc",
+      "docs": [
+        "Swaps between an SPL spot collateral asset and USDC quote collateral through an external venue: Sell debits spot and sweeps received USDC into the global vault as quote collateral; Buy debits USDC from the vault and credits the spot received on the signer's spot token account, moved into the spot custody ATA."
+      ],
+      "discriminator": [
+        119,
+        121,
+        96,
+        136,
+        111,
+        0,
+        215,
+        223
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "writable": true,
+          "docs": [
+            "Global configuration PDA; must be active, supplies the canonical quote mint and deposit cooldown."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map holding spot asset registrations, prices, and global tallies."
+          ]
+        },
+        {
+          "name": "spotMint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "globalVault",
+          "writable": true,
+          "docs": [
+            "Global USDC vault; receives swept USDC on Sell and pays out the quote leg on Buy."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the token transfers."
+          ]
+        },
+        {
+          "name": "traderPhoenixWallet",
+          "docs": [
+            "Trader's wallet PDA; owner of the spot custody ATA and CPI authority for the Sell custody debit."
+          ]
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "The trader wallet or the trader's position authority; the only key allowed to sign inside the packed venue instructions."
+          ]
+        },
+        {
+          "name": "signerQuoteTokenAccount",
+          "writable": true,
+          "docs": [
+            "Signer-owned token account of the canonical quote mint; venue-facing USDC leg (measured on Sell, funded on Buy)."
+          ]
+        },
+        {
+          "name": "signerSpotTokenAccount",
+          "writable": true,
+          "docs": [
+            "Signer-owned token account for the spot mint; receives the Sell custody debit for the venue to spend, and the Buy output the venue pays in."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader state PDA whose quote and spot collateral balances change."
+          ]
+        },
+        {
+          "name": "withdrawQueue",
+          "writable": true,
+          "docs": [
+            "Withdraw queue PDA; the swap's collateral-value decrease is consumed from the contract-wide withdrawal throttle."
+          ]
+        },
+        {
+          "name": "spotTraderPhoenixWalletAta",
+          "writable": true,
+          "docs": [
+            "Wallet PDA's custody associated token account for the spot mint; debited on Sell, receives the swept output on Buy."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account. Remaining accounts follow: caller-supplied venue accounts referenced by the packed instructions."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "SwapSpotWithUsdcInstruction"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "SwapSpotWithSol",
+      "docs": [
+        "Swaps between an SPL spot collateral asset and native SOL collateral through an external venue: Sell debits spot and credits lamports received on the signer as native SOL collateral; Buy debits native SOL via the privileged withdraw self-CPI and credits the spot received on the signer's spot token account, moved into the spot custody ATA."
+      ],
+      "discriminator": [
+        236,
+        150,
+        197,
+        249,
+        54,
+        231,
+        86,
+        101
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "writable": true,
+          "docs": [
+            "Global configuration PDA; must be active and have native SOL collateral enabled."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map holding spot asset registrations, prices, and global tallies."
+          ]
+        },
+        {
+          "name": "spotMint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the spot-leg token transfers."
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "docs": [
+            "System program, required for the native SOL lamport movements."
+          ]
+        },
+        {
+          "name": "nativeSolAuthority",
+          "docs": [
+            "Native SOL authority PDA, required by the Buy direction's withdraw self-CPI."
+          ]
+        },
+        {
+          "name": "traderPhoenixWallet",
+          "docs": [
+            "Trader's wallet PDA; owner of the spot custody ATA and CPI authority for the Sell custody debit."
+          ]
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "The trader wallet or the trader's position authority; writable because lamports flow through it in both directions."
+          ]
+        },
+        {
+          "name": "signerSpotTokenAccount",
+          "writable": true,
+          "docs": [
+            "Signer-owned token account for the spot mint; receives the Sell custody debit for the venue to spend, and the Buy output the venue pays in."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader state PDA; holds the native SOL lamports and the spot collateral ledger entries."
+          ]
+        },
+        {
+          "name": "withdrawQueue",
+          "writable": true,
+          "docs": [
+            "Withdraw queue PDA; the swap's collateral-value decrease is consumed from the contract-wide withdrawal throttle."
+          ]
+        },
+        {
+          "name": "spotTraderPhoenixWalletAta",
+          "writable": true,
+          "docs": [
+            "Wallet PDA's custody associated token account for the spot mint; debited on Sell, receives the swept output on Buy."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account. Remaining accounts follow: caller-supplied venue accounts referenced by the packed instructions."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "SwapSpotWithSolInstruction"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "WithdrawSpot",
+      "docs": [
+        "Withdraws SPL spot collateral (and/or uncounted custody excess) from the trader wallet's custody ATA to a destination token account of the same mint; accounted debits are margin-validated and consume the contract-wide withdrawal throttle, never enqueued."
+      ],
+      "discriminator": [
+        228,
+        41,
+        126,
+        4,
+        112,
+        18,
+        221,
+        112
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "writable": true,
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "signerWallet",
+          "signer": true,
+          "docs": [
+            "Trader authority signing the withdrawal."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader account whose recorded spot collateral is debited."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map for margin checks, oracle valuation, and the global spot collateral tally."
+          ]
+        },
+        {
+          "name": "mint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "traderPhoenixWallet",
+          "docs": [
+            "Trader's wallet PDA; owner of the custody ATA and CPI authority for the token movement."
+          ]
+        },
+        {
+          "name": "custodyTokenAccount",
+          "writable": true,
+          "docs": [
+            "Custody ATA (owned by traderWallet, for the asset's mint) debited by the withdrawal."
+          ]
+        },
+        {
+          "name": "destinationTokenAccount",
+          "writable": true,
+          "docs": [
+            "Destination token account of the same mint; must differ from the custody ATA."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program for the custody token transfer."
+          ]
+        },
+        {
+          "name": "withdrawQueue",
+          "writable": true,
+          "docs": [
+            "Withdraw queue PDA whose throttle budget is consumed by accounted withdrawals."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "WithdrawSpotParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "LiquidateSpot",
+      "docs": [
+        "Seizes a liquidatee's SPL spot collateral at the discounted oracle price, executing packed venue instructions to convert it and depositing the quote proceeds to the liquidatee, bypassing the withdrawal throttle and queue."
+      ],
+      "discriminator": [
+        107,
+        0,
+        128,
+        41,
+        35,
+        229,
+        251,
+        18
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "writable": true,
+          "docs": [
+            "Global configuration PDA; must be active and gates the spot-collateral feature and authority checks."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map holding the spot asset registry entry, oracle valuation data, and global spot collateral tallies."
+          ]
+        },
+        {
+          "name": "spotMint",
+          "docs": [
+            "SPL mint account selecting the spot collateral asset."
+          ]
+        },
+        {
+          "name": "globalVault",
+          "writable": true,
+          "docs": [
+            "Global quote vault token account that receives the liquidator's quote deposit."
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "docs": [
+            "SPL Token program used for the seizure debit and quote deposit transfers."
+          ]
+        },
+        {
+          "name": "traderPhoenixWallet",
+          "docs": [
+            "Liquidatee's wallet PDA; owner of the custody ATA and CPI authority for the seizure debit."
+          ]
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true,
+          "docs": [
+            "Liquidator; must be the risk authority or hold a delegated liquidation permission, and owns both venue-facing token accounts."
+          ]
+        },
+        {
+          "name": "maybePermissionAccount",
+          "writable": true,
+          "docs": [
+            "Permission PDA for the delegated-liquidation path; pass the signer's own key to select the direct risk-authority path."
+          ]
+        },
+        {
+          "name": "signerQuoteTokenAccount",
+          "writable": true,
+          "docs": [
+            "Liquidator's quote token account; its balance delta after the venue instructions is the deposit credited to the liquidatee."
+          ]
+        },
+        {
+          "name": "signerSpotTokenAccount",
+          "writable": true,
+          "docs": [
+            "Liquidator's token account for the seized asset's mint; receives the seized tokens so the venue instructions can spend them."
+          ]
+        },
+        {
+          "name": "liquidateeAccount",
+          "writable": true,
+          "docs": [
+            "Trader account being liquidated; its recorded spot balance is debited and its quote collateral credited."
+          ]
+        },
+        {
+          "name": "traderPhoenixWalletAta",
+          "writable": true,
+          "docs": [
+            "Custody ATA of the seized asset, owned by the liquidatee's wallet PDA."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account. Remaining accounts follow: shortfall-evidence trader accounts (numTradersToCheck of them, writable), then caller-supplied venue accounts referenced by the packed instructions."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "LiquidateSpotParams"
+            }
+          }
+        }
+      ]
+    },
+    {
       "name": "SetSpotAssetPrice",
       "docs": [
         "Records the median spot-collateral price pushed by the Manticore oracle program;",
@@ -16719,33 +18951,6 @@
         {
           "name": "traderAccount",
           "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "traderWallet"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderPdaIndex"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderSubaccountIndex"
-              }
-            ]
-          },
           "docs": [
             "Trader account whose state is updated."
           ]
@@ -16913,33 +19118,6 @@
         {
           "name": "traderAccount",
           "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "traderWallet"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderPdaIndex"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderSubaccountIndex"
-              }
-            ]
-          },
           "docs": [
             "Trader account whose state is updated."
           ]
@@ -17806,33 +19984,6 @@
         {
           "name": "traderAccount",
           "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  116,
-                  114,
-                  97,
-                  100,
-                  101,
-                  114
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "traderWallet"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderPdaIndex"
-              },
-              {
-                "kind": "arg",
-                "path": "params.traderSubaccountIndex"
-              }
-            ]
-          },
           "docs": [
             "Trader account whose state is updated."
           ]
@@ -18821,363 +20972,6 @@
       ]
     },
     {
-      "name": "MigrateTraderState",
-      "docs": [
-        "Reconciles trader order extrema and reduce-only quantities from the orderbook."
-      ],
-      "discriminator": [
-        22,
-        14,
-        74,
-        214,
-        108,
-        72,
-        207,
-        100
-      ],
-      "accounts": [
-        {
-          "name": "phoenixProgram",
-          "docs": [
-            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
-          ]
-        },
-        {
-          "name": "phoenixLogAuthority",
-          "docs": [
-            "Phoenix log authority PDA used for emitting on-chain market events."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  108,
-                  111,
-                  103
-                ]
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                206,
-                112,
-                214,
-                251,
-                86,
-                142,
-                67,
-                235,
-                252,
-                150,
-                74,
-                144,
-                21,
-                108,
-                59,
-                233,
-                86,
-                59,
-                8,
-                23,
-                6,
-                124,
-                171,
-                105,
-                78,
-                188,
-                131,
-                239,
-                221,
-                179,
-                126,
-                134
-              ]
-            }
-          }
-        },
-        {
-          "name": "globalConfiguration",
-          "docs": [
-            "Exchange global configuration PDA."
-          ]
-        },
-        {
-          "name": "traderAccount",
-          "writable": true,
-          "docs": [
-            "Trader account whose state is updated."
-          ]
-        },
-        {
-          "name": "perpAssetMap",
-          "docs": [
-            "Perpetual and spot asset metadata account."
-          ]
-        },
-        {
-          "name": "globalTraderIndex",
-          "writable": true,
-          "docs": [
-            "Global trader index header, followed by any arena accounts."
-          ]
-        },
-        {
-          "name": "activeTraderBuffer",
-          "writable": true,
-          "docs": [
-            "Active trader buffer header, followed by any arena accounts."
-          ]
-        },
-        {
-          "name": "orderbook",
-          "writable": true,
-          "docs": [
-            "Market orderbook account."
-          ]
-        }
-      ],
-      "args": []
-    },
-    {
-      "name": "SetMultiArenaAdditionalNodesWatermark",
-      "docs": [
-        "Updates the additional-node watermark on the trader buffer headers."
-      ],
-      "discriminator": [
-        236,
-        252,
-        222,
-        208,
-        31,
-        131,
-        157,
-        147
-      ],
-      "accounts": [
-        {
-          "name": "phoenixProgram",
-          "docs": [
-            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
-          ]
-        },
-        {
-          "name": "phoenixLogAuthority",
-          "docs": [
-            "Phoenix log authority PDA used for emitting on-chain market events."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  108,
-                  111,
-                  103
-                ]
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                206,
-                112,
-                214,
-                251,
-                86,
-                142,
-                67,
-                235,
-                252,
-                150,
-                74,
-                144,
-                21,
-                108,
-                59,
-                233,
-                86,
-                59,
-                8,
-                23,
-                6,
-                124,
-                171,
-                105,
-                78,
-                188,
-                131,
-                239,
-                221,
-                179,
-                126,
-                134
-              ]
-            }
-          }
-        },
-        {
-          "name": "globalConfiguration",
-          "docs": [
-            "Exchange global configuration PDA."
-          ]
-        },
-        {
-          "name": "authority",
-          "signer": true,
-          "docs": [
-            "Authority signing this instruction."
-          ]
-        },
-        {
-          "name": "maybePermissionAccount",
-          "writable": true,
-          "docs": [
-            "Writable permission account or direct-authority placeholder."
-          ]
-        },
-        {
-          "name": "globalTraderIndex",
-          "writable": true,
-          "docs": [
-            "Global trader index header, followed by any arena accounts."
-          ]
-        },
-        {
-          "name": "activeTraderBuffer",
-          "writable": true,
-          "docs": [
-            "Active trader buffer header, followed by any arena accounts."
-          ]
-        }
-      ],
-      "args": [
-        {
-          "name": "params",
-          "type": {
-            "defined": {
-              "name": "SetMultiArenaAdditionalNodesWatermarkParams"
-            }
-          }
-        }
-      ]
-    },
-    {
-      "name": "SetMultiArenaNumNodesPerArena",
-      "docs": [
-        "Repairs the nodes-per-arena configuration of single-arena trader buffers."
-      ],
-      "discriminator": [
-        91,
-        180,
-        241,
-        192,
-        78,
-        132,
-        252,
-        131
-      ],
-      "accounts": [
-        {
-          "name": "phoenixProgram",
-          "docs": [
-            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
-          ]
-        },
-        {
-          "name": "phoenixLogAuthority",
-          "docs": [
-            "Phoenix log authority PDA used for emitting on-chain market events."
-          ],
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  108,
-                  111,
-                  103
-                ]
-              }
-            ],
-            "program": {
-              "kind": "const",
-              "value": [
-                206,
-                112,
-                214,
-                251,
-                86,
-                142,
-                67,
-                235,
-                252,
-                150,
-                74,
-                144,
-                21,
-                108,
-                59,
-                233,
-                86,
-                59,
-                8,
-                23,
-                6,
-                124,
-                171,
-                105,
-                78,
-                188,
-                131,
-                239,
-                221,
-                179,
-                126,
-                134
-              ]
-            }
-          }
-        },
-        {
-          "name": "globalConfiguration",
-          "docs": [
-            "Exchange global configuration PDA."
-          ]
-        },
-        {
-          "name": "authority",
-          "signer": true,
-          "docs": [
-            "Authority signing this instruction."
-          ]
-        },
-        {
-          "name": "maybePermissionAccount",
-          "writable": true,
-          "docs": [
-            "Writable permission account or direct-authority placeholder."
-          ]
-        },
-        {
-          "name": "globalTraderIndex",
-          "writable": true,
-          "docs": [
-            "Global trader index header, followed by any arena accounts."
-          ]
-        },
-        {
-          "name": "activeTraderBuffer",
-          "writable": true,
-          "docs": [
-            "Active trader buffer header, followed by any arena accounts."
-          ]
-        }
-      ],
-      "args": []
-    },
-    {
       "name": "CloseTraderAccount",
       "docs": [
         "Closes an empty, inactive trader account and returns its rent."
@@ -19415,8 +21209,9 @@
     },
     {
       "name": "PlaceMarketOrderDelegated",
+      "optionalTrailingAdditionalFeeConfig": true,
       "docs": [
-        "Places a market order through a delegated position authority."
+        "Places an IOC order using the owner, primary position authority, or a delegated position authority. Accepts an optional Borsh AdditionalFeeConfig after the legacy payload; any separate conditional_taker rate is ignored."
       ],
       "discriminator": [
         160,
@@ -19557,10 +21352,10 @@
           ]
         },
         {
-          "name": "permissionAccount",
+          "name": "positionAuthorityPermission",
           "writable": true,
           "docs": [
-            "Permission account authorizing the delegated position authority."
+            "Trader-issued position-authority permission, or a non-permission placeholder for owner/primary authority."
           ]
         },
         {
@@ -19822,6 +21617,174 @@
           "type": {
             "defined": {
               "name": "WithdrawFundsInstruction"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "UpdatePerpDisplayName",
+      "docs": [
+        "Sets or clears the display name of a perp asset."
+      ],
+      "discriminator": [
+        205,
+        2,
+        78,
+        167,
+        86,
+        227,
+        2,
+        66
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA used to validate exchange-wide account relationships."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "docs": [
+            "Risk authority."
+          ]
+        },
+        {
+          "name": "maybePermissionAccount",
+          "writable": true,
+          "docs": [
+            "Permission account used for delegated authority validation."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "writable": true,
+          "docs": [
+            "Perp asset map account whose metadata is updated by this instruction."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "UpdatePerpDisplayNameInstruction"
             }
           }
         }
@@ -20875,6 +22838,26 @@
       }
     },
     {
+      "name": "DisplayName",
+      "docs": [
+        "Fixed-width (16 byte) market display name stored as ASCII with trailing zero padding; all zeroes means unset."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bytes",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "Price",
       "docs": [
         "Price representation composed of a mantissa (`value`) and decimal exponent (`expo`)."
@@ -20953,33 +22936,27 @@
             }
           },
           {
-            "name": "shouldResetTimestamp",
-            "type": "bool"
+            "name": "flags",
+            "type": {
+              "defined": {
+                "name": "OraclePriceUpdateFlags"
+              }
+            }
           }
         ]
       }
     },
     {
-      "name": "UpdateSplinePriceParams",
+      "name": "OraclePriceUpdateFlags",
       "docs": [
-        "Parameters for updating a spline's mid-price."
+        "Packed flags controlling timestamp reset, internal-price handling, and sync behavior."
       ],
       "type": {
         "kind": "struct",
         "fields": [
           {
-            "name": "newMidPrice",
-            "type": "u64"
-          },
-          {
-            "name": "userUpdateSlot",
-            "type": {
-              "option": "u64"
-            }
-          },
-          {
-            "name": "refreshRegions",
-            "type": "bool"
+            "name": "flags",
+            "type": "u8"
           }
         ]
       }
@@ -22033,11 +24010,47 @@
             }
           },
           {
+            "name": "depositCooldownPeriodInSlots",
+            "type": "u64"
+          },
+          {
+            "name": "pendingRootAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingRiskAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingMarketAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingOracleAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingReservedAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingAdlAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingCancelAuthority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pendingBackstopAuthority",
+            "type": "pubkey"
+          },
+          {
             "name": "padding1",
             "type": {
               "array": [
                 "u64",
-                73
+                40
               ]
             }
           },
@@ -22046,11 +24059,19 @@
             "type": "u64"
           },
           {
+            "name": "pendingWithdrawThrottleReplenishment",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          },
+          {
             "name": "padding2",
             "type": {
               "array": [
                 "u64",
-                22
+                21
               ]
             }
           },
@@ -22446,11 +24467,19 @@
             "type": "u8"
           },
           {
+            "name": "additionalFees",
+            "type": {
+              "defined": {
+                "name": "AdditionalFees"
+              }
+            }
+          },
+          {
             "name": "padding",
             "type": {
               "array": [
                 "u8",
-                6
+                4
               ]
             }
           },
@@ -24401,6 +26430,28 @@
                 }
               }
             ]
+          },
+          {
+            "name": "DisplayName",
+            "kind": "struct",
+            "fields": [
+              {
+                "name": "previous",
+                "type": {
+                  "defined": {
+                    "name": "DisplayName"
+                  }
+                }
+              },
+              {
+                "name": "new",
+                "type": {
+                  "defined": {
+                    "name": "DisplayName"
+                  }
+                }
+              }
+            ]
           }
         ]
       }
@@ -24705,6 +26756,42 @@
           {
             "name": "newStatusBits",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SpotAssetPriceUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "assetSymbol",
+            "type": {
+              "defined": {
+                "name": "Symbol"
+              }
+            }
+          },
+          {
+            "name": "assetIndex",
+            "type": "u32"
+          },
+          {
+            "name": "price",
+            "type": {
+              "defined": {
+                "name": "Ticks"
+              }
+            }
+          },
+          {
+            "name": "priceSequenceNumber",
+            "type": "u64"
+          },
+          {
+            "name": "prevPriceSequenceNumberSlot",
+            "type": "u64"
           }
         ]
       }
@@ -25635,6 +27722,32 @@
                 "type": {
                   "defined": {
                     "name": "RestartAcknowledgedEvent"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "AdditionalFeeAccrued",
+            "fields": [
+              {
+                "name": "value",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeAccruedEvent"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "SpotAssetPriceUpdated",
+            "fields": [
+              {
+                "name": "value",
+                "type": {
+                  "defined": {
+                    "name": "SpotAssetPriceUpdatedEvent"
                   }
                 }
               }
@@ -29537,6 +31650,33 @@
       }
     },
     {
+      "name": "UpdatePerpDisplayNameInstruction",
+      "docs": [
+        "Borsh payload for setting or clearing the display name of a perp asset."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "perpAssetSymbol",
+            "type": {
+              "defined": {
+                "name": "Symbol"
+              }
+            }
+          },
+          {
+            "name": "displayName",
+            "type": {
+              "defined": {
+                "name": "DisplayName"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "UpdateSplinePositionLimitsConfigParams",
       "docs": [
         "Borsh payload for updating spline position-size limits and leverage decrease configuration."
@@ -29668,6 +31808,451 @@
       }
     },
     {
+      "name": "AddSpotCollateralParams",
+      "docs": [
+        "Parameters for registering a new SPL spot collateral asset; registration requires a complete, valid configuration up front and the entry starts inactive."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "symbol",
+            "type": {
+              "defined": {
+                "name": "Symbol"
+              }
+            }
+          },
+          {
+            "name": "mintAddress",
+            "type": "pubkey"
+          },
+          {
+            "name": "perpAssetSymbol",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "Symbol"
+                }
+              }
+            }
+          },
+          {
+            "name": "config",
+            "type": {
+              "defined": {
+                "name": "SpotAssetConfig"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ConfigureSpotCollateralParams",
+      "docs": [
+        "Parameters for updating a registered spot collateral asset; None fields are left unchanged. isActive = true activates the asset, requiring the SpotCollaterals feature and a configured linked-perp or standalone oracle price source. isActive = false is rejected."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "spotAssetIndex",
+            "type": "u32"
+          },
+          {
+            "name": "update",
+            "type": {
+              "defined": {
+                "name": "SpotAssetConfigUpdate"
+              }
+            }
+          },
+          {
+            "name": "isActive",
+            "type": {
+              "option": "bool"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SpotAssetConfig",
+      "docs": [
+        "Risk parameters for a spot collateral asset. Basis-point fields wrap u32; quote-lot fields wrap u64."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "maxPerTraderBalance",
+            "type": "u64"
+          },
+          {
+            "name": "maxGlobalBalance",
+            "type": "u64"
+          },
+          {
+            "name": "minMarginDiscount",
+            "type": "u32"
+          },
+          {
+            "name": "maxMarginDiscount",
+            "type": "u32"
+          },
+          {
+            "name": "maxLiquidationDiscount",
+            "type": "u32"
+          },
+          {
+            "name": "minLiquidationSlippage",
+            "type": "u32"
+          },
+          {
+            "name": "maxLiquidationSize",
+            "type": "u64"
+          },
+          {
+            "name": "postLiquidationBuffer",
+            "type": "u64"
+          },
+          {
+            "name": "quoteLotCollateralShortfallBuffer",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SpotAssetConfigUpdate",
+      "docs": [
+        "Partial (Option-wrapped) counterpart of SpotAssetConfig; None fields are left unchanged."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "maxPerTraderBalance",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "maxGlobalBalance",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "minMarginDiscount",
+            "type": {
+              "option": "u32"
+            }
+          },
+          {
+            "name": "maxMarginDiscount",
+            "type": {
+              "option": "u32"
+            }
+          },
+          {
+            "name": "maxLiquidationDiscount",
+            "type": {
+              "option": "u32"
+            }
+          },
+          {
+            "name": "minLiquidationSlippage",
+            "type": {
+              "option": "u32"
+            }
+          },
+          {
+            "name": "maxLiquidationSize",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "postLiquidationBuffer",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "quoteLotCollateralShortfallBuffer",
+            "type": {
+              "option": "u64"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TransferSpotParams",
+      "docs": [
+        "Amount is in the token's native units."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawSpotParams",
+      "docs": [
+        "Action selects how the withdrawal splits between accounted collateral and uncounted custody excess."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "action",
+            "type": {
+              "defined": {
+                "name": "WithdrawCollateralAction"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawCollateralAction",
+      "docs": [
+        "Shared by WithdrawNativeSol and WithdrawSpot. AllExcess withdraws every uncounted unit without debiting collateral; WithExcess withdraws exactly amount, consuming uncounted excess before accounted collateral; WithoutExcess withdraws exactly amount from accounted collateral, leaving excess in place. Amounts are in the token's native units."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "AllExcess"
+          },
+          {
+            "name": "WithExcess",
+            "kind": "struct",
+            "fields": [
+              {
+                "name": "amount",
+                "type": "u64"
+              }
+            ]
+          },
+          {
+            "name": "WithoutExcess",
+            "kind": "struct",
+            "fields": [
+              {
+                "name": "amount",
+                "type": "u64"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwapSpotWithSpotInstruction",
+      "docs": [
+        "AmountIn is in the source token's native units, minAmountOut is the slippage bound in the destination token's native units (0 disables the check), and packedInstructions are executed against the trailing remaining accounts."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "amountIn",
+            "type": "u64"
+          },
+          {
+            "name": "minAmountOut",
+            "type": "u64"
+          },
+          {
+            "name": "packedInstructions",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "PackedInstruction"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwapSpotWithUsdcInstruction",
+      "docs": [
+        "Direction (Sell: spot to USDC, Buy: USDC to spot), amountIn (spot native units for Sell, USDC quote lots for Buy), minAmountOut in the output asset's units (0 disables), and the packed external venue instructions."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "direction",
+            "type": {
+              "defined": {
+                "name": "SwapDirection"
+              }
+            }
+          },
+          {
+            "name": "amountIn",
+            "type": "u64"
+          },
+          {
+            "name": "minAmountOut",
+            "type": "u64"
+          },
+          {
+            "name": "packedInstructions",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "PackedInstruction"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwapSpotWithSolInstruction",
+      "docs": [
+        "Direction (Sell: spot to SOL, Buy: SOL to spot), amountIn (spot native units for Sell, lamports for Buy), minAmountOut in the output asset's units (0 disables), and the packed external venue instructions."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "direction",
+            "type": {
+              "defined": {
+                "name": "SwapDirection"
+              }
+            }
+          },
+          {
+            "name": "amountIn",
+            "type": "u64"
+          },
+          {
+            "name": "minAmountOut",
+            "type": "u64"
+          },
+          {
+            "name": "packedInstructions",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "PackedInstruction"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwapDirection",
+      "docs": [
+        "Which side of a two-legged swap the non-quote asset is on. Sell debits the non-quote leg and credits the quote-side leg; Buy the reverse."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Sell"
+          },
+          {
+            "name": "Buy"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidateSpotParams",
+      "docs": [
+        "MaxSpotAmount is the amount of spot collateral, in the token's native units, the liquidator takes over; numTradersToCheck counts the leading remaining accounts used as shortfall evidence; packedInstructions are venue instructions executed via CPI against the trailing venue accounts."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "maxSpotAmount",
+            "type": "u64"
+          },
+          {
+            "name": "numTradersToCheck",
+            "type": "u64"
+          },
+          {
+            "name": "packedInstructions",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "PackedInstruction"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PackedInstruction",
+      "docs": [
+        "Caller-provided CPI instruction whose accounts index into the trailing venue accounts."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "programIdIndex",
+            "type": "u8"
+          },
+          {
+            "name": "data",
+            "type": {
+              "vec": "u8"
+            }
+          },
+          {
+            "name": "accountMetas",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "PackedAccountMeta"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PackedAccountMeta",
+      "docs": [
+        "Single-byte packed account meta: bits 7..2 = account index into the trailing venue accounts, bit 1 = is_signer, bit 0 = is_writable."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "state",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
       "name": "SetSpotAssetPriceInstruction",
       "docs": [
         "Borsh payload for recording a spot-collateral price. The exponent must equal the",
@@ -29710,8 +32295,8 @@
         "kind": "struct",
         "fields": [
           {
-            "name": "assetIndex",
-            "type": "u32"
+            "name": "mintAddress",
+            "type": "pubkey"
           },
           {
             "name": "proxyAuthority",
@@ -29729,6 +32314,12 @@
             "name": "staleThresholdSlots",
             "type": {
               "option": "u64"
+            }
+          },
+          {
+            "name": "hardStaleMultiplier",
+            "type": {
+              "option": "u8"
             }
           }
         ]
@@ -29864,66 +32455,6 @@
             "type": {
               "option": "u64"
             }
-          },
-          {
-            "name": "disablePositionAuthoritySwap",
-            "type": {
-              "option": "bool"
-            }
-          }
-        ]
-      }
-    },
-    {
-      "name": "PackedAccountMeta",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "state",
-            "type": "u8"
-          }
-        ]
-      }
-    },
-    {
-      "name": "PackedInstruction",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "programIdIndex",
-            "type": "u8"
-          },
-          {
-            "name": "data",
-            "type": {
-              "vec": "u8"
-            }
-          },
-          {
-            "name": "accountMetas",
-            "type": {
-              "vec": {
-                "defined": {
-                  "name": "PackedAccountMeta"
-                }
-              }
-            }
-          }
-        ]
-      }
-    },
-    {
-      "name": "SwapDirection",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "Sell"
-          },
-          {
-            "name": "Buy"
           }
         ]
       }
@@ -30221,18 +32752,6 @@
       }
     },
     {
-      "name": "SetMultiArenaAdditionalNodesWatermarkParams",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "numAdditionalNodes",
-            "type": "u32"
-          }
-        ]
-      }
-    },
-    {
       "name": "EnableFeatureParams",
       "type": {
         "kind": "struct",
@@ -30261,6 +32780,212 @@
           },
           {
             "name": "PauseOnClusterRestart"
+          },
+          {
+            "name": "SpotCollaterals"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AdditionalFeeAccruedEvent",
+      "docs": [
+        "Rates are in tenths of a basis point. Rounded combined fee minus rounded base fee. Maker amounts are per fill with an order id; taker amounts aggregate the incoming order without an order id."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "orderSequenceNumber",
+            "type": {
+              "option": "u64"
+            }
+          },
+          {
+            "name": "additionalFeeTenthsBps",
+            "type": {
+              "defined": {
+                "name": "AdditionalFeeTenthsBps"
+              }
+            }
+          },
+          {
+            "name": "quoteLotsFilled",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          },
+          {
+            "name": "feeInQuoteLots",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "AdditionalFees",
+      "docs": [
+        "Additional fees in tenths of a basis point for taker and maker fills."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "taker",
+            "type": {
+              "defined": {
+                "name": "AdditionalFeeTenthsBps"
+              }
+            }
+          },
+          {
+            "name": "maker",
+            "type": {
+              "defined": {
+                "name": "AdditionalFeeTenthsBps"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "AdditionalFeeTenthsBps",
+      "docs": [
+        "Additional fee rate encoded as one raw u8 in tenths of a basis point.",
+        "1 means 0.1 bps; 100 means 10 bps; 255 means 25.5 bps. Zero means no additional fee. There is no Option tag."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "inner",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AdditionalFeeConfig",
+      "docs": [
+        "Optional instruction suffix; Borsh enum with u8 rates in tenths of a basis point. Omit the suffix for zero fees."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "MakerAndTaker",
+            "fields": [
+              {
+                "name": "maker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              },
+              {
+                "name": "taker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "MakerOnly",
+            "fields": [
+              {
+                "name": "maker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "MakerTakerAndConditionalTaker",
+            "fields": [
+              {
+                "name": "maker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              },
+              {
+                "name": "taker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              },
+              {
+                "name": "conditionalTaker",
+                "type": {
+                  "defined": {
+                    "name": "AdditionalFeeTenthsBps"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateSplinePriceWithMetadataParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "newMidPrice",
+            "type": "u32"
+          },
+          {
+            "name": "flags",
+            "type": "u32"
+          },
+          {
+            "name": "userSequenceNumber",
+            "type": "u64"
+          },
+          {
+            "name": "updateSlot",
+            "type": "u64"
+          },
+          {
+            "name": "bidWidth",
+            "type": "u32"
+          },
+          {
+            "name": "askWidth",
+            "type": "u32"
+          },
+          {
+            "name": "clientOrderId",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
           }
         ]
       }
@@ -30975,6 +33700,25 @@
       ],
       "discriminator": [
         70
+      ]
+    },
+    {
+      "name": "AdditionalFeeAccruedEvent",
+      "docs": [
+        "MarketEvent::AdditionalFeeAccrued Borsh payload."
+      ],
+      "discriminator": [
+        71
+      ]
+    },
+    {
+      "name": "SpotAssetPriceUpdatedEvent",
+      "docs": [
+        "MarketEvent::SpotAssetPriceUpdated Borsh variant 72.",
+        "Payload type: SpotAssetPriceUpdatedEvent."
+      ],
+      "discriminator": [
+        72
       ]
     }
   ],
