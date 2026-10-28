@@ -1335,6 +1335,7 @@ templates: []
 
         // chainlink_solana::v2::read_feed_v2 reads one 48-byte round after the 8-byte
         // discriminator and the 192-byte header: slot at 200, timestamp at 208, answer at 216.
+        // The forged data below starts after the discriminator, so its offsets are 8 lower.
         let header = vec![0xAB; 192];
         let values = HashMap::from([
             ("live.slot".to_string(), serde_json::json!(312_000_000u64)),

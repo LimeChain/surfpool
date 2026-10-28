@@ -3,8 +3,7 @@
 Surfpool bundles the IDL of Chainlink's Solana Store program
 (`HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny`) and one template, `chainlink-data-feed`, so a
 scenario can move the latest round of any Chainlink data feed: its answer, slot and timestamp.
-Programs that read the feed, such as Jupiter Lend's oracle, then see that round. The template only
-prepares state.
+Programs that read the feed then see that round. The template only prepares state.
 
 Chainlink Data Streams has no counterpart here. Its reports are verified inside the consuming
 transaction and stored, if at all, in the consumer's own accounts (Kamino's Scope prices, for
@@ -29,9 +28,9 @@ Nothing else differs from the converter's output.
 
 ## Tests
 
-`registry.rs` pins the round's offsets without a network. The live tests read the SOL / USD feed
-and run Jupiter Lend's deployed oracle program against it, checking the rate it returns and the
-staleness limits the template's `llm_context` describes:
+`registry.rs` pins the round's offsets without a network. The live tests read the SOL / USD feed:
+one checks that only the round's bytes change, the other runs the deployed Store program's
+`query` and checks that it returns the round the template wrote:
 
 ```
 cargo test -p surfpool-core --features integration-tests chainlink
