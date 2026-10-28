@@ -39,6 +39,7 @@ const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
 const PROGRAM: &str = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA";
 const PROGRAM_DATA: &str = "4Q8u2ny8YYgytJEncwZQfVWbd5axZtfgDxYKHehvPQR7";
+const DEPLOYED_SLOT: u64 = 456093551;
 const GROUP: &str = "4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8";
 const USDC_BANK: &str = "2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB";
 const SOL_BANK: &str = "CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh";
@@ -363,6 +364,11 @@ async fn each_template_touches_only_its_offsets() {
         ("config.total_asset_value_init_limit", 792, int(34_567, 8)),
         ("config.oracle_max_age", 800, int(3_600, 2)),
         ("config.oracle_max_confidence", 804, int(777_777, 4)),
+        ("config.cb_window_max_up_bps", 770, int(2_100, 2)),
+        ("config.cb_window_max_down_bps", 772, int(5_100, 2)),
+        ("config.cb_deviation_bps_tiers.0", 824, int(650, 2)),
+        ("config.cb_deviation_bps_tiers.1", 826, int(1_100, 2)),
+        ("config.cb_deviation_bps_tiers.2", 828, int(1_900, 2)),
     ]);
     let slot = balance_slot(0);
     let account_rows = vec![
@@ -439,9 +445,16 @@ async fn each_template_touches_only_its_offsets() {
     }
 }
 
-/// The deployed program. 45 bytes of `UpgradeableLoaderState::ProgramData` precede the ELF.
+/// The deployed program. 45 bytes of `UpgradeableLoaderState::ProgramData` precede the ELF: a u32
+/// tag, the deploy slot and the upgrade authority.
 async fn project0_elf() -> Vec<u8> {
-    fetch(&[PROGRAM_DATA]).await.remove(0).data[45..].to_vec()
+    let program_data = fetch(&[PROGRAM_DATA]).await.remove(0).data;
+    let deployed_slot = u64::from_le_bytes(program_data[4..12].try_into().unwrap());
+    assert_eq!(
+        deployed_slot, DEPLOYED_SLOT,
+        "program redeployed at slot {deployed_slot}; re-verify the templates against it"
+    );
+    program_data[45..].to_vec()
 }
 
 /// The live accounts `lending_account_pulse_health` reads, all from one slot.

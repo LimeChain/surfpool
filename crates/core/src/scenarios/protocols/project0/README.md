@@ -82,8 +82,11 @@ Project 0 banks read Pyth `PriceUpdateV2` accounts of the Pyth Pro-compatible re
 bank names at `config.oracle_keys.0`:
 
 ```
+project0-bank-oracle     on the SOL bank, fetchBeforeUse: true
+  cb_reference_price.value: "5629499534213120"         # $20 x 2^48
+  cb_window_reference_price.value: "5629499534213120"
 pyth-pro-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
-  price_message.price: 2000000000        # $20, exponent -8
+  price_message.price: 2000000000                       # $20, exponent -8
   price_message.ema_price: 2000000000
 ```
 
@@ -93,10 +96,12 @@ plays. Borrow and withdraw checks use the EMA price, liquidation the spot price,
 Tested against the deployed program: SOL at $20 turns a healthy SOL-backed USDC borrow
 liquidatable.
 
-**Stablecoins** such as USDC and USDT have a price circuit breaker. Once the price, net of the
-oracle's confidence, is `config.cb_deviation_bps_tiers[0]` basis points (50 for USDC) away from
-the bank's `cb_reference_price`, borrow, withdraw and liquidation fail with
-`CircuitBreakerPriceJump` (6604). Move the reference with the price:
+**Most banks have a price circuit breaker**, among them the stablecoins, SOL and its liquid staking
+tokens, BTC and ETH. It is on when the bank's `config.cb_deviation_bps_tiers[0]` is above 0. Once
+the price, net of the oracle's confidence, is that many basis points (50 for USDC, 600 for SOL)
+away from the bank's `cb_reference_price`, borrow, withdraw and liquidation fail with
+`CircuitBreakerPriceJump` (6604). Read the bank to see its tiers, and move the reference with the
+price, as above for SOL and here for USDC:
 
 ```
 project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
@@ -107,7 +112,15 @@ pyth-pro-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: tru
   price_message.ema_price: 95000000
 ```
 
-The breaker then treats $0.95 as normal and still guards further moves.
+The breaker then treats $0.95 as normal and still guards further moves, as after a slow move it
+has adapted to. That is the default: it keeps the breaker on and tests the protocol as deployed.
+
+The other way is to change the breaker's own thresholds on the bank with the same template: the
+three `config.cb_deviation_bps_tiers` entries and the `config.cb_window_max_up_bps` /
+`config.cb_window_max_down_bps` caps. Use it to test the breaker itself, with a price just under
+or just over the first tier, or to model the admin loosening it. Only all five at `10000` switch
+it off: the first tier alone still lets the price-cache crank halt the bank at a higher tier
+(`BankCircuitBreakerHalted`, 6600).
 
 ## Build a position from scratch
 
@@ -164,7 +177,7 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 | Rejection | Fix |
 |---|---|
 | Stale oracle | Refetch the feed with `fetchBeforeUse: true` |
-| `CircuitBreakerPriceJump` (6604) | A stablecoin price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
+| `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
 | `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
 | The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
 | Your price override did nothing | Write the bank's `config.oracle_keys.0` with `pyth-pro-price-feed-v2`. The default receiver's account for the same feed (`pyth-price-feed-v2`) is a different address, which the bank never reads. See [Move a price](#move-a-price) |

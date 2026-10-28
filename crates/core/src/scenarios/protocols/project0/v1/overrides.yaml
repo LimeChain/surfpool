@@ -84,8 +84,10 @@ templates:
       bank's price account (the lookup above returns it). Move price and ema_price together:
       liquidation reads the spot price, borrows and withdrawals check the EMA. The bank refuses a
       price older than config.oracle_max_age seconds, so keep fetchBeforeUse: true and leave the
-      time fields unset, as pyth-pro-price-feed-v2 explains. A stablecoin bank also needs its circuit
-      breaker reference moved with the price, as project0-bank-oracle explains.
+      time fields unset, as pyth-pro-price-feed-v2 explains. Read the bank first: when its
+      config.cb_deviation_bps_tiers.0 is above 0, the circuit breaker is on and the same scenario
+      needs project0-bank-oracle on that bank with both breaker references at the new price, as
+      that template explains.
 
       EXAMPLE - "SOL collateral only counts at 30% against liquidation":
       config.asset_weight_maint.value: "84442493013197"
@@ -135,11 +137,32 @@ templates:
     properties:
       - "config.oracle_max_age"
       - "config.oracle_max_confidence"
+      - path: config.cb_deviation_bps_tiers.0
+        label: Circuit breaker tier 1 (bps)
+        description: >-
+          Price deviation from cb_reference_price, in basis points, at which the breaker refuses
+          borrow, withdraw and liquidation. 10000 is 100%
+      - path: config.cb_deviation_bps_tiers.1
+        label: Circuit breaker tier 2 (bps)
+        description: >-
+          Deviation at which the breaker's second, longer halt applies. Keep it above tier 1
+      - path: config.cb_deviation_bps_tiers.2
+        label: Circuit breaker tier 3 (bps)
+        description: >-
+          Deviation at which the breaker's longest halt applies. Keep it above tier 2
+      - path: config.cb_window_max_up_bps
+        label: Circuit breaker 24h cap up (bps)
+        description: >-
+          Largest rise from cb_window_reference_price the breaker allows inside its window
+      - path: config.cb_window_max_down_bps
+        label: Circuit breaker 24h cap down (bps)
+        description: >-
+          Largest drop from cb_window_reference_price the breaker allows inside its window
       - path: cb_reference_price.value
         label: Circuit breaker reference price
         description: >-
           Price the circuit breaker treats as normal, scaled by 2^48. Set it to the new price when
-          moving a stablecoin. Example: $0.95 is "267401227875123"
+          moving the price of a bank whose breaker is on. Example: $0.95 is "267401227875123"
       - path: cb_window_reference_price.value
         label: Circuit breaker 24h reference price
         description: >-
@@ -148,21 +171,28 @@ templates:
     address:
       type: pubkey
     llm_context: |
-      Use this template to change how old a price the bank accepts, or to let a stablecoin price
-      move past the bank's circuit breaker.
+      Use this template to change how old a price the bank accepts, or to let a price move past
+      the bank's circuit breaker.
 
       A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
       publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
       65535) to accept older prices. To move the price itself, use pyth-pro-price-feed-v2 on the
       bank's price account, config.oracle_keys.0.
 
-      STABLECOIN CIRCUIT BREAKER: stablecoin banks such as USDC and USDT reject borrow, withdraw and
-      liquidation with error 6604 (CircuitBreakerPriceJump) once their price, net of the oracle's
-      confidence, is config.cb_deviation_bps_tiers.0 basis points (50 for USDC) away from
-      cb_reference_price, or past the 24h cap from cb_window_reference_price. To move such a price,
-      set both fields to the new price in the same scenario as the price override. The breaker then
-      treats the new price as normal and still guards further moves. Banks without the breaker
-      ignore both fields.
+      CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
+      tokens, BTC and ETH. It is on when config.cb_deviation_bps_tiers.0 is above 0. Such a bank
+      rejects borrow, withdraw and liquidation with error 6604 (CircuitBreakerPriceJump) once its
+      price, net of the oracle's confidence, is that many basis points (50 for USDC, 600 for SOL)
+      away from cb_reference_price, or past the 24h cap from cb_window_reference_price. Read the
+      bank with getAccountInfo jsonParsed to see the tiers. Two ways to work with it:
+      - MOVE THE REFERENCES (the default): set cb_reference_price.value and
+        cb_window_reference_price.value to the new price in the same scenario as the price
+        override. The breaker then treats the new price as normal and still guards further moves,
+        like a slow move it has adapted to. A bank whose breaker is off ignores both fields.
+      - CHANGE THE THRESHOLDS: set the three config.cb_deviation_bps_tiers entries and the two
+        config.cb_window_max_*_bps caps. Use this to test the breaker itself, with a price just
+        under or just over tier 1, or to model the admin loosening it. Only all five at 10000
+        switch it off; tier 1 alone still trips the cache crank at the higher tiers.
 
       Kamino, Drift and JupLend wrapped banks also need their venue account refreshed in the same
       transaction, which these templates do not do.
@@ -175,6 +205,17 @@ templates:
       cb_window_reference_price.value: "267401227875123"
       plus pyth-pro-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
       price_message.ema_price 95000000 (exponent -8).
+
+      EXAMPLE - "SOL at $20", on the SOL bank:
+      cb_reference_price.value: "5629499534213120"
+      cb_window_reference_price.value: "5629499534213120"
+      plus pyth-pro-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
+      price_message.ema_price 2000000000.
+
+      EXAMPLE - "the SOL breaker trips at 1% instead of 6%":
+      config.cb_deviation_bps_tiers.0: 100
+      config.cb_deviation_bps_tiers.1: 1050
+      config.cb_deviation_bps_tiers.2: 1800
 
   - id: project0-bank-interest-rate
     name: Override Bank Interest Rate Curve
