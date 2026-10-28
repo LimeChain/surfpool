@@ -7427,6 +7427,202 @@ mod tests {
         );
     }
 
+    /// Closing an account changes the pre/post token-account sets. Keep its
+    /// pre-balance, omit its post-balance, and pair each side with its own mints.
+    #[test_case::test_case(spl_token_interface::ID, false; "spl_token_close_only")]
+    #[test_case::test_case(spl_token_interface::ID, true; "spl_token_mixed_decimals")]
+    #[test_case::test_case(spl_token_2022_interface::ID, false; "token_2022_close_only")]
+    #[test_case::test_case(spl_token_2022_interface::ID, true; "token_2022_mixed_decimals")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closed_token_account_receipt_preserves_mixed_mint_balances(
+        token_program: Pubkey,
+        with_transfer: bool,
+    ) {
+        use crossbeam_channel::unbounded;
+        use solana_program_pack::Pack;
+        use spl_token_2022_interface::instruction::{burn, close_account, transfer_checked};
+        use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint};
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let owner = Keypair::new();
+        // Fixed keys put the closing account before the surviving accounts in
+        // message order, exposing a positional mint mismatch as well as truncation.
+        let token_account = Pubkey::new_from_array([1; 32]);
+        let mint = Pubkey::new_from_array([2; 32]);
+        let source = Pubkey::new_from_array([3; 32]);
+        let destination = Pubkey::new_from_array([4; 32]);
+        let other_mint = Pubkey::new_from_array([5; 32]);
+        locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .expect("airdrop should succeed")
+            .expect("airdrop transaction should succeed");
+        locker.with_svm_writer(|svm| {
+            let mut account = |pubkey: Pubkey, data: Vec<u8>| {
+                let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
+                svm.set_account(
+                    &pubkey,
+                    Account {
+                        lamports,
+                        data,
+                        owner: token_program,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+            };
+            let mints = [(mint, 6, 1_234_567), (other_mint, 9, 2_000_000_000)];
+            for (key, decimals, supply) in mints.into_iter().take(if with_transfer { 2 } else { 1 })
+            {
+                let mut data = vec![0; Mint::LEN];
+                Mint {
+                    is_initialized: true,
+                    decimals,
+                    supply,
+                    ..Default::default()
+                }
+                .pack_into_slice(&mut data);
+                account(key, data);
+            }
+            let tokens = [
+                (token_account, mint, 1_234_567),
+                (source, other_mint, 2_000_000_000),
+                (destination, other_mint, 0),
+            ];
+            for (key, mint, amount) in tokens.into_iter().take(if with_transfer { 3 } else { 1 }) {
+                let mut data = vec![0; TokenAccount::LEN];
+                TokenAccount {
+                    mint,
+                    owner: owner.pubkey(),
+                    amount,
+                    state: AccountState::Initialized,
+                    ..Default::default()
+                }
+                .pack_into_slice(&mut data);
+                account(key, data);
+            }
+        });
+
+        let mut instructions = vec![
+            burn(
+                &token_program,
+                &token_account,
+                &mint,
+                &owner.pubkey(),
+                &[],
+                1_234_567,
+            )
+            .unwrap(),
+            close_account(
+                &token_program,
+                &token_account,
+                &owner.pubkey(),
+                &owner.pubkey(),
+                &[],
+            )
+            .unwrap(),
+        ];
+        if with_transfer {
+            instructions.push(
+                transfer_checked(
+                    &token_program,
+                    &source,
+                    &other_mint,
+                    &destination,
+                    &owner.pubkey(),
+                    &[],
+                    500_000_000,
+                    9,
+                )
+                .unwrap(),
+            );
+        }
+        let message = Message::new_with_blockhash(
+            &instructions,
+            Some(&owner.pubkey()),
+            &locker.latest_absolute_blockhash(),
+        );
+        let account_index = |key: Pubkey| {
+            message
+                .account_keys
+                .iter()
+                .position(|candidate| *candidate == key)
+                .unwrap() as u8
+        };
+        let closed_index = account_index(token_account);
+        let transfer_indexes =
+            with_transfer.then(|| (account_index(source), account_index(destination)));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+            .expect("transaction should sign");
+        let signature = tx.signatures[0];
+        let (status_tx, _status_rx) = unbounded();
+        locker
+            .process_transaction(&None, tx, status_tx, false, true)
+            .await
+            .expect("transaction processing should succeed");
+
+        let meta = locker.with_svm_reader(|svm| {
+            let closed = svm.inner.get_account_no_db(&token_account);
+            assert!(closed.is_none() || closed.unwrap().lamports == 0);
+            if with_transfer {
+                for (key, expected) in [(source, 1_500_000_000), (destination, 500_000_000)] {
+                    let account = svm.inner.get_account_no_db(&key).unwrap();
+                    assert_eq!(
+                        TokenAccount::unpack(&account.data).unwrap().amount,
+                        expected
+                    );
+                }
+            }
+            let (transaction, _) = svm
+                .transactions
+                .get(&signature.to_string())
+                .unwrap()
+                .unwrap()
+                .expect_processed()
+                .clone();
+            transaction.meta
+        });
+        assert_eq!(meta.status, Ok(()));
+        let pre = meta.pre_token_balances.unwrap();
+        let post = meta.post_token_balances.unwrap();
+        assert!(
+            !post
+                .iter()
+                .any(|balance| balance.account_index == closed_index)
+        );
+        assert_eq!(
+            pre.len(),
+            if with_transfer { 3 } else { 1 },
+            "all pre-balances must survive account closure"
+        );
+        assert_eq!(post.len(), if with_transfer { 2 } else { 0 });
+        let check = |balances: &[solana_transaction_status::TransactionTokenBalance],
+                     index,
+                     mint: Pubkey,
+                     amount: u64,
+                     decimals,
+                     ui: &str| {
+            let balance = balances
+                .iter()
+                .find(|balance| balance.account_index == index)
+                .unwrap();
+            assert_eq!(balance.mint, mint.to_string());
+            assert_eq!(balance.owner, owner.pubkey().to_string());
+            assert_eq!(balance.program_id, token_program.to_string());
+            assert_eq!(balance.ui_token_amount.amount, amount.to_string());
+            assert_eq!(balance.ui_token_amount.decimals, decimals);
+            assert_eq!(balance.ui_token_amount.ui_amount_string, ui);
+        };
+        check(&pre, closed_index, mint, 1_234_567, 6, "1.234567");
+        if let Some((source_index, destination_index)) = transfer_indexes {
+            check(&pre, source_index, other_mint, 2_000_000_000, 9, "2");
+            check(&pre, destination_index, other_mint, 0, 9, "0");
+            check(&post, source_index, other_mint, 1_500_000_000, 9, "1.5");
+            check(&post, destination_index, other_mint, 500_000_000, 9, "0.5");
+        }
+    }
+
     use crate::{
         storage::{Storage, StorageError, StorageResult},
         types::MintAccount,
