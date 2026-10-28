@@ -30,8 +30,8 @@ templates:
       Chainlink data feeds on Solana are accounts of the Store program
       HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny. A consumer reads the feed account it was
       configured with, so the address the consumer names wins over a search.
-      1. A feed address the user gives, or one the consuming program's accounts name (for
-         example a source of a Jupiter Lend oracle), is used as is.
+      1. A feed address the user gives, or one the consuming program's accounts name, is used
+         as is.
       2. Otherwise search by the feed's description, the pair text stored at byte 106 such as
          "SOL / USD", "BTC / USD" or "JLP / USD". Call getProgramAccounts on
          HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny with the filters
@@ -46,11 +46,9 @@ templates:
       VALUE: live.answer = value x 10^decimals. USD price feeds use 8 decimals, so $145.00 is
       14500000000. Exchange-rate feeds use 6, 8 or 18; read decimals, never assume.
 
-      TIME: consumers age the round against the Surfnet clock, and the round must not be ahead of
-      it. Jupiter Lend, for example, reads only live.slot: borrows and withdrawals fail once it is
-      2644 slots behind the clock's slot, liquidations once it is 28804 slots behind, and both
-      fail when it is ahead. A round stamped with the Surfnet's own time is neither, so write
-      both time fields with every value:
+      TIME: consumers age the round against the Surfnet clock, by live.slot or by
+      live.timestamp, and reject a round that is too old or ahead of the clock. A round stamped
+      with the Surfnet's own time is neither, so write both time fields with every value:
       - live.slot: the Surfnet's slot, from getSlot with {"commitment":"processed"}.
       - live.timestamp: the Surfnet clock in seconds, from getAccountInfo on
         SysvarC1ock11111111111111111111111111111111 with encoding "jsonParsed", field
