@@ -13,6 +13,7 @@ use solana_keypair::Keypair;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_sysvar::last_restart_slot::LastRestartSlot;
 use solana_transaction::Transaction;
 use spl_associated_token_account_interface::address::get_associated_token_address;
 use surfpool_types::DEFAULT_MAINNET_RPC_URL;
@@ -296,6 +297,7 @@ async fn phoenix_surfnet(graph: &PhoenixMainnetGraph) -> SurfnetSvmLocker {
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
         svm_writer.inner.set_sysvar(&graph.clock);
+        svm_writer.inner.set_sysvar(&graph.last_restart_slot);
         svm_writer
             .inner
             .svm
@@ -330,14 +332,12 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
     let map = PerpAssetMap::try_from_account_bytes(&map_account.data)
         .expect("mainnet PerpAssetMap decodes");
     let mut markets = Vec::new();
-    // A surfnet loads the restart sysvar from its datasource; the bare test VM has none. A local
-    // trader deposits the collateral mint into the global vault.
+    // A local trader deposits the collateral mint into the global vault.
     let mut addresses = vec![
         PHOENIX_GLOBAL_CONFIG,
         perp_asset_map,
         global_trader_index,
         active_trader_buffer,
-        LAST_RESTART_SLOT,
         Pubkey::new_from_array(global.canonical_token_mint_key()),
         Pubkey::new_from_array(global.global_vault_key()),
     ];
@@ -355,13 +355,21 @@ async fn phoenix_mainnet_graph() -> PhoenixMainnetGraph {
 
     // The clock and every account from one bank, so the programs accept them together.
     let clock_address = Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
-    let keys: Vec<Pubkey> = addresses.iter().copied().chain([clock_address]).collect();
+    let keys: Vec<Pubkey> = addresses
+        .iter()
+        .copied()
+        .chain([LAST_RESTART_SLOT, clock_address])
+        .collect();
     let mut fetched = fetch(&keys).await;
     let clock: Clock = bincode::deserialize(&fetched.pop().unwrap().data).unwrap();
     assert!(clock.slot > 0);
+    // A surfnet loads the restart sysvar from its datasource; the bare test VM has none.
+    let last_restart_slot: LastRestartSlot =
+        bincode::deserialize(&fetched.pop().unwrap().data).unwrap();
 
     let mut graph = PhoenixMainnetGraph {
         clock,
+        last_restart_slot,
         accounts: addresses.iter().copied().zip(fetched).collect(),
         global_trader_index,
         active_trader_buffer,
@@ -408,6 +416,7 @@ async fn fetch_books(
 #[derive(Clone)]
 struct PhoenixMainnetGraph {
     clock: Clock,
+    last_restart_slot: LastRestartSlot,
     accounts: Vec<(Pubkey, Account)>,
     global_trader_index: Pubkey,
     active_trader_buffer: Pubkey,
