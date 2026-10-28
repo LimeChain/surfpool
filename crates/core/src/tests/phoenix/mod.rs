@@ -1451,7 +1451,7 @@ fn force_cancel(
             ("orderbook", market.orderbook),
             ("splines", market.splines),
         ],
-        &serde_json::json!({ "params": {} }),
+        &serde_json::json!({}),
     )
     .unwrap()
 }

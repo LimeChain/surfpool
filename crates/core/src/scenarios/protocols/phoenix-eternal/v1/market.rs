@@ -323,7 +323,7 @@ impl MarketContext {
                                 "newExchangePerpPrice": price,
                                 "newExchangeSpotPrice": price,
                             }],
-                            "shouldResetTimestamp": false,
+                            "flags": { "flags": 0 },
                         }
                     }),
                 )
