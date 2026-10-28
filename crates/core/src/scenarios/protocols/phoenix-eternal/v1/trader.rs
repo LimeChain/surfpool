@@ -849,6 +849,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_idl_writes_max_positions_and_leaves_the_trader_preference_bits() {
+        let mut header = cold_trader_header();
+        header.max_positions = 128;
+        header.trader_preference_bits = 5;
+        let account = trader_account(header);
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let written = svm
+            .get_forged_account_data(
+                &Pubkey::new_unique(),
+                &account.data,
+                super::super::state_builder::phoenix_idl(),
+                &std::collections::HashMap::from([(
+                    "maxPositions".to_string(),
+                    serde_json::json!(10),
+                )]),
+            )
+            .unwrap();
+        let header: TraderHeader =
+            bytemuck::pod_read_unaligned(&written[..size_of::<TraderHeader>()]);
+        assert_eq!(
+            (header.max_positions, header.trader_preference_bits),
+            (10, 5)
+        );
+    }
+
+    #[test]
     fn collateral_refuses_a_spline_market_maker() {
         let mut maker = cold_trader_header();
         maker.num_markets_with_splines = 3;

@@ -21835,7 +21835,11 @@
           },
           {
             "name": "maxPositions",
-            "type": "u64"
+            "type": "u32"
+          },
+          {
+            "name": "traderPreferenceBits",
+            "type": "u32"
           },
           {
             "name": "positionAuthority",
