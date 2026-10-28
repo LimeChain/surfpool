@@ -3991,13 +3991,13 @@ mod live_surfnet {
     }
 
     /// Registers a scenario that restates the pool's mid once, which keeps the pool and the tick
-    /// alive every later slot, and waits until the pool shows it. Returns the scenario's id. Nothing
-    /// is written into the pool except through the scenario.
+    /// alive every later slot, and waits until the pool shows it. Nothing is written into the pool
+    /// except through the scenario.
     ///
     /// No base slot is sent. Surfpool never applies an override scheduled for a slot that has
     /// already begun, so a base read here and sent in a later request loses its first slot whenever
     /// a block boundary falls between the two; without one the server uses its own current slot.
-    async fn keep_alive(rpc: &RpcClient) -> String {
+    async fn keep_alive(rpc: &RpcClient) {
         let before = rpc.get_slot().await.expect("slot");
         let pool = rpc.get_account(&POOL).await.expect("pool").data;
         let fair_value = u128::from_le_bytes(pool[832..848].try_into().unwrap());
@@ -4019,7 +4019,6 @@ mod live_surfnet {
                 .into(),
             ),
         );
-        let id = scenario.id.clone();
         cheatcode(
             rpc,
             "surfnet_registerScenario",
@@ -4033,7 +4032,7 @@ mod live_surfnet {
             let republished_at = u64_at(&pool, 72);
             if republished_at > before && republished_at <= rpc.get_slot().await.expect("slot") {
                 assert_publication_follows_the_clock(rpc).await;
-                return id;
+                return;
             }
             assert!(
                 Instant::now() < deadline,
@@ -4218,7 +4217,7 @@ mod live_surfnet {
 
         // 1. A registered scenario keeps the pool and the tick alive, so the pool fills. Keep-alive
         //    loads the tick from upstream itself; no swap has named it yet.
-        let scenario = keep_alive(&rpc).await;
+        keep_alive(&rpc).await;
         assert_tick_matches_clock(&rpc, "before the first swap").await;
         let first = buy(&rpc, &taker).await;
         assert!(first > 0, "a kept-alive pool must fill on a surfnet");
@@ -4230,28 +4229,9 @@ mod live_surfnet {
         let kept = buy(&rpc, &taker).await;
         assert!(kept > 0, "a kept-alive pool must keep filling");
 
-        // 3. Control: unregistering the scenario stops keep-alive, and staleness stops the venue.
-        cheatcode(
-            &rpc,
-            "surfnet_unregisterScenario",
-            serde_json::json!([scenario]),
-        )
-        .await;
-        let stale_from = rpc.get_slot().await.expect("slot") + 4;
-        wait_for_slot(&rpc, stale_from).await;
-        assert_eq!(
-            buy(&rpc, &taker).await,
-            0,
-            "a stale pool must stop filling, or the fills above prove nothing about keep-alive"
-        );
-
-        // 4. Registering again revives it.
-        keep_alive(&rpc).await;
-        let revived = buy(&rpc, &taker).await;
-        assert!(revived > 0, "a kept-alive pool must fill again");
-
-        // 5. Time travel: keep-alive republishes the pool and the tick in the first block after the
-        //    jump.
+        // 3. Time travel with the clock paused: keep-alive republishes the pool and the tick for the
+        //    slot the jump lands on, before any block is produced.
+        cheatcode(&rpc, "surfnet_pauseClock", serde_json::json!([])).await;
         let target = rpc.get_slot().await.expect("slot") + 10_000;
         cheatcode(
             &rpc,
@@ -4259,18 +4239,37 @@ mod live_surfnet {
             serde_json::json!([{ "absoluteSlot": target }]),
         )
         .await;
-        assert!(rpc.get_slot().await.expect("slot") >= target);
-        wait_for_slot(&rpc, rpc.get_slot().await.expect("slot") + 1).await;
-        assert_tick_matches_clock(&rpc, "after time travel").await;
+        let landed = rpc.get_slot().await.expect("slot");
+        assert!(landed >= target);
+        assert_tick_matches_clock(&rpc, "right after time travel").await;
         assert_publication_follows_the_clock(&rpc).await;
-        let travelled = buy(&rpc, &taker).await;
+        // A swap executes at once, but its status is only published with a block, so read the
+        // balance instead of waiting for the status.
+        let before = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        let _ = tokio::time::timeout(Duration::from_secs(3), buy(&rpc, &taker)).await;
+        let after = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        assert_eq!(
+            rpc.get_slot().await.expect("slot"),
+            landed,
+            "the clock is paused, so no block can have refreshed anything"
+        );
+        let travelled = after - before;
         assert!(
             travelled > 0,
-            "a kept-alive pool must fill after time travel"
+            "a kept-alive pool must fill right after time travel"
         );
+        cheatcode(&rpc, "surfnet_resumeClock", serde_json::json!([])).await;
 
         // The same purchase against the same price should buy about the same SOL each time.
-        for fill in [kept, revived, travelled] {
+        for fill in [kept, travelled] {
             let drift_bps = (fill as f64 / first as f64 - 1.0).abs() * 1e4;
             assert!(
                 drift_bps < 50.0,

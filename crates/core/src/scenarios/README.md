@@ -126,10 +126,8 @@ Each import names the keep-alive `template`, the `address` it writes, and the `v
 other value is written as given.
 
 In each slot keep-alive runs before the scenario's own overrides, so an override of the same field in
-that slot wins. It starts in the slot the importing override plays and stops when the scenario is
-unregistered with `surfnet_unregisterScenario`, which Studio's Delete calls. Unregistering also drops
-the scenario's overrides that have not played yet. An account another registered scenario keeps
-alive stays alive.
+that slot wins. It starts in the slot the importing override plays and runs until the network is
+reset.
 
 The registry checks every import when it loads: the template must be a keep-alive template with every
 property the values set, and an input address must name a pubkey input of the importing template.
