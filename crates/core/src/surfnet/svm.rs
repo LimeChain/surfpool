@@ -583,8 +583,8 @@ pub struct SurfnetSvm {
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
-    /// The scenarios registered with `surfnet_registerScenario` and not unregistered since, with
-    /// the accounts their keep-alive templates rewrite every slot.
+    /// The scenarios registered with `surfnet_registerScenario`, with the accounts their keep-alive
+    /// templates rewrite every slot.
     pub scenarios: RegisteredScenarios,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
@@ -3810,7 +3810,7 @@ impl SurfnetSvm {
                     import: index,
                     account,
                 };
-                if self.scenarios.keep_alive(&source.scenario, target.clone()) {
+                if self.scenarios.keep_alive(target.clone()) {
                     info!(
                         "Keep-alive '{}' rewrites {} every slot for scenario {}",
                         import.template, account, source.scenario
@@ -3873,34 +3873,6 @@ impl SurfnetSvm {
             instances.push(instance);
         }
         instances
-    }
-
-    /// Unregisters a scenario: its keep-alive stops and its overrides that have not played yet are
-    /// dropped. Returns whether the scenario was registered.
-    pub fn unregister_scenario(&mut self, scenario_id: &str) -> SurfpoolResult<bool> {
-        let Some(override_ids) = self.scenarios.unregister(scenario_id) else {
-            return Ok(false);
-        };
-        for slot in self.scheduled_overrides.keys()? {
-            let Some(overrides) = self.scheduled_overrides.get(&slot)? else {
-                continue;
-            };
-            let scheduled = overrides.len();
-            let kept: Vec<_> = overrides
-                .into_iter()
-                .filter(|instance| !override_ids.contains(&instance.id))
-                .collect();
-            if kept.len() == scheduled {
-                continue;
-            }
-            if kept.is_empty() {
-                self.scheduled_overrides.take(&slot)?;
-            } else {
-                self.scheduled_overrides.store(slot, kept)?;
-            }
-        }
-        info!("Unregistered scenario {}", scenario_id);
-        Ok(true)
     }
 
     /// Forges account data by applying overrides to existing account data

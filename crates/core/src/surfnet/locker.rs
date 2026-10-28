@@ -2817,12 +2817,6 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
     }
 
-    /// Unregisters a scenario: its keep-alive stops and its overrides still to play are dropped.
-    /// Returns whether it was registered.
-    pub fn unregister_scenario(&self, scenario_id: &str) -> SurfpoolResult<bool> {
-        self.with_svm_writer(|svm_writer| svm_writer.unregister_scenario(scenario_id))
-    }
-
     /// Materializes overrides for a specific slot (not necessarily the current slot)
     pub async fn materialize_overrides_for_slot(
         &self,
