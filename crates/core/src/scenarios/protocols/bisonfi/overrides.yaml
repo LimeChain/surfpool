@@ -148,7 +148,7 @@ templates:
       slippage-scale testing; do not assert that one is untouched to the byte.
 
       EXAMPLE - "BisonFi is thin, selling SOL into it slips badly":
-      quote_reserve: 1100446538524
+      quote_reserve: 1100446538
   - id: bisonfi-spread
     name: Override Spread
     description: >-
