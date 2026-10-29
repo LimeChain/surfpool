@@ -122,9 +122,9 @@ Each import names the keep-alive `template`, the `address` it writes, and the `v
 `$unix_ms`, `$unix_us` and `$unix_ns` are filled in every slot from the slot and its block time; any
 other value is written as given.
 
-In each slot keep-alive runs before the scenario's own overrides, so an override of the same field in
-that slot wins. It starts in the slot the importing override plays and runs until the network is
-reset.
+Keep-alive writes its fields again every slot. If an override sets one of those fields too, keep-alive
+replaces that value by the next slot at the latest. It starts in the slot the importing override plays
+and runs until the network is reset.
 
 The registry checks every import when it loads: the template must be a keep-alive template with every
 property the values set, and an input address must name a pubkey input of the importing template.

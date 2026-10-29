@@ -3330,7 +3330,7 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
         let current_slot = self.latest_epoch_info.absolute_slot;
-        // Keep-alive goes first, so a scenario's own overrides in this slot have the last word.
+        // Keep-alive writes its fields again every slot, so an override of one lasts this slot at most.
         self.apply_keep_alive(remote_ctx).await?;
         self.materialize_overrides_for_slot(remote_ctx, current_slot)
             .await
