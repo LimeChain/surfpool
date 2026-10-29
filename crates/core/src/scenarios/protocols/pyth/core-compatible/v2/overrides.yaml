@@ -9,9 +9,9 @@ tags:
   - defi
 
 templates:
-  - id: pyth-pro-price-feed-v2
-    name: Override Pyth Pro-compatible Price Account
-    description: Override a price account of the Pyth Pro-compatible receiver, found by address
+  - id: pyth-core-compatible-price-feed-v2
+    name: Override Pyth Core Compatible Price Account
+    description: Override a price account of the Pyth Core Compatible receiver, found by address
     idl_account_name: PriceUpdateV2
     properties:
       - path: price_message.price
@@ -43,8 +43,8 @@ templates:
     llm_context: |
       FINDING THE PRICE ACCOUNT:
       Pyth runs two receivers on Solana with the same feed ids at different addresses, and a
-      consumer reads only one. This template writes price accounts owned by the Pyth
-      Pro-compatible receiver rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp; for the default
+      consumer reads only one. This template writes price accounts owned by the Pyth Core
+      Compatible receiver rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp; for the Pyth Core
       receiver rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ use pyth-price-feed-v2.
       1. Take the price account from the account that reads it: the consumer's protocol templates
          say which field names it. A price account the user gives is used as is.
