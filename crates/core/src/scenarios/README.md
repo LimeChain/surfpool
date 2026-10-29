@@ -85,8 +85,8 @@ endpoint.
 
 Some accounts are rewritten every slot by the protocol's own off-chain actor, such as a market maker
 republishing its quote. Nobody runs those actors against a surfnet, so after an override the account
-goes stale. A template can import keep-alive templates, which the surfnet applies every slot while a
-scenario with an override of that template is registered.
+goes stale. A template can import keep-alive templates, which the surfnet applies every slot from the
+slot an override of that template plays.
 
 Keep-alive templates are ordinary override templates kept in a separate file of the protocol and
 loaded with `TemplateRegistry::load_keep_alive`. Studio and MCP never list them, and MCP refuses one
@@ -120,12 +120,15 @@ Each import names the keep-alive `template`, the `address` it writes, and the `v
 | `{ type: pda, program_id, seeds }` | a derived account; seeds resolve against the override's values |
 
 `values` set properties of the keep-alive template. `$slot`, `$slot+N`, `$slot-N`, `$unix_s`,
-`$unix_ms`, `$unix_us` and `$unix_ns` are filled in every slot from the slot and its block time; any
-other value is written as given.
+`$unix_ms`, `$unix_us` and `$unix_ns` are filled in every slot from the slot and the time its Clock
+sysvar reads; any other value is written as given.
 
 Keep-alive writes its fields again every slot. If an override sets one of those fields too, keep-alive
 replaces that value by the next slot at the latest. It starts in the slot the importing override plays
 and runs until the network is reset.
+
+The accounts keep-alive rewrites are kept in memory only: after a restart on a persistent database,
+keep-alive stops until an importing override plays again.
 
 The registry checks every import when it loads: the template must be a keep-alive template with every
 property the values set, and an input address must name a pubkey input of the importing template.
