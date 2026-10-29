@@ -1,12 +1,12 @@
 # HumidiFi
 
-A proprietary market maker (PMM), not an AMM. Four templates control the fair value a market
-quotes around, the spread it quotes at, whether that quote is fresh enough to fill, and the vault
-inventory it pays from.
+A proprietary market maker (PMM), not an AMM. Three templates control the fair value a market
+quotes around, the spread it quotes at, and the vault inventory it pays from. Surfpool keeps the
+quote current on its own once a scenario overrides a market.
 
 HumidiFi publishes no IDL. Every market word it reads is stored XORed with a fixed per-offset key,
-so the templates write through raw offsets with `u64_xor` and `slot_xor` encodings; the values you
-pass stay plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, schema-8 market accounts
+so the templates write through raw offsets with `u64_xor` encodings; the values you pass stay
+plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, schema-8 market accounts
 (1728 bytes, version word 8 at offset 1720).
 
 ## Template index
@@ -14,7 +14,6 @@ pass stay plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, sch
 | Template                 | Overrides                                                 |
 | ------------------------ | --------------------------------------------------------- |
 | `humidifi-price`         | the fair value HumidiFi quotes around                     |
-| `humidifi-freshness`     | whether the quote is current, and how old it may get      |
 | `humidifi-spread`        | the spread HumidiFi adds to each side of its fair value   |
 | `humidifi-vault-balance` | how many tokens HumidiFi has available to pay out a swap  |
 
@@ -23,11 +22,21 @@ pass stay plaintext. Program `9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp`, sch
 | You'll see            | It means                                         | Example                                     |
 | --------------------- | ------------------------------------------------ | ------------------------------------------- |
 | `fair_value`          | quote atoms per base atom × 2^48, decimal string | SOL/USDC at 208 → `"58546795155816"`        |
-| `last_update_slot`    | offset from the materialization slot             | `0` = quoted now, `-1000` = stale           |
-| `max_staleness_slots` | oldest quote age in slots that still fills       | `2` on SOL/USDC                             |
 | `spread`              | thousandths of a basis point on each side        | `25000` = 25 bps on both sides              |
 | `tier_*_spread`       | basis points × 2^48, decimal string              | `"2814749767106560"` = 10 bps               |
 | vault `amount`        | that mint's smallest unit                        | `1000000` = 1 USDC                          |
+
+## Keep-alive (Surfpool handles it)
+
+On mainnet the maker republishes each market's quote, and HumidiFi fills only while the Clock's slot
+is at most the market's staleness limit past the quote's slot. The limits stored in market accounts
+are a few slots (`2` on SOL/USDC). Nobody runs the maker against a surfnet, so Surfpool republishes
+the quote every slot ([keep-alive](../../README.md#keep-alive)): it writes the current slot to the
+quote's slot (offset 616) and leaves the limit as stored. There is nothing to schedule.
+
+The price and spread templates keep the market they write quoting. `humidifi-vault-balance` takes
+the vault's market as its `market` input and keeps that market quoting; the input is not written to
+the vault. Keep-alive starts in the slot the override plays and runs until the network is reset.
 
 Price conversion is:
 
@@ -48,8 +57,8 @@ where `price` is quote tokens per base token. SOL/USDC has 9/6 decimals, so 208 
 | 448    | pubkey, four masked words            | quote vault         | n/a                              | read-only                |
 | 480    | pubkey, four masked words            | base vault          | n/a                              | read-only                |
 | 576    | `u64_xor` `0xb957ed15dc877426`       | fair value          | quote atoms per base atom × 2^48 | `humidifi-price`         |
-| 608    | `u64_xor` `0x6e9de2b30b19f1ea`       | max staleness       | slots                            | `humidifi-freshness`     |
-| 616    | `slot_xor` `0x6e9de2b30b19f1ea`      | last update slot    | slot, written from an offset     | `humidifi-freshness`     |
+| 608    | `u64_xor` `0x6e9de2b30b19f1ea`       | max staleness       | slots                            | read-only                |
+| 616    | `u64_xor` `0x6e9de2b30b19f1ea`       | last update slot    | slot                             | keep-alive               |
 | 176    | `u64_xor` `0x40f849d0005707ba`       | first tier spread   | bps × 2^48                       | `humidifi-spread`        |
 | 256    | `u64_xor` `0x40f249da005d07b4`       | second tier spread  | bps × 2^48                       | `humidifi-spread`        |
 | 336    | `u64_xor` `0x40e449cc004b07ae`       | third tier spread   | bps × 2^48                       | `humidifi-spread`        |
@@ -65,8 +74,8 @@ The four pubkey words use the keys `fb5ce87aae443c38`, `04a2178451bac3c7`, `04a1
 The templates have no default account, and the backend embeds no market catalog. Studio offers a
 short list of featured markets and also accepts a market or vault address directly. API callers must
 provide the market account in the override; `humidifi-vault-balance` takes one of that market's
-vaults instead. The price and freshness templates target the 1728-byte market account, and the
-vault template targets one of its SPL-token vaults.
+vaults instead, with the market as its `market` input. The price and spread templates target the
+1728-byte market account, and the vault template targets one of its SPL-token vaults.
 
 Studio includes four featured markets:
 
@@ -95,13 +104,12 @@ scenario uses `false`, or the re-fetch undoes the earlier write.
 
 ## Two rules that prevent misleading scenarios
 
-**1. Keep the quote fresh while testing price.** HumidiFi rejects a quote older than the market's
-staleness limit before pricing, and the limits stored in market accounts are only a few slots.
-Nothing in the local VM republishes the quote, so apply `humidifi-freshness` with `last_update_slot: 0` and
-`max_staleness_slots: 200` in the same slot as the price, which keeps the quote current for 200
-slots.
+**1. Name the market on a vault override.** Keep-alive republishes a market only once a scenario
+overrides it. A scenario that only lowers a vault keeps its market quoting through the vault
+template's `market` input; without it the market's quote goes stale within its limit and swaps reject
+with `Custom(0xfaded)`.
 
-**2. Do not repeatedly reset transaction-owned inventory.** Price and freshness are configuration
+**2. Do not repeatedly reset transaction-owned inventory.** Price and spread are configuration
 inputs. A vault balance is state that swaps modify. Reapplying a vault override after every swap can
 undo the swap and manufacture or erase inventory.
 
@@ -111,16 +119,13 @@ undo the swap and manufacture or erase inventory.
 
 1. Choose **SOL / USDC** in `humidifi-price`.
 2. Set `fair_value` from the formula, for example `"58546795155816"` for 208 USDC per SOL.
-3. Add `humidifi-freshness` on the same market with `last_update_slot: 0` and
-   `max_staleness_slots: 200`.
-4. Compare a swap before and after. Keep a run with the original price as a control.
+3. Compare a swap before and after. Keep a run with the original price as a control.
 
 ### Maker stops quoting
 
-1. Choose a market in `humidifi-freshness`.
-2. Set `last_update_slot` to `-1000`, older than every market's limit.
-3. Every swap on that market reverts with `Custom(0xfaded)`. Confirm a router falls back to another
-   venue.
+1. Leave a market out of the scenario: no override names it, not even as a vault's `market`.
+2. Nothing republishes its quote, so within its staleness limit every swap on that market reverts
+   with `Custom(0xfaded)`. Confirm a router falls back to another venue.
 
 ### Maker cannot pay one side
 
@@ -143,18 +148,6 @@ proportionally less base. A buy fills within 1% of the price-implied output at t
 a doubled fair value. Pass the value as a string; it can
 exceed what a JSON number holds exactly.
 
-## Keep the quote current
-
-```text
-template: humidifi-freshness
-last_update_slot: 0
-max_staleness_slots: 200
-```
-
-The offset is relative even though the account stores an XOR-masked absolute slot. The limit of
-200 emulates a current maker for 200 slots; without it the quote expires within the stored limit of a
-few slots. For a longer scenario, schedule it again with `fetchBeforeUse: false`.
-
 ## Set a fixed spread
 
 ```text
@@ -171,20 +164,13 @@ falls in; the market sets its tiers by quote notional. The maker republishes `sp
 quote upstream, while the local VM keeps the value it fetched until an override changes it. With
 the tiers at 0, every trade size prices at the set spread on both sides, apart from about 1 bp of
 inventory skew. A Jupiter swap in the local VM also pays HumidiFi's fallback spread (see
-Troubleshooting). Pair it with `humidifi-freshness`.
+Troubleshooting).
 
-## Make the quote stale
-
-```text
-template: humidifi-freshness
-last_update_slot: -1000
-```
+## How the quote ages
 
 HumidiFi fills while `clock_slot - last_update_slot <= max_staleness_slots` and rejects with
-`Custom(0xfaded)` (1027565) one slot later. To test that exact boundary for a swap in the slot the
-override materializes, set `max_staleness_slots` in the same override and `last_update_slot` to
-`-(max_staleness_slots + 1)`; one slot younger still fills. The boundary holds at the stored limit and
-at a rewritten limit.
+`Custom(0xfaded)` (1027565) one slot later; the boundary is inclusive. Keep-alive writes the current
+slot every slot, so a market a scenario overrides is always 0 slots old.
 
 ## Drain inventory
 
@@ -204,8 +190,8 @@ returns roughly a thousandth of its output. This is not an AMM reserve formula; 
 
 | Symptom                                                   | Fix                                                                                  |
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Price override writes correctly but the swap rejects      | Apply `humidifi-freshness` with `last_update_slot: 0` in the swap's window          |
-| `Custom(1027565)` (`0xfaded`)                             | The quote is older than `max_staleness_slots`; refresh it or schedule freshness again |
+| `Custom(1027565)` (`0xfaded`) after lowering a vault      | The vault override has no `market`, so nothing keeps that market quoting             |
+| `Custom(1027565)` (`0xfaded`) on a market you did not override | Expected: nothing republishes a market no override names                        |
 | `Custom(49)` after lowering a vault                       | The payout vault is empty; HumidiFi refuses the swap itself                          |
 | Token program `Custom(1)` (InsufficientFunds)             | The payout vault is empty on a market that leaves the refusal to the token transfer  |
 | `Custom(310)` (`0x136`) in both directions                | Both vaults are empty                                                                |
