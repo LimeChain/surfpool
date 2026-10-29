@@ -317,11 +317,7 @@ fn bisonfi_templates_select_raw_layout_writes() {
         "BisonFi templates must be registered"
     );
 
-    for template in registry
-        .all()
-        .into_iter()
-        .filter(|template| template.id.starts_with("bisonfi-"))
-    {
+    for template in &templates {
         assert!(
             template.raw_layout,
             "{} must select raw-layout writes",
@@ -396,7 +392,7 @@ async fn bisonfi_keep_alive_republishes_the_quote_on_a_live_market() {
 }
 
 /// Every account the program owns, live and dormant, as of program build 3f38e742. The templates
-/// default to one market, but every supported v3 account must accept the same writes.
+/// take any market's address, so every supported v3 account must accept the same writes.
 const BISONFI_ALL_POOLS: [&str; 17] = [
     "2vPjbPRnz7V1SLGr56CmLLc7JspzfSfccWp3Th5KbrMJ",
     "6b5LxeDVxqCGAhZjjjgieGP71c5GBt2cBwiafCFX6NMU",
@@ -504,9 +500,9 @@ async fn bisonfi_every_property_writes_cleanly_on_every_pool() {
     }
 }
 
-/// Offsets 48 and 56 mirror the vaults exactly, which is why no template writes them. This pins
-/// that measurement so the claim in the layout docs cannot rot silently: if a redeploy changes it,
-/// the reserve fields mean something else and the docs need revisiting.
+/// Offsets 48 and 56 mirror the vaults exactly, which is why bisonfi-depth may only lower them. This
+/// pins that measurement so the claim in the layout docs cannot rot silently: if a redeploy changes
+/// it, the reserve fields mean something else and the docs need revisiting.
 #[tokio::test]
 async fn bisonfi_reserves_mirror_the_vaults() {
     const BASE_RESERVE: usize = 48;
@@ -538,8 +534,8 @@ async fn bisonfi_reserves_mirror_the_vaults() {
     let base_held = u64::from_le_bytes(batch[1][64..72].try_into().unwrap());
     let cached = u64::from_le_bytes(data[BASE_RESERVE..BASE_RESERVE + 8].try_into().unwrap());
 
-    // Same slot, so they must agree exactly. This is the measurement that disqualified offset 48
-    // as a "quotable slice" of the vaults: it is the whole balance, mirrored.
+    // Same slot, so they must agree exactly. This is the measurement behind bisonfi-depth's "lower,
+    // do not raise" rule: offset 48 is the whole balance, mirrored.
     assert_eq!(
         cached, base_held,
         "offset 48 is expected to mirror the base vault balance exactly; pool says {cached}, \
