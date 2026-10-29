@@ -1,7 +1,7 @@
 # BisonFi
 
 A proprietary market maker (PMM), not an AMM. Three templates: price, depth and spread. Surfpool
-keeps the quote and the market tick live on its own while a scenario is registered.
+keeps the quote and the market tick live on its own once a scenario overrides a pool.
 
 Because it is a market maker rather than a curve, it can be put into states no constant-product pool
 can reach - quoting wide with deep inventory, or refusing to quote at all. Those are the scenarios
@@ -18,9 +18,9 @@ worth reaching for this protocol to test.
 ## Keep-alive (Surfpool handles it)
 
 On mainnet the maker republishes every pool's quote and two block builders rewrite a shared market
-tick every slot. Nobody runs them against a surfnet, so while a scenario with a BisonFi override is
-registered, Surfpool does it every slot ([keep-alive](../../README.md#keep-alive)). There is nothing
-to schedule:
+tick every slot. Nobody runs them against a surfnet, so once a scenario's BisonFi override plays,
+Surfpool does it every slot ([keep-alive](../../README.md#keep-alive)). There is nothing to
+schedule:
 
 - **The pool's quote.** The publication slot (byte 72) and time (byte 88) follow the surfnet clock,
   and the last book rebuild (byte 688) moves to the previous slot, so the first swap of every slot
@@ -29,11 +29,11 @@ to schedule:
   passes it as a tenth account, and the program checks its slot and nanosecond timestamp against the
   `Clock` sysvar. Without the account a swap succeeds and
   pays out zero; with a tick that disagrees with the clock it falls back to a thinner book. Keep-alive
-  loads it from upstream when the scenario starts.
+  fetches it from upstream, retrying every slot until it is there. With no upstream, or one that is
+  not mainnet, it never loads and every swap pays out zero.
 
-Keep-alive starts in the slot the scenario's first BisonFi override plays and stops when the scenario
-is unregistered, which Studio's Delete does. After `surfnet_timeTravel` it republishes both in the
-first block after the jump.
+Keep-alive starts in the slot the scenario's first BisonFi override plays and runs until the network
+is reset. After `surfnet_timeTravel` it republishes both at the slot the jump lands on.
 
 ## Number formats
 
@@ -95,9 +95,9 @@ that cannot fill at all.
 ## Keep the venue quoting
 
 A pool loaded into the local VM goes stale by itself: a quote more than two slots old pays nothing,
-and the price, depth and spread overrides are then silently ignored. Keep-alive prevents that for as
-long as the scenario is registered, resuming the price the venue already held. A pool no registered
-scenario overrides is left as fetched and goes stale; unregistering the scenario is how to see a
+and the price, depth and spread overrides are then silently ignored. Keep-alive prevents that from
+the slot a scenario first overrides the pool until the network is reset, resuming the price the venue
+already held. A pool no scenario overrides is left as fetched and goes stale, which is how to see a
 stale venue.
 
 A later upstream fetch replaces the full pool account. If one is required, reapply the scenario's
@@ -163,13 +163,13 @@ executable margin - both legs fit in one transaction. Two things to get right:
 
 | Symptom | Fix |
 |---|---|
-| A price, depth or spread override had no effect and nothing errored | The quote is stale, and the freshness gate runs first. Check the scenario is still registered - see "Keep the venue quoting" |
+| A price, depth or spread override had no effect and nothing errored | The quote is stale, and the freshness gate runs first. Check that the override has played - see "Keep the venue quoting" |
 | The pool quotes nothing at any size | Probably one of the dormant markets. Check how far `last_update_slot` is behind the chain |
 | Every swap returns 0 even on a fresh live market | The market tick is missing from the swap. Surfpool keeps it current, but a hand-built swap must pass it as the tenth account - see "Keep-alive" |
 | A spread override does nothing on HYPE-USDC, or less than you set elsewhere | The centre-depth properties were left out. Set all four to `0` |
 | A second swap in the same slot fills worse than the first | Not a bug: swaps consume the book. Keep-alive refills it in the next slot |
 | A spread override does nothing | You set some of a side's four properties but not all, or the trade is too small - very small trades do not consult the ladder. Try a percent or so of `base_reserve`, and try a few sizes |
 | A stale market returns 0 instead of reverting | Not a bug: a stale venue returns zero and the transaction SUCCEEDS, and the swap's minimum-output bound is not enforced on that path |
-| The quote went stale after the scenario was deleted | Expected: unregistering a scenario stops its keep-alive |
+| Every swap returns 0 although the scenario's overrides have played | The market tick never loaded: keep-alive fetches it from upstream, so the surfnet must fork mainnet. Offline, or forked from another network, BisonFi cannot quote |
 | `Custom(60)` | A Token-2022 mint whose token accounts need extension data matching that mint |
 | A large swap exhausts its compute budget | The default 200k compute budget may be too small; request about 1.4M units |
