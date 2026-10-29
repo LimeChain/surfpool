@@ -490,7 +490,7 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        if let Err(e) = svm_locker.with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock)) {
+                        if let Err(e) = svm_locker.apply_time_travel(clock, &remote_client_with_commitment).await {
                             svm_locker.simnet_events_tx().error(format!("Failed to time travel: {e}"));
                         }
                     }
@@ -503,7 +503,8 @@ pub async fn start_block_production_runloop(
                         }
 
                         let epoch_info = svm_locker
-                            .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
+                            .apply_time_travel(clock, &remote_client_with_commitment)
+                            .await
                             .map_err(|e| e.to_string());
 
                         // Send confirmation back
