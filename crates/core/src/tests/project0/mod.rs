@@ -727,7 +727,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
     let fixture = Fixture::load().await;
     let registry = TemplateRegistry::new();
 
-    let price_feed = registry.get("pyth-pro-price-feed-v2").unwrap();
+    let price_feed = registry.get("pyth-core-compatible-price-feed-v2").unwrap();
     for oracle in [SOL_BANK_ORACLE, USDC_BANK_ORACLE] {
         assert_eq!(
             fixture.accounts[oracle].owner.to_string(),
@@ -784,7 +784,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
         .max(pyth_publish_time(fixture.data(USDC_BANK_ORACLE)));
     let crash_price = 20i64 * 100_000_000;
     let crashed_oracle = forge(
-        "pyth-pro-price-feed-v2",
+        "pyth-core-compatible-price-feed-v2",
         fixture.data(&sol_feed),
         &[
             (
@@ -850,7 +850,7 @@ async fn usdc_breaker_accepts_a_move_once_its_reference_prices_follow() {
     let depeg = price * 95 / 100;
     let fresh = pyth_publish_time(usdc_feed).max(pyth_publish_time(fixture.data(SOL_BANK_ORACLE)));
     let moved_feed = forge(
-        "pyth-pro-price-feed-v2",
+        "pyth-core-compatible-price-feed-v2",
         usdc_feed,
         &[
             ("price_message.price".to_string(), serde_json::json!(depeg)),

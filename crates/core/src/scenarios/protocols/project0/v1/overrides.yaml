@@ -80,11 +80,11 @@ templates:
       2. Weights are fixed-point numbers scaled by 2^48 (1.0 = "281474976710656"). Pass them as
          decimal strings
 
-      THE PRICE LEVER: to crash a collateral price instead, use pyth-pro-price-feed-v2 on the
+      THE PRICE LEVER: to crash a collateral price instead, use pyth-core-compatible-price-feed-v2 on the
       bank's price account (the lookup above returns it). Move price and ema_price together:
       liquidation reads the spot price, borrows and withdrawals check the EMA. The bank refuses a
       price older than config.oracle_max_age seconds, so keep fetchBeforeUse: true and leave the
-      time fields unset, as pyth-pro-price-feed-v2 explains. Read the bank first: when its
+      time fields unset, as pyth-core-compatible-price-feed-v2 explains. Read the bank first: when its
       config.cb_deviation_bps_tiers.0 is above 0, the circuit breaker is on and the same scenario
       needs project0-bank-oracle on that bank with both breaker references at the new price, as
       that template explains.
@@ -176,7 +176,7 @@ templates:
 
       A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
       publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
-      65535) to accept older prices. To move the price itself, use pyth-pro-price-feed-v2 on the
+      65535) to accept older prices. To move the price itself, use pyth-core-compatible-price-feed-v2 on the
       bank's price account, config.oracle_keys.0.
 
       CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
@@ -203,13 +203,13 @@ templates:
       EXAMPLE - "USDC at $0.95", on the USDC bank (price x 2^48 as a decimal string):
       cb_reference_price.value: "267401227875123"
       cb_window_reference_price.value: "267401227875123"
-      plus pyth-pro-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
+      plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
       price_message.ema_price 95000000 (exponent -8).
 
       EXAMPLE - "SOL at $20", on the SOL bank:
       cb_reference_price.value: "5629499534213120"
       cb_window_reference_price.value: "5629499534213120"
-      plus pyth-pro-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
+      plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
       price_message.ema_price 2000000000.
 
       EXAMPLE - "the SOL breaker trips at 1% instead of 6%":

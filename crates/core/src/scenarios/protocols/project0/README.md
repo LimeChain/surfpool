@@ -25,7 +25,7 @@ account's shares, the banks' share values and weights, and the live oracle price
 
 | Want to change | Override this | Not this |
 |---|---|---|
-| A price | the bank's Pyth feed with `pyth-pro-price-feed-v2` (see [Move a price](#move-a-price)) | `cache.last_oracle_price` |
+| A price | the bank's Pyth feed with `pyth-core-compatible-price-feed-v2` (see [Move a price](#move-a-price)) | `cache.last_oracle_price` |
 | Position health | `project0-bank-risk-weights` → `config.asset_weight_maint.value` | `health_cache` |
 | A position | `project0-account-balance` | |
 
@@ -77,15 +77,15 @@ borrow goes from healthy to liquidatable.
 
 ## Move a price
 
-Project 0 banks read Pyth `PriceUpdateV2` accounts of the Pyth Pro-compatible receiver,
-`rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp`. Use `pyth-pro-price-feed-v2` on the account the
+Project 0 banks read Pyth `PriceUpdateV2` accounts of the Pyth Core Compatible receiver,
+`rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp`. Use `pyth-core-compatible-price-feed-v2` on the account the
 bank names at `config.oracle_keys.0`:
 
 ```
 project0-bank-oracle     on the SOL bank, fetchBeforeUse: true
   cb_reference_price.value: "5629499534213120"         # $20 x 2^48
   cb_window_reference_price.value: "5629499534213120"
-pyth-pro-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
+pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 2000000000                       # $20, exponent -8
   price_message.ema_price: 2000000000
 ```
@@ -107,7 +107,7 @@ price, as above for SOL and here for USDC:
 project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
   cb_reference_price.value: "267401227875123"          # $0.95 x 2^48
   cb_window_reference_price.value: "267401227875123"
-pyth-pro-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
+pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 95000000                         # $0.95, exponent -8
   price_message.ema_price: 95000000
 ```
@@ -180,7 +180,7 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 | `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
 | `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
 | The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
-| Your price override did nothing | Write the bank's `config.oracle_keys.0` with `pyth-pro-price-feed-v2`. The default receiver's account for the same feed (`pyth-price-feed-v2`) is a different address, which the bank never reads. See [Move a price](#move-a-price) |
+| Your price override did nothing | Write the bank's `config.oracle_keys.0` with `pyth-core-compatible-price-feed-v2`. The Pyth Core receiver's account for the same feed (`pyth-price-feed-v2`) is a different address, which the bank never reads. See [Move a price](#move-a-price) |
 | Wrong oracle account | Pass exactly the bank's `config.oracle_keys.0` |
 | Withdraw fails on the token transfer | Shares imply more tokens than the bank's `liquidity_vault` holds. Raise the vault with `spl-token-account-balance` |
 | `exceeds what a JSON number can hold exactly` | Pass `.value` fields as decimal strings |
