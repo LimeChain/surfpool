@@ -104,7 +104,10 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            prepare_phoenix_override, write_all_or_none,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
@@ -313,7 +316,7 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
-fn json_to_txtx_value_for_idl_type(
+pub(crate) fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
     idl_type: &IdlType,
     idl_types: &[IdlTypeDef],
@@ -570,6 +573,8 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    /// The simnet's `skip_signature_verification`, which a send's `skip_sig_verify` overrides.
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     /// The startup state machine. Kept private so that every mutation goes
     /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
@@ -908,6 +913,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             startup_status: self.startup_status.clone(),
             // Same rule as the dummy event channels above: the sandbox gets a
@@ -1335,6 +1341,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: false,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
@@ -2242,8 +2249,6 @@ impl SurfnetSvm {
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
     pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
-        let signature = tx.signatures[0];
-
         if tx.verify_with_results().iter().any(|valid| !*valid) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
@@ -2251,16 +2256,26 @@ impl SurfnetSvm {
             });
         }
 
-        if matches!(
-            self.transactions.get(&signature.to_string()),
-            Ok(Some(SurfnetTransactionStatus::Processed(_)))
-        ) {
+        if self.processed_slot(tx).is_some() {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
                 meta: TransactionMetadata::default(),
             });
         }
         Ok(())
+    }
+
+    /// The slot that processed `tx`. Agave's status cache keys by message hash, so a stored
+    /// transaction under the same signature counts only if its message is the same.
+    pub(crate) fn processed_slot(&self, tx: &VersionedTransaction) -> Option<Slot> {
+        match self.transactions.get(&tx.signatures[0].to_string()) {
+            Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                if processed.0.transaction.message.hash() == tx.message.hash() =>
+            {
+                Some(processed.0.slot)
+            }
+            _ => None,
+        }
     }
 
     /// Sets an account in the local SVM state and notifies listeners.
@@ -2840,7 +2855,6 @@ impl SurfnetSvm {
     fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
-        let slot = self.latest_epoch_info.slot_index;
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         while let Some((tx, status_tx, error)) =
@@ -2863,7 +2877,7 @@ impl SurfnetSvm {
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::confirmed(),
                 &signature,
-                slot,
+                current_slot,
                 error,
             );
 
@@ -3625,28 +3639,22 @@ impl SurfnetSvm {
 
                 match prepare_phoenix_override(
                     self,
+                    &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
                     remote_ctx,
-                    // Only an account core has just refetched counts as fresh.
-                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
                     target_slot,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
-                        for (pubkey, written) in writes {
-                            if let Err(e) =
-                                self.set_scenario_override_account(&pubkey, written, target_slot)
-                            {
-                                warn!(
-                                    "Failed to set {} for override {}: {}",
-                                    pubkey, override_instance.id, e
-                                );
-                                break;
-                            }
-                            settled_this_slot.insert(pubkey);
+                        match write_all_or_none(self, writes, target_slot) {
+                            Ok(written) => settled_this_slot.extend(written),
+                            Err(e) => warn!(
+                                "Skipping override {} for {}: {}",
+                                override_instance.id, account_pubkey, e
+                            ),
                         }
                         continue;
                     }
