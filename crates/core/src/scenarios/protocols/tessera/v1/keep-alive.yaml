@@ -1,0 +1,33 @@
+protocol: Tessera
+version: v1
+account_type: MarketState
+
+raw_layout: true
+
+templates:
+  - id: tessera-quote-publication
+    name: Quote publication
+    description: The maker republishing a market's quote
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 120
+        encoding: u64
+        description: >-
+          Slot the quote was published in. A quote younger than the market's grace period (offset
+          96) fills at the price formula, an older one fills worse, and one as old as the market's
+          limit (offset 88) rejects with custom error 65535.
+      - path: buy_depth_used
+        offset: 0
+        encoding: u64
+        description: >-
+          Quote atoms buys have taken from the buy ladder since the last publication. Swaps add to
+          it and a publication clears it, so a later buy starts at the first level again.
+      - path: sell_depth_used
+        offset: 8
+        encoding: u64
+        description: >-
+          Base atoms sells have taken from the sell ladder since the last publication. Swaps add to
+          it and a publication clears it.
