@@ -490,6 +490,21 @@ fn pyth_publish_time(data: &[u8]) -> i64 {
     i64::from_le_bytes(data[93..101].try_into().unwrap())
 }
 
+/// `conf` and `ema_conf` of a fully verified `PriceUpdateV2` scaled to `price`, keeping their share
+/// of the price: Project 0 refuses a price whose confidence is too wide a share of it.
+fn confidence_scaled_to(data: &[u8], price: i64) -> [(String, serde_json::Value); 2] {
+    let at =
+        |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as u128;
+    let scaled = |conf: u128, from: u128| serde_json::json!((conf * price as u128 / from) as u64);
+    [
+        ("price_message.conf".to_string(), scaled(at(81), at(73))),
+        (
+            "price_message.ema_conf".to_string(),
+            scaled(at(117), at(109)),
+        ),
+    ]
+}
+
 /// What the risk engine wrote into `health_cache` after a pulse.
 #[derive(Debug)]
 struct Health {
@@ -783,6 +798,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
     let fresh = pyth_publish_time(fixture.data(&sol_feed))
         .max(pyth_publish_time(fixture.data(USDC_BANK_ORACLE)));
     let crash_price = 20i64 * 100_000_000;
+    let [conf, ema_conf] = confidence_scaled_to(fixture.data(&sol_feed), crash_price);
     let crashed_oracle = forge(
         "pyth-core-compatible-price-feed-v2",
         fixture.data(&sol_feed),
@@ -795,6 +811,8 @@ async fn risk_engine_honours_weight_and_price_overrides() {
                 "price_message.ema_price".to_string(),
                 serde_json::json!(crash_price),
             ),
+            conf,
+            ema_conf,
             (
                 "price_message.publish_time".to_string(),
                 serde_json::json!(fresh),
@@ -849,6 +867,7 @@ async fn usdc_breaker_accepts_a_move_once_its_reference_prices_follow() {
     let exponent = i32::from_le_bytes(usdc_feed[89..93].try_into().unwrap());
     let depeg = price * 95 / 100;
     let fresh = pyth_publish_time(usdc_feed).max(pyth_publish_time(fixture.data(SOL_BANK_ORACLE)));
+    let [conf, ema_conf] = confidence_scaled_to(usdc_feed, depeg);
     let moved_feed = forge(
         "pyth-core-compatible-price-feed-v2",
         usdc_feed,
@@ -858,6 +877,8 @@ async fn usdc_breaker_accepts_a_move_once_its_reference_prices_follow() {
                 "price_message.ema_price".to_string(),
                 serde_json::json!(depeg),
             ),
+            conf,
+            ema_conf,
             (
                 "price_message.publish_time".to_string(),
                 serde_json::json!(fresh),

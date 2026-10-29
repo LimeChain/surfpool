@@ -88,11 +88,16 @@ project0-bank-oracle     on the SOL bank, fetchBeforeUse: true
 pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 2000000000                       # $20, exponent -8
   price_message.ema_price: 2000000000
+  price_message.conf: <live conf x 2000000000 / live price>
+  price_message.ema_conf: <live ema_conf x 2000000000 / live ema_price>
 ```
 
 **Why:** the price must be fresh: `clock - publish_time <= config.oracle_max_age`. With
 `fetchBeforeUse: true` the account carries upstream's current `publish_time` when the scenario
 plays. Borrow and withdraw checks use the EMA price, liquidation the spot price, so move both.
+Scale `conf` and `ema_conf` by the same factor: Project 0 multiplies the confidence by 2.12 and
+refuses a price whose result is over the bank's `config.oracle_max_confidence` share of it (10%
+when the field is 0), so a crash that keeps the live confidence can be refused.
 Tested against the deployed program: SOL at $20 turns a healthy SOL-backed USDC borrow
 liquidatable.
 
@@ -110,6 +115,8 @@ project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
 pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 95000000                         # $0.95, exponent -8
   price_message.ema_price: 95000000
+  price_message.conf: <live conf x 95000000 / live price>
+  price_message.ema_conf: <live ema_conf x 95000000 / live ema_price>
 ```
 
 The breaker then treats $0.95 as normal and still guards further moves, as after a slow move it

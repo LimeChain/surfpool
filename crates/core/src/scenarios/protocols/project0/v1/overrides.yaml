@@ -204,13 +204,13 @@ templates:
       cb_reference_price.value: "267401227875123"
       cb_window_reference_price.value: "267401227875123"
       plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
-      price_message.ema_price 95000000 (exponent -8).
+      price_message.ema_price 95000000 (exponent -8), and conf and ema_conf scaled by the same factor.
 
       EXAMPLE - "SOL at $20", on the SOL bank:
       cb_reference_price.value: "5629499534213120"
       cb_window_reference_price.value: "5629499534213120"
       plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
-      price_message.ema_price 2000000000.
+      price_message.ema_price 2000000000, and conf and ema_conf scaled by the same factor.
 
       EXAMPLE - "the SOL breaker trips at 1% instead of 6%":
       config.cb_deviation_bps_tiers.0: 100
