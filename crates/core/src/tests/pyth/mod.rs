@@ -25,8 +25,8 @@ use crate::{
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
-const PYTH_PRO_COMPATIBLE_RECEIVER: &str = "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp";
-const PRO_SOL_USD_FEED: &str = "7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE";
+const PYTH_CORE_COMPATIBLE_RECEIVER: &str = "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp";
+const CORE_COMPATIBLE_SOL_USD_FEED: &str = "7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE";
 const SOL_USD_FEED_ID: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 
 async fn fetch(address: &str) -> solana_account::Account {
@@ -53,16 +53,16 @@ async fn fetch(address: &str) -> solana_account::Account {
 /// Runs the template through the scenario path on the account the caller names, so the IDL comes
 /// from the account's owner.
 #[tokio::test(flavor = "multi_thread")]
-async fn pro_price_feed_touches_only_price_fields() {
-    let live = fetch(PRO_SOL_USD_FEED).await;
-    assert_eq!(live.owner.to_string(), PYTH_PRO_COMPATIBLE_RECEIVER);
+async fn core_compatible_price_feed_touches_only_price_fields() {
+    let live = fetch(CORE_COMPATIBLE_SOL_USD_FEED).await;
+    assert_eq!(live.owner.to_string(), PYTH_CORE_COMPATIBLE_RECEIVER);
     // A Partial verification level shifts every offset below by one.
     assert_eq!(live.data[40], 1, "verification level should be Full");
     let feed_id = hex::decode(SOL_USD_FEED_ID.trim_start_matches("0x")).unwrap();
     assert_eq!(&live.data[41..73], feed_id.as_slice(), "feed_id at 41");
 
     let registry = TemplateRegistry::new();
-    let template = registry.get("pyth-pro-price-feed-v2").unwrap();
+    let template = registry.get("pyth-core-compatible-price-feed-v2").unwrap();
 
     // (path, offset, width, value). Each value differs from the live one, so a skipped write fails.
     let rows: [(&str, usize, usize, i64); 8] = [
@@ -82,7 +82,7 @@ async fn pro_price_feed_touches_only_price_fields() {
         );
     }
 
-    let target = Pubkey::from_str_const(PRO_SOL_USD_FEED);
+    let target = Pubkey::from_str_const(CORE_COMPATIBLE_SOL_USD_FEED);
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let identity = svm
         .get_forged_account_data(&target, &live.data, template.idl(), &HashMap::new())
@@ -97,14 +97,14 @@ async fn pro_price_feed_touches_only_price_fields() {
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm| svm.set_account(&target, live.clone()).unwrap());
     let mut scenario = Scenario::new(
-        "Pyth Pro-compatible SOL/USD".to_string(),
+        "Pyth Core Compatible SOL/USD".to_string(),
         "Move every price field of the live feed".to_string(),
     );
     scenario.add_override(
         OverrideInstance::new(
             template.id.clone(),
             0,
-            AccountAddress::Pubkey(PRO_SOL_USD_FEED.to_string()),
+            AccountAddress::Pubkey(CORE_COMPATIBLE_SOL_USD_FEED.to_string()),
         )
         .with_values(values),
     );

@@ -7,9 +7,10 @@ use surfpool_types::{OverrideInstance, OverrideTemplate, YamlOverrideTemplateCol
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
-pub const PYTH_PRO_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/pro/v2/idl.json");
-pub const PYTH_PRO_V2_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/pyth/pro/v2/overrides.yaml");
+pub const PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT: &str =
+    include_str!("./protocols/pyth/core-compatible/v2/idl.json");
+pub const PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pyth/core-compatible/v2/overrides.yaml");
 
 pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/idl.json");
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
@@ -131,9 +132,9 @@ impl TemplateRegistry {
     pub fn load_pyth_overrides(&mut self) {
         self.load_protocol_overrides(PYTH_V2_IDL_CONTENT, PYTH_V2_OVERRIDES_CONTENT, "pyth");
         self.load_protocol_overrides(
-            PYTH_PRO_V2_IDL_CONTENT,
-            PYTH_PRO_V2_OVERRIDES_CONTENT,
-            "pyth-pro",
+            PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT,
+            PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT,
+            "pyth-core-compatible",
         );
     }
 
@@ -672,7 +673,7 @@ templates:
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
-        assert!(registry.contains("pyth-pro-price-feed-v2"));
+        assert!(registry.contains("pyth-core-compatible-price-feed-v2"));
 
         assert!(registry.contains("jupiter-token-ledger-override"));
 
@@ -1149,7 +1150,7 @@ templates: []
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
-        assert!(ids.contains(&"pyth-pro-price-feed-v2".to_string()));
+        assert!(ids.contains(&"pyth-core-compatible-price-feed-v2".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
@@ -1400,25 +1401,25 @@ templates: []
     }
 
     #[test]
-    fn test_pyth_pro_price_feed_takes_a_caller_selected_account() {
+    fn test_pyth_core_compatible_price_feed_takes_a_caller_selected_account() {
         let registry = TemplateRegistry::new();
-        let pro = registry.get("pyth-pro-price-feed-v2").unwrap();
+        let template = registry.get("pyth-core-compatible-price-feed-v2").unwrap();
 
         assert_eq!(
-            pro.idl().address,
+            template.idl().address,
             "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp"
         );
         assert_eq!(
-            pro.address,
+            template.address,
             AccountAddress::Pubkey(String::new()),
             "the price account must be chosen by the caller"
         );
         assert!(
-            pro.constants.is_empty(),
+            template.constants.is_empty(),
             "the template must not embed a feed catalog"
         );
         assert!(
-            pro.llm_context.as_deref().is_some_and(
+            template.llm_context.as_deref().is_some_and(
                 |context| context.contains("rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp")
             ),
             "the template must say which receiver owns its accounts"
