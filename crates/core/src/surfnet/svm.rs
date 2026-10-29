@@ -3325,28 +3325,26 @@ impl SurfnetSvm {
     /// 3. Optionally fetches fresh account data from remote if `fetch_before_use` is enabled
     /// 4. Applies the overrides to the account data
     /// 5. Updates the SVM state
+    /// 6. Applies keep-alive to every account in `keep_alive_targets`
     pub async fn materialize_overrides(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
         let current_slot = self.latest_epoch_info.absolute_slot;
-        // Keep-alive writes its fields again every slot, so an override of one lasts this slot at most.
-        self.apply_keep_alive(remote_ctx).await;
         self.materialize_overrides_for_slot(remote_ctx, current_slot)
             .await
     }
 
-    /// Rewrites every account keep-alive keeps alive for the current slot and its Clock time.
+    /// Applies keep-alive to every account in `keep_alive_targets`, with the placeholders filled from
+    /// `slot` and its Clock time.
     pub async fn apply_keep_alive(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        slot: Slot,
     ) {
-        let current_slot = self.latest_epoch_info.absolute_slot;
-        let keep_alive = self.keep_alive_overrides(self.keep_alive_targets.clone());
-        // Reported, not returned: keep-alive must never hold back the slot's scheduled overrides or
-        // stop block production.
+        let keep_alive_overrides = self.keep_alive_overrides(slot);
         if let Err(e) = self
-            .apply_overrides(remote_ctx, current_slot, keep_alive, false)
+            .apply_overrides(remote_ctx, slot, keep_alive_overrides, false)
             .await
         {
             self.simnet_events_tx
@@ -3354,33 +3352,28 @@ impl SurfnetSvm {
         }
     }
 
-    /// Materializes scheduled overrides for a specific slot. Accounts that join keep-alive here are
-    /// kept alive from this slot on, not only from the next.
+    /// Materializes scheduled overrides for a specific slot, adds the accounts they touch to
+    /// `keep_alive_targets`, then applies keep-alive to every account on it.
     pub async fn materialize_overrides_for_slot(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
-        // Remove and get overrides for this slot
-        let Some(overrides) = self.scheduled_overrides.take(&target_slot)? else {
-            // No overrides for this slot
-            return Ok(());
-        };
-        let touched = self
-            .apply_overrides(remote_ctx, target_slot, overrides, true)
-            .await?;
-        let joined = self.enrol_keep_alive(touched);
-        let keep_alive = self.keep_alive_overrides(joined);
-        // The slot's scheduled overrides have landed, so a keep-alive failure is reported, not
-        // returned.
-        if let Err(e) = self
-            .apply_overrides(remote_ctx, target_slot, keep_alive, false)
-            .await
-        {
-            self.simnet_events_tx
-                .error(format!("Failed to keep accounts alive: {e}"));
+        let materialized = async {
+            if let Some(overrides) = self.scheduled_overrides.take(&target_slot)? {
+                let touched = self
+                    .apply_overrides(remote_ctx, target_slot, overrides, true)
+                    .await?;
+                self.enrol_keep_alive(touched);
+            }
+            Ok::<_, SurfpoolError>(())
         }
-        Ok(())
+        .await;
+        // Last, so it lands after any override has fetched its account from the remote, and even
+        // when one failed. At the current slot, which `target_slot` need not be.
+        let current_slot = self.latest_epoch_info.absolute_slot;
+        self.apply_keep_alive(remote_ctx, current_slot).await;
+        materialized
     }
 
     /// Applies `overrides` in order and returns the scheduled ones whose template imports
@@ -3819,10 +3812,8 @@ impl SurfnetSvm {
         Ok(keep_alive_touched)
     }
 
-    /// Adds the accounts that `touched` makes keep-alive imports rewrite, returning those not kept
-    /// alive before.
-    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) -> Vec<KeepAliveTarget> {
-        let mut joined = Vec::new();
+    /// Adds the accounts that `touched` makes keep-alive imports rewrite.
+    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
             let Some(template) = template_registry().get(&source.template) else {
                 continue;
@@ -3840,25 +3831,19 @@ impl SurfnetSvm {
                     import: index,
                     account,
                 };
-                if self.keep_alive_targets.insert(target.clone()) {
+                if self.keep_alive_targets.insert(target) {
                     info!(
                         "Keep-alive '{}' rewrites {} every slot",
                         import.template, account
                     );
-                    joined.push(target);
                 }
             }
         }
-        joined
     }
 
-    /// The overrides that apply keep-alive imports to `targets` in this slot, with their
+    /// The keep-alive overrides for every account in `keep_alive_targets` at `slot`, with their
     /// placeholders filled in. An account missing locally is left alone.
-    fn keep_alive_overrides(
-        &self,
-        targets: impl IntoIterator<Item = KeepAliveTarget>,
-    ) -> Vec<OverrideInstance> {
-        let slot = self.get_latest_absolute_slot();
+    fn keep_alive_overrides(&self, slot: Slot) -> Vec<OverrideInstance> {
         // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
         // the block's time.
         let clock = KeepAliveClock {
@@ -3868,7 +3853,7 @@ impl SurfnetSvm {
                 .saturating_sub(self.block_time_lag()),
         };
         let mut instances = Vec::new();
-        for target in targets {
+        for target in &self.keep_alive_targets {
             let Some(import) = template_registry()
                 .get(&target.template)
                 .and_then(|template| template.keep_alive.get(target.import))
