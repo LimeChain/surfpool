@@ -472,8 +472,8 @@ pub struct OverrideTemplate {
     /// re-encoding through an IDL.
     #[serde(default)]
     pub raw_layout: bool,
-    /// Keep-alive templates the surfnet applies every slot while a scenario with an override of
-    /// this template is registered.
+    /// Keep-alive templates the surfnet applies every slot, from the slot an override of this
+    /// template plays until the network is reset.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keep_alive: Vec<KeepAliveImport>,
 }
@@ -1647,9 +1647,9 @@ impl From<YamlKeepAliveImport> for KeepAliveImport {
 }
 
 /// A keep-alive template a template imports. Keep-alive covers what a protocol's own off-chain
-/// actor writes every slot, such as a market maker republishing its quote: while a scenario with an
-/// override of the importing template is registered, the surfnet applies `template` with `values`
-/// to `address` every slot, as an ordinary override ahead of the scenario's own.
+/// actor writes every slot, such as a market maker republishing its quote: from the slot an override
+/// of the importing template plays until the network is reset, the surfnet applies `template` with
+/// `values` to `address` every slot, as an ordinary override.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeepAliveImport {
     /// The keep-alive template applied.
@@ -1747,7 +1747,8 @@ impl OverrideTemplate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepAliveClock {
     pub slot: Slot,
-    /// Unix time in milliseconds, which the Clock sysvar's `unix_timestamp` is derived from.
+    /// Unix time in milliseconds the slot's Clock sysvar is set from; its `unix_timestamp` is this
+    /// in seconds.
     pub unix_time_ms: u64,
 }
 
