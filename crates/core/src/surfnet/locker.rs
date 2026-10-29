@@ -800,14 +800,6 @@ impl SurfnetSvmLocker {
                     .await
                 {
                     Ok(remote_results) => {
-                        if strict && remote_results.len() != pubkeys_to_fetch.len() {
-                            errors.push(format!(
-                                "upstream returned {} results for {} requested accounts: {:?}",
-                                remote_results.len(),
-                                pubkeys_to_fetch.len(),
-                                pubkeys_to_fetch
-                            ));
-                        }
                         for (pubkey, result) in pubkeys_to_fetch.iter().zip(remote_results) {
                             match result {
                                 GetAccountResult::FoundAccount(_, account, _) => {
@@ -863,14 +855,10 @@ impl SurfnetSvmLocker {
         accounts_to_load.sort_by_key(|(_, account, _)| snapshot_load_priority(account));
 
         // Validate required upgradeable program dependencies against the live SVM after loading.
-        let programs: Vec<_> = if strict {
+        let accounts_to_validate: Vec<_> = if strict {
             accounts_to_load
                 .iter()
-                .filter(|(_, account, _)| {
-                    account.executable
-                        && account.owner == solana_sdk_ids::bpf_loader_upgradeable::id()
-                })
-                .map(|(pubkey, account, fetched)| (*pubkey, account.clone(), *fetched))
+                .map(|(pubkey, account, _)| (*pubkey, account.clone()))
                 .collect()
         } else {
             Vec::new()
@@ -882,33 +870,17 @@ impl SurfnetSvmLocker {
 
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
                 let requested_executable = account.executable;
-                let load_result = if fetched_from_remote && strict {
-                    // Match HydrateIfAbsent while preserving the actual insertion error.
-                    // The general hydration path intentionally logs and suppresses it.
-                    match svm.inner.get_account_result(&pubkey) {
-                        Ok(GetAccountResult::None(_)) => svm.set_account(&pubkey, account.clone()),
-                        Ok(local)
-                            if local
-                                .source()
-                                .and_then(AccountUpdatePolicy::for_source)
-                                .is_some() =>
-                        {
-                            local
-                                .map_account()
-                                .and_then(|local_account| svm.set_account(&pubkey, local_account))
-                        }
-                        Ok(_) => Ok(()),
-                        Err(error) => Err(error),
+                let load_result = if fetched_from_remote {
+                    let update = GetAccountResult::FoundAccount(
+                        pubkey,
+                        account.clone(),
+                        AccountSource::Remote,
+                    );
+                    if strict {
+                        svm.hydrate_snapshot_strict(update)
+                    } else {
+                        svm.apply_account_update(update, AccountUpdatePolicy::HydrateIfAbsent)
                     }
-                } else if fetched_from_remote {
-                    svm.apply_account_update(
-                        GetAccountResult::FoundAccount(
-                            pubkey,
-                            account.clone(),
-                            AccountSource::Remote,
-                        ),
-                        AccountUpdatePolicy::HydrateIfAbsent,
-                    )
                 } else {
                     svm.set_account(&pubkey, account.clone())
                 };
@@ -960,15 +932,14 @@ impl SurfnetSvmLocker {
                 loaded_count += 1;
             }
 
-            for (program, requested_account, fetched) in programs {
-                // Hydration may retain a newer live account instead of the fetched one.
-                let account = if fetched {
-                    svm.inner
-                        .get_account_no_db(&program)
-                        .unwrap_or(requested_account)
-                } else {
-                    requested_account
-                };
+            if !strict {
+                return;
+            }
+
+            for (program, requested_account) in accounts_to_validate {
+                // Preserve diagnostics for a program that could not be installed,
+                // while validating the actual account when hydration kept local state.
+                let account = svm.inner.get_account_no_db(&program).unwrap_or(requested_account);
                 if !account.executable
                     || account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
                 {
