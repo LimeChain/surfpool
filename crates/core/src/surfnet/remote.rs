@@ -1,4 +1,9 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use jsonrpc_core::futures::future::try_join_all;
@@ -179,10 +184,90 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
     }
 }
 
+/// How many threads [`datasource_runtime`] runs on. They only wait on sockets
+/// and decode responses, so two serve every surfnet in the process.
+const DATASOURCE_RUNTIME_THREADS: usize = 2;
+
+/// The runtime every datasource request runs on, shared by the whole process.
+///
+/// A pooled HTTP connection is driven by a task on the runtime that opened
+/// it, and any later request can draw it from the pool. Each HTTP RPC worker
+/// is a runtime with a single thread, and handlers such as `requestAirdrop`
+/// block that thread until the runloop has done their work. A connection that
+/// worker opened then cannot make progress: a runloop fetch that draws it
+/// waits out [`DATASOURCE_HTTP_TIMEOUT`] while the blocked handler waits on the
+/// runloop. Opening every connection on a runtime nothing blocks keeps them
+/// all live.
+fn datasource_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(DATASOURCE_RUNTIME_THREADS)
+            .thread_name("surfpool-datasource")
+            .enable_all()
+            .build()
+            .expect("unable to start the datasource runtime")
+    })
+}
+
+/// Runs the sender it wraps on [`datasource_runtime`], whichever runtime the
+/// call comes from.
+struct DatasourceRuntimeSender<S> {
+    inner: Arc<S>,
+}
+
+impl<S> DatasourceRuntimeSender<S> {
+    fn new(inner: S) -> Self {
+        DatasourceRuntimeSender {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: RpcSender + Send + Sync + 'static> RpcSender for DatasourceRuntimeSender<S> {
+    async fn send(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+    ) -> ClientResult<serde_json::Value> {
+        let inner = Arc::clone(&self.inner);
+        let mut task = AbortOnDrop(
+            datasource_runtime().spawn(async move { inner.send(request, params).await }),
+        );
+        match (&mut task.0).await {
+            Ok(response) => response,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(ClientErrorKind::Custom(format!(
+                "{request:?} to the datasource was cancelled: {error}"
+            ))
+            .into()),
+        }
+    }
+
+    fn get_transport_stats(&self) -> RpcTransportStats {
+        self.inner.get_transport_stats()
+    }
+
+    fn url(&self) -> String {
+        self.inner.url()
+    }
+}
+
+/// Aborts the task it holds when dropped, so a caller that stops waiting (at
+/// [`DATASOURCE_DEADLINE`], say) does not leave its request running.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The RPC client a surfnet reaches its datasource through: an HTTP transport
-/// wrapped in a [`DeadlineSender`], assembled behind one constructor so that
-/// layers added later (tracing, recording, a retry policy) land here without
-/// touching a public signature.
+/// run on [`datasource_runtime`] and wrapped in a [`DeadlineSender`], assembled
+/// behind one constructor so that layers added later (tracing, recording, a
+/// retry policy) land here without touching a public signature.
 struct SurfpoolRpcClient {
     client: RpcClient,
 }
@@ -195,7 +280,7 @@ impl SurfpoolRpcClient {
             .pool_idle_timeout(DATASOURCE_POOL_IDLE_TIMEOUT)
             .build()?;
         let sender = DeadlineSender::new(
-            HttpSender::new_with_client(remote_rpc_url, client),
+            DatasourceRuntimeSender::new(HttpSender::new_with_client(remote_rpc_url, client)),
             DATASOURCE_DEADLINE,
         );
         let client = RpcClient::new_sender(
@@ -339,7 +424,12 @@ impl SurfnetRemoteClient {
                         .get_multiple_accounts_with_commitment(chunk, commitment_config)
                         .await
                         .map(|response| response.value)
-                        .map_err(SurfpoolError::get_multiple_accounts)
+                        .map_err(|error| {
+                            SurfpoolError::get_multiple_accounts(
+                                chunk,
+                                sanitized_client_error(&error, &self.client.url()),
+                            )
+                        })
                 }),
         )
         .await?;
@@ -485,9 +575,15 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
+        finalization_slot_threshold: u64,
     ) -> GetTransactionResult {
         match self
-            .try_get_transaction(signature, config, latest_absolute_slot)
+            .try_get_transaction(
+                signature,
+                config,
+                latest_absolute_slot,
+                finalization_slot_threshold,
+            )
             .await
         {
             Ok(result) => result,
@@ -503,6 +599,7 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
+        finalization_slot_threshold: u64,
     ) -> SurfpoolResult<GetTransactionResult> {
         let transaction = self
             .client
@@ -519,9 +616,12 @@ impl SurfnetRemoteClient {
             })?;
 
         Ok(match transaction {
-            Some(tx) => {
-                GetTransactionResult::found_transaction(signature, tx, latest_absolute_slot)
-            }
+            Some(tx) => GetTransactionResult::found_transaction(
+                signature,
+                tx,
+                latest_absolute_slot,
+                finalization_slot_threshold,
+            ),
             None => GetTransactionResult::None(signature),
         })
     }
@@ -727,7 +827,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use solana_client::{
         rpc_config::{RpcContextConfig, RpcProgramAccountsConfig, RpcTokenAccountsFilter},
@@ -859,6 +962,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_transaction_failure_does_not_disclose_datasource_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test server should bind");
@@ -866,22 +971,17 @@ mod tests {
             .local_addr()
             .expect("test server should have a local address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("test server should accept");
+            let (mut stream, _) = listener.accept().await.expect("test server should accept");
             let mut request = [0u8; 4096];
-            stream
-                .readable()
+            let bytes_read = stream
+                .read(&mut request)
                 .await
-                .expect("request stream should become readable");
-            stream
-                .try_read(&mut request)
                 .expect("test server should read the request");
+            assert!(bytes_read > 0, "test server should receive a request");
             let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
             stream
-                .writable()
+                .write_all(response)
                 .await
-                .expect("response stream should become writable");
-            stream
-                .try_write(response)
                 .expect("test server should write the response");
         });
         let datasource =
@@ -890,7 +990,7 @@ mod tests {
         let signature = Signature::new_unique();
 
         let error = match client
-            .try_get_transaction(signature, RpcTransactionConfig::default(), 0)
+            .try_get_transaction(signature, RpcTransactionConfig::default(), 0, 1)
             .await
         {
             Ok(_) => panic!("an HTTP failure should reach the caller"),
@@ -1233,6 +1333,113 @@ mod tests {
         );
     }
 
+    /// Each HTTP RPC worker is a runtime with a single thread, and handlers
+    /// such as `requestAirdrop` block that thread until the runloop has done
+    /// their work. A datasource connection a worker opened has to keep serving
+    /// the runloop once that worker blocks; otherwise the runloop's fetch waits
+    /// out the HTTP timeout, and the blocked handler waits with it.
+    #[test]
+    fn a_blocked_rpc_worker_does_not_stall_datasource_reads_from_the_runloop() {
+        let server = tokio::runtime::Runtime::new().expect("server runtime should build");
+        let (url, connections) = serve_slot_with_keep_alive(&server);
+        let client = SurfnetRemoteClient::new(url);
+        let worker = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("worker runtime should build");
+
+        // A read served on the worker opens the pooled connection.
+        let reader = client.clone();
+        let opened = worker
+            .block_on(worker.spawn(async move { reader.client.get_slot().await }))
+            .expect("the worker's read should finish");
+        assert_eq!(opened.expect("the worker's read should answer"), 7);
+
+        // A handler then parks the worker's only thread.
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        worker.spawn(async move {
+            parked_tx.send(()).expect("the test should await the park");
+            let _ = release_rx.recv();
+        });
+        parked_rx.recv().expect("the worker should park");
+
+        let runloop = tokio::runtime::Runtime::new().expect("runloop runtime should build");
+        let answer = runloop.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), client.client.get_slot()).await
+        });
+        let _ = release_tx.send(());
+        worker.shutdown_background();
+
+        let slot = answer.expect("the runloop's read should not wait on the blocked worker");
+        assert_eq!(slot.expect("the runloop's read should answer"), 7);
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "the runloop's read should reuse the connection the worker opened"
+        );
+    }
+
+    /// A datasource on `runtime` that answers every JSON-RPC request with slot 7
+    /// and keeps each connection open for the next request, as providers do.
+    /// Returns its URL and the number of connections it has accepted; it stops
+    /// with `runtime`.
+    fn serve_slot_with_keep_alive(runtime: &tokio::runtime::Runtime) -> (String, Arc<AtomicUsize>) {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have a local address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(answer_until_closed(stream));
+            }
+        });
+        (format!("http://{address}"), connections)
+    }
+
+    async fn answer_until_closed(stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let mut stream = BufReader::new(stream);
+        loop {
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().expect("content length should parse");
+                }
+            }
+            let mut request = vec![0; content_length];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("test server should read the request");
+            let body = br#"{"jsonrpc":"2.0","result":7,"id":1}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(&[head.as_bytes(), body].concat())
+                .await
+                .expect("test server should answer");
+        }
+    }
+
     struct RejectsUnknownMint;
 
     #[async_trait]
@@ -1541,6 +1748,7 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn any_other_invalid_params_rejection_on_largest_accounts_is_still_an_error() {
         let client = SurfnetRemoteClient {
             client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
@@ -1601,6 +1809,7 @@ mod tests {
         assert_eq!(accounts[0].amount.amount, "42");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
         let client = SurfnetRemoteClient {
             client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
