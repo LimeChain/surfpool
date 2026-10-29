@@ -1,0 +1,74 @@
+protocol: Pyth
+version: v2
+account_type: PriceUpdateV2
+idl_file_path: idl.json
+
+tags:
+  - oracle
+  - price-feed
+  - defi
+
+templates:
+  - id: pyth-core-compatible-price-feed-v2
+    name: Override Pyth Core Compatible Price Account
+    description: Override a price account of the Pyth Core Compatible receiver, found by address
+    idl_account_name: PriceUpdateV2
+    properties:
+      - path: price_message.price
+        label: Price
+        description: Price as a scaled integer - multiply the USD value by 10^-exponent
+      - path: price_message.conf
+        label: Confidence
+        description: Uncertainty band around the price, in the same scale as price
+      - path: price_message.exponent
+        label: Exponent
+        description: Decimal exponent, normally -8 and -10 on some feeds. Rescales every price field
+      - path: price_message.publish_time
+        label: Publish Time
+        description: Unix seconds of this update, interpreted against the Surfnet clock
+      - path: price_message.prev_publish_time
+        label: Previous Publish Time
+        description: Unix seconds of the preceding update
+      - path: price_message.ema_price
+        label: EMA Price
+        description: Exponential moving average price, in the same scale as price
+      - path: price_message.ema_conf
+        label: EMA Confidence
+        description: Exponential moving average confidence, in the same scale as conf
+      - path: posted_slot
+        label: Posted Slot
+        description: Slot the update was posted at, for consumers that measure freshness in slots
+    address:
+      type: pubkey
+    llm_context: |
+      FINDING THE PRICE ACCOUNT:
+      Pyth runs two receivers on Solana with the same feed ids at different addresses, and a
+      consumer reads only one. This template writes price accounts owned by the Pyth Core
+      Compatible receiver rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp; for the Pyth Core
+      receiver rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ use pyth-price-feed-v2.
+      1. Take the price account from the account that reads it: the consumer's protocol templates
+         say which field names it. A price account the user gives is used as is.
+      2. Read it with getAccountInfo, encoding "jsonParsed". Its owner must be
+         rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp; price_message.exponent gives the scale.
+      3. Put it in the override's account as {"pubkey":"<price account>"}.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
+
+      PRICE: price_message.price = usd_price x 10^-exponent, so with exponent -8, $145.00 is
+      14500000000. ema_price, conf and ema_conf use the same scale. Move ema_price with price:
+      consumers use the EMA for some checks and the spot price for others. Scale conf and ema_conf
+      by the same factor as the price: consumers refuse a price whose confidence is too wide a share
+      of it, so a large drop that keeps the live conf can be refused.
+
+      TIME: leave publish_time, prev_publish_time and posted_slot unset. fetchBeforeUse: true
+      brings the upstream account's current values when the override plays, so the price is as
+      fresh as upstream's. A time written into the scenario is fixed when the scenario is created
+      and ages until it plays. To make a price stale on purpose, follow the TIME FIELDS steps of
+      pyth-price-feed-v2.
+
+      EXAMPLE - "SOL drops to $20" on an account with exponent -8, live price p and ema_price q:
+      price_message.price: 2000000000
+      price_message.ema_price: 2000000000
+      price_message.conf: the live conf x 2000000000 / p
+      price_message.ema_conf: the live ema_conf x 2000000000 / q

@@ -7,6 +7,10 @@ use surfpool_types::{OverrideInstance, OverrideTemplate, YamlOverrideTemplateCol
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
+pub const PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT: &str =
+    include_str!("./protocols/pyth/core-compatible/v2/idl.json");
+pub const PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pyth/core-compatible/v2/overrides.yaml");
 
 pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/idl.json");
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
@@ -122,6 +126,11 @@ impl TemplateRegistry {
 
     pub fn load_pyth_overrides(&mut self) {
         self.load_protocol_overrides(PYTH_V2_IDL_CONTENT, PYTH_V2_OVERRIDES_CONTENT, "pyth");
+        self.load_protocol_overrides(
+            PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT,
+            PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT,
+            "pyth-core-compatible",
+        );
     }
 
     pub fn load_jupiter_overrides(&mut self) {
@@ -604,16 +613,17 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (2) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 71
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            71,
+            "Registry should load 71 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
+        assert!(registry.contains("pyth-core-compatible-price-feed-v2"));
 
         assert!(registry.contains("jupiter-token-ledger-override"));
 
@@ -916,7 +926,7 @@ templates: []
         let registry = TemplateRegistry::new();
 
         let pyth_templates = registry.by_protocol("Pyth");
-        assert_eq!(pyth_templates.len(), 1, "Should have 1 Pyth template");
+        assert_eq!(pyth_templates.len(), 2, "Should have 2 Pyth templates");
 
         let jupiter_templates = registry.by_protocol("Jupiter");
         assert_eq!(jupiter_templates.len(), 1, "Should have 1 Jupiter template");
@@ -1025,8 +1035,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            5,
+            "Should find 5 oracle templates (2 Pyth + 3 Kamino Scope)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1074,6 +1084,7 @@ templates: []
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
+        assert!(ids.contains(&"pyth-core-compatible-price-feed-v2".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
@@ -1293,6 +1304,32 @@ templates: []
         assert_eq!(
             direct_pda, expected_address,
             "Direct PDA derivation should match expected SOL/USD address"
+        );
+    }
+
+    #[test]
+    fn test_pyth_core_compatible_price_feed_takes_a_caller_selected_account() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("pyth-core-compatible-price-feed-v2").unwrap();
+
+        assert_eq!(
+            template.idl().address,
+            "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp"
+        );
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey(String::new()),
+            "the price account must be chosen by the caller"
+        );
+        assert!(
+            template.constants.is_empty(),
+            "the template must not embed a feed catalog"
+        );
+        assert!(
+            template.llm_context.as_deref().is_some_and(
+                |context| context.contains("rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp")
+            ),
+            "the template must say which receiver owns its accounts"
         );
     }
 

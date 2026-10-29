@@ -13,7 +13,7 @@ For Surfpool to understand how to serialize and deserialize account data, it nee
 Protocols that are natively supported by Surfpool will have their IDLs included by default.
 
 **Currently supported protocols:**
-- **Pyth v2** - Price oracle with 4 price feed templates (SOL/USD, BTC/USD, ETH/BTC, ETH/USD)
+- **Pyth v2** - Price oracle with a price feed template for the default receiver (`pyth-price-feed-v2`) and one for the Pyth Core Compatible receiver (`pyth-core-compatible-price-feed-v2`)
 - **Jupiter v6** - DEX aggregator with TokenLedger manipulation template
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
