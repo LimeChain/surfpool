@@ -86,3 +86,9 @@ Only pools created after the override copy it. For an existing pool set `protoco
 | The swap succeeds but the amounts look wrong after a price change | `liquidity` was not moved with the price. Use the Studio price shock |
 | The swap fails right after a price change | The new tick has no tick array, or `sqrt_price` and `tick_current_index` disagree |
 | The swap fails on the token transfer | The paying vault (`token_vault_a` / `token_vault_b`) holds less than the output. Fund it with `spl-token-account-balance` |
+
+# IDL
+
+`v1/idl.json` is the IDL Orca publishes on chain in its Anchor IDL account
+`2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`, unchanged (sha256
+`7afddfe8766bd24d30ff9ee5b12c7ee89bff5bc3b7b0396620e021a97a7ef63f`), as written in slot 402013534.
