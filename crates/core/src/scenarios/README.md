@@ -86,14 +86,11 @@ endpoint.
 ### Keep-alive
 
 Some accounts are rewritten every slot by the protocol's own off-chain actor, such as a market maker
-republishing its quote. Nobody runs those actors against a surfnet, so after an override the account
-goes stale. A template can import keep-alive templates, which the surfnet applies every slot from the
-slot an override of that template plays.
-
-Keep-alive templates are ordinary override templates kept in a separate file of the protocol and
-loaded with `TemplateRegistry::load_keep_alive`. Studio and MCP never list them, and MCP refuses one
-in a scenario. A template imports them in its `keep_alive` list, or a whole file does at its top
-level. A template's own list replaces the file's, and `keep_alive: []` turns it off.
+republishing its quote. Nobody runs those actors against a surfnet, so a template can import
+keep-alive templates: ordinary override templates in a separate file of the protocol, loaded with
+`TemplateRegistry::load_keep_alive` and never offered in Studio or MCP. A template imports them in its
+`keep_alive` list, or a whole file at its top level; a template's own list replaces the file's, and
+`keep_alive: []` turns it off.
 
 ```yaml
 templates:
@@ -112,28 +109,21 @@ templates:
         values: { publication_slot: $slot, publication_time: $unix_ms }
 ```
 
-Each import names the keep-alive `template`, the `address` it writes, and the `values` it writes:
-
 | `address` | Writes |
 |---|---|
 | `{ type: override }` | the account the importing override writes |
-| `{ type: input, value: oracle }` | the pubkey given to the override in that `input` property, which must have `value_type: pubkey` and is never written. Studio or the LLM fills it when the account is picked, such as a market's oracle |
+| `{ type: input, value: oracle }` | the pubkey given in that `input` property (`value_type: pubkey`, never written) |
 | `{ type: pubkey, value: <address> }` | a fixed account |
 | `{ type: pda, program_id, seeds }` | a derived account; seeds resolve against the override's values |
 
-`values` set properties of the keep-alive template. `$slot`, `$slot+N`, `$slot-N`, `$unix_s`,
-`$unix_ms`, `$unix_us` and `$unix_ns` are filled in every slot from the slot and the time its Clock
-sysvar reads; any other value is written as given.
+`$slot`, `$slot±N` and `$unix_s`/`ms`/`us`/`ns` in `values` are filled from the slot and its Clock
+time; other values are written as given.
 
-Keep-alive writes its fields again every slot. If an override sets one of those fields too, keep-alive
-replaces that value by the next slot at the latest. It starts in the slot the importing override plays
-and runs until the network is reset.
-
-The accounts keep-alive rewrites are kept in memory only: after a restart on a persistent database,
-keep-alive stops until an importing override plays again.
-
-The registry checks every import when it loads: the template must be a keep-alive template with every
-property the values set, and an input address must name a pubkey input of the importing template.
+Keep-alive starts in the slot the importing override plays and rewrites its fields every slot, after
+that slot's overrides, until the network is reset. An override of one of those fields therefore
+never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it is
+marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
+until an importing override plays again.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
