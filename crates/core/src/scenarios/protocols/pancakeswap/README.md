@@ -89,3 +89,9 @@ Every pool on that tier shares the account, so the change reaches all of them.
 | The swap succeeds but the amounts look wrong after a price change | `liquidity` was not moved with the price. Use the Studio price shock |
 | The swap fails right after a price change | The new tick has no tick array, or `sqrt_price_x64` and `tick_current` disagree |
 | The swap fails on the token transfer | The paying vault holds less than the output. Fund it with `spl-token-account-balance` |
+
+# IDL
+
+`v1/idl.json` is the IDL PancakeSwap publishes on chain in its Anchor IDL account
+`CAD7TZySgk4RkqyAkGu3bJFvf8itWsfTtpViRK8TJrKf`, unchanged (sha256
+`661eb632c441b2adb681ecd547fd8cea18e836be2305064e84b14bb90d7efb4c`), as written in slot 348011868.
