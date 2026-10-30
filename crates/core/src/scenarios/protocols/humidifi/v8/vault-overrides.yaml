@@ -10,6 +10,11 @@ tags:
   - vault
   - inventory
 
+keep_alive:
+  - template: humidifi-quote-publication
+    address: { type: input, value: market }
+    values: { last_update_slot: $slot }
+
 templates:
   - id: humidifi-vault-balance
     name: Override Vault Balance
@@ -23,6 +28,13 @@ templates:
         encoding: u64
         label: Vault token balance
         description: Raw token amount in the mint's smallest unit.
+      - path: market
+        type: input
+        value_type: pubkey
+        label: Market
+        description: >-
+          The market this vault belongs to, which owns it. Surfpool keeps the market's quote current;
+          it is not written to the vault.
     llm_context: |
       FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
       mint needs those masked bytes, which you cannot compute. Work from a market address the user
@@ -50,6 +62,8 @@ templates:
       3. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
          described below. The vault address is never an override value, and this template never
          targets the market account.
+      4. Put the market address in `market`. Surfpool keeps that market's quote current, so the
+         swap being tested is priced instead of rejected as stale.
 
       The input-side vault only receives tokens, so lowering it leaves that direction's output
       unchanged.
