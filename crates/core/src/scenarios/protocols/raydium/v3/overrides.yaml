@@ -23,8 +23,7 @@ constants:
         description: Best for stablecoin pairs like USDC/USDT with minimal price movement
         value: "0"
         metadata:
-          index: 0
-          tick_spacing: 1
+          tick_spacing: 10
           fee_rate_bps: 1
           derived_address: 4BLNHtVe942GSs4teSZqGX24xwKNkqU7bGgNn3iUiUpw
       - id: standard
@@ -32,7 +31,6 @@ constants:
         description: Most common tier for pairs like SOL/USDC
         value: "1"
         metadata:
-          index: 1
           tick_spacing: 60
           fee_rate_bps: 25
           derived_address: E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp
@@ -41,7 +39,6 @@ constants:
         description: For correlated assets with small price deviations
         value: "2"
         metadata:
-          index: 2
           tick_spacing: 10
           fee_rate_bps: 5
           derived_address: HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw
@@ -50,8 +47,7 @@ constants:
         description: For volatile or exotic token pairs
         value: "3"
         metadata:
-          index: 3
-          tick_spacing: 100
+          tick_spacing: 120
           fee_rate_bps: 100
           derived_address: A1BBtTYJd4i3xU8D6Tc2FzU6ZN4oXZWXKZnCxwbHXr8x
       - id: index_8
@@ -59,7 +55,8 @@ constants:
         description: The config used by the primary SOL/USDC CLMM pool
         value: "8"
         metadata:
-          index: 8
+          tick_spacing: 1
+          fee_rate_bps: 4
           derived_address: 3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL
 
   # Token mints loaded from verified tokens registry
@@ -68,11 +65,27 @@ constants:
     description: Select a token mint address from verified tokens
     source: verified_tokens
 
+llm_context: |
+  Raydium CLMM, program CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 1544 and memcmp of the two mints at offsets 73 and 105, once in each
+  order (only one returns pools). Read each pool's token_vault_0 with dataSlice {offset 137, length
+  32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
+  whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
+  ask for the pool address. A pool address the user gives is used as is.
+
+  Set fetchBeforeUse: true.
+
+  PRICE: do not move a pool's price by hand. sqrt_price_x64, tick_current and liquidity must change
+  together, and the new liquidity comes from the pool's tick arrays; tell the user to use the Studio
+  price shock instead.
+
 templates:
   - id: raydium-clmm-custom
-    name: Override Any CLMM Pool (Custom)
+    name: Override CLMM Pool (By Fee Tier and Mints)
     description: |
-      Override any Raydium CLMM v3 pool by specifying the config index and token mints.
+      Override a Raydium CLMM pool given its fee tier index and its two token mints.
       Both the AMM config address AND the pool address are dynamically derived:
       - AMM Config: PDA from ["amm_config", config_index.to_be_bytes()]
       - Pool: PDA from ["pool", amm_config, token_mint_0, token_mint_1]
@@ -80,39 +93,36 @@ templates:
     properties:
       - path: liquidity
         label: Liquidity
-        description: Total liquidity in the current tick range
+        description: Total liquidity in the current tick range (raw u128, no decimals)
       - path: sqrt_price_x64
         label: Square Root Price (Q64.64)
-        description: Current price as sqrt(price) * 2^64
+        description: sqrt(token_1/token_0) in Q64.64 fixed point (raw u128); must agree with tick_current
       - path: tick_current
         label: Current Tick
-        description: Current tick index representing the price
+        description: Tick index of the current price (i32); must agree with sqrt_price_x64
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap, bit5 limit order; 0 = all enabled"
       - path: config_index
         type: constant_ref
         label: Fee Tier
         constant: amm_config_index
+        description: Fee tier of the pool. Together with the two mints it selects the pool address.
       - path: token_mint_0
         type: constant_ref
         label: Token 0 Mint
         constant: token_mint
+        description: First mint of the pair as the program stores it, the lower of the two by raw bytes.
       - path: token_mint_1
         type: constant_ref
         label: Token 1 Mint
         constant: token_mint
+        description: Second mint of the pair as the program stores it, the higher of the two by raw bytes.
     llm_context: |
-      CRITICAL: token_mint_0 and token_mint_1 must be SPL TOKEN MINT addresses, NOT program IDs!
-
-      CORRECT examples of token mints:
-      - SOL (wrapped): So11111111111111111111111111111111111111112
-      - USDC: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-      - JTO: jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL
-
-      WRONG - these are PROGRAM IDs, not token mints:
-      - 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM v4)
-      - CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK (Raydium CLMM)
-
-      Always use get_token_address tool to look up token mints by symbol (e.g., "SOL", "USDC", "JTO").
-      The pool PDA is derived using token mints in specific order, so using wrong addresses will derive the wrong pool.
+      Derives the pool from config_index and the two mints, from get_token_address (never program ids).
+      token_mint_0 must be the mint whose raw 32 bytes are smaller (SOL before USDC); reversed mints
+      derive an empty address and nothing checks it. For a pool found by address, use
+      raydium-clmm-pool-state.
     address:
       type: pda
       program_id: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
@@ -131,3 +141,56 @@ templates:
           value: token_mint_0
         - type: property_ref
           value: token_mint_1
+
+  - id: raydium-clmm-pool-state
+    name: Override CLMM Pool State
+    description: Override a Raydium CLMM pool found by pair or by address
+    idl_account_name: PoolState
+    properties:
+      - path: liquidity
+        label: Liquidity
+        description: Total liquidity in the current tick range (raw u128, no decimals)
+      - path: sqrt_price_x64
+        label: Square Root Price (Q64.64)
+        description: sqrt(token_1/token_0) in Q64.64 fixed point (raw u128); must agree with tick_current
+      - path: tick_current
+        label: Current Tick
+        description: Tick index of the current price (i32); must agree with sqrt_price_x64
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap, bit5 limit order; 0 = all enabled"
+    llm_context: |
+      Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
+
+      status is a bitmask of disabled operations: 16 disables swaps, 0 enables everything.
+    address:
+      type: pubkey
+
+  - id: raydium-clmm-amm-config
+    name: Override CLMM Fee Tier (AmmConfig)
+    description: |
+      Override the fee tier (AmmConfig) a Raydium CLMM pool points to. Every pool on the
+      tier shares the account, so the change reaches all of them.
+    idl_account_name: AmmConfig
+    properties:
+      - path: trade_fee_rate
+        label: Trade Fee Rate
+        description: Fee on the input amount, parts per million (2500 = 0.25%); below 1,000,000
+      - path: protocol_fee_rate
+        label: Protocol Fee Rate
+        description: Protocol treasury's share of the collected trade fee, parts per million
+      - path: fund_fee_rate
+        label: Fund Fee Rate
+        description: Fund owner's share of the collected trade fee, parts per million
+    llm_context: |
+      Put the tier's AmmConfig in the override's account as {"pubkey":"<config>"}: read a pool's
+      amm_config with getAccountInfo, dataSlice {offset 9, length 32} and encoding base58. Every pool
+      on the tier shares the account.
+
+      Rates are parts per million: trade_fee_rate of the input (2500 = 0.25%, below 1,000,000);
+      protocol_fee_rate and fund_fee_rate of the collected fee, together at most 1,000,000.
+
+      A pool created with a dynamic fee (its dynamic_fee_info is not all zeros) adds a volatility-based
+      fee on top of trade_fee_rate, so on such a pool the tier sets only the base fee.
+    address:
+      type: pubkey

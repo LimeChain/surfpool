@@ -20,6 +20,10 @@ pub const RAYDIUM_AMM_V4_IDL_CONTENT: &str = include_str!("./protocols/raydium/v
 pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/raydium/v4/overrides.yaml");
 
+pub const RAYDIUM_CPMM_IDL_CONTENT: &str = include_str!("./protocols/raydium/cpmm/v1/idl.json");
+pub const RAYDIUM_CPMM_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/raydium/cpmm/v1/overrides.yaml");
+
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
@@ -149,6 +153,11 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             RAYDIUM_AMM_V4_IDL_CONTENT,
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
+            "raydium",
+        );
+        self.load_protocol_overrides(
+            RAYDIUM_CPMM_IDL_CONTENT,
+            RAYDIUM_CPMM_OVERRIDES_CONTENT,
             "raydium",
         );
     }
@@ -360,19 +369,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
+
+    #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
         let registry = TemplateRegistry::new();
         let template = registry
-            .get("raydium-amm-custom")
-            .expect("template with a non-PDA constant_ref");
+            .get("pyth-price-feed-v2")
+            .expect("template with a constant_ref");
         let instance = OverrideInstance::new(
             template.id.clone(),
             0,
             AccountAddress::Pubkey(Pubkey::default().to_string()),
         )
         .with_values(HashMap::from([
-            ("market".to_string(), serde_json::json!("selected-market")),
-            ("status".to_string(), serde_json::json!(1)),
+            ("feed_id".to_string(), serde_json::json!("selected-feed")),
+            ("posted_slot".to_string(), serde_json::json!(1)),
         ]));
 
         let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
@@ -380,7 +425,7 @@ mod tests {
         assert_eq!(constant_refs, 1);
         assert_eq!(
             values,
-            HashMap::from([("status".to_string(), serde_json::json!(1))])
+            HashMap::from([("posted_slot".to_string(), serde_json::json!(1))])
         );
     }
 
@@ -604,13 +649,14 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (3) + Raydium AMM v4 (3) + Raydium CPMM (2)
+        // + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 73
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            73,
+            "Registry should load 73 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -618,11 +664,15 @@ mod tests {
         assert!(registry.contains("jupiter-token-ledger-override"));
 
         assert!(registry.contains("raydium-clmm-custom"));
+        assert!(registry.contains("raydium-clmm-pool-state"));
+        assert!(registry.contains("raydium-clmm-amm-config"));
 
         assert!(registry.contains("raydium-amm-pool-state"));
         assert!(registry.contains("raydium-amm-fees"));
         assert!(registry.contains("raydium-amm-swap-stats"));
-        assert!(registry.contains("raydium-amm-custom"));
+
+        assert!(registry.contains("raydium-cpmm-pool-state"));
+        assert!(registry.contains("raydium-cpmm-amm-config"));
 
         assert!(registry.contains("meteora-dlmm-sol-usdc"));
         assert!(registry.contains("meteora-dlmm-usdt-sol"));
@@ -924,8 +974,8 @@ templates: []
         let raydium_templates = registry.by_protocol("Raydium");
         assert_eq!(
             raydium_templates.len(),
-            5,
-            "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
+            8,
+            "Should have 8 Raydium templates (3 CLMM + 3 AMM v4 + 2 CPMM)"
         );
 
         let kamino_templates = registry.by_protocol("kamino");
@@ -1071,7 +1121,6 @@ templates: []
 
         assert!(ids.contains(&"raydium-clmm-custom".to_string()));
         assert!(ids.contains(&"raydium-amm-pool-state".to_string()));
-        assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
@@ -1147,77 +1196,46 @@ templates: []
     }
 
     #[test]
-    fn test_raydium_amm_v4_has_only_openbook_market_options() {
+    fn bundled_idl_discriminators_are_unique_and_empty_only_for_raydium_amm_v4() {
+        use std::collections::{BTreeMap, HashSet};
+
+        use anchor_lang_idl::types::Idl;
+
         let registry = TemplateRegistry::new();
+        let mut idls: BTreeMap<String, &Idl> = BTreeMap::new();
+        for idl in registry.templates.values().filter_map(|t| t.idl.as_ref()) {
+            idls.entry(idl.address.clone()).or_insert(idl);
+        }
+        assert!(
+            idls.len() > 10,
+            "expected every bundled protocol IDL to be registered"
+        );
 
-        // Test the raydium-amm-custom template which uses openbook_market constant_ref
-        let raydium_v4_template = registry
-            .get("raydium-amm-custom")
-            .expect("Raydium AMM v4 custom template should exist");
-
-        // Print ALL constants in this template to debug
-        println!("Constants in raydium-amm-custom template:");
-        for (name, constant) in &raydium_v4_template.constants {
-            println!("  - {}: {} options", name, constant.options.len());
-            for (i, opt) in constant.options.iter().take(3).enumerate() {
-                println!("      {}: id={}, value={}", i, opt.id, opt.value);
+        for (address, idl) in idls {
+            let mut seen = HashSet::new();
+            for account in &idl.accounts {
+                assert!(
+                    account.discriminator.is_empty() || seen.insert(account.discriminator.clone()),
+                    "IDL {address}: account {} repeats discriminator {:?}",
+                    account.name,
+                    account.discriminator
+                );
+                if address == "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" {
+                    assert!(
+                        account.discriminator.is_empty(),
+                        "Raydium AMM v4 account {} must declare no discriminator",
+                        account.name
+                    );
+                } else {
+                    assert_eq!(
+                        account.discriminator.len(),
+                        8,
+                        "IDL {address}: account {} must carry an 8-byte Anchor discriminator",
+                        account.name
+                    );
+                }
             }
         }
-
-        // Check that openbook_market constant exists
-        let openbook_market_constant = raydium_v4_template
-            .constants
-            .get("openbook_market")
-            .expect("openbook_market constant should exist");
-
-        println!(
-            "\nopenbook_market has {} options",
-            openbook_market_constant.options.len()
-        );
-
-        // Print first 5 options to debug
-        for (i, opt) in openbook_market_constant.options.iter().take(5).enumerate() {
-            println!(
-                "  Option {}: id={}, label={}, value={}",
-                i, opt.id, opt.label, opt.value
-            );
-        }
-
-        // Should have around 100 OpenBook markets (not thousands of tokens)
-        assert!(
-            openbook_market_constant.options.len() <= 200,
-            "openbook_market should have only market options, not verified tokens. Got {} options",
-            openbook_market_constant.options.len()
-        );
-
-        // Should NOT contain token symbols like "sol" or "usdc" as IDs
-        // Market IDs should be like "sol-usdc" or "ray-sol"
-        let has_standalone_sol = openbook_market_constant
-            .options
-            .iter()
-            .any(|o| o.id == "sol");
-        assert!(
-            !has_standalone_sol,
-            "openbook_market should NOT have standalone 'sol' option (that's a token, not a market)"
-        );
-
-        // Should have market pair IDs like "sol-usdc"
-        let has_sol_usdc_market = openbook_market_constant
-            .options
-            .iter()
-            .any(|o| o.id == "sol-usdc" || o.id.contains("-usdc") || o.id.contains("-sol"));
-        assert!(
-            has_sol_usdc_market,
-            "openbook_market should have market pair IDs like 'sol-usdc'"
-        );
-
-        // Also make sure raydium-amm-custom does NOT have token_mint constant
-        // (that's for CLMM v3, not AMM v4)
-        let has_token_mint = raydium_v4_template.constants.contains_key("token_mint");
-        assert!(
-            !has_token_mint,
-            "AMM v4 template should NOT have token_mint constant (that's for CLMM v3)"
-        );
     }
 
     #[test]
