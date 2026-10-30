@@ -1,7 +1,8 @@
 # Tessera V
 
-A proprietary market maker (PMM), not an AMM. Five templates control its price, quote freshness,
-ladder depth, ladder curve and a full halt.
+A proprietary market maker (PMM), not an AMM. Four templates control its price, ladder depth,
+ladder curve and a full halt. Surfpool keeps the quote current on its own once a scenario overrides a
+market.
 
 Tessera does not derive its price from vault ratios. Its maker writes one price per swap direction
 into the market account, and two directional ladders of twenty levels decide how much fills at
@@ -15,7 +16,6 @@ Program: `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`.
 | Template            | Overrides                                              |
 | ------------------- | ------------------------------------------------------ |
 | `tessera-price`     | the price Tessera uses for each swap direction         |
-| `tessera-freshness` | whether Tessera's quote is current or stale            |
 | `tessera-depth`     | how much each ladder level fills before the next one   |
 | `tessera-curve`     | the output factor applied at each ladder level         |
 | `tessera-halt`      | whether any level quotes at all                        |
@@ -29,7 +29,6 @@ Program: `TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH`.
 | `*_level_N_amount`                  | capacity in atoms of the swap's input token       | sell side of SOL/USDC: `1000000000` = 1 SOL     |
 | `*_level_N_factor`                  | output factor in millionths, below `1000000`      | `990000` pays 1% less than the bare price        |
 | `*_levels_enabled`                  | enabled flag of all twenty levels on one side     | `0` halts that side                              |
-| `last_update_slot`                  | offset from the materialization slot              | `0` = updated now, `-20` = twenty slots old      |
 
 Price conversion, with both decimals taken from the two mints:
 
@@ -45,8 +44,8 @@ sell output = floor(base_in  × quote_atoms_per_base_atom_x1e15 × sell_level_0_
 buy output  = floor(quote_in × base_atoms_per_quote_atom_x1e15 × buy_level_0_factor  / 10^21)
 ```
 
-The formulas hold for a quote younger than its grace period (see
-[How a quote ages](#how-a-quote-ages)) and with neutral quote-start configs. The five quote-start configs at offset 1136 can lower a fill or make it skip leading levels. Which
+The formulas hold for a quote younger than its grace period, which keep-alive keeps it (see
+[How a quote ages](#how-a-quote-ages)), and with neutral quote-start configs. The five quote-start configs at offset 1136 can lower a fill or make it skip leading levels. Which
 one applies depends on how many slots ago the config account
 `BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK` was updated. A surfnet never updates it, so after
 about 300 slots the last config applies. Configs that each hold `0`, `1000000` and `0` change
@@ -58,11 +57,13 @@ The market account is 1264 bytes. Offsets not listed are not written by any temp
 
 | Offset    | Field                                  | Encoding          | Unit                     |
 | --------- | -------------------------------------- | ----------------- | ------------------------ |
+| 0         | buy depth used since the publication   | u64, keep-alive   | quote atoms              |
+| 8         | sell depth used since the publication  | u64, keep-alive   | base atoms               |
 | 24        | base mint                              | pubkey, read-only | -                        |
 | 56        | quote mint                             | pubkey, read-only | -                        |
 | 88        | freshness limit                        | u64, read-only    | slots                    |
 | 96        | grace period                           | u64, read-only    | slots                    |
-| 120       | last update slot                       | `slot`            | slot offset              |
+| 120       | last update slot                       | u64, keep-alive   | slot                     |
 | 128       | quote atoms per base atom              | u128              | × 10^15                  |
 | 144       | base atoms per quote atom              | u128              | × 10^15                  |
 | 160 + 24n | sell level n capacity                  | u64               | base atoms               |
@@ -100,23 +101,31 @@ Use `fetchBeforeUse: true` so the selected market is loaded into the local VM fr
 datasource before its bytes are changed. A later override that builds on an earlier one in the same
 scenario uses `false`, or the re-fetch undoes the earlier write.
 
-## Two rules that prevent misleading scenarios
+## Keep-alive (Surfpool handles it)
 
-**1. Keep the quote fresh.** Tessera rejects a quote whose last update is at least the market's
-freshness limit old with custom error 65535, so a correct price or depth change can appear to do
-nothing. Before that, an ageing quote fills worse; see [How a quote ages](#how-a-quote-ages). Apply
-`tessera-freshness` with `last_update_slot: 0` alongside every price, depth or curve change, and
-schedule it again, with `fetchBeforeUse: false`, at least every 4 slots where a quote is needed.
+On mainnet the maker republishes each market's quote every slot or two. Each publication writes the
+slot (offset 120) and clears the depth swaps have used since the last one (offsets 0 and 8). Nobody
+runs the maker against a surfnet, so Surfpool republishes the quote every slot
+([keep-alive](../../README.md#keep-alive)): the quote stays 0 slots old, and every slot starts with
+the full ladder. Swaps in one slot still use up the ladder as on mainnet; the next slot gives it back.
+There is nothing to schedule.
 
-**2. Change a ladder as a whole.** The stored ladder has a different number of enabled levels on
+Every template keeps the market it writes quoting. Keep-alive starts in the slot the override plays
+and runs until the network is reset.
+
+## A rule that prevents misleading scenarios
+
+**Change a ladder as a whole.** The stored ladder has a different number of enabled levels on
 each market and side, and the maker can pull a side at any moment. Read the selected market account
 first, scale every enabled level on the side you stress by one ratio, and keep factors descending.
 
 ## How a quote ages
 
-A quote younger than the market's grace period (offset 96, 5 slots on the featured markets) fills
-at the formula. From then on each slot lowers the fill by a growing amount, in both directions,
-until the quote rejects at its freshness limit. Measured on SOL / USDC:
+Keep-alive keeps a market a scenario overrides 0 slots old. A market no override names is not
+republished, and ages like this. A quote younger than the market's grace period (offset 96, 5 slots
+on the featured markets) fills at the formula. From then on each slot lowers the fill by a growing
+amount, in both directions, until the quote rejects at its freshness limit (offset 88). Measured on
+SOL / USDC:
 
 | Slots since the update | Fill        |
 | ---------------------- | ----------- |
@@ -129,8 +138,7 @@ until the quote rejects at its freshness limit. Measured on SOL / USDC:
 | 15 to 19               | -0.5% (cap) |
 | 20                     | rejected (`65535`) |
 
-cbBTC / USDC loses half as much per slot. Schedule `tessera-freshness` at least every 4 slots for a
-stable price.
+cbBTC / USDC loses half as much per slot.
 
 ## Scenario ideas
 
@@ -141,8 +149,7 @@ Use this to test whether a router or strategy reacts when Tessera's SOL price mo
 1. Choose **SOL / USDC** in `tessera-price`.
 2. Set both price fields from the formula. $100 per SOL is `100000000000000` and
    `10000000000000000`.
-3. Add `tessera-freshness` with `last_update_slot: 0`.
-4. Compare both swap directions before and after. Doubling the price doubles a sell's output and
+3. Compare both swap directions before and after. Doubling the price doubles a sell's output and
    halves a buy's.
 
 ### Maker widens one side
@@ -152,7 +159,7 @@ Use this to test a maker that still quotes but pays less in one direction.
 1. Choose the market in `tessera-curve`.
 2. Multiply all twenty sell factors by one ratio to make selling base worse, or the buy factors to
    make buying base worse. The other side is unaffected.
-3. Keep the quote fresh and compare equal-size swaps in both directions.
+3. Compare equal-size swaps in both directions.
 
 ### Thin liquidity for large orders
 
@@ -161,15 +168,6 @@ Use this to test order splitting when Tessera's depth drops.
 1. Choose the market in `tessera-depth`.
 2. Multiply every enabled capacity on one side by one ratio, for example 10%.
 3. Swap a small and a large amount. The small fill is unchanged; the large one gets worse.
-
-### Stale maker
-
-Use this to test fallback routing when Tessera stops updating.
-
-1. Choose the market in `tessera-freshness`.
-2. Set `last_update_slot` to minus the market's freshness limit (the u64 at bytes 88..96), for
-   example `-20` on SOL / USDC.
-3. Confirm both directions fail with custom error 65535 and that one slot younger still fills.
 
 ### Maker pulls all liquidity
 
@@ -180,8 +178,9 @@ Use this to test fallback routing when Tessera stops updating.
 
 Use this to test a router's slippage limit when Tessera reprices after the router quoted it.
 
-1. Add `tessera-freshness` with `last_update_slot: 0` at the first slot, so the stored price quotes.
-2. Two slots later, add `tessera-price` 1% lower in both directions and `tessera-freshness` again.
+1. Add `tessera-price` at the first slot with the stored price, so keep-alive keeps the market
+   quoting.
+2. Two slots later, add `tessera-price` 1% lower in both directions.
 3. Quote a swap in the first slot and fill it after the move. The fill pays 1% less, and a tight
    slippage limit must reject it.
 
@@ -190,7 +189,7 @@ Use this to test a router's slippage limit when Tessera reprices after the route
 Use this to test an arbitrage bot across Tessera and an AMM pool.
 
 1. Read the SOL / USDC price of an AMM pool, for example Orca Whirlpool.
-2. Set Tessera's SOL / USDC price 2% above it with `tessera-price` and keep the quote fresh.
+2. Set Tessera's SOL / USDC price 2% above it with `tessera-price`.
 3. Buying SOL on the AMM and selling it into Tessera should clear both venues' fees.
 
 # Recipes
@@ -205,27 +204,6 @@ base_atoms_per_quote_atom_x1e15: "10000000000000000"
 
 Set both fields. Offset 128 alone moves only sells and offset 144 alone moves only buys, so a
 single-field write creates a one-sided price.
-
-## Keep the quote current
-
-```text
-template: tessera-freshness
-last_update_slot: 0
-```
-
-A fresh quote fills at the formula for its grace period and is rejected at its freshness limit.
-Schedule the template again, with `fetchBeforeUse: false`, at least every 4 slots where a quote is
-needed.
-
-## Make the quote stale
-
-```text
-template: tessera-freshness
-last_update_slot: -20      # the SOL / USDC freshness limit is 20 slots
-```
-
-The boundary is exclusive: `-19` still fills in the slot it lands, `-20` rejects, and every later
-slot ages the quote by one more. Do not schedule a fresh override after it.
 
 ## Reduce depth
 
@@ -263,7 +241,7 @@ Tessera fills swaps only through a router. A direct call must carry the DFlow se
 `8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d` as a signer. To send one on a local surfnet:
 
 1. Start surfpool with `--skip-signature-verification`, so the sentinel needs no key.
-2. Play the scenario. Studio pauses the clock, so the quote stays fresh until Complete.
+2. Play the scenario. Keep-alive keeps the quote fresh.
 3. Simulate the swap before sending it. On a fresh surfnet the send otherwise fails with
    "Failed to fetch accounts from remote".
 
@@ -279,13 +257,12 @@ one per mint, and the USDC vault is shared by every USDC market.
 
 | Symptom                                               | Fix                                                                                   |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `Custom(65535)` after a price, depth or curve change  | The quote is stale. Add `tessera-freshness` with `last_update_slot: 0` in that slot   |
+| `Custom(65535)` on a market you did not override      | Expected: nothing republishes a market no override names, so it went stale            |
 | `Custom(65535)` on a market you did not halt          | The maker pulled that side upstream; every level on it is disabled                    |
 | `Custom(8)`                                           | A curve factor is not lower than the level before it; scale all factors by one ratio  |
 | `Custom(7)`                                           | A curve factor is `1000000` or more; factors stay below it                            |
-| A fill lands below the formula without an error       | The quote is past its grace period; refresh it with `tessera-freshness`               |
+| A second swap in one slot fills worse than the first  | Not a bug: swaps use up the ladder; the next slot's republication gives it back       |
 | Only one direction repriced                           | Set both price fields; 128 prices sells and 144 prices buys                           |
 | A depth change has no visible effect                  | The fill was smaller than the first level; use a larger swap                          |
 | A price change lands on the wrong account          | No owner or size check exists on raw writes; pick a featured market or check that a typed address is a Tessera market account |
 | `buy_levels_enabled: 1` re-enabled maker-disabled levels | Only 0 is supported; 1 makes the program quote levels the maker had pulled                                   |
-| A stale override stops rejecting                      | A later `tessera-freshness` with a non-negative offset refreshed it; remove it        |

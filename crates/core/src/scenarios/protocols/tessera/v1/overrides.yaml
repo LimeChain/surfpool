@@ -9,6 +9,11 @@ tags:
   - prop-amm
   - swap
 
+keep_alive:
+  - template: tessera-quote-publication
+    address: { type: override }
+    values: { last_update_slot: $slot, buy_depth_used: 0, sell_depth_used: 0 }
+
 llm_context: |
   FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
   1. Resolve both token symbols with get_token_address, both calls at once; each result also
@@ -55,9 +60,9 @@ templates:
           Base atoms paid per quote atom, times 10^15. Prices quote-to-base buys; the integer floor
           of 10^30 divided by quote_atoms_per_base_atom_x1e15.
     llm_context: |
-      PRECONDITION - THE QUOTE MUST BE FRESH. Tessera rejects a quote whose last update is at least
-      the market's freshness limit old with custom error 65535 (0xffff), so a correct price can
-      appear to do nothing. Also apply tessera-freshness with last_update_slot 0 in the same slot.
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, as the maker does on mainnet, so this price keeps filling at the
+      formula in later slots and every slot starts with the full ladder.
 
       Tessera stores one price per direction in raw atoms. Offset 128 alone moves base-to-quote
       sells, offset 144 alone moves quote-to-base buys, so set both as one invariant. Take
@@ -74,7 +79,7 @@ templates:
         sell output = floor(base_in * quote_atoms_per_base_atom_x1e15 * sell_level_0_factor / 10^21)
         buy output  = floor(quote_in * base_atoms_per_quote_atom_x1e15 * buy_level_0_factor / 10^21)
       Factors are in millionths and always below 1000000. The formula holds for a quote younger than
-      its grace period (see tessera-freshness) and with neutral quote-start configs. The five 12-byte quote-start configs
+      its grace period, which keep-alive keeps it, and with neutral quote-start configs. The five 12-byte quote-start configs
       at market bytes 1136..1196 can lower a fill or make it skip leading levels. Which one applies
       depends on how many slots ago the config account BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK
       was updated; a surfnet never updates it, so after about 300 slots the last config applies.
@@ -87,46 +92,6 @@ templates:
       EXAMPLE - "BTC is worth $100000" on cbBTC / USDC (8/6 decimals):
         quote_atoms_per_base_atom_x1e15: "1000000000000000000"
         base_atoms_per_quote_atom_x1e15: "1000000000000"
-
-  - id: tessera-freshness
-    name: Override Quote Freshness
-    description: Keep a Tessera quote current or age it past the market's freshness limit
-    idl_account_name: MarketState
-    address:
-      type: pubkey
-    properties:
-      - path: last_update_slot
-        offset: 120
-        encoding:
-          slot:
-            lead: 0
-        label: Last-update offset
-        description: >-
-          Relative to the slot where the override materializes; 0 means updated now, a negative
-          value ages the quote by that many slots.
-    llm_context: |
-      This one template covers both a fresh and a stale quote. The stored word is an absolute slot;
-      the value is an offset from the slot where the override materializes, clamped at zero.
-
-      Tessera rejects a quote whose age is at least the market's own limit, a u64 at market bytes
-      88..96. The boundary is exclusive: last_update_slot -(limit - 1) still fills in the slot it
-      materializes, -limit rejects both swap directions with custom error 65535 (0xffff), and every
-      later slot ages the quote by one more.
-
-      AGE: a quote younger than the market's grace period, the u64 at market bytes 96..104 (5 slots
-      on the featured markets), fills at the price formula. From the grace period on, each slot
-      lowers the fill by a growing amount, both directions. Measured on SOL / USDC: -50 ppm at 5
-      slots, -200 at 6, -800 at 8, -1800 at 10, -3200 at 12, -5000 (a 0.5% cap) at 15 to 19, and
-      rejected at its 20-slot limit. cbBTC / USDC loses half as much per slot. For a stable price,
-      schedule this template again at least every 4 slots.
-
-      HOW TO USE:
-      1. For a fresh quote set last_update_slot to 0
-      2. For a stale quote set it to -10000, past every market's limit; use minus the limit only to
-         land on the boundary, e.g. -20 on a 20-slot market
-      3. A fresh quote fills at the formula for its grace period and is rejected at its limit;
-         schedule this template again with fetchBeforeUse: false at least every 4 slots where a
-         quote is needed, and never after a stale override you want to keep stale
 
   - id: tessera-depth
     name: Override Depth
@@ -176,8 +141,9 @@ templates:
       - { path: buy_level_18_amount, offset: 1072, encoding: u64, label: "Buy level 19 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
       - { path: buy_level_19_amount, offset: 1096, encoding: u64, label: "Buy level 20 capacity", description: "Capacity of this level in input-token atoms; scale it, and keep it nonzero where the maker quotes." }
     llm_context: |
-      PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
-      otherwise the swap rejects with custom error 65535 and the new depth is never used.
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, so this depth keeps filling in later slots. Swaps in one slot use up
+      the ladder; the next slot starts with the full ladder again, as after a maker publication.
 
       Each side is a ladder of twenty 24-byte levels: a u64 capacity at +0, a u64 output factor at
       +8 and a u8 enabled flag at +16. The sell ladder starts at 160 and fills base-to-quote sells
@@ -246,8 +212,8 @@ templates:
       - { path: buy_level_18_factor, offset: 1080, encoding: u64, label: "Buy level 19 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
       - { path: buy_level_19_factor, offset: 1104, encoding: u64, label: "Buy level 20 output factor", description: "Output factor of this level in millionths; must be lower than the previous level's factor." }
     llm_context: |
-      PRECONDITION - THE QUOTE MUST BE FRESH. Apply tessera-freshness with last_update_slot 0,
-      otherwise the swap rejects with custom error 65535 and the new curve is never used.
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, so this curve keeps filling in later slots.
 
       The factor multiplies the directional price: output = input * price * factor / 10^21. Factors
       are in millionths and must stay below 1000000; 1000000 or more rejects with custom error 7, and
