@@ -51,6 +51,10 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
 
+pub const PROJECT0_V1_IDL_CONTENT: &str = include_str!("./protocols/project0/v1/idl.json");
+pub const PROJECT0_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/project0/v1/overrides.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -116,6 +120,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_project0_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -193,6 +198,14 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_IDL_CONTENT,
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
+        );
+    }
+
+    pub fn load_project0_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PROJECT0_V1_IDL_CONTENT,
+            PROJECT0_V1_OVERRIDES_CONTENT,
+            "Project 0",
         );
     }
 
@@ -367,6 +380,42 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -615,11 +664,12 @@ mod tests {
 
         // Pyth (2) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 71
+        // + Project 0 (Bank 6, MarginfiAccount 2 = 8)
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 79
         assert_eq!(
             registry.count(),
-            71,
-            "Registry should load 71 templates total"
+            79,
+            "Registry should load 79 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -669,6 +719,15 @@ mod tests {
         assert!(registry.contains("kamino-liquidity-strategy-balances"));
         assert!(registry.contains("kamino-liquidity-strategy-rewards"));
         assert!(registry.contains("kamino-liquidity-strategy-guards"));
+
+        assert!(registry.contains("project0-bank-risk-weights"));
+        assert!(registry.contains("project0-bank-limits"));
+        assert!(registry.contains("project0-bank-status"));
+        assert!(registry.contains("project0-bank-oracle"));
+        assert!(registry.contains("project0-bank-interest-rate"));
+        assert!(registry.contains("project0-bank-shares"));
+        assert!(registry.contains("project0-account-balance"));
+        assert!(registry.contains("project0-account-authority"));
 
         assert!(registry.contains("drift-perp-market"));
         assert!(registry.contains("drift-spot-market"));
@@ -987,6 +1046,7 @@ templates: []
             ("kamino-swap", vec!["Order", "GlobalConfig"]),
             ("kamino-vault", vec!["VaultState", "ReserveWhitelistEntry"]),
             ("kamino-liquidity", vec!["WhirlpoolStrategy"]),
+            ("Project 0", vec!["Bank", "MarginfiAccount"]),
         ] {
             let account_types: BTreeSet<&str> = registry
                 .by_protocol(protocol)
@@ -1002,6 +1062,12 @@ templates: []
                 );
             }
         }
+
+        assert_eq!(
+            registry.by_protocol("Project 0").len(),
+            8,
+            "Should have 8 Project 0 templates"
+        );
 
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
@@ -1305,6 +1371,33 @@ templates: []
             direct_pda, expected_address,
             "Direct PDA derivation should match expected SOL/USD address"
         );
+    }
+
+    #[test]
+    fn project0_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        let templates = registry.by_protocol("Project 0");
+        assert_eq!(templates.len(), 8);
+        for template in templates {
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{} must require an explicit target account",
+                template.id
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{} must not embed a backend account catalog",
+                template.id
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA")
+                ),
+                "{} must say how to find its account on the program",
+                template.id
+            );
+        }
     }
 
     #[test]
@@ -1749,7 +1842,7 @@ templates: []
     /// Descriptions come from the IDL's own `docs`, or from an explicit `description` in the
     /// YAML. Studio and any LLM reading a template rely on them.
     #[test]
-    fn test_every_kamino_property_has_a_description() {
+    fn test_every_kamino_and_project0_property_has_a_description() {
         let registry = TemplateRegistry::new();
         let mut missing = Vec::new();
         let mut described = 0;
@@ -1761,6 +1854,7 @@ templates: []
             "kamino-swap",
             "kamino-vault",
             "kamino-liquidity",
+            "Project 0",
         ] {
             for template in registry.by_protocol(protocol) {
                 for property in &template.properties {
@@ -1774,7 +1868,7 @@ templates: []
 
         assert!(
             missing.is_empty(),
-            "{} Kamino propert(ies) have no description ({} do):\n  {}",
+            "{} Kamino or Project 0 propert(ies) have no description ({} do):\n  {}",
             missing.len(),
             described,
             missing.join("\n  ")
