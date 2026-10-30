@@ -112,7 +112,7 @@ use crate::{
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData,
-        keep_alive::{KeepAliveSource, KeepAliveBinding},
+        keep_alive::{KeepAliveBinding, KeepAliveSource},
         locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -3342,7 +3342,7 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         slot: Slot,
     ) {
-        let keep_alive_overrides = self.keep_alive_overrides(slot);
+        let keep_alive_overrides = self.keep_alive_overrides(slot, remote_ctx.is_some());
         if let Err(e) = self
             .apply_overrides(remote_ctx, slot, keep_alive_overrides, false)
             .await
@@ -3842,8 +3842,9 @@ impl SurfnetSvm {
     }
 
     /// The keep-alive overrides for every account in `keep_alive_bindings` at `slot`, with their
-    /// placeholders filled in. An account missing locally is left alone.
-    fn keep_alive_overrides(&self, slot: Slot) -> Vec<OverrideInstance> {
+    /// placeholders filled in. An account missing locally is fetched from upstream first when
+    /// `can_fetch`, as a transaction naming it would hydrate it, and is otherwise left alone.
+    fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
         // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
         // the block's time.
         let clock = KeepAliveClock {
@@ -3860,8 +3861,9 @@ impl SurfnetSvm {
             else {
                 continue;
             };
-            match self.get_account(&binding.account) {
-                Ok(Some(_)) => {}
+            let missing = match self.get_account(&binding.account) {
+                Ok(Some(_)) => false,
+                Ok(None) if can_fetch => true,
                 Ok(None) => {
                     debug!("Keep-alive skips {}: not in this surfnet", binding.account);
                     continue;
@@ -3870,7 +3872,7 @@ impl SurfnetSvm {
                     warn!("Keep-alive cannot read {}: {}", binding.account, e);
                     continue;
                 }
-            }
+            };
             let values = match import.values_at(&clock) {
                 Ok(values) => values,
                 Err(e) => {
@@ -3889,6 +3891,7 @@ impl SurfnetSvm {
             .with_values(values)
             .with_label(format!("keep-alive {}", import.template));
             instance.id = format!("keep-alive:{}:{}", import.template, binding.account);
+            instance.fetch_before_use = missing;
             instances.push(instance);
         }
         instances
