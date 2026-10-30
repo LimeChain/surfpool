@@ -3841,9 +3841,8 @@ impl SurfnetSvm {
         }
     }
 
-    /// The keep-alive overrides for every account in `keep_alive_bindings` at `slot`, with their
-    /// placeholders filled in. An account missing locally is fetched from upstream first when
-    /// `can_fetch`, as a transaction naming it would hydrate it, and is otherwise left alone.
+    /// The keep-alive overrides for every binding at `slot`. A missing account is fetched first when
+    /// `can_fetch` and not offline, otherwise skipped.
     fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
         // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
         // the block's time.
@@ -3863,7 +3862,15 @@ impl SurfnetSvm {
             };
             let missing = match self.get_account(&binding.account) {
                 Ok(Some(_)) => false,
-                Ok(None) if can_fetch => true,
+                Ok(None)
+                    if can_fetch
+                        && !self
+                            .offline_accounts
+                            .contains_key(&binding.account.to_string())
+                            .unwrap_or(false) =>
+                {
+                    true
+                }
                 Ok(None) => {
                     debug!("Keep-alive skips {}: not in this surfnet", binding.account);
                     continue;
