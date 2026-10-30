@@ -1683,6 +1683,25 @@ impl OverrideTemplate {
                 _ => None,
             })
     }
+
+    /// The seeds keep-alive PDAs are derived from that are not fields of this template. Like the
+    /// override's own PDA seeds, they only name an account and are never written.
+    pub fn keep_alive_pda_seeds(&self) -> Vec<String> {
+        self.keep_alive
+            .iter()
+            .filter_map(|import| match &import.address {
+                KeepAliveAddress::Account(address) => Some(address.get_pda_seed_references()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|seed| {
+                !self
+                    .properties
+                    .iter()
+                    .any(|p| &p.path == seed && p.is_field())
+            })
+            .collect()
+    }
 }
 
 /// The slot and block time keep-alive values are filled in for.
