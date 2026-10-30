@@ -26,8 +26,8 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
     rpc_response::{
-        RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
-        RpcLogsResponse, RpcTokenAccountBalance,
+        RpcAccountBalance, RpcBlockUpdate, RpcConfirmedTransactionStatusWithSignature,
+        RpcKeyedAccount, RpcLogsResponse, RpcTokenAccountBalance,
     },
 };
 use solana_clock::{Clock, Slot, UnixTimestamp};
@@ -4066,7 +4066,9 @@ impl SurfnetSvmLocker {
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
         let epoch_info = svm_writer.apply_time_travel(clock)?;
-        svm_writer.apply_keep_alive(remote_ctx).await;
+        svm_writer
+            .apply_keep_alive(remote_ctx, epoch_info.absolute_slot)
+            .await;
         Ok(epoch_info)
     }
 
@@ -4136,6 +4138,18 @@ impl SurfnetSvmLocker {
     ) -> Receiver<(Slot, RpcLogsResponse)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_logs_updates(commitment_level, filter)
+        })
+    }
+
+    /// Subscribes for `blockSubscribe` notifications and returns a receiver of block updates.
+    pub fn subscribe_for_block_updates(
+        &self,
+        commitment_level: CommitmentLevel,
+        mentions: Option<Pubkey>,
+        config: RpcBlockConfig,
+    ) -> Arc<Receiver<RpcBlockUpdate>> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.subscribe_for_block_updates(commitment_level, mentions, config)
         })
     }
 
