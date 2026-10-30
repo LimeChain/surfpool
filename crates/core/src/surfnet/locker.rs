@@ -4066,7 +4066,9 @@ impl SurfnetSvmLocker {
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
         let epoch_info = svm_writer.apply_time_travel(clock)?;
-        svm_writer.apply_keep_alive(remote_ctx).await;
+        svm_writer
+            .apply_keep_alive(remote_ctx, epoch_info.absolute_slot)
+            .await;
         Ok(epoch_info)
     }
 

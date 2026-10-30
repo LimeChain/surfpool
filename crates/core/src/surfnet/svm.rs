@@ -112,7 +112,7 @@ use crate::{
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData,
-        keep_alive::{KeepAliveSource, KeepAliveTarget},
+        keep_alive::{KeepAliveBinding, KeepAliveSource},
         locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -590,7 +590,7 @@ pub struct SurfnetSvm {
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
     /// The accounts keep-alive rewrites every slot, from the slot a scenario's override first
     /// touched them. Kept in memory only, so a restart on a persistent database stops keep-alive.
-    pub keep_alive_targets: BTreeSet<KeepAliveTarget>,
+    pub keep_alive_bindings: BTreeSet<KeepAliveBinding>,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -870,7 +870,7 @@ impl SurfnetSvm {
             registered_idls: OverlayStorage::wrap(self.registered_idls.clone_box()),
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
-            keep_alive_targets: self.keep_alive_targets.clone(),
+            keep_alive_bindings: self.keep_alive_bindings.clone(),
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -1349,7 +1349,7 @@ impl SurfnetSvm {
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
-            keep_alive_targets: BTreeSet::new(),
+            keep_alive_bindings: BTreeSet::new(),
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -2571,7 +2571,7 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
-        self.keep_alive_targets.clear();
+        self.keep_alive_bindings.clear();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -3325,28 +3325,26 @@ impl SurfnetSvm {
     /// 3. Optionally fetches fresh account data from remote if `fetch_before_use` is enabled
     /// 4. Applies the overrides to the account data
     /// 5. Updates the SVM state
+    /// 6. Applies keep-alive to every account in `keep_alive_bindings`
     pub async fn materialize_overrides(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
         let current_slot = self.latest_epoch_info.absolute_slot;
-        // Keep-alive writes its fields again every slot, so an override of one lasts this slot at most.
-        self.apply_keep_alive(remote_ctx).await;
         self.materialize_overrides_for_slot(remote_ctx, current_slot)
             .await
     }
 
-    /// Rewrites every account keep-alive keeps alive for the current slot and its Clock time.
+    /// Applies keep-alive to every account in `keep_alive_bindings`, with the placeholders filled from
+    /// `slot` and its Clock time.
     pub async fn apply_keep_alive(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        slot: Slot,
     ) {
-        let current_slot = self.latest_epoch_info.absolute_slot;
-        let keep_alive = self.keep_alive_overrides(self.keep_alive_targets.clone());
-        // Reported, not returned: keep-alive must never hold back the slot's scheduled overrides or
-        // stop block production.
+        let keep_alive_overrides = self.keep_alive_overrides(slot, remote_ctx.is_some());
         if let Err(e) = self
-            .apply_overrides(remote_ctx, current_slot, keep_alive, false)
+            .apply_overrides(remote_ctx, slot, keep_alive_overrides, false)
             .await
         {
             self.simnet_events_tx
@@ -3354,33 +3352,28 @@ impl SurfnetSvm {
         }
     }
 
-    /// Materializes scheduled overrides for a specific slot. Accounts that join keep-alive here are
-    /// kept alive from this slot on, not only from the next.
+    /// Materializes scheduled overrides for a specific slot, adds the accounts they touch to
+    /// `keep_alive_bindings`, then applies keep-alive to every account on it.
     pub async fn materialize_overrides_for_slot(
         &mut self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         target_slot: Slot,
     ) -> SurfpoolResult<()> {
-        // Remove and get overrides for this slot
-        let Some(overrides) = self.scheduled_overrides.take(&target_slot)? else {
-            // No overrides for this slot
-            return Ok(());
-        };
-        let touched = self
-            .apply_overrides(remote_ctx, target_slot, overrides, true)
-            .await?;
-        let joined = self.enrol_keep_alive(touched);
-        let keep_alive = self.keep_alive_overrides(joined);
-        // The slot's scheduled overrides have landed, so a keep-alive failure is reported, not
-        // returned.
-        if let Err(e) = self
-            .apply_overrides(remote_ctx, target_slot, keep_alive, false)
-            .await
-        {
-            self.simnet_events_tx
-                .error(format!("Failed to keep accounts alive: {e}"));
+        let materialized = async {
+            if let Some(overrides) = self.scheduled_overrides.take(&target_slot)? {
+                let touched = self
+                    .apply_overrides(remote_ctx, target_slot, overrides, true)
+                    .await?;
+                self.enrol_keep_alive(touched);
+            }
+            Ok::<_, SurfpoolError>(())
         }
-        Ok(())
+        .await;
+        // Last, so it lands after any override has fetched its account from the remote, and even
+        // when one failed. At the current slot, which `target_slot` need not be.
+        let current_slot = self.latest_epoch_info.absolute_slot;
+        self.apply_keep_alive(remote_ctx, current_slot).await;
+        materialized
     }
 
     /// Applies `overrides` in order and returns the scheduled ones whose template imports
@@ -3819,10 +3812,8 @@ impl SurfnetSvm {
         Ok(keep_alive_touched)
     }
 
-    /// Adds the accounts that `touched` makes keep-alive imports rewrite, returning those not kept
-    /// alive before.
-    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) -> Vec<KeepAliveTarget> {
-        let mut joined = Vec::new();
+    /// Adds the accounts that `touched` makes keep-alive imports rewrite.
+    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
             let Some(template) = template_registry().get(&source.template) else {
                 continue;
@@ -3835,30 +3826,24 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
-                let target = KeepAliveTarget {
+                let binding = KeepAliveBinding {
                     template: template.id.clone(),
                     import: index,
                     account,
                 };
-                if self.keep_alive_targets.insert(target.clone()) {
+                if self.keep_alive_bindings.insert(binding) {
                     info!(
                         "Keep-alive '{}' rewrites {} every slot",
                         import.template, account
                     );
-                    joined.push(target);
                 }
             }
         }
-        joined
     }
 
-    /// The overrides that apply keep-alive imports to `targets` in this slot, with their
-    /// placeholders filled in. An account missing locally is left alone.
-    fn keep_alive_overrides(
-        &self,
-        targets: impl IntoIterator<Item = KeepAliveTarget>,
-    ) -> Vec<OverrideInstance> {
-        let slot = self.get_latest_absolute_slot();
+    /// The keep-alive overrides for every binding at `slot`. A missing account is fetched first when
+    /// `can_fetch` and not offline, otherwise skipped.
+    fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
         // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
         // the block's time.
         let clock = KeepAliveClock {
@@ -3868,30 +3853,39 @@ impl SurfnetSvm {
                 .saturating_sub(self.block_time_lag()),
         };
         let mut instances = Vec::new();
-        for target in targets {
+        for binding in &self.keep_alive_bindings {
             let Some(import) = template_registry()
-                .get(&target.template)
-                .and_then(|template| template.keep_alive.get(target.import))
+                .get(&binding.template)
+                .and_then(|template| template.keep_alive.get(binding.import))
             else {
                 continue;
             };
-            match self.get_account(&target.account) {
-                Ok(Some(_)) => {}
+            let missing = match self.get_account(&binding.account) {
+                Ok(Some(_)) => false,
+                Ok(None)
+                    if can_fetch
+                        && !self
+                            .offline_accounts
+                            .contains_key(&binding.account.to_string())
+                            .unwrap_or(false) =>
+                {
+                    true
+                }
                 Ok(None) => {
-                    debug!("Keep-alive skips {}: not in this surfnet", target.account);
+                    debug!("Keep-alive skips {}: not in this surfnet", binding.account);
                     continue;
                 }
                 Err(e) => {
-                    warn!("Keep-alive cannot read {}: {}", target.account, e);
+                    warn!("Keep-alive cannot read {}: {}", binding.account, e);
                     continue;
                 }
-            }
+            };
             let values = match import.values_at(&clock) {
                 Ok(values) => values,
                 Err(e) => {
                     warn!(
                         "Keep-alive '{}' skips {}: {}",
-                        import.template, target.account, e
+                        import.template, binding.account, e
                     );
                     continue;
                 }
@@ -3899,11 +3893,12 @@ impl SurfnetSvm {
             let mut instance = OverrideInstance::new(
                 import.template.clone(),
                 0,
-                surfpool_types::AccountAddress::Pubkey(target.account.to_string()),
+                surfpool_types::AccountAddress::Pubkey(binding.account.to_string()),
             )
             .with_values(values)
             .with_label(format!("keep-alive {}", import.template));
-            instance.id = format!("keep-alive:{}:{}", import.template, target.account);
+            instance.id = format!("keep-alive:{}:{}", import.template, binding.account);
+            instance.fetch_before_use = missing;
             instances.push(instance);
         }
         instances
