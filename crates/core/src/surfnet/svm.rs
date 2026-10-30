@@ -3430,11 +3430,14 @@ impl SurfnetSvm {
                 }
             };
 
+            // Joins keep-alive only once its write succeeds: a failed override leaves the account as
+            // if no scenario had touched it.
+            let mut keep_alive_source = None;
             if scheduled
                 && let Some(template) = template_registry().get(&override_instance.template_id)
                 && !template.keep_alive.is_empty()
             {
-                keep_alive_touched.push(KeepAliveSource {
+                keep_alive_source = Some(KeepAliveSource {
                     template: template.id.clone(),
                     account: account_pubkey,
                     values: override_instance.values.clone(),
@@ -3614,6 +3617,7 @@ impl SurfnetSvm {
                                     account_pubkey
                                 );
                                 settled_this_slot.insert(account_pubkey);
+                                keep_alive_touched.extend(keep_alive_source.take());
                             }
                         }
                         Err(e) => warn!(
@@ -3637,7 +3641,10 @@ impl SurfnetSvm {
                 {
                     Ok(Some(writes)) => {
                         match write_all_or_none(self, writes, target_slot) {
-                            Ok(written) => settled_this_slot.extend(written),
+                            Ok(written) => {
+                                settled_this_slot.extend(written);
+                                keep_alive_touched.extend(keep_alive_source.take());
+                            }
                             Err(e) => warn!(
                                 "Skipping override {} for {}: {}",
                                 override_instance.id, account_pubkey, e
@@ -3689,6 +3696,7 @@ impl SurfnetSvm {
                             restore_unprocessed(self, index);
                             return Err(e);
                         }
+                        keep_alive_touched.extend(keep_alive_source.take());
                         continue;
                     }
                 }
@@ -3786,6 +3794,7 @@ impl SurfnetSvm {
                         override_instance.id
                     );
                     settled_this_slot.insert(account_pubkey);
+                    keep_alive_touched.extend(keep_alive_source.take());
                 }
             }
         }

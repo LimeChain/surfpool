@@ -94,15 +94,11 @@ pub(crate) fn account_data_values(
     template: Option<&OverrideTemplate>,
 ) -> (HashMap<String, serde_json::Value>, usize, usize) {
     let mut pda_refs = instance.account.get_pda_seed_references();
-    // A keep-alive PDA's seeds name the account it writes.
-    for import in template
-        .into_iter()
-        .flat_map(|template| &template.keep_alive)
-    {
-        if let KeepAliveAddress::Account(address) = &import.address {
-            pda_refs.extend(address.get_pda_seed_references());
-        }
-    }
+    pda_refs.extend(
+        template
+            .into_iter()
+            .flat_map(OverrideTemplate::keep_alive_pda_seeds),
+    );
     // Keep-alive inputs only name the account a keep-alive writes, so they count as selectors.
     let constant_refs: HashSet<&str> = template
         .into_iter()
@@ -961,6 +957,26 @@ templates:
                 serde_json::json!("11111111111111111111111111111111"),
             ),
         ]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
+    fn a_keep_alive_pda_seed_that_is_a_field_is_still_written() {
+        let registry = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: pda, program_id: \"11111111111111111111111111111111\", seeds: [{ type: property_ref, value: balance }] }",
+        ));
+        registry.check_keep_alive_imports().unwrap();
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([(
+            "balance".to_string(),
+            serde_json::json!(1),
+        )]));
         let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
         assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
     }
