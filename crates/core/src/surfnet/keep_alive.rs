@@ -16,9 +16,10 @@ pub struct KeepAliveSource {
     pub values: HashMap<String, serde_json::Value>,
 }
 
-/// One account a keep-alive import rewrites.
+/// Binds a template's keep-alive import to the account it rewrites every slot, resolved when an
+/// override of that template first touched it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct KeepAliveTarget {
+pub struct KeepAliveBinding {
     /// The importing template's ID.
     pub template: String,
     /// The import's index in that template's `keep_alive` list.
