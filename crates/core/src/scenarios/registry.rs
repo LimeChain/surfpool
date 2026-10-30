@@ -4,7 +4,7 @@ use std::{
 };
 
 use surfpool_types::{
-    KeepAliveAddress, OverrideInstance, OverrideTemplate, PropertyKind,
+    KeepAliveAddress, OverrideInstance, OverrideTemplate, PropertyKind, RawEncoding,
     YamlOverrideTemplateCollection,
 };
 
@@ -100,7 +100,12 @@ pub(crate) fn account_data_values(
     instance: &OverrideInstance,
     template: Option<&OverrideTemplate>,
 ) -> (HashMap<String, serde_json::Value>, usize, usize) {
-    let pda_refs = instance.account.get_pda_seed_references();
+    let mut pda_refs = instance.account.get_pda_seed_references();
+    pda_refs.extend(
+        template
+            .into_iter()
+            .flat_map(OverrideTemplate::keep_alive_pda_seeds),
+    );
     // Keep-alive inputs only name the account a keep-alive writes, so they count as selectors.
     let constant_refs: HashSet<&str> = template
         .into_iter()
@@ -195,9 +200,20 @@ impl TemplateRegistry {
                 let Some(keep_alive) = self.keep_alive_templates.get(&import.template) else {
                     return fail("no keep-alive file defines it".to_string());
                 };
-                for path in import.values.keys() {
-                    if !keep_alive.properties.iter().any(|p| &p.path == path) {
+                for (path, value) in &import.values {
+                    let Some(property) = keep_alive.properties.iter().find(|p| &p.path == path)
+                    else {
                         return fail(format!("it has no property '{path}'"));
+                    };
+                    // A slot encoding writes the current slot plus the value, so `$slot` would
+                    // write twice the slot.
+                    let is_placeholder = value.as_str().is_some_and(|v| v.trim().starts_with('$'));
+                    if is_placeholder && matches!(property.encoding, Some(RawEncoding::Slot { .. }))
+                    {
+                        return fail(format!(
+                            "'{path}' is slot-encoded and already tracks the slot: give it a lead, \
+                             not {value}"
+                        ));
                     }
                 }
                 if let KeepAliveAddress::Input(name) = &import.address {
@@ -981,6 +997,49 @@ templates:
     }
 
     #[test]
+    fn a_keep_alive_pda_seed_is_never_written() {
+        let registry = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: pda, program_id: \"11111111111111111111111111111111\", seeds: [{ type: property_ref, value: oracle }] }",
+        ));
+        registry.check_keep_alive_imports().unwrap();
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([
+            ("balance".to_string(), serde_json::json!(1)),
+            (
+                "oracle".to_string(),
+                serde_json::json!("11111111111111111111111111111111"),
+            ),
+        ]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
+    fn a_keep_alive_pda_seed_that_is_a_field_is_still_written() {
+        let registry = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: pda, program_id: \"11111111111111111111111111111111\", seeds: [{ type: property_ref, value: balance }] }",
+        ));
+        registry.check_keep_alive_imports().unwrap();
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([(
+            "balance".to_string(),
+            serde_json::json!(1),
+        )]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
     fn imports_the_registry_cannot_apply_are_refused() {
         let refused = |overrides: String, expected: &str| {
             let error = keep_alive_registry(&overrides)
@@ -1010,6 +1069,25 @@ templates:
         refused(
             KEEP_ALIVE_OVERRIDES.replace("values: { slot: $slot }", "values: { slot: $later }"),
             "unknown placeholder",
+        );
+    }
+
+    #[test]
+    fn a_placeholder_on_a_slot_encoded_field_is_refused() {
+        let mut registry = TemplateRegistry::default();
+        registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
+        registry.load_keep_alive(
+            None,
+            &KEEP_ALIVE.replace(
+                "{ path: slot, offset: 8, encoding: u64",
+                "{ path: slot, offset: 8, encoding: { slot: { lead: 0 } }",
+            ),
+            "example",
+        );
+        let error = registry.check_keep_alive_imports().unwrap_err();
+        assert!(
+            error.contains("'slot' is slot-encoded and already tracks the slot"),
+            "{error}"
         );
     }
 
