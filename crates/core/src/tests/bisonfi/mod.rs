@@ -1159,17 +1159,24 @@ async fn bisonfi_scenario_spread_is_side_specific() {
             continue;
         };
 
-        // Widening the bid must hurt sells and leave buys exactly where they were.
+        // Widening the bid must hurt sells and leave buys where they were. Some markets price a trade
+        // off both sides' ticks: by a fraction of a basis point, and a few on a trade deep into the
+        // ladder. So the widened side must move at least ten times more, relative to its control,
+        // than the other; a transposed template would move both sides alike.
+        let tenth = |other: (u64, u64), widened: (u64, u64)| {
+            other.0.abs_diff(other.1) as u128 * widened.1 as u128 * 10
+                <= widened.0.abs_diff(widened.1) as u128 * other.1 as u128
+        };
         let sell_wide = rig.scenario(pool, data, *tp, "bisonfi-spread", &bids, sell, 0);
         let buy_untouched = rig.scenario(pool, data, *tp, "bisonfi-spread", &bids, buy, 1);
         assert!(
             sell_wide < sell_control,
             "{pool}: widening the BID must pay a seller less, got {sell_wide} vs {sell_control}"
         );
-        assert_eq!(
-            buy_untouched, buy_control,
-            "{pool}: widening the BID must not change a BUY. If this fires the bid and ask offsets \
-             are transposed in the template"
+        assert!(
+            tenth((buy_untouched, buy_control), (sell_wide, sell_control)),
+            "{pool}: widening the BID must not change a BUY, got {buy_untouched} vs {buy_control}. \
+             If this fires the bid and ask offsets are transposed in the template"
         );
 
         // And the mirror image.
@@ -1179,9 +1186,9 @@ async fn bisonfi_scenario_spread_is_side_specific() {
             buy_wide < buy_control,
             "{pool}: widening the ASK must give a buyer less base, got {buy_wide} vs {buy_control}"
         );
-        assert_eq!(
-            sell_untouched, sell_control,
-            "{pool}: widening the ASK must not change a SELL"
+        assert!(
+            tenth((sell_untouched, sell_control), (buy_wide, buy_control)),
+            "{pool}: widening the ASK must not change a SELL, got {sell_untouched} vs {sell_control}"
         );
         checked += 1;
     }
