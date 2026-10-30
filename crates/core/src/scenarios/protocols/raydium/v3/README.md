@@ -26,7 +26,7 @@ found by its address, and a fee tier. For how scenarios work in general see the
 
 `price_raw` is token_1 per token_0 in raw units; multiply by `10^(decimals_0 - decimals_1)` for the
 human price. `status` bits: 0 open or increase liquidity, 1 decrease liquidity, 2 collect fees,
-3 collect rewards, 4 swap.
+3 collect rewards, 4 swap, 5 limit orders.
 
 ## Picking a pool
 
@@ -86,7 +86,9 @@ template: raydium-clmm-amm-config     # on the pool's amm_config
 trade_fee_rate: 10000                 # 1%
 ```
 
-Every pool on that tier shares the account, so the change reaches all of them.
+Every pool on that tier shares the account, so the change reaches all of them. A pool created with a
+dynamic fee (its `dynamic_fee_info` is not all zeros) adds a volatility-based fee on top of
+`trade_fee_rate`, so on such a pool the tier sets only the base fee.
 
 # Troubleshooting
 
@@ -96,3 +98,9 @@ Every pool on that tier shares the account, so the change reaches all of them.
 | The swap fails right after a price change | The new tick has no tick array, or `sqrt_price_x64` and `tick_current` disagree |
 | `raydium-clmm-custom` changed nothing | The mints are in the wrong order, so the derived address is empty |
 | The swap fails on the token transfer | The paying vault holds less than the output. Fund it with `spl-token-account-balance` |
+
+# IDL
+
+`idl.json` is the IDL Raydium publishes on chain in its Program Metadata account
+`4wQuz7ZDMMxihw8qwm6zt7fNzRNdEvHMAT1eyPHNhWri`, unchanged (sha256
+`862adbd60703fac5a5b397de8130778bd127d944c909b883f831f5cbbf911c8f`), as written in slot 459532766.

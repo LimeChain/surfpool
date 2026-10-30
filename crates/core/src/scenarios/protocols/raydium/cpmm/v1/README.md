@@ -94,3 +94,9 @@ Every pool created on that tier shares the account, so the change reaches all of
 **Known limitation.** `spl-token-account-balance` writes a token account's `amount` and keeps its
 lamports. Raising a wrapped-SOL vault therefore leaves part of the new balance without lamports
 behind it, and a swap that pays out more SOL than the vault held before fails in the token program.
+
+# IDL
+
+`idl.json` is the IDL Raydium publishes on chain in its Program Metadata account
+`FHuJXL7cEttfHk4sXdTAXVaRymBdKfVs7ZH6cMgA1ihk`, unchanged (sha256
+`e970d765469559c62089c0cf0bdceb6524c36eb9fd1ae7244d1ef85dd3afcaac`), as written in slot 462074068.

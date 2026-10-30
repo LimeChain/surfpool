@@ -102,7 +102,7 @@ templates:
         description: Tick index of the current price (i32); must agree with sqrt_price_x64
       - path: status
         label: Pool Status
-        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap, bit5 limit order; 0 = all enabled"
       - path: config_index
         type: constant_ref
         label: Fee Tier
@@ -158,7 +158,7 @@ templates:
         description: Tick index of the current price (i32); must agree with sqrt_price_x64
       - path: status
         label: Pool Status
-        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap; 0 = all enabled"
+        description: "Disable bitmask (u8): bit0 open/increase liquidity, bit1 decrease liquidity, bit2 collect fee, bit3 collect reward, bit4 swap, bit5 limit order; 0 = all enabled"
     llm_context: |
       Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
 
@@ -189,5 +189,8 @@ templates:
 
       Rates are parts per million: trade_fee_rate of the input (2500 = 0.25%, below 1,000,000);
       protocol_fee_rate and fund_fee_rate of the collected fee, together at most 1,000,000.
+
+      A pool created with a dynamic fee (its dynamic_fee_info is not all zeros) adds a volatility-based
+      fee on top of trade_fee_rate, so on such a pool the tier sets only the base fee.
     address:
       type: pubkey
