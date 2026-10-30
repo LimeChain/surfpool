@@ -192,14 +192,30 @@ async fn forks() -> Arc<Vec<SolfiFork>> {
                     Pubkey::from_str_const(def.quote_vault)
                 );
                 let slot = u64::from_le_bytes(a[0].data[1352..1360].try_into().unwrap());
+                // The tests trade both directions, but a live vault can be all but empty, as
+                // USDT/USDC's USDT vault has been. Fund a vault that could not pay 200 trades; a
+                // funded vault stays as fetched. A wrapped-SOL vault holds its amount as lamports,
+                // so those rise with it.
+                let funded = |vault: &Account, trade: u64| {
+                    let mut vault = vault.clone();
+                    let (held, floor) = (amount(&vault.data), trade.saturating_mul(200));
+                    if held < floor {
+                        vault.data[64..72].copy_from_slice(&floor.to_le_bytes());
+                        let is_native = vault.data[109..113] == 1u32.to_le_bytes();
+                        if is_native {
+                            vault.lamports += floor - held;
+                        }
+                    }
+                    vault
+                };
                 out.push(SolfiFork {
                     def,
                     elf: elf.clone(),
                     market: a[0].clone(),
                     oracle: a[1].clone(),
                     cfg: a[2].clone(),
-                    base_vault: a[3].clone(),
-                    quote_vault: a[4].clone(),
+                    base_vault: funded(&a[3], def.base_trade),
+                    quote_vault: funded(&a[4], def.quote_trade),
                     base_mint: a[5].clone(),
                     quote_mint: a[6].clone(),
                     slot,
@@ -1461,18 +1477,29 @@ async fn solfi_swap_pressure_resets_consecutive_swaps() {
         ],
         fork.slot,
     );
+    // SolFi counts a sale by its value, about 100 USDC on WSOL/USDC, not by its SOL amount. Size
+    // every sale at about 300 USDC so the count builds up whatever SOL trades at.
+    let usdc_per_sol = run(
+        fork,
+        fork.def.base_trade,
+        0,
+        fork.market.data.clone(),
+        oracle.clone(),
+    )
+    .expect("a 1 SOL sale should settle");
+    let sale = fork.def.base_trade * 300_000_000 / usdc_per_sol;
     // Vaults are reloaded for every sale so only the market's own state carries over.
     let sell = |market: Vec<u8>| {
         replay_with_market(
             fork,
-            fork.def.base_trade,
+            sale,
             0,
             market,
             oracle.clone(),
             fork.base_vault.data.clone(),
             fork.quote_vault.data.clone(),
         )
-        .expect("a 1 SOL sale should settle")
+        .expect("a 300 USDC sale should settle")
     };
     let bps_below_first = |first: u64, out: u64| (1.0 - out as f64 / first as f64) * 1e4;
 
@@ -1483,7 +1510,7 @@ async fn solfi_swap_pressure_resets_consecutive_swaps() {
     let pressured = sell(market.clone()).0;
     assert!(
         bps_below_first(first, pressured) > 50.0,
-        "twelve 1 SOL sales should widen the next by tens of bps, got {:.1}",
+        "twelve 300 USDC sales should widen the next by tens of bps, got {:.1}",
         bps_below_first(first, pressured)
     );
 

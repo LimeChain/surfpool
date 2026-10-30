@@ -274,8 +274,8 @@ on the other side.
 
 ## Reset swap pressure
 
-SolFi counts consecutive large swaps in each direction. Small swaps do not count (on WSOL/USDC a
-1 SOL swap counts and a 0.5 SOL swap does not), and a swap the other way does not reset the count.
+SolFi counts consecutive large swaps in each direction. A swap counts by its value, not its token
+amount: on WSOL/USDC from about 100 USDC. A swap the other way does not reset the count.
 The count widens that direction twice over: the `additional_widening_curve_y` term grows with it, and
 from the ninth swap the program multiplies the trade-size widening by about ten, capped by
 `max_widening`.
