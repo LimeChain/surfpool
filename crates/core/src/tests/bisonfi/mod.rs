@@ -29,7 +29,6 @@ use std::{
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
-
 use surfpool_types::KeepAliveClock;
 
 use crate::{
