@@ -35,6 +35,7 @@ pub const SOLFI_MARKET_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/solfi/v2/market-overrides.yaml");
 pub const SOLFI_VAULT_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/solfi/v2/vault-overrides.yaml");
+pub const SOLFI_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/solfi/v2/keep-alive.yaml");
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -270,6 +271,7 @@ impl TemplateRegistry {
         self.load_raw_layout_overrides(SOLFI_ORACLE_OVERRIDES_CONTENT, "solfi-oracle");
         self.load_raw_layout_overrides(SOLFI_MARKET_OVERRIDES_CONTENT, "solfi-market");
         self.load_raw_layout_overrides(SOLFI_VAULT_OVERRIDES_CONTENT, "solfi-vault");
+        self.load_keep_alive(None, SOLFI_KEEP_ALIVE_CONTENT, "solfi");
     }
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
@@ -733,12 +735,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + SolFi (5)
-        // + Phoenix Eternal (19) = 86
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + SolFi (4)
+        // + Phoenix Eternal (19) = 85
         assert_eq!(
             registry.count(),
-            86,
-            "Registry should load 86 templates total"
+            85,
+            "Registry should load 85 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -810,7 +812,10 @@ mod tests {
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
         assert!(registry.contains("solfi-price"));
-        assert!(registry.contains("solfi-freshness"));
+        assert!(
+            !registry.contains("solfi-freshness"),
+            "the oracle stays current by keep-alive"
+        );
         assert!(registry.contains("solfi-size-impact"));
         assert!(registry.contains("solfi-swap-pressure"));
         assert!(registry.contains("solfi-vault-balance"));
@@ -1373,8 +1378,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            6,
-            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 2 SolFi)"
+            5,
+            "Should find 5 oracle templates (Pyth + 3 Kamino Scope + 1 SolFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -2098,7 +2103,6 @@ templates: []
         let mut checked = 0;
         for id in [
             "solfi-price",
-            "solfi-freshness",
             "solfi-size-impact",
             "solfi-swap-pressure",
             "solfi-vault-balance",
@@ -2126,7 +2130,7 @@ templates: []
                 checked += 1;
             }
         }
-        assert_eq!(checked, 26, "every shipped SolFi property must be checked");
+        assert_eq!(checked, 27, "every shipped SolFi property must be checked");
     }
 
     #[test]
@@ -2134,7 +2138,6 @@ templates: []
         let registry = TemplateRegistry::new();
         for template_id in [
             "solfi-price",
-            "solfi-freshness",
             "solfi-size-impact",
             "solfi-swap-pressure",
             "solfi-vault-balance",
@@ -2154,6 +2157,19 @@ templates: []
                     |context| context.contains("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF")
                 ),
                 "{template_id} must explain how to discover its target account"
+            );
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{template_id} must keep its market's oracle alive");
+            };
+            assert_eq!(import.template, "solfi-oracle-publication");
+            let expected = if template_id == "solfi-price" {
+                surfpool_types::KeepAliveAddress::Override
+            } else {
+                surfpool_types::KeepAliveAddress::Input("oracle".to_string())
+            };
+            assert_eq!(
+                import.address, expected,
+                "{template_id} keeps alive the oracle it writes or the one it is given"
             );
         }
     }
