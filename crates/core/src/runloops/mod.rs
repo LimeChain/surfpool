@@ -4,7 +4,10 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
@@ -14,7 +17,9 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     ReplicaEntryInfoVersions, ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, SlotStatus,
 };
 use chrono::{Local, Utc};
-use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, Sender, TrySendError, bounded, select, unbounded,
+};
 use itertools::Itertools;
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{DomainsValidation, ServerBuilder};
@@ -32,7 +37,7 @@ use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
     SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
-    SurfpoolConfig,
+    SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -182,6 +187,10 @@ pub async fn start_local_surfnet_runloop(
     let Some(simnet) = config.simnets.first() else {
         return Ok(());
     };
+    if let Some(lock) = &config.rpc.cheatcode_lock {
+        lock.validate()
+            .map_err(|e| format!("cannot lock cheatcodes: {e}"))?;
+    }
     let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 
@@ -196,9 +205,13 @@ pub async fn start_local_surfnet_runloop(
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
-    if let Some(genesis_hash) = simnet.genesis_hash {
-        svm_locker.with_svm_writer(|svm| svm.cached_genesis_hash = Some(genesis_hash));
-    }
+    // Before the RPC servers start: `sendTransaction`'s preflight reads the skip flag.
+    svm_locker.with_svm_writer(|svm_writer| {
+        svm_writer.skip_signature_verification = simnet.skip_signature_verification;
+        if let Some(genesis_hash) = simnet.genesis_hash {
+            svm_writer.cached_genesis_hash = Some(genesis_hash);
+        }
+    });
 
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker
@@ -246,6 +259,13 @@ pub async fn start_local_surfnet_runloop(
 
     let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
 
+    // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
+    // send data for a slot they don't track yet.
+    svm_locker.with_svm_writer(|svm| {
+        let _ = svm.geyser_events_tx.send(GeyserEvent::EndOfStartup);
+        svm.announce_open_slot();
+    });
+
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
@@ -268,8 +288,14 @@ pub async fn start_local_surfnet_runloop(
         }
     };
 
-    let (clock_event_rx, clock_command_tx) =
-        start_clock_runloop(simnet_config.slot_time, Some(simnet_events_tx_cc.clone()));
+    let (coalesced_slots, clock_driven) =
+        svm_locker.with_svm_reader(|svm| (svm.coalesced_slots.clone(), svm.clock_driven.clone()));
+    let (clock_event_rx, clock_command_tx) = start_clock_runloop(
+        simnet_config.slot_time,
+        Some(simnet_events_tx_cc.clone()),
+        coalesced_slots,
+        clock_driven,
+    );
 
     // Emit TransactionProcessed events for each stored transaction before Ready
     let initial_transaction_count = svm_locker.with_svm_reader(|svm| {
@@ -340,9 +366,6 @@ pub async fn start_local_surfnet_runloop(
     }
     simnet_events_tx_cc.core_started(initial_transaction_count);
 
-    // Notify geyser plugins that startup is complete
-    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
-
     start_block_production_runloop(
         clock_event_rx,
         clock_command_tx,
@@ -388,7 +411,12 @@ pub async fn start_block_production_runloop(
     // Whether the clock is paused as this loop sees it: a tick the clock thread queued before
     // it read a Pause is no slot, and a pause is acknowledged only after no tick can follow.
     let mut clock_paused = false;
+    let clock_driven = svm_locker.with_svm_reader(|svm| svm.clock_driven.clone());
     loop {
+        clock_driven.store(
+            block_production_mode.eq(&BlockProductionMode::Clock),
+            Ordering::Relaxed,
+        );
         let mut do_produce_block = false;
 
         select! {
@@ -522,6 +550,13 @@ pub async fn start_block_production_runloop(
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        let signature = transaction.signatures[0];
+                       // A duplicate of a send that was still queued or executing when this one
+                       // passed the RPC: the bank drops it, and Agave's RPC returns the signature.
+                       if svm_locker.with_svm_reader(|svm_reader| svm_reader.processed_slot(&transaction).is_some()) {
+                           svm_locker.mark_transaction_complete(&signature);
+                           let _ = status_tx.try_send(TransactionStatusEvent::Success(TransactionConfirmationStatus::Processed));
+                           continue
+                       }
                        let result = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await;
                        svm_locker.mark_transaction_complete(&signature);
                        if let Err(e) = result {
@@ -685,52 +720,102 @@ pub async fn start_block_production_runloop(
     Ok(())
 }
 
+/// Ticks on a fixed cadence, `slot_time` apart, from a deadline rather than a
+/// sleep after each tick, so slots don't drift slower than `slot_time`.
+///
+/// When block production falls behind (CPU starvation, a host that slept, a
+/// heavy block), the ticks it can't keep up with are coalesced, not queued:
+/// the chain stretches, and every slot stays visible to a client polling at
+/// the slot rate. Queued ticks would instead replay as a burst of slots once
+/// production caught up, moving the chain several slots between two polls.
+/// Each tick dropped while `clock_driven` is set (blocks are produced in
+/// `BlockProductionMode::Clock`) is counted in `coalesced_slots`. In other
+/// modes ticks produce no block, so a dropped one isn't a late slot.
 pub fn start_clock_runloop(
     mut slot_time: u64,
     simnet_events_tx: Option<SimnetEventsTx>,
+    coalesced_slots: Arc<AtomicU64>,
+    clock_driven: Arc<AtomicBool>,
 ) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
-    let (clock_event_tx, clock_event_rx) = unbounded::<ClockEvent>();
+    // One tick in flight at most: a tick sent while the last is unconsumed is
+    // coalesced into it.
+    let (clock_event_tx, clock_event_rx) = bounded::<ClockEvent>(1);
     let (clock_command_tx, clock_command_rx) = unbounded::<ClockCommand>();
 
     let _handle = hiro_system_kit::thread_named("clock").spawn(move || {
         let mut enabled = true;
+        let period = |slot_time: u64| Duration::from_millis(slot_time.max(1));
+        let mut next_tick = Instant::now() + period(slot_time);
+        // Warn once per stretch of lag, not on every dropped tick.
+        let mut lagging = false;
 
         loop {
-            match clock_command_rx.try_recv() {
-                Ok(ClockCommand::Pause) => {
-                    enabled = false;
-                    if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
+            let wait = next_tick.saturating_duration_since(Instant::now());
+            match clock_command_rx.recv_timeout(wait) {
+                Ok(command) => {
+                    match command {
+                        ClockCommand::Pause | ClockCommand::PauseWithConfirmation(_) => {
+                            // PauseWithConfirmation is handled in the block
+                            // production runloop; here it's a plain pause.
+                            enabled = false;
+                            if let Some(ref simnet_events_tx) = simnet_events_tx {
+                                let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
+                            }
+                        }
+                        ClockCommand::Resume => {
+                            enabled = true;
+                            if let Some(ref simnet_events_tx) = simnet_events_tx {
+                                let _ = simnet_events_tx.clock_update(ClockCommand::Resume);
+                            }
+                        }
+                        ClockCommand::Toggle => {
+                            enabled = !enabled;
+                            if let Some(ref simnet_events_tx) = simnet_events_tx {
+                                let _ = simnet_events_tx.clock_update(ClockCommand::Toggle);
+                            }
+                        }
+                        ClockCommand::UpdateSlotInterval(updated_slot_time) => {
+                            slot_time = updated_slot_time;
+                        }
                     }
+                    // A paused or retimed clock starts a fresh cadence: time
+                    // spent paused isn't lag.
+                    next_tick = Instant::now() + period(slot_time);
+                    continue;
                 }
-                Ok(ClockCommand::Resume) => {
-                    enabled = true;
-                    if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ = simnet_events_tx.clock_update(ClockCommand::Resume);
-                    }
-                }
-                Ok(ClockCommand::Toggle) => {
-                    enabled = !enabled;
-                    if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ = simnet_events_tx.clock_update(ClockCommand::Toggle);
-                    }
-                }
-                Ok(ClockCommand::UpdateSlotInterval(updated_slot_time)) => {
-                    slot_time = updated_slot_time;
-                }
-                Ok(ClockCommand::PauseWithConfirmation(_)) => {
-                    // This should be handled in the block production runloop, not here
-                    // If it reaches here, just treat it as a regular Pause
-                    enabled = false;
-                    if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
-                    }
-                }
-                Err(_e) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            sleep(Duration::from_millis(slot_time));
-            if enabled {
-                let _ = clock_event_tx.send(ClockEvent::Tick);
+
+            // Deadlines missed while this thread itself was starved count as
+            // dropped ticks too; skip past them rather than catching up.
+            let late = Instant::now().saturating_duration_since(next_tick);
+            let missed = (late.as_millis() / period(slot_time).as_millis()) as u64;
+            next_tick += period(slot_time) * (missed as u32 + 1);
+            if !enabled {
+                continue;
+            }
+            let mut dropped = missed;
+            match clock_event_tx.try_send(ClockEvent::Tick) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => dropped += 1,
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+            if !clock_driven.load(Ordering::Relaxed) {
+                dropped = 0;
+            }
+            if dropped > 0 {
+                coalesced_slots.fetch_add(dropped, Ordering::Relaxed);
+                if !lagging {
+                    lagging = true;
+                    if let Some(ref simnet_events_tx) = simnet_events_tx {
+                        let _ = simnet_events_tx.warn(format!(
+                            "Block production is behind the clock: slots are arriving later than every {slot_time}ms"
+                        ));
+                    }
+                }
+            } else {
+                lagging = false;
             }
         }
     });
@@ -878,6 +963,7 @@ fn start_geyser_runloop(
                     }
                     Ok(GeyserEvent::UpdateSlotStatus { slot, parent, status }) => {
                         let slot_status = match status {
+                            crate::surfnet::GeyserSlotStatus::CreatedBank => SlotStatus::CreatedBank,
                             crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
                             crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
                             crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
@@ -1240,6 +1326,7 @@ fn start_ws_rpc_server_runloop(
                 slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                block_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 tokio_handle: tokio_handle.clone(),
             }
@@ -1389,5 +1476,84 @@ mod absent_after_hydration_tests {
             vec![missing],
             "an account kept offline on purpose is not a surprise; a missing one is"
         );
+    }
+}
+
+#[cfg(test)]
+mod clock_runloop_tests {
+    use super::*;
+
+    fn clock_driven() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+
+    /// Outside `Clock` mode a tick produces no block, so one dropped while
+    /// the consumer is busy isn't a late slot.
+    #[test]
+    fn ticks_dropped_outside_clock_mode_are_not_counted() {
+        let coalesced = Arc::new(AtomicU64::new(0));
+        let (ticks, _commands) = start_clock_runloop(
+            10,
+            None,
+            coalesced.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        sleep(Duration::from_millis(100));
+        assert!(ticks.recv_timeout(Duration::from_millis(5)).is_ok());
+        assert_eq!(coalesced.load(Ordering::Relaxed), 0);
+    }
+
+    /// A consumer that falls behind finds one tick waiting, not a backlog to
+    /// replay as a burst, and the ticks it missed are counted.
+    #[test]
+    fn a_stalled_consumer_gets_one_tick_and_the_rest_are_counted() {
+        let coalesced = Arc::new(AtomicU64::new(0));
+        let (ticks, _commands) = start_clock_runloop(10, None, coalesced.clone(), clock_driven());
+
+        sleep(Duration::from_millis(200));
+        assert!(ticks.recv_timeout(Duration::from_millis(5)).is_ok());
+        assert!(
+            ticks.try_recv().is_err(),
+            "a stall must not leave a backlog of ticks"
+        );
+        let dropped = coalesced.load(Ordering::Relaxed);
+        assert!(
+            (10..=20).contains(&dropped),
+            "~19 ticks were due while stalled; counted {dropped}"
+        );
+    }
+
+    /// A consumer that keeps up sees the clock's cadence, without drift and
+    /// without coalesced ticks.
+    #[test]
+    fn a_consumer_that_keeps_up_sees_every_tick_on_cadence() {
+        let coalesced = Arc::new(AtomicU64::new(0));
+        let (ticks, _commands) = start_clock_runloop(20, None, coalesced.clone(), clock_driven());
+
+        let start = Instant::now();
+        for _ in 0..20 {
+            ticks.recv_timeout(Duration::from_millis(200)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(380) && elapsed < Duration::from_millis(520),
+            "20 ticks at 20ms took {elapsed:?}"
+        );
+        assert_eq!(coalesced.load(Ordering::Relaxed), 0);
+    }
+
+    /// Time spent paused isn't lag.
+    #[test]
+    fn pausing_does_not_count_as_coalesced() {
+        let coalesced = Arc::new(AtomicU64::new(0));
+        let (ticks, commands) = start_clock_runloop(10, None, coalesced.clone(), clock_driven());
+
+        commands.send(ClockCommand::Pause).unwrap();
+        sleep(Duration::from_millis(100));
+        while ticks.try_recv().is_ok() {}
+        commands.send(ClockCommand::Resume).unwrap();
+        ticks.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(coalesced.load(Ordering::Relaxed) <= 1);
     }
 }
