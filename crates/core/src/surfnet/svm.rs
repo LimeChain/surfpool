@@ -105,8 +105,9 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::{
-            prepare_phoenix_override, write_all_or_none,
+        protocols::{
+            manifest::v1::market::prepare_manifest_override,
+            phoenix_eternal::v1::state_builder::{prepare_phoenix_override, write_all_or_none},
         },
         template_registry,
     },
@@ -3589,6 +3590,32 @@ impl SurfnetSvm {
                         ),
                     }
                     continue;
+                }
+
+                let clock_slot = self.inner.get_sysvar::<Clock>().slot;
+                match prepare_manifest_override(&account, &account_values, clock_slot) {
+                    Ok(Some(data)) => {
+                        let market = Account { data, ..account };
+                        if let Err(e) =
+                            self.set_scenario_override_account(&account_pubkey, market, target_slot)
+                        {
+                            warn!(
+                                "Failed to set {} for override {}: {}",
+                                account_pubkey, override_instance.id, e
+                            );
+                        } else {
+                            settled_this_slot.insert(account_pubkey);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "Skipping override {} for {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        continue;
+                    }
                 }
 
                 match prepare_phoenix_override(
