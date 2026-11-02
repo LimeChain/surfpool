@@ -1,0 +1,312 @@
+protocol: Velocity
+version: v2.169.0
+account_type: PerpMarket
+idl_file_path: idl.json
+
+tags:
+  - perpetuals
+  - liquidation
+  - defi
+
+templates:
+  - id: velocity-oracle-price
+    name: Override Oracle Price
+    description: Set the price a Velocity market reads from its PythLazerOracle account
+    idl_account_name: PythLazerOracle
+    properties:
+      - path: price
+        label: Price
+        description: "Price x 10^8 (every live oracle has exponent -8). Example: 8500000000 for $85"
+      - path: conf
+        label: Confidence
+        description: Uncertainty band in the same scale as price; scale it with price so their ratio holds
+      - path: posted_slot
+        label: Posted Slot
+        description: Slot the price counts as posted at; the program ages the price from it. Write the current slot
+      - path: publish_time
+        label: Publish Time
+        description: Pyth Lazer timestamp in microseconds (unix seconds x 1000000)
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. Each perp market reads
+      the PythLazerOracle account named in its `oracle` field. A spot market can share it: SOL
+      collateral is priced from the SOL-PERP oracle.
+
+      FIND THE ORACLE: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":1560}] and dataSlice {"offset":0,"length":0}: these are the perp markets. Read
+      them with getMultipleAccounts and encoding jsonParsed; `name` holds the market name as ASCII
+      bytes (SOL-PERP starts 83,79,76,45), `market_index` its index and `oracle` the oracle
+      account. A market or oracle address the user gives is used as is.
+
+      Set fetchBeforeUse: true. Put the oracle in the override's account as {"pubkey":"<oracle>"},
+      never in values.
+
+      Write price, posted_slot and publish_time together. Read the oracle and the Clock in one
+      getMultipleAccounts call with encoding jsonParsed: [<oracle>,
+      "SysvarC1ock11111111111111111111111111111111"]. price is the USD price x 10^8; leave exponent
+      alone. posted_slot is the Clock's slot. publish_time is its unixTimestamp x 1000000
+      (microseconds). Scale conf by the same factor as price.
+
+      Nothing republishes the price on a surfnet, so it ages as the clock moves past posted_slot.
+      Margin checks, such as withdrawals, orders that add risk and matched fills, refuse it once it
+      is older than the State's slots_before_stale_for_margin window: 240 slots, three times that
+      for the USDT price (InvalidOracle, 6035). Add velocity-exchange-risk with a higher
+      oracle_guard_rails.validity.slots_before_stale_for_margin to keep it usable longer. AMM fills,
+      and settling PnL right after a price move, need the price posted within the last 20 slots.
+      Liquidations ignore a price's age.
+
+      Fills read the market's own MM oracle price instead of this one when the two are within 1%
+      and the market's market_stats.mm_oracle_sequence_id is newer than publish_time; for a move
+      under 1%, write publish_time above that sequence id.
+
+      Liquidation refuses a price more than 50% from the market's 5-minute TWAP
+      (PriceBandsBreached, 6023) or more than 5x from its TWAP. For a deeper move add
+      velocity-exchange-risk to the same scenario.
+
+      EXAMPLE - "SOL drops 20%": with the SOL-PERP oracle's live price p, price: p x 0.8,
+      posted_slot: the Clock's slot, publish_time: its unixTimestamp x 1000000.
+
+  - id: velocity-perp-market-risk
+    name: Override Perp Market Risk
+    description: Change a Velocity perp market's margin ratios, status, paused operations, open interest cap and liquidation fees
+    idl_account_name: PerpMarket
+    properties:
+      - path: margin_ratio_maintenance
+        label: Maintenance Margin Ratio
+        description: "Share of position value an account must keep, 10000 = 100%. Below it the account can be liquidated. Example: 300"
+      - path: margin_ratio_initial
+        label: Initial Margin Ratio
+        description: "Share of position value needed to add risk, 10000 = 100%. Keep it above maintenance. Example: 500"
+      - path: status
+        label: Market Status
+        description: 'Initialized, Active, ReduceOnly (only orders that cut risk), Settlement or Delisted. Example: {"ReduceOnly": null}'
+      - path: paused_operations
+        label: Paused Operations
+        description: "Bit flags: 1 funding, 2 AMM fills, 4 fills, 8 settle PnL, 16 settle PnL with position, 32 liquidation, 64 AMM immediate fills, 128 settle revenue pool. 0 pauses nothing"
+      - path: max_open_interest
+        label: Max Open Interest
+        description: "Cap on each side's open position in base units (10^9 = one unit of the asset); 0 means no cap. Example: \"500000000000\""
+      - path: liquidator_fee
+        label: Liquidator Fee
+        description: "Share of the liquidated position's value the liquidator earns, 1000000 = 100%. Example: 7500"
+      - path: if_liquidation_fee
+        label: Insurance Fund Liquidation Fee
+        description: "Share of the liquidated position's value the account pays the insurance fund, 1000000 = 100%. Example: 7500"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P.
+
+      FIND A MARKET: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":1560}] and dataSlice {"offset":0,"length":0}: these are the perp markets. Read
+      them with getMultipleAccounts and encoding jsonParsed; `name` holds the market name as ASCII
+      bytes (SOL-PERP starts 83,79,76,45) and `market_index` its index. A market address the user
+      gives is used as is.
+
+      Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
+      never in values.
+
+      Margin ratios are shares of position value where 10000 = 100%. An account whose collateral
+      falls below the maintenance requirement can be liquidated. Raising
+      margin_ratio_maintenance makes leveraged accounts liquidatable without moving the price.
+      Keep margin_ratio_initial above margin_ratio_maintenance and both between 125 and 10000, as
+      the program's own admin path requires.
+
+      status is an enum written as an object: {"Active": null} or {"ReduceOnly": null}. ReduceOnly
+      refuses orders that add risk (6046). Settlement and Delisted are end-of-life states.
+
+      paused_operations is a bit mask; 32 pauses liquidation in this market (InvalidLiquidation,
+      6220) and 0 pauses nothing. Read the live value and add bits to it.
+
+      max_open_interest caps the open base amount of each side. An order that would take its side
+      past it fails with MaxOpenInterest (6154). Pass it as a decimal string; 0 removes the cap.
+
+      liquidator_fee is the liquidator's discount on the position it takes over, as a share of
+      the position's value (1000000 = 100%). For an account inactive for more than 10 minutes the
+      program raises it over time, up to 3x liquidator_fee or the maintenance margin, whichever is
+      lower. if_liquidation_fee is what the account also pays the insurance fund, capped by the
+      margin the account has left. Keep the two together below margin_ratio_maintenance x 100, as
+      the program's admin path requires.
+
+      EXAMPLE - "SOL-PERP needs 25% maintenance margin": margin_ratio_maintenance: 2500,
+      margin_ratio_initial: 3000.
+
+      EXAMPLE - "liquidators earn 2% on SOL-PERP": liquidator_fee: 20000.
+
+  - id: velocity-exchange-risk
+    name: Override Exchange Status, Oracle Guard Rails and Liquidation Buffer
+    description: Pause Velocity actions exchange-wide, keep prices usable for margin checks longer, widen the price moves liquidation accepts or change how much a liquidation closes
+    idl_account_name: State
+    properties:
+      - path: exchange_status
+        label: Exchange Status
+        description: "Bit flags: 1 deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM immediate fills. 0 means everything runs"
+      - path: oracle_guard_rails.validity.slots_before_stale_for_margin
+        label: Margin Staleness Window
+        description: "Margin checks refuse a price older than this many 400 ms units, counted from its posted_slot at two slots per unit, and three times that for USDT. Live: 120 (240 slots). Raise it to keep a moved price usable longer. Example: 1000000"
+      - path: oracle_guard_rails.price_divergence.oracle_twap_5min_percent_divergence
+        label: Max Distance From 5-Minute TWAP
+        description: "How far a price may sit from the 5-minute TWAP for liquidation, 1000000 = 100%. Never below 50%. Example: 1000000"
+      - path: oracle_guard_rails.validity.too_volatile_ratio
+        label: Too Volatile Ratio
+        description: "A price this many times above or below the market's TWAP is invalid. Example: 5"
+      - path: liquidation_margin_buffer_ratio
+        label: Liquidation Margin Buffer
+        description: "Margin above maintenance a liquidation restores, 10000 = 100%. Higher values liquidate more of a position. Example: 200"
+    address:
+      type: pubkey
+      value: "2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW"
+    llm_context: |
+      The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
+      fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
+
+      exchange_status pauses actions on every market. It is a bit mask, 0 runs everything: 1
+      deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM
+      immediate fills. A paused action fails with ExchangePaused (6024). The State comes with
+      mainnet's pauses; exchange_status: 0 lifts them.
+
+      Nothing republishes Velocity prices on a surfnet. Margin checks, such as withdrawals, orders
+      that add risk and matched fills, refuse a price more than slots_before_stale_for_margin units
+      of 400 ms past its posted_slot. The program counts two slots per unit and gives the USDT price
+      three times the window; the live 120 is 240 slots. Raise it to keep moved prices usable
+      longer. The program's admin path allows up to 1000000 (2,000,000 slots); the program reads
+      any value.
+
+      Liquidation refuses a price further from the market's 5-minute TWAP than
+      oracle_twap_5min_percent_divergence (1000000 = 100%, never below 500000) with
+      PriceBandsBreached (6023). It also refuses a price more than too_volatile_ratio times above
+      or below the market's TWAP. Raise these to let a deep crash liquidate.
+
+      A liquidation closes enough of a position to bring the account back above its maintenance
+      requirement plus liquidation_margin_buffer_ratio (10000 = 100%). A larger buffer closes more
+      of the position in one liquidation.
+
+      EXAMPLE - "SOL crashes 70% and accounts get liquidated": this template with
+      oracle_twap_5min_percent_divergence: 1000000, and velocity-oracle-price on the SOL-PERP
+      oracle, both at slot 0 of one scenario. An 85% crash also needs too_volatile_ratio: 10.
+
+      EXAMPLE - "liquidations are halted": exchange_status: 16.
+
+      EXAMPLE - "keep prices usable for margin checks for days":
+      oracle_guard_rails.validity.slots_before_stale_for_margin: 1000000.
+
+  - id: velocity-fees
+    name: Override Perp Trading Fees
+    description: Change the taker fee and maker rebate every Velocity perp trader pays
+    idl_account_name: State
+    properties:
+      - path: promo_fee_tier
+        label: Promo Fee Tier
+        description: "Lowest fee tier any account is charged at. Accounts pay the fees of the higher of their 30-day volume tier and this one; 3 puts every account on tier 3"
+      - path: perp_fee_structure.fee_tiers.3.fee_numerator
+        label: Taker Fee Numerator
+        description: "Taker fee of tier 3 is fee_numerator / fee_denominator of the fill's quote value. Example: 100"
+      - path: perp_fee_structure.fee_tiers.3.fee_denominator
+        label: Taker Fee Denominator
+        description: "Example: 100000, so 100 / 100000 = 0.1%"
+      - path: perp_fee_structure.fee_tiers.3.maker_rebate_numerator
+        label: Maker Rebate Numerator
+        description: "Maker rebate of tier 3 is maker_rebate_numerator / maker_rebate_denominator of the fill's quote value. Keep it below the taker fee. Example: 3"
+      - path: perp_fee_structure.fee_tiers.3.maker_rebate_denominator
+        label: Maker Rebate Denominator
+        description: "Example: 100000"
+    address:
+      type: pubkey
+      value: "2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW"
+    llm_context: |
+      The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
+      fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
+
+      An account pays the perp fees of the higher of its 30-day volume tier and promo_fee_tier.
+      The program uses tiers 0 to 3 only, so promo_fee_tier: 3 puts every account on tier 3.
+      Write promo_fee_tier: 3 together with the tier 3 fees and every trader pays them, whatever
+      its volume.
+
+      A taker pays its fill's quote value x fee_numerator / fee_denominator, rounded up; a
+      market's own taker_fee_addon_tenth_bps and fee_adjustment apply on top. A maker earns the
+      quote value x maker_rebate_numerator / maker_rebate_denominator. Keep the rebate below the
+      taker fee: a matched fill pays the rebate out of the taker fee and fails when it cannot.
+      The program's admin path keeps fees at or below 30 bps and rebates at or below 3 bps; the
+      program charges whatever is written.
+
+      EXAMPLE - "taking liquidity costs 0.1%": promo_fee_tier: 3,
+      perp_fee_structure.fee_tiers.3.fee_numerator: 100,
+      perp_fee_structure.fee_tiers.3.fee_denominator: 100000.
+
+  - id: velocity-spot-market-risk
+    name: Override Spot Market Risk
+    description: Change how much a Velocity spot asset counts as collateral, what borrowing it costs, its status, paused operations and deposit cap
+    idl_account_name: SpotMarket
+    properties:
+      - path: initial_asset_weight
+        label: Initial Asset Weight
+        description: "Share of a deposit's value that backs new risk, 10000 = 100%. Keep it at or below the maintenance weight. Example: 8000"
+      - path: maintenance_asset_weight
+        label: Maintenance Asset Weight
+        description: "Share of a deposit's value that counts against liquidation, 10000 = 100%. Example: 9000"
+      - path: initial_liability_weight
+        label: Initial Liability Weight
+        description: "A borrow's value times this, 10000 = 100%, when adding risk. Keep it at or above the maintenance weight. Example: 11500"
+      - path: maintenance_liability_weight
+        label: Maintenance Liability Weight
+        description: "A borrow's value times this, 10000 = 100%, against liquidation. Example: 11000"
+      - path: optimal_utilization
+        label: Optimal Utilization
+        description: "Utilization where the borrow rate reaches optimal_borrow_rate, 1000000 = 100%. Example: 800000"
+      - path: optimal_borrow_rate
+        label: Optimal Borrow Rate
+        description: "Yearly borrow rate at optimal utilization, 1000000 = 100%. Example: 100000"
+      - path: max_borrow_rate
+        label: Max Borrow Rate
+        description: "Yearly borrow rate at 100% utilization, 1000000 = 100%. Keep it at or above optimal_borrow_rate. Example: 1500000"
+      - path: min_borrow_rate
+        label: Min Borrow Rate
+        description: "Floor of the yearly borrow rate in steps of 0.5%, at most 255. Example: 200 (100%)"
+      - path: status
+        label: Market Status
+        description: 'Initialized, Active, ReduceOnly, Settlement or Delisted. Deposits need Active. Example: {"ReduceOnly": null}'
+      - path: paused_operations
+        label: Paused Operations
+        description: "Bit flags: 1 interest updates, 2 fills, 4 deposits, 8 withdrawals, 16 liquidation. 0 pauses nothing"
+      - path: max_token_deposits
+        label: Max Token Deposits
+        description: "Cap on total deposits in the token's base units; 0 means no cap. Example: 1000000000"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity spot markets hold the collateral and borrows of perps traders, program
+      vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P.
+
+      FIND A MARKET: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":1064}] and dataSlice {"offset":0,"length":0}: these are the spot markets. Read
+      them with getMultipleAccounts and encoding jsonParsed; `name` holds the asset name as ASCII
+      bytes (SOL starts 83,79,76), `market_index` its index and `mint` the token. A market address
+      the user gives is used as is.
+
+      Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
+      never in values.
+
+      Weights use 10000 = 100%. A deposit counts as collateral at its value x asset weight; a
+      borrow counts at its value x liability weight. Initial weights decide whether an account may
+      add risk, maintenance weights whether it can be liquidated, so lowering
+      maintenance_asset_weight makes accounts that hold the asset liquidatable without a price
+      move. Keep initial_asset_weight <= maintenance_asset_weight <= 10000 and
+      initial_liability_weight >= maintenance_liability_weight >= 10000, as the program's admin
+      path does. The quote market (index 0, USDT) keeps every weight at 10000.
+
+      The yearly borrow rate rises linearly from 0 to optimal_borrow_rate at optimal_utilization,
+      then towards max_borrow_rate at full utilization, and never goes below min_borrow_rate x
+      0.5%. Rates and utilization use 1000000 = 100%. Interest accrues when anyone sends
+      update_spot_market_cumulative_interest or moves the market's balances.
+
+      status is an enum object such as {"Active": null}; deposits need Active. paused_operations
+      is a bit mask (4 deposits, 8 withdrawals, 16 liquidation); read the live value and add bits.
+      max_token_deposits caps total deposits in the token's base units (MaxDeposit, 6038); 0
+      removes the cap.
+
+      EXAMPLE - "SOL collateral counts for half": maintenance_asset_weight: 5000,
+      initial_asset_weight: 4500.
+
+      EXAMPLE - "borrowing USDT costs 100% a year": optimal_borrow_rate: 1000000,
+      max_borrow_rate: 1000000, min_borrow_rate: 200.
