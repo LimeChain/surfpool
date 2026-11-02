@@ -179,11 +179,26 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 
 ---
 
+## Prices on a fork
+
+Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the Surfnet clock is its
+`config.oracle_max_age` seconds past the price's `publish_time`:
+
+- A price override with `fetchBeforeUse: true` loads upstream's current account when it plays.
+  Playing the scenario again loads it again.
+- A health check reads the price of every bank the account uses, not only the one the scenario
+  moves. Reload an older one with `surfnet_resetAccount` on its price account, or raise that bank's
+  `oracle_max_age` with `project0-bank-oracle`.
+- Studio's paused clock stops prices ageing after Play. A running clock or a time travel ages them.
+
+Keep-alive ([solana-foundation/surfpool#906](https://github.com/solana-foundation/surfpool/pull/906))
+will keep the prices published once it lands.
+
 # Troubleshooting
 
 | Rejection | Fix |
 |---|---|
-| Stale oracle | Refetch the feed with `fetchBeforeUse: true` |
+| Stale oracle | Refetch the feed with `fetchBeforeUse: true`, or reload it with `surfnet_resetAccount` - see [Prices on a fork](#prices-on-a-fork) |
 | `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
 | `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
 | The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
