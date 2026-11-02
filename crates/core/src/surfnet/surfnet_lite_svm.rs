@@ -12,10 +12,11 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_loader_v3_interface::get_program_data_address;
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
+use solana_sdk_ids::sysvar;
 use solana_slot_hashes::SlotHashes;
-use solana_sysvar::last_restart_slot::LastRestartSlot;
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::RecentBlockhashes;
+use solana_sysvar::{last_restart_slot::LastRestartSlot, slot_history::SlotHistory};
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
@@ -27,6 +28,22 @@ use crate::{
 };
 
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+/// Sysvars surfpool derives itself; an account write would desync them from the sysvar cache.
+const MANAGED_SYSVARS: [(Pubkey, &str); 5] = [
+    (sysvar::clock::ID, "Clock"),
+    (sysvar::slot_hashes::ID, "SlotHashes"),
+    (sysvar::recent_blockhashes::ID, "RecentBlockhashes"),
+    (sysvar::epoch_schedule::ID, "EpochSchedule"),
+    (sysvar::last_restart_slot::ID, "LastRestartSlot"),
+];
+
+pub fn reject_managed_sysvar(pubkey: &Pubkey) -> SurfpoolResult<()> {
+    match MANAGED_SYSVARS.iter().find(|(id, _)| id == pubkey) {
+        Some((_, name)) => Err(SurfpoolError::managed_sysvar(*pubkey, name)),
+        None => Ok(()),
+    }
+}
 
 #[derive(Clone)]
 pub struct SurfnetLiteSvm {
@@ -112,11 +129,13 @@ impl SurfnetLiteSvm {
         // - Clock: for time-dependent programs
         // - EpochSchedule: the surfnet's own (or the datasource's), not LiteSVM's default
         // - LastRestartSlot: the datasource's, not LiteSVM's 0
+        // - SlotHistory: the blocks produced so far, which Geyser plugins receive with each block
         let recent_blockhashes = self.svm.get_sysvar::<RecentBlockhashes>();
         let slot_hashes = self.svm.get_sysvar::<SlotHashes>();
         let clock = self.svm.get_sysvar::<Clock>();
         let epoch_schedule = self.svm.get_sysvar::<EpochSchedule>();
         let last_restart_slot = self.svm.get_sysvar::<LastRestartSlot>();
+        let slot_history = self.svm.get_sysvar::<SlotHistory>();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::litesvm_settings(feature_set);
@@ -129,6 +148,7 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&clock);
         self.svm.set_sysvar(&epoch_schedule);
         self.svm.set_sysvar(&last_restart_slot);
+        self.svm.set_sysvar(&slot_history);
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {
@@ -241,6 +261,7 @@ impl SurfnetLiteSvm {
     }
 
     pub fn set_account(&mut self, pubkey: Pubkey, account: Account) -> SurfpoolResult<()> {
+        reject_managed_sysvar(&pubkey)?;
         self.set_account_in_db(pubkey, account.clone().into())?;
 
         self.svm.set_account(pubkey, account)?;

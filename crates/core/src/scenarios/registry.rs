@@ -665,11 +665,11 @@ templates:
         // Pyth (2) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Project 0 (Bank 6, MarginfiAccount 2 = 8)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 79
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 90
         assert_eq!(
             registry.count(),
-            79,
-            "Registry should load 79 templates total"
+            90,
+            "Registry should load 90 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -751,8 +751,9 @@ templates:
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
 
-        assert!(registry.contains("phoenix-trader-collateral-stress"));
-        assert!(registry.contains("phoenix-direct-mark-risk-shock"));
+        assert!(registry.contains("phoenix-market-move"));
+        assert!(registry.contains("phoenix-oracle-price"));
+        assert!(registry.contains("phoenix-trader-collateral"));
     }
 
     #[test]
@@ -1089,8 +1090,8 @@ templates: []
         let phoenix_templates = registry.by_protocol("Phoenix Eternal");
         assert_eq!(
             phoenix_templates.len(),
-            8,
-            "Should have 8 Phoenix Eternal templates"
+            19,
+            "Should have 19 Phoenix Eternal templates"
         );
     }
 
