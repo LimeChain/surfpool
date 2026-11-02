@@ -1,11 +1,14 @@
 use std::{fmt::Display, future::Future, pin::Pin};
 
 use crossbeam_channel::TrySendError;
+use itertools::Itertools;
 use jsonrpc_core::{Error, Result};
 use litesvm::error::LiteSVMError;
 use serde::Serialize;
 use serde_json::json;
-use solana_client::{client_error::ClientError, rpc_request::TokenAccountsFilter};
+use solana_client::{
+    client_error::ClientError, rpc_custom_error::RpcCustomError, rpc_request::TokenAccountsFilter,
+};
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -123,6 +126,14 @@ impl SurfpoolError {
     pub fn enable_cheatcode(e: String) -> Self {
         let mut error = Error::invalid_request();
         error.data = Some(json!(format!("Unable to enable cheatcode: {}", e)));
+        Self(error)
+    }
+
+    pub fn managed_sysvar(pubkey: Pubkey, name: &str) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::InvalidParams);
+        error.data = Some(json!(format!(
+            "Failed to set account {pubkey}: the {name} sysvar is maintained by surfpool; use surfnet_timeTravel instead"
+        )));
         Self(error)
     }
 
@@ -248,13 +259,14 @@ impl SurfpoolError {
         Self(error)
     }
 
-    pub fn get_multiple_accounts<T>(e: T) -> Self
+    pub fn get_multiple_accounts<T>(pubkeys: &[Pubkey], e: T) -> Self
     where
         T: ToString,
     {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(
-            "Failed to fetch accounts from remote: {}",
+            "Failed to fetch accounts [{}] from remote: {}",
+            pubkeys.iter().join(", "),
             e.to_string()
         )));
         Self(error)
@@ -449,6 +461,14 @@ impl SurfpoolError {
         )))
     }
 
+    /// A slot a time travel skipped, as Agave answers it: skipped once rooted, else unavailable.
+    pub fn slot_skipped(slot: Slot, rooted: bool) -> Self {
+        Self(match rooted {
+            true => RpcCustomError::SlotSkipped { slot }.into(),
+            false => RpcCustomError::BlockNotAvailable { slot }.into(),
+        })
+    }
+
     pub fn get_block(e: ClientError, block: Slot) -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(
@@ -478,6 +498,15 @@ impl SurfpoolError {
     pub fn invalid_token_account_state(state: &str) -> Self {
         let error = Error::invalid_params(format!("Invalid token account state {state}"));
         Self(error)
+    }
+
+    pub fn filter_transaction_not_found(signature: &str) -> Self {
+        Self(
+            RpcCustomError::FilterTransactionNotFound {
+                signature: signature.to_string(),
+            }
+            .into(),
+        )
     }
 
     pub fn tag_not_found(tag: &str) -> Self {

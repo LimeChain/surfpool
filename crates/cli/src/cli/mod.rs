@@ -16,6 +16,7 @@ use hiro_system_kit::{self, Logger};
 // The only caller is the daemon fork, which exists on Linux alone.
 #[cfg(target_os = "linux")]
 use log::info;
+use solana_hash::Hash;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
@@ -23,10 +24,11 @@ use surfpool_core::surfnet::svm::SurfnetSvmConfig;
 use surfpool_mcp::McpOptions;
 use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
-    DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL, DEFAULT_NETWORK_HOST,
-    DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL, DEFAULT_TPU_PORT,
-    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StartupPlanner,
-    StudioConfig, SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
+    CheatcodeFilter, DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL,
+    DEFAULT_NETWORK_HOST, DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL,
+    DEFAULT_TPU_PORT, DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SURFNET_CHEATCODE_METHODS,
+    SimnetConfig, SimnetEvent, StartupPlanner, StudioConfig, SubgraphConfig, SurfpoolConfig,
+    SvmFeatureConfig, parse_feature_pubkey,
 };
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
@@ -284,6 +286,13 @@ pub struct StartNetworkOptions {
         long_help = "Run without a remote RPC datasource. Use this to simulate an offline environment.\n\nExample: surfpool start --offline"
     )]
     pub offline: bool,
+    /// Report this hash from getGenesisHash.
+    #[arg(
+        long = "genesis-hash",
+        value_name = "HASH",
+        long_help = "Report this hash from getGenesisHash instead of the datasource's, so clients identify the surfnet as that cluster. Offline, the default is a hash that changes on every start.\n\nExample: surfpool start --offline --genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+    )]
+    pub genesis_hash: Option<Hash>,
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -468,6 +477,39 @@ pub struct StartSvmOptions {
     /// Skip transaction blockhash validation.
     #[clap(long = "skip-blockhash-check", action=ArgAction::SetTrue, default_value = "false")]
     pub skip_blockhash_check: bool,
+    /// Lock cheatcodes for the life of the surfnet.
+    #[arg(
+        long = "lock-cheatcodes",
+        value_name = "METHODS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "all",
+        value_delimiter = ',',
+        value_parser = parse_lockable_method,
+        long_help = "Lock cheatcodes before the RPC server accepts its first request. Locked methods are refused for the life of the surfnet: nothing, including surfnet_enableCheatcode, turns them back on.\n\nWithout a value, locks the whole surfnet: every surfnet_* method, requestAirdrop, the snapshotSubscribe WebSocket import, and the admin methods exit, loadPlugin, reloadPlugin and unloadPlugin. Stop it with Ctrl-C or a signal, since `surfpool stop` relies on exit. With a comma-separated list, locks only those surfnet_* methods.\n\nExample: surfpool start --lock-cheatcodes\nExample: surfpool start --lock-cheatcodes=surfnet_setAccount,surfnet_timeTravel"
+    )]
+    pub lock_cheatcodes: Option<Vec<String>>,
+}
+
+impl StartSvmOptions {
+    pub fn cheatcode_lock(&self) -> Option<CheatcodeFilter> {
+        let methods = self.lock_cheatcodes.as_ref()?;
+        Some(if methods.iter().any(|m| m == "all") {
+            CheatcodeFilter::all()
+        } else {
+            CheatcodeFilter::List(methods.clone())
+        })
+    }
+}
+
+fn parse_lockable_method(method: &str) -> Result<String, String> {
+    if method == "all" || SURFNET_CHEATCODE_METHODS.contains(&method) {
+        Ok(method.to_string())
+    } else {
+        Err(format!(
+            "{method} is not a cheatcode; expected `all` or a surfnet_* method"
+        ))
+    }
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -607,6 +649,7 @@ impl StartSimnet {
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
+            cheatcode_lock: self.svm.cheatcode_lock(),
         }
     }
 
@@ -689,6 +732,7 @@ impl StartSimnet {
             skip_blockhash_check: self.svm.skip_blockhash_check,
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
+            genesis_hash: self.network.genesis_hash,
         }
     }
 
@@ -1049,6 +1093,11 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
 
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         if let Some(message) = error.get("message").and_then(|message| message.as_str()) {
+            if message.contains("is currently disabled") {
+                return Err(format!(
+                    "Surfpool RPC returned error: {message}. The surfnet's cheatcodes are locked; stop it with Ctrl-C or by signalling its process"
+                ));
+            }
             return Err(format!("Surfpool RPC returned error: {message}"));
         }
         return Err(format!("Surfpool RPC returned error: {error}"));
@@ -1066,8 +1115,25 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+/// The command tree completion scripts are generated from. Subcommands name themselves as bare
+/// binaries for their help; a completion script needs each one's path from the root, or it
+/// offers none of their arguments.
+fn completion_command() -> clap::Command {
     let mut app = Opts::command();
+    let names: Vec<String> = app
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_string())
+        .collect();
+    for name in names {
+        app = app.mut_subcommand(&name, |subcommand| {
+            subcommand.bin_name(format!("surfpool {name}"))
+        });
+    }
+    app
+}
+
+async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+    let mut app = completion_command();
     let file_name = cmd.shell.file_name("surfpool");
     let mut file = File::create(file_name.clone())
         .map_err(|e| format!("unable to create file {}: {}", file_name, e))?;
@@ -1209,6 +1275,42 @@ pub fn setup_logger(
 mod tests {
     use super::*;
 
+    #[test]
+    fn bash_completion_offers_the_start_arguments() {
+        let mut script = Vec::new();
+        clap_complete::generate(
+            Shell::Bash,
+            &mut completion_command(),
+            "surfpool",
+            &mut script,
+        );
+        let script = String::from_utf8(script).unwrap();
+        // The case `surfpool start` enters, then the options that case offers.
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let entered = lines
+            .iter()
+            .position(|line| *line == "surfpool,start)")
+            .expect("a start transition");
+        let name = lines[entered + 1]
+            .strip_prefix("cmd=\"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the start case name");
+        let section = lines
+            .iter()
+            .position(|line| *line == format!("{name})"))
+            .expect("a start section");
+        let opts = lines[section..]
+            .iter()
+            .find(|line| line.starts_with("opts="))
+            .expect("start options");
+        for flag in ["--rpc-url", "--port", "--no-tui"] {
+            assert!(
+                opts.split(['"', ' ']).any(|word| word == flag),
+                "{flag} missing from {opts}"
+            );
+        }
+    }
+
     fn start_long_help() -> String {
         let mut command = Opts::command();
         let start = command
@@ -1313,6 +1415,23 @@ mod tests {
         .expect_err("rpc-url and network should conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn start_parser_passes_genesis_hash_to_the_simnet() {
+        let mainnet = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+        let cmd = parse_start(&["surfpool", "start", "--offline", "--genesis-hash", mainnet]);
+
+        assert_eq!(
+            cmd.simnet_config(vec![], BTreeMap::new()).genesis_hash,
+            Some(mainnet.parse().unwrap())
+        );
+        assert_eq!(
+            parse_start(&["surfpool", "start"])
+                .simnet_config(vec![], BTreeMap::new())
+                .genesis_hash,
+            None
+        );
     }
 
     #[test]
