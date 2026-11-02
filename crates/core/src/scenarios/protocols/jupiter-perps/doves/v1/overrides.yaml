@@ -1,0 +1,56 @@
+protocol: jupiter-perps-doves
+version: v1
+account_type: AgPriceFeed
+idl_file_path: idl.json
+
+tags:
+  - oracle
+  - price-feed
+  - perpetuals
+  - defi
+
+templates:
+  - id: jupiter-perps-doves-price
+    name: Override Perps Oracle Price
+    description: Override the Doves price Jupiter Perps reads for one asset
+    idl_account_name: AgPriceFeed
+    properties:
+      - path: price
+        label: Price
+        description: "Price mantissa; the USD price is price x 10^expo. Example: 8000000000 is $80 at expo -8"
+    address:
+      type: pubkey
+    llm_context: |
+      Jupiter Perps prices every market from a Doves AgPriceFeed, and this template moves that
+      price. Liquidations, JLP deposits and quotes all read it. Perps never reads the custody's
+      Pyth account, so pyth-price-feed-v2 does not move Perps.
+
+      FIND THE FEED (read it live, nothing is hardcoded):
+      1. getAccountInfo on the JLP Pool 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with
+         encoding jsonParsed. result.value.data.parsed.custodies lists every custody.
+      2. getMultipleAccounts on those custodies with jsonParsed. Take the custody whose mint is
+         the asset's mint; its doves_ag_oracle is this template's address.
+
+      SET THE PRICE:
+      - price = usd_price x 10^-expo; read expo from the feed and keep it.
+        $80.00 -> 8000000000
+      - Set fetchBeforeUse: true so the feed's other fields keep their live values.
+      - Set only the price for a liquidation: liquidations do not check a feed's age.
+      - Nothing publishes Doves prices on a surfnet. A JLP deposit, withdrawal, swap or quote
+        reads every custody's feed and refuses one older than 5 seconds (a quote 15), and a
+        keeper fill needs a price published after its request. For those, also write timestamp
+        on every feed the action reads, ahead of the Surfnet clock by as long as the test runs:
+        Perps accepts a time ahead of the clock and records only the clock.
+
+      LIQUIDATIONS: a keeper liquidates a position once collateral + PnL - close and borrow
+      fees falls below size x 10000 / the custody's pricing.max_leverage. Move a long's price
+      below its liquidation price, or a short's above it. A cascade is one override per asset
+      in the same slot.
+
+      JLP PRICE GUARD: a shock that moves the JLP price more than the pool's
+      max_lp_token_price_change_bps (500 = 5%) refuses JLP deposits (error 6066), so a large shock
+      on a heavily weighted token such as SOL trips it. Raise the limit with
+      jupiter-perps-pool-limits.
+
+      EXAMPLE - SOL crashes to $80:
+      price: 8000000000
