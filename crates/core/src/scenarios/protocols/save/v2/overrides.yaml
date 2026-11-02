@@ -105,7 +105,8 @@ templates:
       rejects a price whose conf x 10 exceeds it. Save accepts a Pyth price for 120 seconds, so
       keep fetchBeforeUse: true and leave publish_time unset; upstream's current value arrives when
       the override plays. The price then stays valid for 120 s of Surfnet clock; play the scenario
-      again before acting later.
+      again before acting later. Every other reserve the obligation lists needs a price under 120 s
+      old as well.
 
       To make one debt asset riskier than others, raise config.added_borrow_weight_bps on the DEBT
       reserve: 10000 counts every borrowed dollar twice.

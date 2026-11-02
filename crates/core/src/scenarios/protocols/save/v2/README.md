@@ -155,21 +155,29 @@ save-reserve-rates
 
 Rates are APR in whole percent, compounded per slot on the next `refresh_reserve`.
 
-## Keep the price fresh
+## Prices on a fork
 
 Save accepts a Pyth price for **120 seconds** after its `publish_time`, measured against the Surfnet
-clock, not the real one. Playing a scenario with an enabled Save or Pyth override marks every Pyth
-price already loaded as published at that moment (see the
-[scenarios README](../../../README.md#scenario-registration)), so leave `publish_time` unset.
-Prices age again while the clock runs; play the scenario again to refresh them. A `publish_time`
-written into the scenario is kept, which is how to make a price stale on purpose.
+clock, and has no setting for it. Nothing publishes Pyth prices on a surfnet, so a price is usable
+for 120 seconds of Surfnet clock after it was loaded:
+
+- A price override with `fetchBeforeUse: true` loads upstream's current price account when it plays,
+  so leave `publish_time` unset. Playing the scenario again loads it again.
+- A transaction refreshes every reserve the obligation lists, so every one of their prices must be
+  fresh, not only the one the scenario moves. Reload an older one with `surfnet_resetAccount` on its
+  price account; the next read loads upstream's current copy.
+- Studio's paused clock stops prices ageing after Play. A running clock or a time travel ages them.
+- An older `publish_time` written into the scenario makes a price stale on purpose.
+
+Keep-alive ([solana-foundation/surfpool#906](https://github.com/solana-foundation/surfpool/pull/906))
+will keep the prices published once it lands.
 
 # Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| A price override on SOL had no effect | The Pyth price aged past 120 s while the clock ran, and SOL fell back to its Switchboard feed. Play the scenario again - see "Keep the price fresh" |
-| `InvalidOracleConfig` on refresh_reserve | Same cause on a reserve with no fallback, such as USDC; play the scenario again. It also fires when `conf x 10 > price`, so lower `conf` along with a crashed price |
+| A price override on SOL had no effect | The Pyth price aged past 120 s while the clock ran, and SOL fell back to its Switchboard feed. Play the scenario again - see "Prices on a fork" |
+| `InvalidOracleConfig` on refresh_reserve | Same cause on a reserve with no fallback, such as USDC; reload its price account with `surfnet_resetAccount`. It also fires when `conf x 10 > price`, so lower `conf` along with a crashed price |
 | `Math operation overflow` on refresh_reserve | The reserve was loaded from upstream after the Surfnet clock stopped, so its `last_update.slot` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
 | A health or `market_price` override disappeared | Recomputed by `refresh_reserve` or `refresh_obligation`. Override the oracle or the reserve's settings instead |
 | `NegativeInterestRate` | The borrow entry's `cumulative_borrow_rate_wads` is above the reserve's. Copy the reserve's current value |
