@@ -259,13 +259,15 @@ templates:
         encoding: u8
         label: Number of deposits
         description: >-
-          Always 1. This template writes exactly one deposit entry
+          Must be 1: this template writes exactly one deposit entry, and any other count makes the
+          program read entries this template did not write
       - path: borrows_len
         offset: 203
         encoding: u8
         label: Number of borrows
         description: >-
-          Always 1. This template writes exactly one borrow entry
+          Must be 1: this template writes exactly one borrow entry, and any other count makes the
+          program read entries this template did not write
       - path: deposits.0.deposit_reserve
         offset: 204
         encoding: bytes32
@@ -305,6 +307,10 @@ templates:
       The obligation's cached values (deposited_value, borrowed_value and the borrow limits) keep
       their old numbers until refresh_obligation runs, which a Save transaction does first, so
       read the position's health after a refresh, not from the account right after the override.
+      The deposit entry also keeps its attributed_borrow_value, the share of the debt its reserve
+      counts; a refresh subtracts it from the new deposit_reserve's total before adding the fresh
+      share. That total is right when the deposit stays on the same reserve, and off by the old
+      share when the reserve changes, which only the reserve's attributed-borrow limits read.
 
       THE ACCOUNT MUST ALREADY EXIST. An obligation is not a PDA. Its address is
       createWithSeed(owner, seed, So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo), where seed is

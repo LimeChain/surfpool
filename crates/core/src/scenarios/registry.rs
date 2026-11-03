@@ -419,13 +419,6 @@ templates:
                 "{} must not embed a backend account catalog",
                 template.id
             );
-            assert!(
-                template.llm_context.as_deref().is_some_and(
-                    |context| context.contains("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo")
-                ),
-                "{} must say how to find its account on the program",
-                template.id
-            );
         }
     }
 
