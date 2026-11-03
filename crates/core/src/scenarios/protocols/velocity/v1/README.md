@@ -221,9 +221,9 @@ fail with `MaxOpenInterest` (6154). `status: {"ReduceOnly": null}` refuses any o
 
 `idl.json` is the IDL Velocity publishes on chain in its Program Metadata account
 `Bv2hvSEESQELxaqhtm7gGqGpquEVEgFcsArTWLif56ci`, unchanged (sha256
-`a76b9e9872b538b8a9261e3e4347cad88270b46ff7ab59a15c828403a71d0317`). Velocity rewrites that account
-with every upgrade; this copy was written in slot 451568782 together with the deployed release,
-version 2.169.0 of [velocity-exchange/velocity-v1](https://github.com/velocity-exchange/velocity-v1).
+`1a746c36f818be772c8adfccc2393e197ab879c23093dcfab929c564608a62b2`). Velocity rewrites that account
+with every upgrade; this copy was written in slot 464750765 together with the deployed release,
+version 2.170.0 of [velocity-exchange/velocity-v1](https://github.com/velocity-exchange/velocity-v1).
 The IDL in the npm package `@velocity-exchange/sdk` adds LP pool and devnet instructions and
 accounts that the published one leaves out.
 

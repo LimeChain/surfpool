@@ -42,8 +42,8 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const PROGRAM: Pubkey = Pubkey::from_str_const("vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P");
 const STATE: Pubkey = Pubkey::from_str_const("2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW");
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("HkRf36jvUB32dnHjHqpMnPcKJhUP2TUKJTH7RDTifJm7");
-/// Release program-velocity-v2.169.0.
-const DEPLOYED_SLOT: u64 = 451_568_782;
+/// Release program-velocity-v2.170.0.
+const DEPLOYED_SLOT: u64 = 464_750_765;
 
 const ORACLE_PRICE: &str = "velocity-oracle-price";
 const MARKET_RISK: &str = "velocity-perp-market-risk";

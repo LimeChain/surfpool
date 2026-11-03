@@ -1,5 +1,5 @@
 protocol: Velocity
-version: v2.169.0
+version: v2.170.0
 account_type: PerpMarket
 idl_file_path: idl.json
 
