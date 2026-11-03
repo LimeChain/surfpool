@@ -85,9 +85,9 @@ templates:
       liquidation reads the spot price, borrows and withdrawals check the EMA. The bank refuses a
       price older than config.oracle_max_age seconds, so keep fetchBeforeUse: true and leave the
       time fields unset, as pyth-core-compatible-price-feed-v2 explains. Read the bank first: when its
-      config.cb_deviation_bps_tiers.0 is above 0, the circuit breaker is on and the same scenario
-      needs project0-bank-oracle on that bank with both breaker references at the new price, as
-      that template explains.
+      flags include 2048 (bit 11), the circuit breaker is on and the same scenario needs
+      project0-bank-oracle on that bank with both breaker references moved with the price, as that
+      template explains.
 
       EXAMPLE - "SOL collateral only counts at 30% against liquidation":
       config.asset_weight_maint.value: "84442493013197"
@@ -180,19 +180,26 @@ templates:
       bank's price account, config.oracle_keys.0.
 
       CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
-      tokens, BTC and ETH. It is on when config.cb_deviation_bps_tiers.0 is above 0. Such a bank
+      tokens, BTC and ETH. It is on when the bank's flags include 2048 (bit 11). Such a bank
       rejects borrow, withdraw and liquidation with error 6604 (CircuitBreakerPriceJump) once its
-      price, net of the oracle's confidence, is that many basis points (50 for USDC, 600 for SOL)
-      away from cb_reference_price, or past the 24h cap from cb_window_reference_price. Read the
-      bank with getAccountInfo jsonParsed to see the tiers. Two ways to work with it:
-      - MOVE THE REFERENCES (the default): set cb_reference_price.value and
-        cb_window_reference_price.value to the new price in the same scenario as the price
-        override. The breaker then treats the new price as normal and still guards further moves,
-        like a slow move it has adapted to. A bank whose breaker is off ignores both fields.
+      price, net of the oracle's confidence, is config.cb_deviation_bps_tiers.0 basis points (50
+      for USDC, 600 for SOL) away from cb_reference_price, or past the 24h cap from
+      cb_window_reference_price. The confidence counts 2.12 times, so at a typical USDC confidence
+      the 50 bps take about a 0.7% move. Read the bank with getAccountInfo jsonParsed to see its
+      flags, tiers and references. Two ways to work with it:
+      - MOVE THE REFERENCES (the default): in the same scenario as the price override, multiply
+        the bank's current cb_reference_price.value and cb_window_reference_price.value by the
+        price move (new price / current price). They hold the price the bank computes, which for
+        liquid staking tokens includes the exchange rate, so scaling the current values works for
+        every bank; on SOL and USDC they are the price x 2^48. The breaker then treats the new
+        price as normal and still guards further moves, like a slow move it has adapted to. A
+        bank whose breaker is off ignores both fields.
       - CHANGE THE THRESHOLDS: set the three config.cb_deviation_bps_tiers entries and the two
         config.cb_window_max_*_bps caps. Use this to test the breaker itself, with a price just
-        under or just over tier 1, or to model the admin loosening it. Only all five at 10000
-        switch it off; tier 1 alone still trips the cache crank at the higher tiers.
+        under or just over tier 1, or to model the admin loosening it. Raising tier 1 alone is not
+        enough: a borrow or withdrawal still checks tiers 2 and 3 and the 24h caps and can halt
+        the bank (6600). All five at 10000 let any move through. The breaker's own off switch is
+        bit 11 of flags, which these templates do not write.
 
       Kamino, Drift and JupLend wrapped banks also need their venue account refreshed in the same
       transaction, which these templates do not do.

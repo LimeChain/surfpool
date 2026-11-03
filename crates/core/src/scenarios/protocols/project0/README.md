@@ -102,11 +102,14 @@ Tested against the deployed program: SOL at $20 turns a healthy SOL-backed USDC 
 liquidatable.
 
 **Most banks have a price circuit breaker**, among them the stablecoins, SOL and its liquid staking
-tokens, BTC and ETH. It is on when the bank's `config.cb_deviation_bps_tiers[0]` is above 0. Once
-the price, net of the oracle's confidence, is that many basis points (50 for USDC, 600 for SOL)
-away from the bank's `cb_reference_price`, borrow, withdraw and liquidation fail with
-`CircuitBreakerPriceJump` (6604). Read the bank to see its tiers, and move the reference with the
-price, as above for SOL and here for USDC:
+tokens, BTC and ETH. It is on when the bank's `flags` include `2048` (bit 11). Once the price, net
+of the oracle's confidence, is `config.cb_deviation_bps_tiers[0]` basis points (50 for USDC, 600
+for SOL) away from the bank's `cb_reference_price`, borrow, withdraw and liquidation fail with
+`CircuitBreakerPriceJump` (6604). The confidence counts 2.12 times, so at a typical USDC
+confidence the 50 bps take about a 0.7% move. Read the bank to see its flags and tiers, and move
+both references by the same factor as the price. They hold the price the bank computes, which for
+liquid staking tokens includes the exchange rate, so scale the bank's current values; on SOL and
+USDC they are the price x 2^48, as above for SOL and here for USDC:
 
 ```
 project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
@@ -125,9 +128,10 @@ has adapted to. That is the default: it keeps the breaker on and tests the proto
 The other way is to change the breaker's own thresholds on the bank with the same template: the
 three `config.cb_deviation_bps_tiers` entries and the `config.cb_window_max_up_bps` /
 `config.cb_window_max_down_bps` caps. Use it to test the breaker itself, with a price just under
-or just over the first tier, or to model the admin loosening it. Only all five at `10000` switch
-it off: the first tier alone still lets the price-cache crank halt the bank at a higher tier
-(`BankCircuitBreakerHalted`, 6600).
+or just over the first tier, or to model the admin loosening it. Raising the first tier alone is
+not enough: a borrow or withdrawal still checks the higher tiers and the 24h caps and can halt the
+bank (`BankCircuitBreakerHalted`, 6600). All five at `10000` let any move through. The breaker's
+own off switch is bit 11 of `flags`, which these templates do not write.
 
 ## Build a position from scratch
 
@@ -207,6 +211,7 @@ will keep the prices published once it lands.
 | Withdraw fails on the token transfer | Shares imply more tokens than the bank's `liquidity_vault` holds. Raise the vault with `spl-token-account-balance` |
 | `exceeds what a JSON number can hold exactly` | Pass `.value` fields as decimal strings |
 | A Kamino-, Drift- or JupLend-wrapped bank rejects its price | Those need the venue account refreshed in the same transaction, which these templates do not cover |
+| An earlier change to a bank or account is gone | A later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it. Give later overrides of the same account `fetchBeforeUse: false` |
 
 ---
 
