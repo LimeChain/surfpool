@@ -125,7 +125,9 @@ templates:
       config.operational_state is an enum. Pass the variant name, e.g. "ReduceOnly".
 
       Variants: Paused, Operational, ReduceOnly, KilledByBankruptcy, Uninitialized,
-      ReduceOnlyWithBorrowingPower, CircuitBroken.
+      ReduceOnlyWithBorrowingPower, CircuitBroken. Scenarios use the first three and
+      ReduceOnlyWithBorrowingPower; KilledByBankruptcy, Uninitialized and CircuitBroken are states
+      the program moves a bank into itself.
 
       EXAMPLE - "no new deposits or borrows, repayments still allowed":
       config.operational_state: "ReduceOnly"
@@ -153,11 +155,13 @@ templates:
       - path: config.cb_window_max_up_bps
         label: Circuit breaker 24h cap up (bps)
         description: >-
-          Largest rise from cb_window_reference_price the breaker allows inside its window
+          Largest rise from cb_window_reference_price the breaker allows inside its window; 0 means
+          the program's default cap, not no cap
       - path: config.cb_window_max_down_bps
         label: Circuit breaker 24h cap down (bps)
         description: >-
-          Largest drop from cb_window_reference_price the breaker allows inside its window
+          Largest drop from cb_window_reference_price the breaker allows inside its window; 0 means
+          the program's default cap, not no cap
       - path: cb_reference_price.value
         label: Circuit breaker reference price
         description: >-
