@@ -16,7 +16,7 @@ templates:
     properties:
       - path: price
         label: Price
-        description: "Price x 10^8 (every live oracle has exponent -8). Example: 8500000000 for $85"
+        description: "USD x 10^-exponent, with exponent read from the oracle (-8 on every live oracle today). Example: 8500000000 for $85 at -8"
       - path: conf
         label: Confidence
         description: Uncertainty band in the same scale as price; scale it with price so their ratio holds
@@ -41,7 +41,8 @@ templates:
 
       Set fetchBeforeUse: true. Put the oracle in the override's account as {"pubkey":"<oracle>"},
       never in values. A later override of the same account, in another scenario or slot, uses
-      fetchBeforeUse false, since a reload drops earlier local changes to it.
+      fetchBeforeUse false, since a reload drops earlier local changes to it; two overrides of it
+      in the same slot can both keep true.
 
       Write price, posted_slot and publish_time together. Read the oracle and the Clock in one
       getMultipleAccounts call with encoding jsonParsed: [<oracle>,
@@ -110,7 +111,8 @@ templates:
 
       Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
       never in values. A later override of the same account, in another scenario or slot, uses
-      fetchBeforeUse false, since a reload drops earlier local changes to it.
+      fetchBeforeUse false, since a reload drops earlier local changes to it; two overrides of it
+      in the same slot can both keep true.
 
       Margin ratios are shares of position value where 10000 = 100%. An account whose collateral
       falls below the maintenance requirement can be liquidated. Raising
@@ -169,7 +171,8 @@ templates:
       The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
       fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
       A later override of the State, in another scenario or slot, uses fetchBeforeUse false,
-      since a reload drops earlier local changes to it, such as an unpause.
+      since a reload drops earlier local changes to it, such as an unpause; two State overrides
+      in the same slot can both keep true.
 
       exchange_status pauses actions on every market. It is a bit mask, 0 runs everything: 1
       deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM
@@ -228,7 +231,8 @@ templates:
       The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
       fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
       A later override of the State, in another scenario or slot, uses fetchBeforeUse false,
-      since a reload drops earlier local changes to it, such as an unpause.
+      since a reload drops earlier local changes to it, such as an unpause; two State overrides
+      in the same slot can both keep true.
 
       An account pays the perp fees of the higher of its 30-day volume tier and promo_fee_tier.
       The program uses tiers 0 to 3 only, so promo_fee_tier: 3 puts every account on tier 3.
@@ -298,7 +302,8 @@ templates:
 
       Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
       never in values. A later override of the same account, in another scenario or slot, uses
-      fetchBeforeUse false, since a reload drops earlier local changes to it.
+      fetchBeforeUse false, since a reload drops earlier local changes to it; two overrides of it
+      in the same slot can both keep true.
 
       Weights use 10000 = 100%. A deposit counts as collateral at its value x asset weight; a
       borrow counts at its value x liability weight. Initial weights decide whether an account may

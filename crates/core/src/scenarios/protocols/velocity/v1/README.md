@@ -23,7 +23,7 @@ liquidations are sent by your own code. For how scenarios work in general see th
 
 | Field | Meaning | Example |
 |---|---|---|
-| `price`, `conf` | USD x 10^8 (every live oracle has `exponent` -8) | `8500000000` = $85 |
+| `price`, `conf` | USD x 10^-`exponent`, read from the oracle (-8 on every live oracle today) | `8500000000` = $85 at -8 |
 | `posted_slot` | the slot the price counts as posted at; write the current slot | |
 | `publish_time` | Pyth Lazer timestamp in microseconds | unix seconds x `1000000` |
 | `margin_ratio_maintenance`, `margin_ratio_initial` | share of position value, `10000` = 100% | `300` = 3% |
