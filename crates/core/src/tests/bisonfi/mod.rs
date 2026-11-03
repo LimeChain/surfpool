@@ -627,6 +627,33 @@ async fn bisonfi_rig() -> std::sync::Arc<BisonfiRig> {
         .clone()
 }
 
+/// The byte the maker sets to halt a pool: while it is non-zero the pool pays nothing in either
+/// direction, at any size, though the maker keeps republishing it.
+const BISONFI_HALTED: usize = 824;
+
+/// The pools in `all` a replay must be able to quote: the maker still republishes them and has not
+/// halted them, they hold reserves, and both their mints are classic SPL tokens the harness can build
+/// accounts for. Which pools that is changes with the maker's decisions, so tests assert on this set
+/// rather than on a count of pools.
+fn bisonfi_pools_expected_to_quote(all: &[Vec<u8>], programs: &[(Pubkey, Pubkey)]) -> Vec<usize> {
+    let spl = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    let published = |data: &[u8]| u64::from_le_bytes(data[72..80].try_into().unwrap());
+    let newest = all.iter().map(|data| published(data)).max().unwrap_or(0);
+    all.iter()
+        .zip(programs)
+        .enumerate()
+        .filter(|(_, (data, (base, quote)))| {
+            // Dormant pools are millions of slots behind; a republished one is a few slots at most.
+            newest - published(data) <= 1_000
+                && data[BISONFI_HALTED] == 0
+                && u64::from_le_bytes(data[48..56].try_into().unwrap()) >= 1_000_000
+                && *base == spl
+                && *quote == spl
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 async fn bisonfi_rig_uncached() -> BisonfiRig {
     let elf = bisonfi_elf().await;
     let all = fetch(&BISONFI_ALL_POOLS).await;
@@ -651,16 +678,20 @@ async fn bisonfi_rig_uncached() -> BisonfiRig {
             }
         }
     }
-    // Six of the seventeen v3 pools publish a current mid. Two more are live but quote a Token-2022
-    // base asset the harness cannot build accounts for; the rest are dormant by 13-30 million slots
-    // and return no quote whatever is written to them. If this count drops, coverage silently
-    // narrowed and the scenario assertions below stop meaning anything.
+    // Every pool the maker republishes and has not halted must quote, or coverage silently narrowed
+    // and the scenario assertions below stop meaning anything. Dormant, halted and Token-2022 pools
+    // are skipped: which pools those are is the maker's decision, not a regression.
+    let expected = bisonfi_pools_expected_to_quote(&all, &programs);
+    let silent: Vec<&str> = expected
+        .iter()
+        .map(|&index| BISONFI_ALL_POOLS[index])
+        .filter(|pool| !quoting.iter().any(|(quoted, _, _)| quoted == pool))
+        .collect();
     assert!(
-        quoting.len() >= 6,
-        "only {} of {} pools can be quoted; scenario coverage has narrowed",
-        quoting.len(),
-        BISONFI_ALL_POOLS.len()
+        silent.is_empty(),
+        "{silent:?} are republished and not halted but cannot be quoted; scenario coverage has narrowed"
     );
+    assert!(!quoting.is_empty(), "no BisonFi pool can be quoted");
     BisonfiRig { elf, quoting }
 }
 
@@ -849,9 +880,10 @@ async fn bisonfi_scenario_one_sided_liquidity() {
     }
     // Both directions must actually have been exercised, or a wrong notional skips the buy leg
     // silently.
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised both directions of the depth template"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised both directions of the depth template"
     );
 }
 
@@ -909,7 +941,11 @@ async fn bisonfi_a_stale_quote_pays_nothing_and_ignores_min_out() {
         );
         checked += 1;
     }
-    assert!(checked >= 6, "only {checked} markets were checked");
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets were checked"
+    );
 }
 
 /// SCENARIO: make a given market unable to fill a trade at all.
@@ -1105,9 +1141,10 @@ async fn bisonfi_scenario_set_spread() {
         );
         checked += 1;
     }
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the spread template; the claim needs the live markets"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the spread template; the claim needs the live markets"
     );
 }
 
@@ -1567,9 +1604,10 @@ async fn bisonfi_scenario_dislocated_price_behind_thin_depth() {
         );
         checked += 1;
     }
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the combined scenario"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the combined scenario"
     );
 }
 
@@ -1737,15 +1775,18 @@ async fn bisonfi_spread_lever_moves_the_quote_on_every_pool() {
         }
     }
 
-    // Without this the whole test could pass while quoting on nothing at all. Six of the seventeen v3
-    // pools publish a current mid and can be replayed; two more are live but quote a Token-2022 base
-    // asset the harness cannot build accounts for (Custom(60)), and the rest are dormant, between 13
-    // and 30 million slots behind, and return no quote whatever is written to them.
+    // Without this the whole test could pass while quoting on nothing at all. Every pool the maker
+    // republishes and has not halted must have priced; dormant, halted and Token-2022 pools, which the
+    // harness cannot build accounts for (Custom(60)), return no quote whatever is written to them.
+    let silent: Vec<&str> = bisonfi_pools_expected_to_quote(&all, &programs)
+        .into_iter()
+        .map(|index| BISONFI_ALL_POOLS[index])
+        .filter(|pool| !peaks.iter().any(|(priced, _, _)| priced == pool))
+        .collect();
     assert!(
-        peaks.len() >= 6,
-        "only {} pools produced a quote at any size: {peaks:?}. This test proves nothing if the \
-         markets are not actually pricing",
-        peaks.len()
+        silent.is_empty() && !peaks.is_empty(),
+        "{silent:?} are republished and not halted but produced no quote at any size ({peaks:?}). \
+         This test proves nothing if the markets are not actually pricing"
     );
 }
 
@@ -2470,9 +2511,10 @@ async fn bisonfi_depth_lever_is_monotonic_on_every_quoting_market() {
 
     // Previously this test covered three hardcoded markets while the other three templates were proven
     // on every pool that quotes. Without this floor it could silently narrow back to one.
-    assert!(
-        checked >= 6,
-        "only {checked} quoting markets exercised the depth lever"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the depth lever"
     );
 }
 
@@ -3324,9 +3366,10 @@ async fn bisonfi_staleness_suppresses_the_price_and_spread_levers() {
         checked += 1;
     }
 
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the precedence of the freshness gate"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the precedence of the freshness gate"
     );
 }
 
