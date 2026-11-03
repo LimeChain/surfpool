@@ -165,6 +165,7 @@ deposits then fail with 6043.
 | 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | write the position's feed `timestamp` later than the request - see "Prices on a fork" |
 | 6066 `LpTokenPriceChangeLimitExceeded` | the JLP price moved past the guard | raise `max_lp_token_price_change_bps` |
 | 6000 `MathOverflow` on a stablecoin custody | its borrow-lend debt overflowed a large rate or time jump | lower the rate or the time step |
+| an earlier change to a custody, the pool or a feed is gone | a later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it | give later overrides of the same account `fetchBeforeUse: false` |
 
 # IDL provenance
 

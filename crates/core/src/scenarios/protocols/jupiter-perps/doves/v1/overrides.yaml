@@ -18,6 +18,9 @@ templates:
       - path: price
         label: Price
         description: "Price mantissa; the USD price is price x 10^expo. Example: 8000000000 is $80 at expo -8"
+      - path: timestamp
+        label: Publish time
+        description: "Unix seconds the price was published. Deposits, swaps and quotes refuse a feed 5 seconds older than the clock, and a keeper fill needs a time after its request; Perps accepts a time ahead of the clock"
     address:
       type: pubkey
     llm_context: |
