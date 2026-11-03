@@ -1,0 +1,128 @@
+{
+  "address": "MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms",
+  "metadata": {
+    "name": "manifest",
+    "version": "3.0.26",
+    "spec": "0.1.0",
+    "description": "The MarketFixed header of a Manifest market. Orders live in the tree nodes after it."
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "MarketFixed",
+      "discriminator": [
+        240,
+        175,
+        97,
+        143,
+        147,
+        159,
+        113,
+        67
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "MarketFixed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "base_mint_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "quote_mint_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "base_vault_bump",
+            "type": "u8"
+          },
+          {
+            "name": "quote_vault_bump",
+            "type": "u8"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "base_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "order_sequence_number",
+            "type": "u64"
+          },
+          {
+            "name": "num_bytes_allocated",
+            "type": "u32"
+          },
+          {
+            "name": "bids_root_index",
+            "type": "u32"
+          },
+          {
+            "name": "bids_best_index",
+            "type": "u32"
+          },
+          {
+            "name": "asks_root_index",
+            "type": "u32"
+          },
+          {
+            "name": "asks_best_index",
+            "type": "u32"
+          },
+          {
+            "name": "claimed_seats_root_index",
+            "type": "u32"
+          },
+          {
+            "name": "free_list_head_index",
+            "type": "u32"
+          },
+          {
+            "name": "padding2",
+            "type": "u32"
+          },
+          {
+            "name": "quote_volume",
+            "type": "u64"
+          },
+          {
+            "name": "base_global",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_global",
+            "type": "pubkey"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -68,6 +68,10 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const MANIFEST_V1_IDL_CONTENT: &str = include_str!("./protocols/manifest/v1/idl.json");
+pub const MANIFEST_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/manifest/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -117,6 +121,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_manifest_overrides();
         default
     }
 
@@ -221,6 +226,14 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_manifest_overrides(&mut self) {
+        self.load_protocol_overrides(
+            MANIFEST_V1_IDL_CONTENT,
+            MANIFEST_V1_OVERRIDES_CONTENT,
+            "manifest",
         );
     }
 
@@ -606,11 +619,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19)
+        // + Manifest (3) = 84
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            84,
+            "Registry should load 84 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -685,6 +699,10 @@ mod tests {
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("manifest-book-shift"));
+        assert!(registry.contains("manifest-orders-expire"));
+        assert!(registry.contains("manifest-depth-cut"));
     }
 
     #[test]
@@ -1016,6 +1034,13 @@ templates: []
             phoenix_templates.len(),
             19,
             "Should have 19 Phoenix Eternal templates"
+        );
+
+        let manifest_templates = registry.by_protocol("Manifest");
+        assert_eq!(
+            manifest_templates.len(),
+            3,
+            "Should have 3 Manifest templates"
         );
     }
 
