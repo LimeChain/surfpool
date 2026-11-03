@@ -34,6 +34,16 @@ const SELL: u8 = 0;
 const BUY: u8 = 1;
 
 async fn fetch(addresses: &[&str]) -> Vec<Account> {
+    fetch_optional(addresses)
+        .await
+        .into_iter()
+        .zip(addresses)
+        .map(|(account, address)| account.unwrap_or_else(|| panic!("{address} no longer exists")))
+        .collect()
+}
+
+/// [`fetch`] for accounts that may not exist, such as a Whirlpool tick array nobody initialised.
+async fn fetch_optional(addresses: &[&str]) -> Vec<Option<Account>> {
     let client = SurfnetRemoteClient::new(
         std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
     );
@@ -57,11 +67,10 @@ async fn fetch(addresses: &[&str]) -> Vec<Account> {
     };
     results
         .into_iter()
-        .zip(addresses)
-        .map(|(result, address)| match result {
+        .map(|result| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account,
-            GetAccountResult::None(_) => panic!("{address} no longer exists"),
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => Some(account),
+            GetAccountResult::None(_) => None,
         })
         .collect()
 }
@@ -446,7 +455,6 @@ fn run(
     use solana_instruction::{AccountMeta, Instruction};
     use solana_keypair::Keypair;
     use solana_signer::Signer;
-    use solana_transaction::Transaction;
 
     let program = Pubkey::from_str_const(PROGRAM);
     let token_program = Pubkey::from_str_const(TOKEN_PROGRAM);
@@ -537,21 +545,34 @@ fn run(
             data,
         },
     ];
-    let mut msg = solana_message::Message::new(&instructions, Some(&taker.pubkey()));
+    send(&mut svm, &taker, &instructions)?;
+    let dst = if side == SELL { user_quote } else { user_base };
+    Ok(u64_at(
+        &svm.get_account(&dst).expect("destination").data,
+        64,
+    ))
+}
+
+/// Sends `instructions` signed by `payer` alone, with the program's logs on failure.
+fn send(
+    svm: &mut litesvm::LiteSVM,
+    payer: &solana_keypair::Keypair,
+    instructions: &[solana_instruction::Instruction],
+) -> Result<(), String> {
+    use solana_signer::Signer;
+    use solana_transaction::Transaction;
+
+    let mut msg = solana_message::Message::new(instructions, Some(&payer.pubkey()));
     msg.recent_blockhash = svm.latest_blockhash();
     let mut tx = Transaction::new_unsigned(msg);
     tx.signatures = vec![
         solana_signature::Signature::default();
         tx.message.header.num_required_signatures as usize
     ];
-    tx.signatures[0] = taker.sign_message(&tx.message.serialize());
+    tx.signatures[0] = payer.sign_message(&tx.message.serialize());
     svm.send_transaction(tx)
-        .map_err(|e| format!("{:?} {:?}", e.err, e.meta.logs))?;
-    let dst = if side == SELL { user_quote } else { user_base };
-    Ok(u64_at(
-        &svm.get_account(&dst).expect("destination").data,
-        64,
-    ))
+        .map(|_| ())
+        .map_err(|e| format!("{:?} {:?}", e.err, e.meta.logs))
 }
 
 fn assert_rejects(result: Result<u64, String>, code: &str, context: &str) {
@@ -1174,4 +1195,320 @@ async fn goonfi_keep_alive_stamps_one_slot_back_because_the_update_slot_pays_one
             }
         }
     }
+}
+
+const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+/// The Orca SOL/USDC pool the `whirlpool-sol-usdc` template targets.
+const WHIRLPOOL_SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
+/// Ticks one Whirlpool tick array holds, in units of the pool's tick spacing.
+const TICK_ARRAY_SIZE: i32 = 88;
+/// Whirlpool's upper sqrt-price bound, the limit of a swap that buys token A.
+const MAX_SQRT_PRICE_X64: u128 = 79_226_673_515_401_279_992_447_579_055;
+
+/// The Whirlpool SOL/USDC pool and every account a swap on it reads, loaded from mainnet.
+struct WhirlpoolRig {
+    elf: Vec<u8>,
+    pool: Account,
+    vault_a: Account,
+    vault_b: Account,
+    tick_arrays: HashMap<Pubkey, Account>,
+    oracle: Option<Account>,
+}
+
+fn whirlpool_pda(seeds: &[&[u8]]) -> Pubkey {
+    Pubkey::find_program_address(seeds, &Pubkey::from_str_const(WHIRLPOOL_PROGRAM)).0
+}
+
+fn tick_array_address(tick: i32, spacing: i32) -> Pubkey {
+    let size = TICK_ARRAY_SIZE * spacing;
+    let start = tick.div_euclid(size) * size;
+    whirlpool_pda(&[
+        b"tick_array",
+        Pubkey::from_str_const(WHIRLPOOL_SOL_USDC).as_ref(),
+        start.to_string().as_bytes(),
+    ])
+}
+
+fn pool_tick(pool: &[u8]) -> (i32, i32) {
+    let spacing = i32::from(u16::from_le_bytes(pool[41..43].try_into().unwrap()));
+    (
+        i32::from_le_bytes(pool[81..85].try_into().unwrap()),
+        spacing,
+    )
+}
+
+/// The three tick arrays a swap that buys token A walks through, from the pool's current tick up.
+fn buy_tick_arrays(pool: &[u8]) -> [Pubkey; 3] {
+    let (tick, spacing) = pool_tick(pool);
+    let size = TICK_ARRAY_SIZE * spacing;
+    [0, 1, 2].map(|i| tick_array_address(tick + spacing + i * size, spacing))
+}
+
+async fn whirlpool_rig() -> WhirlpoolRig {
+    let a = fetch(&[WHIRLPOOL_PROGRAM, WHIRLPOOL_SOL_USDC]).await;
+    let (program, pool) = (&a[0], &a[1]);
+    let programdata = fetch(&[&pubkey_at(&program.data, 4).to_string()])
+        .await
+        .remove(0);
+    let vaults = fetch(&[
+        &pubkey_at(&pool.data, 133).to_string(),
+        &pubkey_at(&pool.data, 213).to_string(),
+    ])
+    .await;
+    // Every array a purchase can walk from the live tick or from up to about 10% below it.
+    let (tick, spacing) = pool_tick(&pool.data);
+    let size = TICK_ARRAY_SIZE * spacing;
+    let arrays: Vec<Pubkey> = (-1..=4)
+        .map(|i| tick_array_address(tick - 1_100 + i * size, spacing))
+        .collect();
+    let oracle = whirlpool_pda(&[
+        b"oracle",
+        Pubkey::from_str_const(WHIRLPOOL_SOL_USDC).as_ref(),
+    ]);
+    let keys: Vec<String> = arrays
+        .iter()
+        .chain([&oracle])
+        .map(Pubkey::to_string)
+        .collect();
+    let mut found = fetch_optional(&keys.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let oracle = found.pop().flatten();
+    WhirlpoolRig {
+        elf: programdata.data[45..].to_vec(),
+        pool: pool.clone(),
+        vault_a: vaults[0].clone(),
+        vault_b: vaults[1].clone(),
+        tick_arrays: arrays
+            .into_iter()
+            .zip(found)
+            .filter_map(|(key, account)| account.map(|account| (key, account)))
+            .collect(),
+        oracle,
+    }
+}
+
+/// Buys SOL with `usdc_in` on the Whirlpool, in the pool state `pool`; returns the SOL received.
+fn whirlpool_buy_sol(
+    rig: &WhirlpoolRig,
+    fixture: &GoonfiFixture,
+    pool: &[u8],
+    usdc_in: u64,
+) -> Result<u64, String> {
+    use litesvm::LiteSVM;
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
+    use solana_signer::Signer;
+
+    let program = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
+    let whirlpool = Pubkey::from_str_const(WHIRLPOOL_SOL_USDC);
+    let (vault_a, vault_b) = (pubkey_at(pool, 133), pubkey_at(pool, 213));
+    let oracle = whirlpool_pda(&[b"oracle", whirlpool.as_ref()]);
+    let tick_arrays = buy_tick_arrays(pool);
+    let mut svm = LiteSVM::new()
+        .with_sigverify(false)
+        .with_blockhash_check(false);
+    svm.add_program(program, &rig.elf)
+        .map_err(|e| format!("add_program: {e:?}"))?;
+    let mut clock: solana_clock::Clock = svm.get_sysvar();
+    clock.unix_timestamp = fixture.unix_timestamp + 1;
+    svm.set_sysvar(&clock);
+
+    let pool_account = Account {
+        data: pool.to_vec(),
+        ..rig.pool.clone()
+    };
+    let mut accounts = vec![
+        (whirlpool, pool_account),
+        (vault_a, rig.vault_a.clone()),
+        (vault_b, rig.vault_b.clone()),
+        fixture.base_mint.clone(),
+        fixture.quote_mint.clone(),
+    ];
+    accounts.extend(tick_arrays.iter().filter_map(|key| {
+        rig.tick_arrays
+            .get(key)
+            .map(|account| (*key, account.clone()))
+    }));
+    accounts.extend(rig.oracle.clone().map(|account| (oracle, account)));
+    for (key, account) in accounts {
+        svm.set_account(key, account)
+            .map_err(|e| format!("set {key}: {e:?}"))?;
+    }
+
+    let taker = Keypair::new();
+    svm.airdrop(&taker.pubkey(), 10_000_000_000)
+        .map_err(|e| format!("airdrop: {e:?}"))?;
+    let (user_sol, user_usdc) = (Pubkey::new_unique(), Pubkey::new_unique());
+    for (key, mint, amount) in [
+        (user_sol, fixture.base_mint.0, 0),
+        (user_usdc, fixture.quote_mint.0, usdc_in),
+    ] {
+        svm.set_account(key, token_account(&mint, &taker.pubkey(), amount))
+            .map_err(|e| format!("user token account: {e:?}"))?;
+    }
+
+    // swap(amount, other_amount_threshold, sqrt_price_limit, amount_specified_is_input, a_to_b)
+    let mut data = vec![248, 198, 158, 145, 225, 117, 135, 200];
+    data.extend_from_slice(&usdc_in.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&MAX_SQRT_PRICE_X64.to_le_bytes());
+    data.extend_from_slice(&[1, 0]);
+    let swap = Instruction {
+        program_id: program,
+        accounts: vec![
+            AccountMeta::new_readonly(Pubkey::from_str_const(TOKEN_PROGRAM), false),
+            AccountMeta::new_readonly(taker.pubkey(), true),
+            AccountMeta::new(whirlpool, false),
+            AccountMeta::new(user_sol, false),
+            AccountMeta::new(vault_a, false),
+            AccountMeta::new(user_usdc, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new(tick_arrays[0], false),
+            AccountMeta::new(tick_arrays[1], false),
+            AccountMeta::new(tick_arrays[2], false),
+            AccountMeta::new(oracle, false),
+        ],
+        data,
+    };
+    send(&mut svm, &taker, &[swap])?;
+    Ok(u64_at(
+        &svm.get_account(&user_sol).expect("SOL account").data,
+        64,
+    ))
+}
+
+/// The "PMM Arbitrage" example Studio offers: SOL drops 5% on the Whirlpool SOL/USDC pool while
+/// GoonFi still prices it at the old level. The scenario is built from the shipped templates through
+/// `SurfnetSvm` and played 30 slots on, past the point GoonFi's own quote would have gone stale. Both
+/// legs then run against the deployed programs: USDC buys SOL on Whirlpool and the SOL sells to
+/// GoonFi for more USDC than was spent, while the same round trip on mainnet state does not pay.
+#[tokio::test]
+async fn goonfi_pmm_arbitrage_against_a_whirlpool_drop_pays_end_to_end() {
+    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+
+    use crate::surfnet::svm::SurfnetSvm;
+
+    let fixture = &fixtures().await[0];
+    let rig = whirlpool_rig().await;
+    assert_eq!(
+        (
+            pubkey_at(&rig.pool.data, 101),
+            pubkey_at(&rig.pool.data, 181)
+        ),
+        (fixture.base_mint.0, fixture.quote_mint.0),
+        "the Whirlpool must trade the same SOL and USDC as the GoonFi market"
+    );
+    let later = fixture.slot + 30;
+    // USDC gained by buying SOL on Whirlpool and selling it to GoonFi, in basis points of the USDC spent.
+    let round_trip = |pool: &[u8], goonfi: &State, clock: u64| -> i64 {
+        let usdc_in = fixture.quote_trade;
+        let sol = whirlpool_buy_sol(&rig, fixture, pool, usdc_in)
+            .unwrap_or_else(|e| panic!("buy SOL on Whirlpool: {e}"));
+        let usdc_out = run(fixture, goonfi, SELL, sol, clock)
+            .unwrap_or_else(|e| panic!("sell {sol} SOL to GoonFi: {e}"));
+        (i128::from(usdc_out) - i128::from(usdc_in)) as i64 * 10_000 / usdc_in as i64
+    };
+    let control = round_trip(&rig.pool.data, &fixture.upstream(), fixture.slot + 1);
+
+    // What the AI writes for the prompt: the pool's price 5% lower, and GoonFi's price as it stands.
+    let sqrt_price = u128::from_le_bytes(rig.pool.data[65..81].try_into().unwrap());
+    let dropped = (sqrt_price as f64 * 0.95f64.sqrt()) as u128;
+    let dropped_tick = ((dropped as f64 / 2f64.powi(64)).powi(2).ln() / 1.0001f64.ln()).floor();
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(fixture.slot);
+    for (address, seeded) in [
+        (WHIRLPOOL_SOL_USDC, &rig.pool),
+        (fixture.def.oracle, &fixture.oracle),
+    ] {
+        svm.inner
+            .set_account(Pubkey::from_str_const(address), seeded.clone())
+            .unwrap_or_else(|e| panic!("seed {address}: {e:?}"));
+    }
+    let mut scenario = Scenario::new(
+        "PMM Arbitrage".to_string(),
+        "SOL drops 5% on Whirlpool while GoonFi still prices it at the old level".to_string(),
+    );
+    for (template_id, target_account, values) in [
+        (
+            "whirlpool-sol-usdc",
+            WHIRLPOOL_SOL_USDC,
+            vec![
+                ("sqrt_price", serde_json::json!(dropped.to_string())),
+                ("tick_current_index", serde_json::json!(dropped_tick as i32)),
+            ],
+        ),
+        (
+            "goonfi-price",
+            fixture.def.oracle,
+            vec![
+                (
+                    "bid_price_x1e6",
+                    serde_json::json!(u64_at(&fixture.oracle.data, 0)),
+                ),
+                (
+                    "ask_price_x1e6",
+                    serde_json::json!(u64_at(&fixture.oracle.data, 8)),
+                ),
+            ],
+        ),
+    ] {
+        scenario.add_override(
+            OverrideInstance::new(
+                template_id.to_string(),
+                0,
+                AccountAddress::Pubkey(target_account.to_string()),
+            )
+            .with_values(
+                values
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
+        );
+    }
+    svm.register_scenario(scenario, Some(fixture.slot))
+        .expect("register the PMM Arbitrage scenario");
+    for slot in [fixture.slot, later] {
+        svm.set_latest_absolute_slot(slot);
+        svm.materialize_overrides_for_slot(&None, slot)
+            .await
+            .unwrap_or_else(|e| panic!("play slot {slot}: {e}"));
+    }
+    let materialized = |address: &str| {
+        svm.inner
+            .get_account(&Pubkey::from_str_const(address))
+            .expect("read scenario account")
+            .unwrap_or_else(|| panic!("missing scenario account {address}"))
+            .data
+    };
+    let pool = materialized(WHIRLPOOL_SOL_USDC);
+    assert_eq!(
+        u128::from_le_bytes(pool[65..81].try_into().unwrap()),
+        dropped,
+        "the Whirlpool template writes the dropped price"
+    );
+    let played = State {
+        oracle: materialized(fixture.def.oracle),
+        ..fixture.upstream()
+    };
+
+    assert_rejects(
+        run(
+            fixture,
+            &fixture.upstream(),
+            SELL,
+            fixture.base_trade,
+            later,
+        ),
+        STALE_ORACLE,
+        "GoonFi's own quote 30 slots on, which only keep-alive keeps fillable",
+    );
+    let profit = round_trip(&pool, &played, later);
+    assert!(
+        control < 100,
+        "mainnet state alone must not hold a 1% arbitrage: {control} bp"
+    );
+    assert!(
+        profit > 300,
+        "a 5% drop less Whirlpool's 0.3% fee and GoonFi's spread must pay: {profit} bp (mainnet {control} bp)"
+    );
 }
