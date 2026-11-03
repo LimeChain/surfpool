@@ -1269,119 +1269,8 @@ async fn bisonfi_spread_template_writes_only_its_tick_fields() {
     }
 }
 
-/// The live Orca Whirlpool SOL/USDC market, used as the AMM side of the arbitrage scenario.
+/// The live Orca Whirlpool SOL/USDC market the swap harness is checked against.
 const WHIRLPOOL_SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
-
-/// SCENARIO: arbitrage between BisonFi and an AMM on the same pair.
-///
-/// Surfpool loads mainnet state into the local VM, so dislocating BisonFi alone creates a real
-/// arbitrage against every other venue's upstream state with no second override. This measures that
-/// against Orca's actual on-chain price rather than a hardcoded number.
-///
-/// The Whirlpool's price comes from its `sqrt_price` (Q64.64 at offset 65), squared. Nothing is
-/// executed on the AMM side: pricing an Orca swap needs its tick arrays, which is a much larger piece
-/// of harness. What this proves is that the override produces a dislocation that is real, correctly
-/// signed, and of the right size against a live competing venue - which is what a router would act on.
-///
-/// It is also self-validating: the first assertion is that both venues agree on the price BEFORE any
-/// override. If the Whirlpool layout were misread, or the pair mismatched, that would fail rather than
-/// silently making the arbitrage numbers meaningless.
-#[tokio::test]
-async fn bisonfi_scenario_arbitrage_against_an_amm() {
-    let rig = bisonfi_rig().await;
-    let (pool, data, tp) = rig
-        .quoting
-        .iter()
-        .find(|(p, _, _)| *p == BISONFI_POOL)
-        .expect("the WSOL/USDC market must be quoting for this scenario");
-
-    let whirlpool = fetch(&[WHIRLPOOL_SOL_USDC]).await.remove(0);
-    // Confirm the two venues really are the same pair and the same way round, so the comparison below
-    // is between like and like.
-    let (bisonfi_base, bisonfi_quote) = (&data[184..216], &data[216..248]);
-    assert_eq!(
-        &whirlpool[101..133],
-        bisonfi_base,
-        "the Whirlpool's token A must be BisonFi's base mint"
-    );
-    assert_eq!(
-        &whirlpool[181..213],
-        bisonfi_quote,
-        "the Whirlpool's token B must be BisonFi's quote mint"
-    );
-
-    // Whirlpool price, in quote smallest-units per base smallest-unit. Squaring a Q64.64 needs care:
-    // done in f64 after the shift, which is ample for a comparison at this tolerance.
-    let sqrt_price = u128::from_le_bytes(whirlpool[65..81].try_into().unwrap());
-    let amm_price = (sqrt_price as f64 / 2f64.powi(64)).powi(2);
-    assert!(
-        amm_price > 0.0,
-        "the Whirlpool must carry a live sqrt_price, got {sqrt_price}"
-    );
-
-    // BisonFi's realized price on the same basis: quote received per base sold.
-    let size = u64::from_le_bytes(data[48..56].try_into().unwrap()) / 100;
-    let realized = |image: Option<Vec<u8>>| -> f64 {
-        let out = match image {
-            None => bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {}),
-            Some(img) => bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, move |d| *d = img),
-        }
-        .unwrap_or_else(|e| panic!("replay failed: {e}"));
-        assert!(
-            out > 0,
-            "BisonFi must fill for the comparison to mean anything"
-        );
-        out as f64 / size as f64
-    };
-
-    // 1. Undislocated, the two venues must agree. A proprietary market maker that disagreed with the
-    //    largest AMM on SOL by more than a fraction of a percent would be arbitraged instantly.
-    let quiet = realized(None);
-    let disagreement = (quiet - amm_price).abs() / amm_price;
-    assert!(
-        disagreement < 0.02,
-        "BisonFi and Orca should price SOL within 2% of each other before any override; got \
-         {quiet:.9} against {amm_price:.9} ({:.3}% apart). Either a layout offset is wrong or one \
-         venue is not live",
-        disagreement * 100.0
-    );
-
-    // 2. Now dislocate BisonFi upward by 10% through the shipped template, and the arbitrage appears:
-    //    buy SOL on Orca, sell it to BisonFi.
-    let mid = u128::from_le_bytes(data[832..848].try_into().unwrap());
-    let registry = TemplateRegistry::new();
-    let template = registry.get("bisonfi-fair-value").expect("template");
-    assert!(template.raw_layout, "fair value uses raw-layout writes");
-    let dislocated = template
-        .materialize_raw_layout(
-            data,
-            &HashMap::from([(
-                "fair_value".to_string(),
-                serde_json::json!((mid * 11 / 10).to_string()),
-            )]),
-            0,
-        )
-        .expect("price override");
-    let rich = realized(Some(dislocated));
-
-    let edge = (rich - amm_price) / amm_price;
-    assert!(
-        rich > quiet,
-        "the dislocated market must pay more than the quiet one, got {rich:.9} vs {quiet:.9}"
-    );
-    assert!(
-        edge > 0.05,
-        "a 10% dislocation should leave at least 5% of edge against the AMM after BisonFi's own \
-         spread and slippage; got {:.3}%",
-        edge * 100.0
-    );
-    assert!(
-        edge < 0.11,
-        "the edge cannot exceed the 10% dislocation that created it; got {:.3}%, which would mean \
-         the price override is scaling by more than it was asked to",
-        edge * 100.0
-    );
-}
 
 /// A long run stays quoting with nothing scheduled after its first override: keep-alive republishes
 /// the pool every slot while the scenario is registered.
@@ -2861,119 +2750,6 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
 
 const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
-/// Every account an Orca Whirlpool `swap` needs is derivable and present, so the AMM leg of the
-/// cross-venue arbitrage scenario can be executed rather than only priced.
-///
-/// `bisonfi_scenario_arbitrage_against_an_amm` currently compares BisonFi's quote against Whirlpool's
-/// published state. Making that leg atomic - both swaps in one transaction - needs three tick arrays
-/// and an oracle at PDAs that are only created lazily, so whether they exist is a fact about the
-/// market and not something to assume. This pins it, and pins the derivation itself: a `TickArray`
-/// stores its own `start_tick_index` and a back-pointer to its whirlpool, so if the seed scheme were
-/// wrong the addresses would either not resolve or resolve to another pool's arrays. A derivation that
-/// skips the off-curve bump search produces addresses that look plausible and do not exist, which is
-/// exactly the failure this guards against.
-#[tokio::test]
-async fn whirlpool_swap_account_graph_is_derivable_and_present() {
-    const TICK_ARRAY_LEN: usize = 9988;
-    const TICKS_PER_ARRAY: i32 = 88;
-
-    let prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
-    let wp_key = Pubkey::from_str_const(WHIRLPOOL_SOL_USDC);
-    let wp = fetch(&[WHIRLPOOL_SOL_USDC]).await.remove(0);
-
-    let spacing = u16::from_le_bytes(wp[41..43].try_into().unwrap());
-    let tick_current = i32::from_le_bytes(wp[81..85].try_into().unwrap());
-    let mint_a = Pubkey::try_from(&wp[101..133]).expect("token_mint_a");
-    let vault_a = Pubkey::try_from(&wp[133..165]).expect("token_vault_a");
-    let mint_b = Pubkey::try_from(&wp[181..213]).expect("token_mint_b");
-    let vault_b = Pubkey::try_from(&wp[213..245]).expect("token_vault_b");
-    assert!(spacing > 0, "tick_spacing must be positive, got {spacing}");
-
-    // The array a tick falls in starts at a multiple of spacing*88, rounded toward negative infinity.
-    // Integer division truncates toward zero, which is the wrong way for the negative ticks a SOL/USDC
-    // pool actually sits at, so this rounds explicitly.
-    let per_array = spacing as i32 * TICKS_PER_ARRAY;
-    let start = (tick_current as f32 / per_array as f32).floor() as i32 * per_array;
-    assert!(
-        start <= tick_current && tick_current < start + per_array,
-        "the current tick {tick_current} must fall inside its own array [{start}, {})",
-        start + per_array
-    );
-
-    let (oracle, _) = Pubkey::find_program_address(&[b"oracle", wp_key.as_ref()], &prog);
-    let starts: Vec<i32> = [-1i32, 0, 1]
-        .iter()
-        .map(|k| start + k * per_array)
-        .collect();
-    let arrays: Vec<Pubkey> = starts
-        .iter()
-        .map(|s| {
-            Pubkey::find_program_address(
-                &[b"tick_array", wp_key.as_ref(), s.to_string().as_bytes()],
-                &prog,
-            )
-            .0
-        })
-        .collect();
-
-    let mut addrs: Vec<String> = arrays.iter().map(|a| a.to_string()).collect();
-    addrs.push(vault_a.to_string());
-    addrs.push(vault_b.to_string());
-    addrs.push(oracle.to_string());
-    let refs: Vec<&str> = addrs.iter().map(|s| s.as_str()).collect();
-    let got = fetch_optional(&refs).await;
-
-    for ((s, addr), data) in starts.iter().zip(arrays.iter()).zip(got.iter()) {
-        let data = data.as_ref().unwrap_or_else(|| {
-            panic!(
-                "tick array for start {s} ({addr}) does not exist. A swap crossing into it would \
-                 fail, so the atomic leg needs a pool whose neighbouring arrays are initialized"
-            )
-        });
-        assert_eq!(data.len(), TICK_ARRAY_LEN, "{addr}: not a TickArray");
-        // start_tick_index sits right after the 8-byte Anchor discriminator.
-        assert_eq!(
-            i32::from_le_bytes(data[8..12].try_into().unwrap()),
-            *s,
-            "{addr}: the account's own start_tick_index disagrees with the seed it was derived \
-             from, so the derivation is wrong"
-        );
-        // ...and the trailing whirlpool back-pointer proves it belongs to THIS pool.
-        assert_eq!(
-            Pubkey::try_from(&data[TICK_ARRAY_LEN - 32..]).expect("whirlpool back-pointer"),
-            wp_key,
-            "{addr}: belongs to a different whirlpool"
-        );
-    }
-
-    for (label, mint, vault, data) in [
-        ("a", mint_a, vault_a, &got[3]),
-        ("b", mint_b, vault_b, &got[4]),
-    ] {
-        let data = data
-            .as_ref()
-            .unwrap_or_else(|| panic!("token_vault_{label} {vault} does not exist"));
-        assert_eq!(
-            data.len(),
-            165,
-            "token_vault_{label}: not an SPL token account"
-        );
-        assert_eq!(
-            Pubkey::try_from(&data[0..32]).expect("vault mint"),
-            mint,
-            "token_vault_{label} does not hold the mint the whirlpool declares"
-        );
-    }
-
-    // The oracle is only initialized for adaptive-fee pools. Classic `swap` takes it as an
-    // UncheckedAccount, so an absent one is passable as an empty account - but the address still has to
-    // be the right PDA, which is why it is derived here rather than faked.
-    assert!(
-        got[5].is_none() || got[5].as_ref().map(|d| !d.is_empty()).unwrap_or(false),
-        "oracle {oracle} resolved to a zero-length account, which is neither absent nor valid"
-    );
-}
-
 /// Orca's `swap`, transcribed from the IDL the program itself publishes on chain.
 ///
 /// Taken from the Anchor IDL account at `2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`, which carries
@@ -3267,7 +3043,7 @@ fn whirlpool_replay(
 
 /// A real Orca Whirlpool swap executes against state loaded from upstream, in both directions.
 ///
-/// This is the AMM leg the cross-venue arbitrage scenario needs, and it is also what validates the
+/// This is the AMM leg the cross-pair arbitrage scenario runs on, and it is also what validates the
 /// instruction layout transcribed in `whirlpool_swap`: the assertions below pin all four balances that
 /// move, so a wrong account order or argument encoding cannot pass by coincidence.
 #[tokio::test]
@@ -3309,7 +3085,7 @@ async fn whirlpool_swap_executes_against_loaded_upstream_state() {
         "round-tripping must return less than the 1 SOL it started with after fees, got {got_b}"
     );
 
-    // And the threshold argument is enforced, which the arbitrage test relies on for its profit floor.
+    // And the threshold argument is enforced.
     let greedy = whirlpool_replay(&fork, ONE_SOL, true, got + 1);
     assert!(
         greedy.is_err(),
@@ -3317,315 +3093,148 @@ async fn whirlpool_swap_executes_against_loaded_upstream_state() {
     );
 }
 
-/// Buys a fixed quantity of the base asset on Orca and sells it on BisonFi in ONE transaction.
+/// BisonFi's SOL/USDT pool, the second pair of the cross-pair arbitrage scenario.
+const BISONFI_SOL_USDT: &str = "FJnaiidSLXFweWkgbinxEHRykVHsnkzDcYbNDR3RF5LN";
+/// Orca's USDC/USDT Whirlpool, where the cross-pair arbitrage turns its USDT back into USDC.
+const WHIRLPOOL_USDC_USDT: &str = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4";
+
+/// SCENARIO: Studio's "Cross-Pair Arbitrage" example, end to end.
 ///
-/// `dislocation` scales BisonFi's published mid, so a value above 1.0 makes BisonFi the richer bid and
-/// the round trip profitable. Returns the taker's net change in the quote asset - negative is a loss.
-///
-/// The two legs are coupled by using an exact-OUTPUT swap on Orca: an instruction's amounts are fixed
-/// when the transaction is built, so a leg that bought "whatever N USDC gets" could not be followed by
-/// a leg that sells exactly that. Asking Orca for exactly N base tokens and paying whatever it costs
-/// makes the second leg's size known in advance, which is what lets both legs sit in one transaction.
-fn bisonfi_orca_atomic_arb(
-    orca: &WhirlpoolFork,
-    bf_elf: &[u8],
-    bisonfi_pool: &str,
-    bisonfi_snapshot: &[u8],
-    bf_programs: (Pubkey, Pubkey),
-    base_out: u64,
-    fair_value: u128,
-) -> Result<i64, String> {
-    use litesvm::LiteSVM;
-    use solana_account::Account;
-    use solana_instruction::{AccountMeta, Instruction};
-    use solana_keypair::Keypair;
-    use solana_signer::Signer;
-    use solana_transaction::Transaction;
+/// BisonFi's SOL/USDC pool is held at its price and its SOL/USDT pool set 1.5% higher through the
+/// shipped template and `SurfnetSvm`, then played for several slots so keep-alive republishes both
+/// pools. The cycle runs against the deployed programs: USDC buys SOL on BisonFi, the SOL sells for
+/// USDT on BisonFi, and Orca turns the USDT back into USDC - for more than was spent, while the same
+/// cycle on mainnet state does not pay.
+#[tokio::test]
+async fn bisonfi_scenario_cross_pair_arbitrage_pays_end_to_end() {
+    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-    let mut bf = bisonfi_snapshot.to_vec();
+    const PLAY_FOR: u64 = 10;
+    const USDC_IN: u64 = 1_000_000_000;
 
-    let g64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    let base_reserve = g64(&bf, 48);
-    let quote_reserve = g64(&bf, 56);
-    let bf_base_vault = Pubkey::new_from_array(bf[120..152].try_into().unwrap());
-    let bf_quote_vault = Pubkey::new_from_array(bf[152..184].try_into().unwrap());
-    let base_mint = Pubkey::new_from_array(bf[184..216].try_into().unwrap());
-    let quote_mint = Pubkey::new_from_array(bf[216..248].try_into().unwrap());
-    let bf_slot = g64(&bf, 72);
-
-    // Both venues have to be quoting the same pair in the same order, or the shared token accounts
-    // below would be silently routing two unrelated markets.
+    let elf = bisonfi_elf().await;
+    let pools = fetch(&[BISONFI_POOL, BISONFI_SOL_USDT]).await;
+    let programs = bisonfi_token_programs(&pools).await;
+    let (usdc_pool, usdt_pool) = (pools[0].clone(), pools[1].clone());
+    let (usdc_programs, usdt_programs) = (programs[0], programs[1]);
+    let orca = whirlpool_fork(WHIRLPOOL_USDC_USDT).await;
+    let mint = |data: &[u8], offset: usize| Pubkey::try_from(&data[offset..offset + 32]).unwrap();
+    assert_eq!(
+        mint(&usdc_pool, 184),
+        mint(&usdt_pool, 184),
+        "both BisonFi pools must trade the same base"
+    );
     assert_eq!(
         (orca.mint_a, orca.mint_b),
-        (base_mint, quote_mint),
-        "the Orca pool and the BisonFi market must quote the same base/quote pair"
+        (mint(&usdc_pool, 216), mint(&usdt_pool, 216)),
+        "the Whirlpool must trade the two pools' quote tokens, USDC as A and USDT as B"
     );
 
-    // Every run starts from the same external reference, not BisonFi's independently moving live
-    // price. This makes fair and dislocated runs differ only by the template value under test.
-    bisonfi_apply_template(
-        "bisonfi-fair-value",
-        &[("fair_value", serde_json::json!(fair_value.to_string()))],
-    )(&mut bf);
-
-    let bf_prog = Pubkey::from_str_const(BISONFI_PROGRAM);
-    let orca_prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
-    let spl = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-    let bf_key = Pubkey::from_str_const(bisonfi_pool);
-
-    let mut svm = LiteSVM::new()
-        .with_sigverify(false)
-        .with_blockhash_check(false);
-    svm.add_program(bf_prog, bf_elf)
-        .map_err(|e| format!("add bisonfi: {e:?}"))?;
-    svm.add_program(orca_prog, &orca.elf)
-        .map_err(|e| format!("add orca: {e:?}"))?;
-
-    // One clock satisfies both venues: BisonFi checks the SLOT against its own last_update_slot and
-    // Orca checks the TIMESTAMP against its reward accrual, so the two constraints do not collide.
-    let orca_ts = u64::from_le_bytes(orca.data[261..269].try_into().unwrap());
-    let mut clock: solana_clock::Clock = svm.get_sysvar();
-    // BisonFi's tick must also agree with the timestamp to the second. Running at the pool's own
-    // publication time, which is later than Orca's last reward update, satisfies both.
-    let bf_block_time_ms = publish_millis(&bf);
-    clock.slot = bf_slot;
-    clock.unix_timestamp = (orca_ts as i64).max((bf_block_time_ms / 1_000) as i64);
-    svm.set_sysvar(&clock);
-    let tick = install_market_tick(&mut svm, bf_slot, clock.unix_timestamp as u64 * 1_000);
-    svm.set_sysvar(&LastRestartSlot {
-        // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
-        last_restart_slot: 246_464_040,
-    });
-
-    let owned = |data: Vec<u8>, owner: Pubkey| Account {
-        lamports: 10_000_000_000,
-        data,
-        owner,
-        executable: false,
-        rent_epoch: 0,
-    };
-    svm.set_account(orca.key, owned(orca.data.clone(), orca_prog))
-        .map_err(|e| format!("{e:?}"))?;
-    for (_, k, d) in &orca.arrays {
-        svm.set_account(*k, owned(d.clone(), orca_prog))
-            .map_err(|e| format!("{e:?}"))?;
-    }
-    for (k, d) in [&orca.vault_a, &orca.vault_b] {
-        svm.set_account(*k, owned(d.clone(), spl))
-            .map_err(|e| format!("{e:?}"))?;
-    }
-    svm.set_account(bf_key, owned(bf, bf_prog))
-        .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        bf_base_vault,
-        owned(
-            token_account(&base_mint, &bf_key, base_reserve),
-            bf_programs.0,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        bf_quote_vault,
-        owned(
-            token_account(&quote_mint, &bf_key, quote_reserve + 79_168),
-            bf_programs.1,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-
-    // The arbitrageur: funded in the quote asset, empty in the base. Both legs share these two
-    // accounts, which is what makes the profit measurable as a single balance change.
-    let taker = Keypair::new();
-    svm.airdrop(&taker.pubkey(), 10_000_000_000)
-        .map_err(|e| format!("{e:?}"))?;
-    let (base_ta, quote_ta) = (Pubkey::new_unique(), Pubkey::new_unique());
-    let quote_funding = quote_reserve / 4;
-    svm.set_account(
-        base_ta,
-        owned(token_account(&base_mint, &taker.pubkey(), 0), spl),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        quote_ta,
-        owned(
-            token_account(&quote_mint, &taker.pubkey(), quote_funding),
-            spl,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-
-    let (oracle, _) = Pubkey::find_program_address(&[b"oracle", orca.key.as_ref()], &orca_prog);
-    let arrays = orca.tick_arrays(false); // buying base means B -> A
-    let buy_on_orca = Instruction {
-        program_id: orca_prog,
-        accounts: vec![
-            AccountMeta::new_readonly(spl, false),
-            AccountMeta::new_readonly(taker.pubkey(), true),
-            AccountMeta::new(orca.key, false),
-            AccountMeta::new(base_ta, false),
-            AccountMeta::new(orca.vault_a.0, false),
-            AccountMeta::new(quote_ta, false),
-            AccountMeta::new(orca.vault_b.0, false),
-            AccountMeta::new(arrays[0], false),
-            AccountMeta::new(arrays[1], false),
-            AccountMeta::new(arrays[2], false),
-            AccountMeta::new_readonly(oracle, false),
-            AccountMeta::new_readonly(orca_prog, false),
-        ],
-        // Exact output: `base_out` of token A, paying up to u64::MAX of token B.
-        data: whirlpool_swap::data(
-            base_out,
-            u64::MAX,
-            whirlpool_swap::MAX_SQRT_PRICE,
-            false,
-            false,
-        ),
-    };
-
-    let mut bf_data = Vec::with_capacity(19);
-    bf_data.push(0x07);
-    bf_data.extend_from_slice(&base_out.to_le_bytes());
-    bf_data.extend_from_slice(&0u64.to_le_bytes()); // min_out; profit is asserted on balances
-    bf_data.push(0); // direction 0 = sell base for quote
-    bf_data.push(0);
-    let sell_on_bisonfi = Instruction {
-        program_id: bf_prog,
-        accounts: vec![
-            AccountMeta::new(taker.pubkey(), true),
-            AccountMeta::new(bf_key, false),
-            AccountMeta::new(bf_base_vault, false),
-            AccountMeta::new(bf_quote_vault, false),
-            AccountMeta::new(base_ta, false),
-            AccountMeta::new(quote_ta, false),
-            AccountMeta::new_readonly(bf_programs.0, false),
-            AccountMeta::new_readonly(bf_programs.1, false),
-            AccountMeta::new_readonly(Pubkey::from_str_const(BISONFI_NINTH), true),
-        ],
-        data: bf_data,
-    };
-    let mut sell_on_bisonfi = sell_on_bisonfi;
-    sell_on_bisonfi.accounts.extend(tick);
-
-    let mut budget = vec![2u8];
-    budget.extend_from_slice(&1_800_000u32.to_le_bytes());
-    let ixs = vec![
-        Instruction {
-            program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
-            accounts: vec![],
-            data: budget,
-        },
-        buy_on_orca,
-        sell_on_bisonfi,
-    ];
-
-    let before = spl_amount(&svm.get_account(&quote_ta).expect("quote_ta").data);
-    let mut msg = solana_message::Message::new(&ixs, Some(&taker.pubkey()));
-    msg.recent_blockhash = svm.latest_blockhash();
-    let nsig = msg.header.num_required_signatures as usize;
-    let mut tx = Transaction::new_unsigned(msg);
-    tx.signatures = vec![solana_signature::Signature::default(); nsig];
-    tx.signatures[0] = taker.sign_message(&tx.message.serialize());
-    svm.send_transaction(tx)
-        .map_err(|e| format!("{:?}", e.err))?;
-
-    let after = spl_amount(&svm.get_account(&quote_ta).expect("quote_ta").data);
-    let leftover = spl_amount(&svm.get_account(&base_ta).expect("base_ta").data);
-    assert_eq!(
-        leftover, 0,
-        "the arbitrageur must end flat in the base asset, or the profit below is really an \
-         unrealized position: {leftover} left over"
-    );
-    Ok(after as i64 - before as i64)
-}
-
-/// SCENARIO: arbitrage between BisonFi and an AMM on the same pair, executed atomically.
-///
-/// Goes further than `bisonfi_scenario_arbitrage_against_an_amm`, which compares the two venues'
-/// quotes without trading: here both legs run in a single transaction against upstream state loaded for both
-/// programs, and the profit is a real balance change in the arbitrageur's own account.
-///
-/// Self-validating in both directions. At the market's true mid the round trip must LOSE money, since
-/// the arbitrageur pays fees on both venues - if that leg showed a profit, the harness would be minting
-/// value and every number it produced would be suspect. Only once the fair-value template dislocates
-/// BisonFi does the same transaction become profitable, and the profit has to grow with the
-/// dislocation.
-#[tokio::test]
-async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
-    const SOL_USDC: &str = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo";
-    const ONE_SOL: u64 = 1_000_000_000;
-
-    // Load both venues once so every point in the sweep executes against exactly the same state.
-    let orca = whirlpool_fork(WHIRLPOOL_SOL_USDC).await;
-    let bf_elf = bisonfi_elf().await;
-    let bf = fetch(&[SOL_USDC]).await.remove(0);
-    let bf_programs = bisonfi_token_programs(&[bf.clone()]).await.remove(0);
-
-    // Orca stores sqrt(raw quote/base) in Q64.64. SOL has 9 decimals and USDC has 6, while
-    // BisonFi stores the human quote/base price in Q40.88, hence the 1000 raw-unit adjustment.
-    let sqrt_price = u128::from_le_bytes(orca.data[65..81].try_into().unwrap());
-    let reference_fair_value = (sqrt_price
-        .checked_mul(sqrt_price)
-        .expect("the Orca square-root price must fit in u128")
-        >> 40)
-        .checked_mul(1_000)
-        .expect("the converted Orca price must fit in u128");
-
-    // No dislocation: both legs use Orca's snapshot price, so fees make the round trip a loss.
-    let fair = bisonfi_orca_atomic_arb(
-        &orca,
-        &bf_elf,
-        SOL_USDC,
-        &bf,
-        bf_programs,
-        ONE_SOL,
-        reference_fair_value,
-    )
-    .expect("the round trip must execute at the shared reference price");
-    assert!(
-        fair < 0,
-        "buying on Orca and selling on BisonFi at the true mid returned a profit of {fair}. Two \
-         venues both charging a fee cannot pay the taker, so the harness is not measuring a real \
-         round trip"
-    );
-
-    // Mark BisonFi up so it becomes the richer bid, and the same transaction becomes an arbitrage.
-    let mut last = fair;
-    let mut two_percent_profit = None;
-    for pct in [2u128, 5, 10] {
-        let dislocated = reference_fair_value
-            .checked_mul(100 + pct)
-            .expect("the dislocated price must fit in u128")
-            / 100;
-        let profit = bisonfi_orca_atomic_arb(
-            &orca,
-            &bf_elf,
-            SOL_USDC,
-            &bf,
-            bf_programs,
-            ONE_SOL,
-            dislocated,
+    // USDC gained by the cycle, in basis points of the USDC spent. Each replay runs at its pool's own
+    // publication, so a played image swaps at the slot keep-alive republished it in.
+    let cycle = |usdc_image: &[u8], usdt_image: &[u8]| -> i64 {
+        let sol = bisonfi_replay(
+            &elf,
+            BISONFI_POOL,
+            usdc_image,
+            usdc_programs,
+            USDC_IN,
+            1,
+            |_| {},
         )
-        .unwrap_or_else(|e| panic!("the round trip must execute with BisonFi {pct}% rich: {e}"));
-        assert!(
-            profit > last,
-            "marking BisonFi up {pct}% must pay better than the {last} the previous step returned, \
-             got {profit}"
+        .unwrap_or_else(|e| panic!("buy SOL for USDC on BisonFi: {e}"));
+        assert!(sol > 0, "BisonFi must sell SOL for USDC");
+        let usdt = bisonfi_replay(
+            &elf,
+            BISONFI_SOL_USDT,
+            usdt_image,
+            usdt_programs,
+            sol,
+            0,
+            |_| {},
+        )
+        .unwrap_or_else(|e| panic!("sell {sol} SOL for USDT on BisonFi: {e}"));
+        assert!(usdt > 0, "BisonFi must buy SOL for USDT");
+        let (_, usdc_out) = whirlpool_replay(&orca, usdt, false, 0)
+            .unwrap_or_else(|e| panic!("swap {usdt} USDT for USDC on Orca: {e}"));
+        (i128::from(usdc_out) - i128::from(USDC_IN)) as i64 * 10_000 / USDC_IN as i64
+    };
+    let control = cycle(&usdc_pool, &usdt_pool);
+
+    // What the AI writes for the prompt: SOL/USDC at the mid it quotes, SOL/USDT 1.5% above its own.
+    let fair_value = |data: &[u8]| u128::from_le_bytes(data[832..848].try_into().unwrap());
+    let published = |data: &[u8]| u64::from_le_bytes(data[72..80].try_into().unwrap());
+    let base_slot = published(&usdc_pool).max(published(&usdt_pool));
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(base_slot);
+    let mut scenario = Scenario::new(
+        "Cross-Pair Arbitrage".to_string(),
+        "BisonFi prices SOL 1.5% higher in USDT than in USDC".to_string(),
+    );
+    for (pool, data, fair_value) in [
+        (BISONFI_POOL, &usdc_pool, fair_value(&usdc_pool)),
+        (
+            BISONFI_SOL_USDT,
+            &usdt_pool,
+            fair_value(&usdt_pool) * 1_015 / 1_000,
+        ),
+    ] {
+        svm.inner
+            .set_account(
+                Pubkey::from_str_const(pool),
+                solana_account::Account {
+                    lamports: 1_000_000,
+                    data: data.clone(),
+                    owner: Pubkey::from_str_const(BISONFI_PROGRAM),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("seed {pool}: {e:?}"));
+        scenario.add_override(
+            OverrideInstance::new(
+                "bisonfi-fair-value".to_string(),
+                0,
+                AccountAddress::Pubkey(pool.to_string()),
+            )
+            .with_values(HashMap::from([(
+                "fair_value".to_string(),
+                serde_json::json!(fair_value.to_string()),
+            )])),
         );
-        if pct == 2 {
-            two_percent_profit = Some(profit);
-        }
-        last = profit;
     }
-    let two_percent_profit = two_percent_profit.expect("the 2% leg must run");
+    svm.register_scenario(scenario, Some(base_slot))
+        .expect("register the Cross-Pair Arbitrage scenario");
+    let last = base_slot + PLAY_FOR;
+    let usdt_image = bisonfi_play(
+        &mut svm,
+        Pubkey::from_str_const(BISONFI_SOL_USDT),
+        base_slot,
+        last,
+    )
+    .await
+    .remove(&last)
+    .expect("the SOL/USDT pool at the last slot");
+    let usdc_image = svm
+        .inner
+        .get_account(&Pubkey::from_str_const(BISONFI_POOL))
+        .expect("get_account")
+        .expect("the SOL/USDC pool")
+        .data;
+    assert_eq!(
+        published(&usdc_image),
+        last,
+        "keep-alive must republish the SOL/USDC pool too"
+    );
+
+    let profit = cycle(&usdc_image, &usdt_image);
     assert!(
-        two_percent_profit > 0,
-        "the documented scenario claims a 2% premium clears both venues' fees, got \
-         {two_percent_profit}"
+        control < 50,
+        "the same cycle on mainnet state must not hold an arbitrage: {control} bp"
     );
     assert!(
-        last > 0,
-        "a 10% dislocation must produce an outright profit, got {last}. The fair-value template's \
-         guidance claims this lever creates a cross-venue arbitrage, so it has to actually do so"
+        profit > 100,
+        "a 1.5% cross-pair gap less BisonFi's and Orca's costs must pay: {profit} bp (mainnet {control} bp)"
     );
 }
 
