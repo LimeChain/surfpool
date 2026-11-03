@@ -274,7 +274,8 @@ fn shift_book(data: &mut [u8], ratio_ppm: u128, side: Side) -> Result<(), String
 }
 
 /// Bids round down and asks round up, so a shift of both sides cannot cross the book. A bid's
-/// size is divided by the ratio, so it never locks more quote than its maker deposited.
+/// size is divided by the ratio, so it never locks more quote than its maker deposited; a bid
+/// too small to keep any size refuses the shift, since Manifest never rests an empty order.
 fn shifted(order: &Order, ratio_ppm: u128, is_bid: bool) -> Result<(u128, u64), String> {
     let scaled = order
         .price
@@ -282,6 +283,13 @@ fn shifted(order: &Order, ratio_ppm: u128, is_bid: bool) -> Result<(u128, u64), 
         .ok_or("the shift overflows a price")?;
     let (price, size) = if is_bid {
         let size = u128::from(order.size) * PPM / ratio_ppm;
+        if size == 0 {
+            return Err(format!(
+                "the shift takes a bid of {} at price {} to zero size; shift the asks only or use \
+                 a smaller ratio",
+                order.size, order.price
+            ));
+        }
         (
             scaled / PPM,
             u64::try_from(size).map_err(|_| "the shift overflows a bid's size")?,
@@ -520,10 +528,9 @@ mod tests {
         let (bids, asks) = read_book(&before).unwrap();
         for (ratio, side) in [
             ("900000", "both"),
-            ("1100000", "both"),
             ("1", "both"),
-            ("123456789", "both"),
             ("1050000", "asks"),
+            ("1100000", "asks"),
         ] {
             let after = apply(&before, json!({"ratio_ppm": ratio, "side": side}), 1).unwrap();
             let ratio: u128 = ratio.parse().unwrap();
@@ -621,6 +628,7 @@ mod tests {
         let huge = market(&[(u128::MAX / 2, 1)], &[]);
         let big_bid = market(&[(P, u64::MAX)], &[]);
         let big_ask = market(&[], &[(P, u64::MAX)]);
+        let no_dust = market(&[(108 * P + 7, 3_000_000_001)], &[(109 * P - 3, 5)]);
         let shift = |ratio: &str, side: &str| json!({"ratio_ppm": ratio, "side": side});
         let cut = |size: &str, side: &str| json!({"size_ppm": size, "side": side});
         let no_levels = json!({"side": "both", "expire_after_slots": 1});
@@ -632,7 +640,9 @@ mod tests {
             (&big_ask, shift("2000000", "asks"), "64 bits"),
             (&big_bid, shift("999999", "bids"), "a bid's size"),
             (&one_bid, shift("900000", "asks"), "no orders"),
-            (&good, shift("1010000", "bids"), "cross the book"),
+            (&no_dust, shift("1010000", "bids"), "cross the book"),
+            (&good, shift("1100000", "both"), "to zero size"),
+            (&good, shift("123456789", "both"), "to zero size"),
             (&good, no_levels, "levels is required"),
             (&good, cut("0", "both"), "between 1 and"),
             (&good, cut("1000001", "asks"), "between 1 and"),
