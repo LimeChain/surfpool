@@ -17,6 +17,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Jupiter v6** - DEX aggregator with TokenLedger manipulation template
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
+- **Project 0** – Lending (marginfi v2, v0.1.12): bank risk, limits, oracle and share settings, and account positions. See [protocols/project0/README.md](./protocols/project0/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
@@ -46,6 +47,13 @@ accounts from mainnet, so they need a network connection and are compiled only b
 
 ```
 cargo test -p surfpool-core --features integration-tests kamino
+```
+
+Project 0 has the same kind of suite in `crates/core/src/tests/project0/`, plus a test that runs
+the deployed program over overridden state:
+
+```
+cargo test -p surfpool-core --features integration-tests project0
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
