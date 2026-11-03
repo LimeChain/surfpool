@@ -5,9 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
+use surfpool_types::KeepAliveClock;
 
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, template_registry},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient},
     tests::helpers::diff_indices,
 };
@@ -16,7 +17,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: &str = "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE";
 const PROGRAMDATA: &str = "124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s";
-const DEPLOYED_SLOT: u64 = 461989610;
+const DEPLOYED_SLOT: u64 = 464833996;
 const ORACLE_PROGRAM: &str = "dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu";
 const GLOBAL: &str = "BNrK9LpEn65QA4TyBLVSMdngW3XHj3xLfFPwGdCBv8wV";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -320,6 +321,27 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
         .unwrap_or_else(|e| panic!("{id}: {e}"))
 }
 
+/// What the surfnet writes every slot while a scenario on a GoonFi market is registered: the
+/// oracle's republication, applied as the shipped templates import it, at `slot`.
+fn goonfi_keep_alive(oracle: &[u8], slot: u64) -> Vec<u8> {
+    let registry = template_registry();
+    let import = registry
+        .get("goonfi-price")
+        .and_then(|template| template.keep_alive.first())
+        .expect("goonfi-price keeps its oracle alive");
+    let values = import
+        .values_at(&KeepAliveClock {
+            slot,
+            unix_time_ms: 0,
+        })
+        .expect("keep-alive values");
+    registry
+        .keep_alive_template(&import.template)
+        .expect("keep-alive template")
+        .materialize_raw_layout(oracle, &values, slot)
+        .unwrap_or_else(|e| panic!("{}: {e}", import.template))
+}
+
 fn assert_writes_within(before: &[u8], after: &[u8], allowed: std::ops::Range<usize>, what: &str) {
     assert!(
         diff_indices(before, after)
@@ -574,7 +596,6 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
         let slot = u64::from(u32_at(&upstream.oracle, 16));
         for (id, data) in [
             ("goonfi-price", &upstream.oracle),
-            ("goonfi-freshness", &upstream.oracle),
             ("goonfi-reference-band", &upstream.market),
             ("goonfi-size-impact", &upstream.market),
             ("goonfi-vault-balance", &upstream.base_vault),
@@ -602,14 +623,13 @@ async fn goonfi_templates_write_only_proven_bytes_on_every_market() {
             (99_740_000, 99_750_000)
         );
 
-        let fresh = apply_raw(
-            "goonfi-freshness",
-            &upstream.oracle,
-            &[("last_update_slot", serde_json::json!(-7))],
-            slot + 100,
+        let fresh = goonfi_keep_alive(&upstream.oracle, slot + 100);
+        assert_writes_within(&upstream.oracle, &fresh, 16..20, "keep-alive");
+        assert_eq!(
+            u64::from(u32_at(&fresh, 16)),
+            slot + 99,
+            "keep-alive stamps the quote one slot back"
         );
-        assert_writes_within(&upstream.oracle, &fresh, 16..20, "goonfi-freshness");
-        assert_eq!(u64::from(u32_at(&fresh, 16)), slot + 93);
 
         let band = apply_raw(
             "goonfi-reference-band",
@@ -717,6 +737,8 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
     let payout_capacity = expected / 2;
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    // The surfnet starts at the fixture's slot, as a surfnet forked at that moment would.
+    svm.set_latest_absolute_slot(fixture.slot);
     for (address, seeded) in [
         (&fixture.def.oracle, &fixture.oracle),
         (&fixture.def.market, &fixture.market),
@@ -728,8 +750,7 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
     }
     let mut scenario = Scenario::new(
         "GoonFi SOL/USDC repricing".to_string(),
-        "Reprice SOL by 1.5x with its band, keep the quote fresh and cap USDC inventory"
-            .to_string(),
+        "Reprice SOL by 1.5x with its band and cap USDC inventory".to_string(),
     );
     for (template_id, target_account, values) in [
         (
@@ -741,22 +762,21 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
             ],
         ),
         (
-            "goonfi-freshness",
-            &fixture.def.oracle,
-            vec![("last_update_slot", serde_json::json!(0))],
-        ),
-        (
             "goonfi-reference-band",
             &fixture.def.market,
             vec![
                 ("reference_price_a_x1e6", serde_json::json!(target)),
                 ("reference_price_b_x1e6", serde_json::json!(target)),
+                ("oracle", serde_json::json!(fixture.def.oracle)),
             ],
         ),
         (
             "goonfi-vault-balance",
             &fixture.def.quote_vault,
-            vec![("amount", serde_json::json!(payout_capacity))],
+            vec![
+                ("amount", serde_json::json!(payout_capacity)),
+                ("oracle", serde_json::json!(fixture.def.oracle)),
+            ],
         ),
     ] {
         scenario.add_override(
@@ -806,7 +826,11 @@ async fn goonfi_scenario_materializes_every_collection_through_surfnet_svm() {
         "band override",
     );
     assert_writes_within(&upstream.quote_vault, &limited_quote_vault, 64..72, "vault");
-    assert_eq!(u64::from(u32_at(&prepared.oracle, 16)), fixture.slot);
+    assert_eq!(
+        u64::from(u32_at(&prepared.oracle, 16)),
+        fixture.slot - 1,
+        "keep-alive republishes the oracle in the scenario's first slot"
+    );
     assert_eq!(u64_at(&limited_quote_vault, 64), payout_capacity);
 
     let filled = run(
@@ -997,8 +1021,10 @@ async fn goonfi_drained_payout_vault_rejects_only_its_direction_with_0x1() {
     }
 }
 
+/// Keep-alive restamps a quote that went stale, and a republication older than the market's window
+/// rejects with 0x15.
 #[tokio::test]
-async fn goonfi_freshness_restamps_a_stale_quote_and_a_negative_lead_rejects_with_0x15() {
+async fn goonfi_keep_alive_restamps_a_stale_quote_and_an_old_republication_rejects_with_0x15() {
     let fixtures = fixtures().await;
     for fixture in fixtures.iter() {
         let upstream = fixture.upstream();
@@ -1017,26 +1043,30 @@ async fn goonfi_freshness_restamps_a_stale_quote_and_a_negative_lead_rejects_wit
             &format!("{} upstream oracle 5000 slots later", fixture.def.pair),
         );
 
-        let stamp = |lead: i64| State {
-            oracle: apply_raw(
-                "goonfi-freshness",
-                &upstream.oracle,
-                &[("last_update_slot", serde_json::json!(lead))],
-                later,
-            ),
+        let republished = |slots_back: u64| State {
+            oracle: goonfi_keep_alive(&upstream.oracle, later - slots_back),
             ..upstream.clone()
         };
         for side in [SELL, BUY] {
-            let restamped = run(fixture, &stamp(0), side, fixture.trade(side), later)
+            let restamped = run(fixture, &republished(0), side, fixture.trade(side), later)
                 .unwrap_or_else(|e| panic!("{} side {side} restamped: {e}", fixture.def.pair));
             assert!(restamped > 0);
             assert_rejects(
-                run(fixture, &stamp(-2_000), side, fixture.trade(side), later),
+                run(
+                    fixture,
+                    &republished(2_000),
+                    side,
+                    fixture.trade(side),
+                    later,
+                ),
                 STALE_ORACLE,
-                &format!("{} side {side} lead -2000", fixture.def.pair),
+                &format!(
+                    "{} side {side} republished 2000 slots back",
+                    fixture.def.pair
+                ),
             );
         }
-        let restamped = run(fixture, &stamp(0), SELL, fixture.base_trade, later).unwrap();
+        let restamped = run(fixture, &republished(0), SELL, fixture.base_trade, later).unwrap();
         assert!(
             restamped * 100 >= fresh * 99,
             "{}: restamped {restamped} vs fresh {fresh}",
@@ -1101,31 +1131,39 @@ async fn goonfi_size_impact_prices_larger_trades_worse_on_the_fixture_markets() 
     }
 }
 
-/// A swap in the slot the quote was stamped in pays one decay step, so the documented `-1` lead
-/// never fills worse than `0` there.
+/// A swap in the slot the quote was stamped in pays one decay step, so keep-alive stamps the quote one
+/// slot back and a swap in any slot fills best.
 #[tokio::test]
-async fn goonfi_a_swap_in_the_update_slot_pays_one_decay_step() {
+async fn goonfi_keep_alive_stamps_one_slot_back_because_the_update_slot_pays_one_decay_step() {
     let fixtures = fixtures().await;
     for fixture in fixtures.iter() {
         // Well past the market's own last swaps, so only the quote's slot matters.
         let clock = fixture.slot + 50;
-        let stamped = |lead: i64| State {
-            oracle: apply_raw(
-                "goonfi-freshness",
-                &fixture.oracle.data,
-                &[("last_update_slot", serde_json::json!(lead))],
-                clock,
-            ),
+        // The next slot's republication is stamped in the swap's own slot.
+        let republished_in = |slot: u64| State {
+            oracle: goonfi_keep_alive(&fixture.oracle.data, slot),
             ..fixture.upstream()
         };
         for side in [SELL, BUY] {
-            let same_slot = run(fixture, &stamped(0), side, fixture.trade(side), clock)
-                .unwrap_or_else(|e| panic!("{} side {side} lead 0: {e}", fixture.def.pair));
-            let one_slot_old = run(fixture, &stamped(-1), side, fixture.trade(side), clock)
-                .unwrap_or_else(|e| panic!("{} side {side} lead -1: {e}", fixture.def.pair));
+            let same_slot = run(
+                fixture,
+                &republished_in(clock + 1),
+                side,
+                fixture.trade(side),
+                clock,
+            )
+            .unwrap_or_else(|e| panic!("{} side {side} same slot: {e}", fixture.def.pair));
+            let one_slot_old = run(
+                fixture,
+                &republished_in(clock),
+                side,
+                fixture.trade(side),
+                clock,
+            )
+            .unwrap_or_else(|e| panic!("{} side {side} keep-alive: {e}", fixture.def.pair));
             assert!(
                 one_slot_old >= same_slot,
-                "{} side {side}: lead -1 {one_slot_old} vs lead 0 {same_slot}",
+                "{} side {side}: keep-alive {one_slot_old} vs same slot {same_slot}",
                 fixture.def.pair
             );
             if fixture.def.pair == "SOL / USDC" {

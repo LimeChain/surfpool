@@ -9,6 +9,11 @@ tags:
   - prop-amm
   - swap
 
+keep_alive:
+  - template: goonfi-quote-publication
+    address: { type: input, value: oracle }
+    values: { last_update_slot: $slot-1 }
+
 llm_context: |
   FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
   1. Resolve both token symbols with get_token_address, both calls at once.
@@ -55,12 +60,23 @@ templates:
         encoding: u64
         label: Reference price B
         description: Buy reference (quote per base times 10^6); buys reject while the ask is below it.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the market.
     llm_context: |
       PRECONDITION - MOVE THE BAND WITH THE PRICE. GoonFi checks the oracle quote against these two
       reference prices before it fills, and each has a fixed role, within a small per-market
       tolerance. A sell whose oracle bid sits above reference A, or a buy whose oracle ask sits
       below reference B, rejects with custom error 0x24 (36). Every goonfi-price move needs this
       template on the same market, scaled by the same factor, in the same scenario.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this change.
 
       UNIT: quote per base times 10^6, the same scale as the oracle and independent of mint
       decimals. SOL at 99.74 USDC is 99740000.
@@ -191,6 +207,13 @@ templates:
         encoding: u64
         label: Purchase penalty at size 10
         description: Millionths taken off a purchase at the market's tenth purchase size (quote atoms at byte 1624); interpolated linearly in between.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the market.
     llm_context: |
       WHAT IT CHANGES: GoonFi takes a size penalty off every fill. Each direction has ten size
       points and a penalty for each. The penalty is in millionths of the price: 10000 makes the fill
@@ -209,6 +232,10 @@ templates:
         direction are 0, every swap in that direction rejects with custom error 0xd (13).
       - Penalties do not have to increase with size.
       - The penalty does not move the oracle quote, so the reference band is unaffected.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this change.
 
       Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
       that builds on state an earlier override in the same scenario prepared, such as a

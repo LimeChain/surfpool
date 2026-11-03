@@ -1,8 +1,8 @@
 # GoonFi V2
 
-A proprietary market maker (PMM), not an AMM. Five templates control its external quote, quote
-freshness, the reference band that guards the quote, the penalty for larger trades, and vault
-inventory.
+A proprietary market maker (PMM), not an AMM. Four templates control its external quote, the
+reference band that guards the quote, the penalty for larger trades, and vault inventory. Surfpool
+keeps the quote current on its own once a scenario overrides a market.
 
 GoonFi does not derive its price from vault ratios. Each market reads a 32-byte oracle owned by a
 companion publisher program, checks that quote against a reference band stored in the market, and
@@ -16,7 +16,6 @@ Programs: market program `goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE`, oracle p
 | Template                | Overrides                                          |
 | ----------------------- | -------------------------------------------------- |
 | `goonfi-price`          | the bid and ask GoonFi quotes                      |
-| `goonfi-freshness`      | whether GoonFi's quote is current or stale         |
 | `goonfi-reference-band` | the band that must contain the quote for a fill    |
 | `goonfi-size-impact`    | how much worse larger trades fill, per direction   |
 | `goonfi-vault-balance`  | how many tokens GoonFi has available for swaps     |
@@ -26,7 +25,6 @@ Programs: market program `goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE`, oracle p
 | You'll see                   | It means                                        | Example                          |
 | ---------------------------- | ----------------------------------------------- | -------------------------------- |
 | bid, ask, reference prices   | quote per base × 10^6, whatever the mint decimals | SOL at 99.74 USDC → `99740000` |
-| `last_update_slot`           | offset from the materialization slot            | `0` = this slot, `-2000` = stale |
 | size penalties               | millionths of the price                         | `10000` = 1%                     |
 | vault `amount`               | that mint's smallest unit                       | `1000000` = 1 USDC               |
 
@@ -55,7 +53,7 @@ price_x1e6 = human_price × 10^6
 | MarketState | market program   | 2048 | 1720   | `reference_price_b_x1e6` | u64      | `goonfi-reference-band` |
 | PriceOracle | oracle publisher | 32   | 0      | `bid_price_x1e6`         | u64      | `goonfi-price`          |
 | PriceOracle | oracle publisher | 32   | 8      | `ask_price_x1e6`         | u64      | `goonfi-price`          |
-| PriceOracle | oracle publisher | 32   | 16     | `last_update_slot`       | slot32   | `goonfi-freshness`      |
+| PriceOracle | oracle publisher | 32   | 16     | last update slot         | u32      | keep-alive              |
 | PriceOracle | oracle publisher | 32   | 20     | decay multiplier         | u32      | read only               |
 | PriceOracle | oracle publisher | 32   | 24     | publish timestamp (ms)   | u64      | read only, not consulted |
 | TokenAccount | token program   | 165  | 64     | `amount`                 | u64      | `goonfi-vault-balance`  |
@@ -65,8 +63,10 @@ price_x1e6 = human_price × 10^6
 The templates have no default account, and the backend embeds no market catalog. Studio offers a
 short list of featured markets and also accepts a market, oracle or vault address directly; API and
 MCP callers put the account in the override. The band and size templates target the market account, the
-price and freshness templates target the oracle the market points at (bytes 208..240), and the
-vault template targets one of the market's SPL-token vaults (base at 144..176, quote at 176..208).
+price template targets the oracle the market points at (bytes 208..240), and the vault template
+targets one of the market's SPL-token vaults (base at 144..176, quote at 176..208). Market and vault
+templates also take that oracle in their `oracle` input, which is never written: it names the oracle
+keep-alive keeps current.
 
 Studio includes four featured markets:
 
@@ -88,6 +88,21 @@ Do not reuse an oracle or vault merely because the token pair looks similar. Use
 `fetchBeforeUse: true` so the selected account is loaded into the local VM from the upstream
 datasource before its bytes are changed.
 
+## Keep-alive (Surfpool handles it)
+
+On mainnet GoonFi's maker republishes each market's quote every slot or few. Nobody runs it against a
+surfnet, so while a scenario with a GoonFi override is registered Surfpool republishes the oracle
+every slot ([keep-alive](../../README.md#keep-alive)): it stamps the update slot (byte 16) one slot
+back, because a swap in the update slot itself pays one decay step. The quote stays one slot old and
+every swap gets the best fill. The price stays as set. There is nothing to schedule:
+
+- `goonfi-price` keeps the oracle it writes current.
+- `goonfi-reference-band`, `goonfi-size-impact` and `goonfi-vault-balance` keep the oracle in their
+  `oracle` input current. Without it, nothing keeps that oracle current, and a stale one rejects
+  swaps with `0x15`.
+
+Keep-alive starts in the slot the override plays and runs until the network is reset.
+
 ## Three rules that prevent misleading scenarios
 
 **1. Move the band with the price.** A price can be encoded correctly and still never fill. The two
@@ -98,8 +113,8 @@ Each fill moves its own anchor: a sell sets A to its bid, a buy sets B to its as
 made after swaps meets the anchors those swaps left: apply the band again in the same slot as the
 price move.
 
-**2. Do not repeatedly reset transaction-owned inventory.** Price, band and freshness are
-configuration inputs. A vault balance is state that swaps modify. Reapplying a vault override
+**2. Do not repeatedly reset transaction-owned inventory.** Price and band are configuration
+inputs. A vault balance is state that swaps modify. Reapplying a vault override
 after every swap can undo the swap and manufacture or erase inventory.
 
 **3. A later scenario meets an earlier band.** `fetchBeforeUse: true` reloads only the override's
@@ -109,9 +124,10 @@ band again in the later scenario.
 
 ## How quote age changes the fill
 
-A quote fills best one to four slots after its update. From the fifth slot, each slot costs one
-decay step, whose size is set per market, until the quote rejects with `0x15`. Measured on the
-featured markets:
+Keep-alive keeps a market a scenario overrides one slot old. A market no override names is not
+republished, and ages like this. A quote fills best one to four slots after its update. From the
+fifth slot, each slot costs one decay step, whose size is set per market, until the quote rejects
+with `0x15`. Measured on the featured markets:
 
 | Slots since the update | SOL / USDC  | HYPE / USDC | JUP / USDC |
 | ---------------------- | ----------- | ----------- | ---------- |
@@ -125,8 +141,8 @@ featured markets:
 | 21                     |             | `0x15`      | `0x15`     |
 
 A swap in the same slot as the quote update, or as the market's previous swap, pays one decay step.
-From the next slot the fill is normal again; repeated swaps leave nothing behind. When a swap lands
-in the same slot as `goonfi-freshness`, use `last_update_slot: -1` instead of `0`.
+From the next slot the fill is normal again; repeated swaps leave nothing behind. Keep-alive stamps
+the quote one slot back, so only the previous-swap rule applies to an overridden market.
 
 ## How trade size changes the fill
 
@@ -149,9 +165,7 @@ with `0xd`. Measured on the featured markets, compared with a 100 USDC trade:
 
 1. On **SOL / USDC**, use `goonfi-price` with bid and ask at 1.5 times the bid stored in its oracle.
 2. Use `goonfi-reference-band` with both anchors at the same value.
-3. Use `goonfi-freshness` with `last_update_slot: 0`, and swap one to four slots later for the
-   best fill.
-4. Use `goonfi-vault-balance` on the **USDC vault** with half the expected sell output. Apply this
+3. Use `goonfi-vault-balance` on the **USDC vault** with half the expected sell output. Apply this
    transaction-owned balance once before the swaps being tested.
 
 A sale of about 100 USDC worth of SOL fills at the new price with the original inventory, the same
@@ -162,20 +176,13 @@ sale fails with error `0x1` against the capped USDC vault, and a buy still fills
 1. Find the **USDT / USDC** market as [Picking a market](#picking-a-market) describes (Studio does
    not list it), then target its oracle in `goonfi-price` and the market in `goonfi-reference-band`.
 2. Set bid, ask and both anchors to `950000` for $0.95 or `1050000` for $1.05.
-3. Keep the quote current with `goonfi-freshness`.
-4. Compare both swap directions against an unchanged control run.
+3. Compare both swap directions against an unchanged control run.
 
 ### The maker refuses one direction
 
 1. Choose a market in `goonfi-price` and leave the band untouched.
 2. Raise the bid above reference A to block sells, or lower the ask below reference B to block buys.
 3. Confirm the blocked side fails with `0x24` while the other side still fills.
-
-### The maker's quote goes stale
-
-1. Choose a market in `goonfi-freshness`.
-2. Set `last_update_slot` to `-2000`. Both swap directions reject with `0x15`.
-3. To recover, schedule `goonfi-freshness` with `0` at a later slot.
 
 ### Large trades get much worse
 
@@ -208,20 +215,6 @@ reference_price_b_x1e6: 150000000
 Set all four fields. A coupled 2x move doubles a sell's output and a coupled halving doubles a
 buy's output, within 1%. Keep ask at or above bid.
 
-## Keep the quote current
-
-```text
-template: goonfi-freshness
-last_update_slot: 0
-```
-
-The stored value is an absolute 4-byte slot; the input is an offset from the materialization slot.
-The stamp is written once. Swaps one to four slots later get the best fill; a swap in the same slot
-pays one decay step, so use `-1` there. After that the quote decays per market and then rejects
-with `0x15`, as [How quote age changes the fill](#how-quote-age-changes-the-fill) shows; stablecoin
-pairs reject after hundreds of slots. For a longer scenario, schedule this template again in each
-later slot where a quote is needed.
-
 ## Make trade size not matter
 
 ```text
@@ -232,16 +225,6 @@ buy_penalty_0  ... buy_penalty_9:  <one value, e.g. the market's buy_penalty_1>
 
 With equal penalties, a 100 USDC trade and a 10,000 USDC trade fill at the same price, within a couple
 of basis points. Set all twenty to `10000` to make every fill 1% worse.
-
-## Make the quote stale
-
-```text
-template: goonfi-freshness
-last_update_slot: -2000
-```
-
-`-2000` is past both windows. A smaller negative offset prepares a decayed but still fillable
-quote.
 
 ## Reduce inventory or make a direction unfillable
 
@@ -261,13 +244,13 @@ base vault moves a buy's output slightly before it blocks it.
 | --------------------------------------------------------- | -------------------------------------------------------------------- |
 | `Custom(36)` (`0x24`) after a price change                 | Move `goonfi-reference-band` by the same factor as the price         |
 | `Custom(36)` (`0x24`) when a later scenario reloads the oracle | An earlier scenario's band is still set; apply `goonfi-reference-band` again |
-| `Custom(21)` (`0x15`)                                      | The quote is past its window; apply `goonfi-freshness` with `0`      |
-| `Custom(38)` (`0x26`) on an ageing quote                   | A decayed fill fell about 5% below the fresh quote; refresh it       |
+| `Custom(21)` (`0x15`)                                      | Nothing republishes that oracle: override the price, or set `oracle` on the market and vault overrides |
+| `Custom(38)` (`0x26`) on an ageing quote                   | A decayed fill fell about 5% below the fresh quote; set `oracle` as for `0x15` |
 | `Custom(1)` (`0x1`) after lowering a vault                 | The token program refused the transfer: the payout vault holds less than the output |
 | `Custom(9)` (`0x9`)                                        | A zero bid or ask; set both prices above 0                           |
 | `Custom(13)` (`0xd`) on one direction after `goonfi-size-impact` | All ten penalties of that direction are 0; set at least one above 0 |
 | A price move after swaps rejects one side with `0x24`      | The swaps moved the anchors; apply `goonfi-reference-band` again in the same slot |
-| A fill is a few basis points worse than expected           | The swap shares a slot with the quote update or the previous swap; swap one slot later |
+| A fill is a few basis points worse than expected           | The swap shares a slot with the market's previous swap; swap one slot later |
 | `Custom(15)` (`0xf`)                                       | The swap's minimum output is above the fill                          |
 | A price override writes correctly but the fill is unchanged | The override targets another market's oracle; read it from 208..240 |
 | A vault balance returns after a swap                       | Remove the later vault reset; it is undoing transaction-owned state  |
