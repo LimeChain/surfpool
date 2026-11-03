@@ -58,7 +58,9 @@ templates:
       FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
       5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
       custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
-      is the token's mint. Set fetchBeforeUse: true.
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on later ones in
+      another scenario or slot, since a reload drops earlier local changes; a custody reloaded on
+      its own can also fall out of step with its vault (6014), which the README covers.
 
       pricing.max_leverage is the liquidation threshold, in BPS (10000 = 1x). A keeper
       liquidates a position once collateral + PnL - close and borrow fees falls below
@@ -107,7 +109,10 @@ templates:
       FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
       5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
       custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
-      is the token's mint. Set fetchBeforeUse: true. A long pays its own token's custody. A
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on later ones in
+      another scenario or slot, since a reload drops earlier local changes; a custody reloaded on
+      its own can also fall out of step with its vault (6014), which the README covers.
+      A long pays its own token's custody. A
       short does not pay the traded token's rate; its fee follows the USDC or USDT custody
       holding its collateral. Those custodies also carry borrow-lend debt, and a high rate or a
       long time jump on them overflows (error 6000).
@@ -141,7 +146,9 @@ templates:
       FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
       5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
       custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
-      is the token's mint. Set fetchBeforeUse: true.
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on later ones in
+      another scenario or slot, since a reload drops earlier local changes; a custody reloaded on
+      its own can also fall out of step with its vault (6014), which the README covers.
 
       Fees come out of the position's collateral, in USD with 6 decimals:
       - opening or increasing: size x increase_position_bps / 10000
@@ -177,7 +184,9 @@ templates:
       value: 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq
     llm_context: |
       Use this template to refuse or reopen JLP deposits. The address is the JLP Pool, the only
-      pool Jupiter Perps runs. Set fetchBeforeUse: true. limit.max_aum_usd and
+      pool Jupiter Perps runs. Set fetchBeforeUse: true on the first override of the pool and
+      false on later ones in another scenario or slot, since a reload drops earlier local changes.
+      limit.max_aum_usd and
       limit.token_weightage_buffer_bps are u128: pass them as decimal strings.
 
       - limit.max_aum_usd: a deposit that would take the pool's value above it is refused
@@ -218,7 +227,8 @@ templates:
       value: 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq
     llm_context: |
       Use this template to change what JLP deposits, withdrawals and pool swaps cost. The
-      address is the JLP Pool, the only pool Jupiter Perps runs. Set fetchBeforeUse: true.
+      address is the JLP Pool, the only pool Jupiter Perps runs. Set fetchBeforeUse: true on the first override of the pool and
+      false on later ones in another scenario or slot, since a reload drops earlier local changes.
       Every field is in BPS (10000 = 100%).
 
       - fees.add_remove_liquidity_bps: base fee on JLP deposits and withdrawals.

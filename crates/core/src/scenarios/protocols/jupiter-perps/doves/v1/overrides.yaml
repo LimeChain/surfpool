@@ -20,7 +20,7 @@ templates:
         description: "Price mantissa; the USD price is price x 10^expo. Example: 8000000000 is $80 at expo -8"
       - path: timestamp
         label: Publish time
-        description: "Unix seconds the price was published. Deposits, swaps and quotes refuse a feed 5 seconds older than the clock, and a keeper fill needs a time after its request; Perps accepts a time ahead of the clock"
+        description: "Unix seconds the price was published. Deposits and swaps refuse a feed 5 seconds older than the clock (quotes 15), and a keeper fill needs a time after its request; Perps accepts a time ahead of the clock"
     address:
       type: pubkey
     llm_context: |
@@ -37,7 +37,9 @@ templates:
       SET THE PRICE:
       - price = usd_price x 10^-expo; read expo from the feed and keep it.
         $80.00 -> 8000000000
-      - Set fetchBeforeUse: true so the feed's other fields keep their live values.
+      - Set fetchBeforeUse: true so the feed's other fields keep their live values, and false
+        on a later override of the same feed in another scenario or slot: a reload drops the
+        earlier local change.
       - Set only the price for a liquidation: liquidations do not check a feed's age.
       - Nothing publishes Doves prices on a surfnet. A JLP deposit, withdrawal, swap or quote
         reads every custody's feed and refuses one older than 5 seconds (a quote 15), and a
