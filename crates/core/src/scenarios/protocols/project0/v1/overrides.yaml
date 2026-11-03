@@ -76,7 +76,8 @@ templates:
       HOW TO USE THIS TEMPLATE:
       1. Lower config.asset_weight_maint.value on the bank the borrower deposited into. The account
          becomes liquidatable once sum(deposit value x asset_weight_maint) falls below
-         sum(debt value x liability_weight_maint)
+         sum(debt value x liability_weight_maint). Lower config.asset_weight_init.value with it,
+         since the liquidation weight must stay at or above the borrowing weight
       2. Weights are fixed-point numbers scaled by 2^48 (1.0 = "281474976710656"). Pass them as
          decimal strings
 

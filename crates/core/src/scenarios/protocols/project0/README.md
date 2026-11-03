@@ -69,6 +69,7 @@ and reads `7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE`; the native USDC bank i
 ```
 project0-bank-risk-weights   on the SOL bank
   config.asset_weight_maint.value: "84442493013197"   # 0.3
+  config.asset_weight_init.value: "84442493013197"    # 0.3
 ```
 
 **Why:** health is `sum(deposits x asset_weight_maint) - sum(debts x liability_weight_maint)`,
