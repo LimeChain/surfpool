@@ -3593,7 +3593,12 @@ impl SurfnetSvm {
                 }
 
                 let clock_slot = self.inner.get_sysvar::<Clock>().slot;
-                match prepare_manifest_override(&account, &account_values, clock_slot) {
+                let manifest = if override_instance.template_id.starts_with("manifest-") {
+                    prepare_manifest_override(&account, &account_values, clock_slot)
+                } else {
+                    Ok(None)
+                };
+                match manifest {
                     Ok(Some(data)) => {
                         let market = Account { data, ..account };
                         if let Err(e) =

@@ -154,6 +154,7 @@ refreshing its quotes.
 | A cut was skipped with "size_ppm must be between 1 and 1000000" | A cut only shrinks orders. To deepen the book, place orders in the local VM with your own code |
 | A trade still fills at an expired price | It ran within the `expire_after_slots` slots the orders keep matching, which count the override's own slot. Use `0` to remove them at once |
 | Fewer orders filled than the book shows | Global orders are backed by their maker's balance in a shared Global account, which can be smaller than the orders show. Manifest skips an order its maker cannot cover |
+| An earlier shift, expiry or cut is gone | A later override with `fetchBeforeUse: true` loaded the market from mainnet again, which drops every local change to it. Give later overrides of the same market `fetchBeforeUse: false` |
 
 # Layout source
 
