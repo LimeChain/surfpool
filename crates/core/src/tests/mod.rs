@@ -1,6 +1,8 @@
 pub mod helpers;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
+pub mod jupiter_perps;
+#[cfg(feature = "integration-tests")]
 pub mod kamino;
 #[cfg(feature = "integration-tests")]
 pub mod phoenix;
