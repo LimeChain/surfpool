@@ -46,9 +46,9 @@ templates:
 
       Write price, posted_slot and publish_time together. Read the oracle and the Clock in one
       getMultipleAccounts call with encoding jsonParsed: [<oracle>,
-      "SysvarC1ock11111111111111111111111111111111"]. price is the USD price x 10^8; leave exponent
-      alone. posted_slot is the Clock's slot. publish_time is its unixTimestamp x 1000000
-      (microseconds). Scale conf by the same factor as price.
+      "SysvarC1ock11111111111111111111111111111111"]. price is USD x 10^-exponent, with exponent
+      read from the same oracle; leave exponent alone. posted_slot is the Clock's slot. publish_time
+      is its unixTimestamp x 1000000 (microseconds). Scale conf by the same factor as price.
 
       Nothing republishes the price on a surfnet, so it ages as the clock moves past posted_slot.
       Margin checks, such as withdrawals, orders that add risk and matched fills, refuse it once it
