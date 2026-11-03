@@ -216,6 +216,7 @@ fail with `MaxOpenInterest` (6154). `status: {"ReduceOnly": null}` refuses any o
 | `MaxDeposit` (6038) | the spot market's deposits would pass `max_token_deposits` |
 | `status` override did nothing | it must be an object such as `{"Active": null}`, not a number or a bare string |
 | a `u64` override did nothing | `u64` fields such as `max_token_deposits` take JSON numbers; only 128-bit fields take decimal strings |
+| an earlier change to the State, a market or an oracle is gone, such as an unpause | a later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it; give later overrides of the same account `fetchBeforeUse: false` |
 
 # IDL
 

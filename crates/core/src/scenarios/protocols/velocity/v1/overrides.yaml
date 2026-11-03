@@ -40,7 +40,8 @@ templates:
       account. A market or oracle address the user gives is used as is.
 
       Set fetchBeforeUse: true. Put the oracle in the override's account as {"pubkey":"<oracle>"},
-      never in values.
+      never in values. A later override of the same account, in another scenario or slot, uses
+      fetchBeforeUse false, since a reload drops earlier local changes to it.
 
       Write price, posted_slot and publish_time together. Read the oracle and the Clock in one
       getMultipleAccounts call with encoding jsonParsed: [<oracle>,
@@ -66,6 +67,9 @@ templates:
 
       EXAMPLE - "SOL drops 20%": with the SOL-PERP oracle's live price p, price: p x 0.8,
       posted_slot: the Clock's slot, publish_time: its unixTimestamp x 1000000.
+
+      If an action fails with ExchangePaused (6024), the copied State carries a mainnet pause:
+      add velocity-exchange-risk with exchange_status: 0.
 
   - id: velocity-perp-market-risk
     name: Override Perp Market Risk
@@ -105,7 +109,8 @@ templates:
       gives is used as is.
 
       Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
-      never in values.
+      never in values. A later override of the same account, in another scenario or slot, uses
+      fetchBeforeUse false, since a reload drops earlier local changes to it.
 
       Margin ratios are shares of position value where 10000 = 100%. An account whose collateral
       falls below the maintenance requirement can be liquidated. Raising
@@ -134,6 +139,9 @@ templates:
 
       EXAMPLE - "liquidators earn 2% on SOL-PERP": liquidator_fee: 20000.
 
+      If an action fails with ExchangePaused (6024), the copied State carries a mainnet pause:
+      add velocity-exchange-risk with exchange_status: 0.
+
   - id: velocity-exchange-risk
     name: Override Exchange Status, Oracle Guard Rails and Liquidation Buffer
     description: Pause Velocity actions exchange-wide, keep prices usable for margin checks longer, widen the price moves liquidation accepts or change how much a liquidation closes
@@ -160,6 +168,8 @@ templates:
     llm_context: |
       The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
       fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
+      A later override of the State, in another scenario or slot, uses fetchBeforeUse false,
+      since a reload drops earlier local changes to it, such as an unpause.
 
       exchange_status pauses actions on every market. It is a bit mask, 0 runs everything: 1
       deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM
@@ -217,6 +227,8 @@ templates:
     llm_context: |
       The Velocity State is one account: 2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW. Set
       fetchBeforeUse: true and put it in the override's account as {"pubkey":"<state>"}.
+      A later override of the State, in another scenario or slot, uses fetchBeforeUse false,
+      since a reload drops earlier local changes to it, such as an unpause.
 
       An account pays the perp fees of the higher of its 30-day volume tier and promo_fee_tier.
       The program uses tiers 0 to 3 only, so promo_fee_tier: 3 puts every account on tier 3.
@@ -285,7 +297,8 @@ templates:
       the user gives is used as is.
 
       Set fetchBeforeUse: true. Put the market in the override's account as {"pubkey":"<market>"},
-      never in values.
+      never in values. A later override of the same account, in another scenario or slot, uses
+      fetchBeforeUse false, since a reload drops earlier local changes to it.
 
       Weights use 10000 = 100%. A deposit counts as collateral at its value x asset weight; a
       borrow counts at its value x liability weight. Initial weights decide whether an account may
