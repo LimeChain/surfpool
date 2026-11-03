@@ -164,9 +164,13 @@ for 120 seconds of Surfnet clock after it was loaded:
 - A price override with `fetchBeforeUse: true` loads upstream's current price account when it plays,
   so leave `publish_time` unset. Playing the scenario again loads it again.
 - A transaction refreshes every reserve the obligation lists, so every one of their prices must be
-  fresh, not only the one the scenario moves. Reload an older one with `surfnet_resetAccount` on its
-  price account; the next read loads upstream's current copy.
+  fresh, not only the one the scenario moves. Give each its own price override with
+  `fetchBeforeUse: true`, at its current price for an asset you do not move, or reload it with
+  `surfnet_resetAccount` on its price account; the next read loads upstream's current copy.
 - Studio's paused clock stops prices ageing after Play. A running clock or a time travel ages them.
+- After a forward time travel the Surfnet clock is ahead of mainnet, so a reload brings a price that
+  is already old. Write `price_message.publish_time` as the Surfnet clock's `unixTimestamp`, read
+  after the time travel, on every price the transaction reads.
 - An older `publish_time` written into the scenario makes a price stale on purpose.
 
 Keep-alive ([solana-foundation/surfpool#906](https://github.com/solana-foundation/surfpool/pull/906))
@@ -186,3 +190,4 @@ will keep the prices published once it lands.
 | The position override did nothing | The obligation account does not exist on the surfnet yet. Pull a mainnet one from upstream with `fetchBeforeUse: true` or create it with `init_obligation` |
 | Unexpected entries after a position override | The old account had more entries and a property was left out. Set every property of `save-obligation-position` |
 | The entries swapped places after a refresh | Not a bug. `refresh_obligation` moves the highest-weighted borrow first and drops empty entries |
+| An earlier change to a reserve or obligation is gone | A later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it. Give later overrides of the same account `fetchBeforeUse: false` |

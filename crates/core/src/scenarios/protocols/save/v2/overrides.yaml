@@ -106,7 +106,10 @@ templates:
       keep fetchBeforeUse: true and leave publish_time unset; upstream's current value arrives when
       the override plays. The price then stays valid for 120 s of Surfnet clock; play the scenario
       again before acting later. Every other reserve the obligation lists needs a price under 120 s
-      old as well.
+      old as well: add pyth-price-feed-v2 with fetchBeforeUse: true on each of their price
+      accounts, at its current price. After a forward time travel, write price_message.publish_time
+      as the Surfnet clock's unixTimestamp, read after the travel, on every price the transaction
+      reads, since a reload then brings a price that is already old.
 
       To make one debt asset riskier than others, raise config.added_borrow_weight_bps on the DEBT
       reserve: 10000 counts every borrowed dollar twice.
@@ -299,6 +302,9 @@ templates:
     llm_context: |
       Builds a position of exactly ONE collateral deposit and ONE borrow. Set every property:
       the account's old entries are not cleared, so a field left out keeps whatever was there.
+      The obligation's cached values (deposited_value, borrowed_value and the borrow limits) keep
+      their old numbers until refresh_obligation runs, which a Save transaction does first, so
+      read the position's health after a refresh, not from the account right after the override.
 
       THE ACCOUNT MUST ALREADY EXIST. An obligation is not a PDA. Its address is
       createWithSeed(owner, seed, So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo), where seed is

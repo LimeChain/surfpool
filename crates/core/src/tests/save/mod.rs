@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use litesvm::LiteSVM;
 use solana_account::Account;
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_account_decoder::{UiAccount, UiAccountEncoding, UiDataSliceConfig};
 use solana_client::{
     rpc_config::RpcAccountInfoConfig,
     rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
@@ -54,12 +54,6 @@ const USDC_ORACLE: &str = "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX";
 const PYTH_RECEIVER: &str = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ";
 const SOL_USD_FEED: &str = "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
 const USDC_USD_FEED: &str = "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
-/// One deposit and one borrow, SOL against USDC.
-const OBLIGATION_1D1B: &str = "142ajEdeDtNPKokqySkqqr5eNdFEcoJPNGn2ddEJYrbP";
-const OBLIGATION_1D1B_OWNER: &str = "6cPZda7Qt7RK8HfYtz2rjiAEeh3ztR6fQ5o2G2Frb36z";
-/// Three deposits and two borrows, with non-zero bytes past its last entry. The fixed-shape
-/// template must work over an account like this, not only over a tidy one.
-const OBLIGATION_3D2B: &str = "8XBi1bNjZScafhk5XrunTEW7BQCMjfx4q13xP5Lks7Qo";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 /// Offsets and widths from the deployed build's `pack_into_slice` (SPL@d04ce00b), written down
@@ -95,6 +89,96 @@ const LAYOUT: &[(&str, &str, usize, usize)] = &[
     ),
     ("Obligation", "borrows.0.borrowed_amount_wads", 340, 16),
 ];
+
+/// Main-pool obligations of the shapes these tests need, found on mainnet when they run, so an
+/// owner closing or reshaping a position never breaks them.
+struct Obligations {
+    /// One deposit and one borrow, SOL against USDC, at its createWithSeed address.
+    one_by_one: String,
+    one_by_one_owner: String,
+    /// Three deposits and two borrows: the fixed-shape template must work over an account with
+    /// entries past the ones it writes, not only over a tidy one.
+    three_by_two: String,
+}
+
+static OBLIGATIONS: tokio::sync::OnceCell<Obligations> = tokio::sync::OnceCell::const_new();
+
+async fn obligations() -> &'static Obligations {
+    OBLIGATIONS.get_or_init(find_obligations).await
+}
+
+async fn find_obligations() -> Obligations {
+    // deposits_len and borrows_len are the bytes at 202 and 203.
+    let shaped = |counts: [u8; 2]| {
+        vec![
+            RpcFilterType::DataSize(1300),
+            base58_at(10, MAIN_MARKET),
+            RpcFilterType::Memcmp(Memcmp::new_base58_encoded(202, &counts)),
+        ]
+    };
+    let mut sol_against_usdc = shaped([1, 1]);
+    sol_against_usdc.extend([base58_at(204, SOL_RESERVE), base58_at(292, USDC_RESERVE)]);
+    let owners = UiDataSliceConfig {
+        offset: 42,
+        length: 32,
+    };
+    let program = Pubkey::from_str_const(SAVE_PROGRAM);
+    let (one_by_one, owner) = program_accounts(UiAccountEncoding::Base64, sol_against_usdc, owners)
+        .await
+        .into_iter()
+        .find_map(|(address, account)| {
+            let owner = Pubkey::try_from(account.data.decode()?.as_slice()).ok()?;
+            let derived = Pubkey::create_with_seed(&owner, &MAIN_MARKET[..32], &program).ok()?;
+            (derived == address).then_some((address, owner))
+        })
+        .expect("no SOL against USDC main-pool obligation at its createWithSeed address");
+    let nothing = UiDataSliceConfig {
+        offset: 0,
+        length: 0,
+    };
+    let three_by_two = program_accounts(UiAccountEncoding::Base64, shaped([3, 2]), nothing)
+        .await
+        .first()
+        .map(|(address, _)| address.to_string())
+        .expect("no main-pool obligation with three deposits and two borrows");
+    Obligations {
+        one_by_one: one_by_one.to_string(),
+        one_by_one_owner: owner.to_string(),
+        three_by_two,
+    }
+}
+
+fn base58_at(offset: usize, bytes: &str) -> RpcFilterType {
+    RpcFilterType::Memcmp(Memcmp::new(
+        offset,
+        MemcmpEncodedBytes::Base58(bytes.to_string()),
+    ))
+}
+
+/// getProgramAccounts on the Save program, on mainnet.
+async fn program_accounts(
+    encoding: UiAccountEncoding,
+    filters: Vec<RpcFilterType>,
+    slice: UiDataSliceConfig,
+) -> Vec<(Pubkey, UiAccount)> {
+    let client = SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+    );
+    let config = RpcAccountInfoConfig {
+        encoding: Some(encoding),
+        data_slice: Some(slice),
+        commitment: Some(CommitmentConfig::confirmed()),
+        ..Default::default()
+    };
+    match client
+        .get_program_accounts(&Pubkey::from_str_const(SAVE_PROGRAM), config, Some(filters))
+        .await
+        .unwrap_or_else(|e| panic!("getProgramAccounts failed: {e}"))
+    {
+        RemoteRpcResult::Ok(found) => found,
+        RemoteRpcResult::MethodNotSupported => panic!("the RPC does not serve getProgramAccounts"),
+    }
+}
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
 async fn fetch(addresses: &[&str]) -> Vec<Account> {
@@ -166,10 +250,10 @@ fn changed_value(data: &[u8], offset: usize, encoding: &RawEncoding) -> serde_js
 }
 
 /// The live account each template is exercised against.
-fn live_account_for(account_type: &str) -> &'static str {
+fn live_account_for(account_type: &str, obligations: &'static Obligations) -> &'static str {
     match account_type {
         "Reserve" => SOL_RESERVE,
-        "Obligation" => OBLIGATION_3D2B,
+        "Obligation" => &obligations.three_by_two,
         other => panic!("no live account for {other:?}"),
     }
 }
@@ -177,12 +261,13 @@ fn live_account_for(account_type: &str) -> &'static str {
 /// Live accounts match the deployed layout the templates are written against.
 #[tokio::test]
 async fn save_live_accounts_match_the_layout() {
+    let obligations = obligations().await;
     let accounts = fetch(&[
         MAIN_MARKET,
         SOL_RESERVE,
         USDC_RESERVE,
-        OBLIGATION_1D1B,
-        OBLIGATION_3D2B,
+        &obligations.one_by_one,
+        &obligations.three_by_two,
     ])
     .await;
     let program = Pubkey::from_str_const(SAVE_PROGRAM);
@@ -248,10 +333,11 @@ async fn save_live_accounts_match_the_layout() {
 /// that field's bytes and nothing else.
 #[tokio::test]
 async fn save_templates_write_only_their_offsets() {
-    let accounts = fetch(&[SOL_RESERVE, OBLIGATION_3D2B]).await;
+    let obligations = obligations().await;
+    let accounts = fetch(&[SOL_RESERVE, &obligations.three_by_two]).await;
     let by_address: HashMap<&str, &Vec<u8>> = [
         (SOL_RESERVE, &accounts[0].data),
-        (OBLIGATION_3D2B, &accounts[1].data),
+        (obligations.three_by_two.as_str(), &accounts[1].data),
     ]
     .into_iter()
     .collect();
@@ -263,7 +349,7 @@ async fn save_templates_write_only_their_offsets() {
         .into_iter()
         .filter(|t| t.id.starts_with("save-"))
     {
-        let data = by_address[live_account_for(&template.account_type)];
+        let data = by_address[live_account_for(&template.account_type, obligations)];
         let mut allowed = Vec::new();
         let mut values = HashMap::new();
         for property in &template.properties {
@@ -358,16 +444,17 @@ async fn save_scenario_materializes_once_through_surfnet_svm() {
 /// The address rule the templates document, checked against a live obligation and its owner.
 #[tokio::test]
 async fn save_obligation_address_is_created_with_seed() {
-    let owner = Pubkey::from_str_const(OBLIGATION_1D1B_OWNER);
+    let obligations = obligations().await;
+    let owner = Pubkey::from_str_const(&obligations.one_by_one_owner);
     let derived = Pubkey::create_with_seed(
         &owner,
         &MAIN_MARKET[..32],
         &Pubkey::from_str_const(SAVE_PROGRAM),
     )
     .unwrap();
-    assert_eq!(derived, Pubkey::from_str_const(OBLIGATION_1D1B));
+    assert_eq!(derived, Pubkey::from_str_const(&obligations.one_by_one));
 
-    let obligation = fetch(&[OBLIGATION_1D1B]).await.remove(0);
+    let obligation = fetch(&[&obligations.one_by_one]).await.remove(0);
     assert_eq!(pubkey_at(&obligation.data, 42), owner);
 }
 
@@ -396,36 +483,18 @@ async fn save_reserve_oracles_are_pyth_v2_template_accounts() {
 /// size empties them without an error, and this test is what notices.
 #[tokio::test]
 async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
-    let client = SurfnetRemoteClient::new(
-        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
-    );
+    let obligations = obligations().await;
     let lookup = async |encoding: UiAccountEncoding,
                         size: u64,
                         memcmps: &[(usize, &str)],
                         slice: UiDataSliceConfig| {
         let mut filters = vec![RpcFilterType::DataSize(size)];
-        filters.extend(memcmps.iter().map(|(offset, bytes)| {
-            RpcFilterType::Memcmp(Memcmp::new(
-                *offset,
-                MemcmpEncodedBytes::Base58(bytes.to_string()),
-            ))
-        }));
-        let config = RpcAccountInfoConfig {
-            encoding: Some(encoding),
-            data_slice: Some(slice),
-            commitment: Some(CommitmentConfig::confirmed()),
-            ..Default::default()
-        };
-        match client
-            .get_program_accounts(&Pubkey::from_str_const(SAVE_PROGRAM), config, Some(filters))
-            .await
-            .unwrap_or_else(|e| panic!("getProgramAccounts failed: {e}"))
-        {
-            RemoteRpcResult::Ok(found) => found,
-            RemoteRpcResult::MethodNotSupported => {
-                panic!("the RPC does not serve getProgramAccounts")
-            }
-        }
+        filters.extend(
+            memcmps
+                .iter()
+                .map(|(offset, bytes)| base58_at(*offset, bytes)),
+        );
+        program_accounts(encoding, filters, slice).await
     };
 
     for (mint, reserve, oracle) in [
@@ -465,14 +534,14 @@ async fn llm_context_lookups_find_the_main_reserves_and_an_owners_obligation() {
     let found = lookup(
         UiAccountEncoding::Base64,
         1300,
-        &[(42, OBLIGATION_1D1B_OWNER)],
+        &[(42, &obligations.one_by_one_owner)],
         slice,
     )
     .await;
     assert!(
         found
             .iter()
-            .any(|(pubkey, _)| pubkey.to_string() == OBLIGATION_1D1B),
+            .any(|(pubkey, _)| pubkey.to_string() == obligations.one_by_one),
         "the owner's obligation is missing from {found:?}"
     );
 }
@@ -496,6 +565,7 @@ const TOKEN_RENT: u64 = 2_039_280;
 struct SaveFixture {
     elf: Vec<u8>,
     accounts: HashMap<Pubkey, Account>,
+    obligation: &'static str,
 }
 
 impl SaveFixture {
@@ -507,6 +577,7 @@ impl SaveFixture {
 /// The deployed program and every account a refresh and a liquidation touch, fetched fresh.
 async fn fixture() -> SaveFixture {
     let elf = fetch(&[SAVE_PROGRAMDATA]).await.remove(0).data[45..].to_vec();
+    let obligation = obligations().await.three_by_two.as_str();
 
     let base = [
         MAIN_MARKET,
@@ -514,7 +585,7 @@ async fn fixture() -> SaveFixture {
         USDC_RESERVE,
         SOL_ORACLE,
         USDC_ORACLE,
-        OBLIGATION_3D2B,
+        obligation,
     ];
     let mut accounts: HashMap<Pubkey, Account> = base
         .iter()
@@ -536,7 +607,11 @@ async fn fixture() -> SaveFixture {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     accounts.extend(extra.into_iter().zip(fetch(&names).await));
 
-    SaveFixture { elf, accounts }
+    SaveFixture {
+        elf,
+        accounts,
+        obligation,
+    }
 }
 
 fn token_account(mint: &Pubkey, owner: &Pubkey, amount: u64, native: bool) -> Account {
@@ -605,7 +680,7 @@ fn prepare_position(fixture: &mut SaveFixture) -> i64 {
     apply(
         fixture,
         "save-obligation-position",
-        OBLIGATION_3D2B,
+        fixture.obligation,
         serde_json::json!({
             "owner": Pubkey::new_unique().to_string(),
             "lending_market": MAIN_MARKET,
@@ -643,7 +718,7 @@ fn run(fixture: &SaveFixture, publish_time: i64) -> Health {
     let market = Pubkey::from_str_const(MAIN_MARKET);
     let sol = Pubkey::from_str_const(SOL_RESERVE);
     let usdc = Pubkey::from_str_const(USDC_RESERVE);
-    let obligation = Pubkey::from_str_const(OBLIGATION_3D2B);
+    let obligation = Pubkey::from_str_const(fixture.obligation);
     let token_program = Pubkey::from_str_const(TOKEN_PROGRAM);
     let (sol_data, usdc_data) = (fixture.data(SOL_RESERVE), fixture.data(USDC_RESERVE));
 
@@ -812,7 +887,7 @@ async fn save_position_template_builds_a_healthy_position() {
 async fn save_lower_threshold_makes_the_position_liquidatable() {
     let mut fixture = fixture().await;
     let publish_time = prepare_position(&mut fixture);
-    let debt_before = u128_at(fixture.data(OBLIGATION_3D2B), 340);
+    let debt_before = u128_at(fixture.data(fixture.obligation), 340);
     apply(
         &mut fixture,
         "save-reserve-risk",
@@ -829,7 +904,7 @@ async fn save_lower_threshold_makes_the_position_liquidatable() {
 async fn save_sol_price_crash_makes_the_position_liquidatable() {
     let mut fixture = fixture().await;
     let publish_time = prepare_position(&mut fixture);
-    let debt_before = u128_at(fixture.data(OBLIGATION_3D2B), 340);
+    let debt_before = u128_at(fixture.data(fixture.obligation), 340);
     let oracle = fixture.data(SOL_ORACLE);
     let (price, ema) = (i64_at(oracle, PYTH_PRICE), i64_at(oracle, PYTH_EMA));
     apply_pyth(
