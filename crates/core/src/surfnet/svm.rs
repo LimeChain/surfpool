@@ -3592,9 +3592,12 @@ impl SurfnetSvm {
                     continue;
                 }
 
-                let clock_slot = self.inner.get_sysvar::<Clock>().slot;
                 let manifest = if override_instance.template_id.starts_with("manifest-") {
-                    prepare_manifest_override(&account, &account_values, clock_slot)
+                    prepare_manifest_override(
+                        &account,
+                        &account_values,
+                        self.inner.get_sysvar::<Clock>().slot,
+                    )
                 } else {
                     Ok(None)
                 };
