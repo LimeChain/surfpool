@@ -18,6 +18,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
+- **Save v2.0.2** – Lending (formerly Solend) with reserve risk, rate, limit and liquidity templates and a one-deposit, one-borrow obligation template. See [protocols/save/v2/README.md](./protocols/save/v2/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
@@ -46,6 +47,13 @@ accounts from mainnet, so they need a network connection and are compiled only b
 
 ```
 cargo test -p surfpool-core --features integration-tests kamino
+```
+
+Save coverage in `crates/core/src/tests/save/` works the same way, and also runs the deployed Save
+program in LiteSVM over those accounts:
+
+```
+cargo test -p surfpool-core --features integration-tests save
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
