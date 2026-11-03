@@ -170,14 +170,20 @@ async fn program_accounts(
         commitment: Some(CommitmentConfig::confirmed()),
         ..Default::default()
     };
-    match client
-        .get_program_accounts(&Pubkey::from_str_const(SAVE_PROGRAM), config, Some(filters))
-        .await
-        .unwrap_or_else(|e| panic!("getProgramAccounts failed: {e}"))
-    {
-        RemoteRpcResult::Ok(found) => found,
-        RemoteRpcResult::MethodNotSupported => panic!("the RPC does not serve getProgramAccounts"),
-    }
+    let program = Pubkey::from_str_const(SAVE_PROGRAM);
+    with_retries(&format!("Save accounts matching {filters:?}"), || async {
+        match client
+            .get_program_accounts(&program, config.clone(), Some(filters.clone()))
+            .await?
+        {
+            RemoteRpcResult::Ok(found) => Ok(found),
+            // A 503 lands here too: "Service Unavailable" matches a method-not-supported needle.
+            RemoteRpcResult::MethodNotSupported => {
+                Err("the RPC does not serve getProgramAccounts".to_string())
+            }
+        }
+    })
+    .await
 }
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
@@ -190,25 +196,10 @@ async fn fetch(addresses: &[&str]) -> Vec<Account> {
         .map(|a| Pubkey::from_str_const(a))
         .collect();
 
-    // The public endpoint throttles and intermittently 503s, which has nothing to do with what these
-    // tests assert.
-    let mut errors = Vec::new();
-    let results = loop {
-        match client
-            .get_multiple_accounts(&pubkeys, CommitmentConfig::confirmed())
-            .await
-        {
-            Ok(r) => break r,
-            Err(e) => {
-                errors.push(e.to_string());
-                if errors.len() >= 5 {
-                    panic!("failed to fetch {addresses:?} from mainnet: {errors:#?}");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(750 * errors.len() as u64))
-                    .await;
-            }
-        }
-    };
+    let results = with_retries(&format!("{addresses:?}"), || {
+        client.get_multiple_accounts(&pubkeys, CommitmentConfig::confirmed())
+    })
+    .await;
     results
         .into_iter()
         .zip(addresses)
@@ -220,6 +211,29 @@ async fn fetch(addresses: &[&str]) -> Vec<Account> {
             }
         })
         .collect()
+}
+
+async fn with_retries<T, E, Fut>(what: &str, request: impl Fn() -> Fut) -> T
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    // The public endpoint throttles and intermittently 503s, which has nothing to do with what these
+    // tests assert.
+    let mut errors = Vec::new();
+    loop {
+        match request().await {
+            Ok(r) => break r,
+            Err(e) => {
+                errors.push(e.to_string());
+                if errors.len() >= 5 {
+                    panic!("failed to fetch {what} from mainnet: {errors:#?}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(750 * errors.len() as u64))
+                    .await;
+            }
+        }
+    }
 }
 
 fn u64_at(data: &[u8], at: usize) -> u64 {
