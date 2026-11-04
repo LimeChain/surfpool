@@ -37,7 +37,7 @@ templates:
         label: Fair value
         description: >-
           Mid price as a fixed-point integer scaled by 2^88. Pass it as a decimal string.
-          Example: $75.45 is "23350643991020486314894032896"
+          Example: $75.45 is "23350643991020485435284730675"
     llm_context: |
       THE QUOTE STAYS LIVE BY ITSELF. From the slot this override plays, Surfpool republishes this
       pool's quote and the shared market tick every slot, as the maker and the block builders do on
