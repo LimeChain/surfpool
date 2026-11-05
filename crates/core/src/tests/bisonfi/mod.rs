@@ -29,12 +29,44 @@ use std::{
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
+use surfpool_types::KeepAliveClock;
 
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, template_registry},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
     tests::helpers::diff_indices,
 };
+
+/// The block builders' market tick a swap passes tenth, and the program that owns it.
+const MARKET_TICK: Pubkey = Pubkey::from_str_const("4cG31VNF9TzFinNc7BmnjhFvGjxkY3sCETVMtMgbrhPs");
+const MARKET_TICK_PROGRAM: Pubkey =
+    Pubkey::from_str_const("tickUcsEQegChaAuo9VYQQztB4ZGApY6ZT4FkULWY6N");
+
+/// What the surfnet writes every slot while a scenario on a BisonFi pool is registered: `keep_alive`
+/// applied to `data` as the shipped templates import it, at `slot` and `block_time_ms`.
+fn bisonfi_keep_alive(keep_alive: &str, data: &[u8], slot: u64, block_time_ms: u64) -> Vec<u8> {
+    let registry = template_registry();
+    let import = registry
+        .get("bisonfi-fair-value")
+        .and_then(|template| {
+            template
+                .keep_alive
+                .iter()
+                .find(|import| import.template == keep_alive)
+        })
+        .unwrap_or_else(|| panic!("BisonFi templates must import {keep_alive}"));
+    let values = import
+        .values_at(&KeepAliveClock {
+            slot,
+            unix_time_ms: block_time_ms,
+        })
+        .expect("keep-alive values");
+    registry
+        .keep_alive_template(keep_alive)
+        .expect("keep-alive template")
+        .materialize_raw_layout(data, &values, slot)
+        .unwrap_or_else(|e| panic!("{keep_alive}: {e}"))
+}
 
 // ---------------------------------------------------------------- fetch/diff helpers
 
@@ -293,12 +325,14 @@ fn bisonfi_templates_select_raw_layout_writes() {
     }
 }
 
-/// last_update_slot is what makes the staleness scenario possible, so pin that it really is the
-/// chain slot on a live market and that ageing it is a one-field write.
+/// last_update_slot is the chain slot on a live market, and keep-alive's publication writes exactly
+/// the three fields the maker's publication moves.
 #[tokio::test]
-async fn bisonfi_freshness_tracks_the_chain_slot() {
+async fn bisonfi_keep_alive_republishes_the_quote_on_a_live_market() {
     const LAST_UPDATE: usize = 72;
     const PREVIOUS_UPDATE: usize = 80;
+    const PUBLICATION_NS: usize = 88;
+    const LAST_REBUILD: usize = 688;
 
     let client = SurfnetRemoteClient::new(
         std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
@@ -330,31 +364,29 @@ async fn bisonfi_freshness_tracks_the_chain_slot() {
         "previous_update_slot ({prev}) must never lead last_update_slot ({last})"
     );
 
-    let registry = TemplateRegistry::new();
-    let template = registry
-        .get("bisonfi-freshness")
-        .expect("freshness template");
-    assert!(template.raw_layout, "freshness uses raw-layout writes");
-
-    let aged = last - 1000;
-    let forged = template
-        .materialize_raw_layout(
-            &data,
-            &HashMap::from([("last_update_slot".to_string(), serde_json::json!(aged))]),
-            0,
-        )
-        .expect("ageing the quote should apply");
-    assert_eq!(
-        u64::from_le_bytes(forged[LAST_UPDATE..LAST_UPDATE + 8].try_into().unwrap()),
-        aged
+    let (published_at, block_time_ms) = (last + 10, 1_800_000_000_123u64);
+    let published = bisonfi_keep_alive(
+        "bisonfi-quote-publication",
+        &data,
+        published_at,
+        block_time_ms,
     );
-    let diffs = diff_indices(&forged, &data);
-    assert!(!diffs.is_empty(), "the slot should have changed");
+    let at = |offset: usize| u64::from_le_bytes(published[offset..offset + 8].try_into().unwrap());
+    assert_eq!(at(LAST_UPDATE), published_at);
+    assert_eq!(at(PUBLICATION_NS), block_time_ms * 1_000_000);
+    assert_eq!(
+        at(LAST_REBUILD),
+        published_at - 1,
+        "the first swap of the slot must refill the book"
+    );
+    let diffs = diff_indices(&published, &data);
     assert!(
         diffs
             .iter()
-            .all(|i| (LAST_UPDATE..LAST_UPDATE + 8).contains(i)),
-        "only bytes within last_update_slot should change, got {diffs:?}"
+            .all(|i| [LAST_UPDATE, PUBLICATION_NS, LAST_REBUILD]
+                .iter()
+                .any(|field| (*field..field + 8).contains(i))),
+        "only the three publication fields should change, got {diffs:?}"
     );
 }
 
@@ -407,7 +439,7 @@ async fn bisonfi_every_property_writes_cleanly_on_every_pool() {
             serde_json::json!((50u128 * (1u128 << 88)).to_string()),
         ),
         (
-            "bisonfi-freshness",
+            "bisonfi-quote-publication",
             "last_update_slot",
             72,
             8,
@@ -531,8 +563,7 @@ impl BisonfiRig {
     ) -> u64 {
         // Materialize INSIDE the replay, not before it. `bisonfi_replay` derives the simnet clock
         // from the pool's own last_update_slot, so handing it an already-aged account moves the clock
-        // back along with the field and the quote never looks stale at all - which is exactly how the
-        // freshness scenario first appeared to fail.
+        // back along with the field and the quote never looks stale at all.
         self.try_scenario(pool, data, tp, template_id, values, amount_in, direction)
             .unwrap_or_else(|e| panic!("{template_id} on {pool}: replay failed: {e}"))
     }
@@ -577,12 +608,8 @@ impl BisonfiRig {
     }
 
     /// The quote-side notional matching [`Self::sell_size`], taken from what a control sell actually
-    /// pays out.
-    ///
-    /// An earlier version derived this from the pool's fixed-point mid, which is the price in HUMAN
-    /// units - so it was out by the market's decimal shift, a thousand-fold on a 9/6 pair. Every buy
-    /// leg then asked for more than the venue would fill and was quietly skipped. Using the control
-    /// fill needs no decimal table and cannot drift.
+    /// pays out. The pool's fixed-point mid is the price in HUMAN units, out by the market's decimal
+    /// shift; the control fill needs no decimal table and cannot drift.
     fn buy_size(control_sell_out: u64) -> u64 {
         control_sell_out
     }
@@ -598,6 +625,33 @@ async fn bisonfi_rig() -> std::sync::Arc<BisonfiRig> {
         .get_or_init(|| async { std::sync::Arc::new(bisonfi_rig_uncached().await) })
         .await
         .clone()
+}
+
+/// The byte the maker sets to halt a pool: while it is non-zero the pool pays nothing in either
+/// direction, at any size, though the maker keeps republishing it.
+const BISONFI_HALTED: usize = 824;
+
+/// The pools in `all` a replay must be able to quote: the maker still republishes them and has not
+/// halted them, they hold reserves, and both their mints are classic SPL tokens the harness can build
+/// accounts for. Which pools that is changes with the maker's decisions, so tests assert on this set
+/// rather than on a count of pools.
+fn bisonfi_pools_expected_to_quote(all: &[Vec<u8>], programs: &[(Pubkey, Pubkey)]) -> Vec<usize> {
+    let spl = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    let published = |data: &[u8]| u64::from_le_bytes(data[72..80].try_into().unwrap());
+    let newest = all.iter().map(|data| published(data)).max().unwrap_or(0);
+    all.iter()
+        .zip(programs)
+        .enumerate()
+        .filter(|(_, (data, (base, quote)))| {
+            // Dormant pools are millions of slots behind; a republished one is a few slots at most.
+            newest - published(data) <= 1_000
+                && data[BISONFI_HALTED] == 0
+                && u64::from_le_bytes(data[48..56].try_into().unwrap()) >= 1_000_000
+                && *base == spl
+                && *quote == spl
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 async fn bisonfi_rig_uncached() -> BisonfiRig {
@@ -624,16 +678,20 @@ async fn bisonfi_rig_uncached() -> BisonfiRig {
             }
         }
     }
-    // Six of the seventeen v3 pools publish a current mid. Two more are live but quote a Token-2022
-    // base asset the harness cannot build accounts for; the rest are dormant by 13-30 million slots
-    // and return no quote whatever is written to them. If this count drops, coverage silently
-    // narrowed and the scenario assertions below stop meaning anything.
+    // Every pool the maker republishes and has not halted must quote, or coverage silently narrowed
+    // and the scenario assertions below stop meaning anything. Dormant, halted and Token-2022 pools
+    // are skipped: which pools those are is the maker's decision, not a regression.
+    let expected = bisonfi_pools_expected_to_quote(&all, &programs);
+    let silent: Vec<&str> = expected
+        .iter()
+        .map(|&index| BISONFI_ALL_POOLS[index])
+        .filter(|pool| !quoting.iter().any(|(quoted, _, _)| quoted == pool))
+        .collect();
     assert!(
-        quoting.len() >= 6,
-        "only {} of {} pools can be quoted; scenario coverage has narrowed",
-        quoting.len(),
-        BISONFI_ALL_POOLS.len()
+        silent.is_empty(),
+        "{silent:?} are republished and not halted but cannot be quoted; scenario coverage has narrowed"
     );
+    assert!(!quoting.is_empty(), "no BisonFi pool can be quoted");
     BisonfiRig { elf, quoting }
 }
 
@@ -820,20 +878,23 @@ async fn bisonfi_scenario_one_sided_liquidity() {
             (buy_starved.clone(), buy_control),
         );
     }
-    // Both directions must actually have been exercised. The buy leg used to be skipped on every
-    // market because the notional was computed wrongly, and nothing said so.
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised both directions of the depth template"
+    // Both directions must actually have been exercised, or a wrong notional skips the buy leg
+    // silently.
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised both directions of the depth template"
     );
 }
 
-/// SCENARIO: silence a given market maker so it stops quoting entirely.
+/// A maker that stopped publishing: the venue pays nothing, and says so with a SUCCESSFUL
+/// transaction. Keep-alive keeps a registered scenario's pool from getting here; this pins what the
+/// program does when a quote is stale.
 ///
 /// This is the behaviour no constant-product AMM can imitate - an AMM always quotes something - so
-/// it is the scenario most likely to be untested on the consuming side.
+/// it is the case most likely to be untested on the consuming side.
 #[tokio::test]
-async fn bisonfi_scenario_silence_the_maker() {
+async fn bisonfi_a_stale_quote_pays_nothing_and_ignores_min_out() {
     const STALE_BY: u64 = 1_000_000;
 
     let rig = bisonfi_rig().await;
@@ -842,27 +903,10 @@ async fn bisonfi_scenario_silence_the_maker() {
         let size = BisonfiRig::sell_size(data);
         let published = u64::from_le_bytes(data[72..80].try_into().unwrap());
 
-        // The exact tolerance is maker policy and has varied between live pools/builds. Age the
-        // publication deliberately far beyond any observed threshold so this tests the template's
-        // useful guarantee (the maker can be silenced), not an unstable policy constant.
-        let silent = rig.scenario(
-            pool,
-            data,
-            *tp,
-            "bisonfi-freshness",
-            &[("last_update_slot", serde_json::json!(-(STALE_BY as i64)))],
-            size,
-            0,
-        );
-        assert_eq!(
-            silent, 0,
-            "{pool}: aged by {STALE_BY} slots the venue must not fill at all, got {silent}"
-        );
-
-        // And the sharp part: the swap's minimum-output bound is NOT honoured on the stale path, so
-        // the caller gets a CONFIRMED transaction that moved nothing and ignored their slippage
-        // protection. The healthy control below proves the bound is otherwise real, so this is the
-        // program returning early rather than the harness failing to set the field.
+        // The swap's minimum-output bound is NOT honoured on the stale path, so the caller gets a
+        // CONFIRMED transaction that moved nothing and ignored their slippage protection. The
+        // healthy control below proves the bound is otherwise real, so this is the program
+        // returning early rather than the harness failing to set the field.
         let healthy = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {})
             .unwrap_or_else(|e| panic!("{pool}: control failed: {e}"));
         assert!(
@@ -871,6 +915,8 @@ async fn bisonfi_scenario_silence_the_maker() {
             "{pool}: a minimum above the fillable amount must revert on a healthy market, or the \
              bound is not a slippage guard at all and the claim below means nothing"
         );
+        // The exact tolerance is maker policy and has varied between live pools/builds, so the
+        // quote is aged far beyond any observed threshold.
         let ignored = bisonfi_replay_min_out(
             &rig.elf,
             pool,
@@ -889,15 +935,16 @@ async fn bisonfi_scenario_silence_the_maker() {
         assert_eq!(
             ignored,
             Ok(0),
-            "{pool}: a silenced market must succeed with zero even when the caller demands \
-             {healthy} out - if this ever starts reverting, the scenario's symptom changed from a \
-             silent no-op to a failed transaction and every consumer's handling changes with it"
+            "{pool}: a stale market must succeed with zero even when the caller demands \
+             {healthy} out - if this ever starts reverting, the symptom changed from a silent no-op \
+             to a failed transaction and every consumer's handling changes with it"
         );
         checked += 1;
     }
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the freshness template"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets were checked"
     );
 }
 
@@ -939,6 +986,24 @@ const BISONFI_SPREAD_PROPS: [(&str, usize, usize); 8] = [
     ("continuation_source_levels.0.tick_offset", 1208, 5),
     ("continuation_source_levels.5.tick_offset", 1288, 5),
 ];
+
+/// The spread template's centre-depth properties: (path, offset, bytes written). Every market fills
+/// a slice at the mid itself before the ladder starts, and the program restores that slice from the
+/// fresh and aged depth tables, so all four places have to be emptied together.
+const BISONFI_CENTRE_DEPTH_PROPS: [(&str, usize, usize); 4] = [
+    ("working_levels.8.depth", 416, 8),
+    ("configured_levels.8.depth", 656, 8),
+    ("fresh_depth_table.0", 1536, 2),
+    ("aged_depth_table.0", 1556, 2),
+];
+
+/// The centre-depth properties all set to 0, which makes the ladder's spread the spread a trade pays.
+fn bisonfi_centre_emptied() -> Vec<(&'static str, serde_json::Value)> {
+    BISONFI_CENTRE_DEPTH_PROPS
+        .iter()
+        .map(|(path, _, _)| (*path, serde_json::json!(0)))
+        .collect()
+}
 
 /// The bid half of the spread template's properties, all set to `v`.
 ///
@@ -983,6 +1048,7 @@ fn bisonfi_apply_template(
 }
 
 /// Values setting the whole book to one magnitude: bid properties negative, ask properties positive.
+/// The centre is emptied too, as the template documents for an exact spread.
 fn bisonfi_spread_values(magnitude: i32) -> Vec<(&'static str, serde_json::Value)> {
     BISONFI_SPREAD_PROPS
         .iter()
@@ -996,6 +1062,7 @@ fn bisonfi_spread_values(magnitude: i32) -> Vec<(&'static str, serde_json::Value
             };
             (*path, serde_json::json!(v))
         })
+        .chain(bisonfi_centre_emptied())
         .collect()
 }
 
@@ -1074,9 +1141,10 @@ async fn bisonfi_scenario_set_spread() {
         );
         checked += 1;
     }
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the spread template; the claim needs the live markets"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the spread template; the claim needs the live markets"
     );
 }
 
@@ -1128,17 +1196,24 @@ async fn bisonfi_scenario_spread_is_side_specific() {
             continue;
         };
 
-        // Widening the bid must hurt sells and leave buys exactly where they were.
+        // Widening the bid must hurt sells and leave buys where they were. Some markets price a trade
+        // off both sides' ticks: by a fraction of a basis point, and a few on a trade deep into the
+        // ladder. So the widened side must move at least ten times more, relative to its control,
+        // than the other; a transposed template would move both sides alike.
+        let tenth = |other: (u64, u64), widened: (u64, u64)| {
+            other.0.abs_diff(other.1) as u128 * widened.1 as u128 * 10
+                <= widened.0.abs_diff(widened.1) as u128 * other.1 as u128
+        };
         let sell_wide = rig.scenario(pool, data, *tp, "bisonfi-spread", &bids, sell, 0);
         let buy_untouched = rig.scenario(pool, data, *tp, "bisonfi-spread", &bids, buy, 1);
         assert!(
             sell_wide < sell_control,
             "{pool}: widening the BID must pay a seller less, got {sell_wide} vs {sell_control}"
         );
-        assert_eq!(
-            buy_untouched, buy_control,
-            "{pool}: widening the BID must not change a BUY. If this fires the bid and ask offsets \
-             are transposed in the template"
+        assert!(
+            tenth((buy_untouched, buy_control), (sell_wide, sell_control)),
+            "{pool}: widening the BID must not change a BUY, got {buy_untouched} vs {buy_control}. \
+             If this fires the bid and ask offsets are transposed in the template"
         );
 
         // And the mirror image.
@@ -1148,9 +1223,9 @@ async fn bisonfi_scenario_spread_is_side_specific() {
             buy_wide < buy_control,
             "{pool}: widening the ASK must give a buyer less base, got {buy_wide} vs {buy_control}"
         );
-        assert_eq!(
-            sell_untouched, sell_control,
-            "{pool}: widening the ASK must not change a SELL"
+        assert!(
+            tenth((sell_untouched, sell_control), (buy_wide, buy_control)),
+            "{pool}: widening the ASK must not change a SELL, got {sell_untouched} vs {sell_control}"
         );
         checked += 1;
     }
@@ -1206,148 +1281,51 @@ async fn bisonfi_spread_template_writes_only_its_tick_fields() {
             }
         }
     }
+
+    for (path, offset, width) in BISONFI_CENTRE_DEPTH_PROPS {
+        for (pool, data) in BISONFI_ALL_POOLS.iter().zip(all.iter()) {
+            let forged = template
+                .materialize_raw_layout(
+                    data,
+                    &HashMap::from([(path.to_string(), serde_json::json!(0))]),
+                    0,
+                )
+                .unwrap_or_else(|e| panic!("{path} on {pool}: {e}"));
+            for i in diff_indices(&forged, data) {
+                assert!(
+                    (offset..offset + width).contains(&i),
+                    "{path} on {pool}: byte {i} changed, outside {offset}..{}",
+                    offset + width
+                );
+            }
+            assert!(
+                forged[offset..offset + width].iter().all(|b| *b == 0),
+                "{path} on {pool}: the centre depth was not emptied"
+            );
+        }
+    }
 }
 
-/// The live Orca Whirlpool SOL/USDC market, used as the AMM side of the arbitrage scenario.
+/// The live Orca Whirlpool SOL/USDC market the swap harness is checked against.
 const WHIRLPOOL_SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
 
-/// SCENARIO: arbitrage between BisonFi and an AMM on the same pair.
-///
-/// Surfpool loads mainnet state into the local VM, so dislocating BisonFi alone creates a real
-/// arbitrage against every other venue's upstream state with no second override. This measures that
-/// against Orca's actual on-chain price rather than a hardcoded number.
-///
-/// The Whirlpool's price comes from its `sqrt_price` (Q64.64 at offset 65), squared. Nothing is
-/// executed on the AMM side: pricing an Orca swap needs its tick arrays, which is a much larger piece
-/// of harness. What this proves is that the override produces a dislocation that is real, correctly
-/// signed, and of the right size against a live competing venue - which is what a router would act on.
-///
-/// It is also self-validating: the first assertion is that both venues agree on the price BEFORE any
-/// override. If the Whirlpool layout were misread, or the pair mismatched, that would fail rather than
-/// silently making the arbitrage numbers meaningless.
+/// A long run stays quoting with nothing scheduled after its first override: keep-alive republishes
+/// the pool every slot while the scenario is registered.
 #[tokio::test]
-async fn bisonfi_scenario_arbitrage_against_an_amm() {
-    let rig = bisonfi_rig().await;
-    let (pool, data, tp) = rig
-        .quoting
-        .iter()
-        .find(|(p, _, _)| *p == BISONFI_POOL)
-        .expect("the WSOL/USDC market must be quoting for this scenario");
-
-    let whirlpool = fetch(&[WHIRLPOOL_SOL_USDC]).await.remove(0);
-    // Confirm the two venues really are the same pair and the same way round, so the comparison below
-    // is between like and like.
-    let (bisonfi_base, bisonfi_quote) = (&data[184..216], &data[216..248]);
-    assert_eq!(
-        &whirlpool[101..133],
-        bisonfi_base,
-        "the Whirlpool's token A must be BisonFi's base mint"
-    );
-    assert_eq!(
-        &whirlpool[181..213],
-        bisonfi_quote,
-        "the Whirlpool's token B must be BisonFi's quote mint"
-    );
-
-    // Whirlpool price, in quote smallest-units per base smallest-unit. Squaring a Q64.64 needs care:
-    // done in f64 after the shift, which is ample for a comparison at this tolerance.
-    let sqrt_price = u128::from_le_bytes(whirlpool[65..81].try_into().unwrap());
-    let amm_price = (sqrt_price as f64 / 2f64.powi(64)).powi(2);
-    assert!(
-        amm_price > 0.0,
-        "the Whirlpool must carry a live sqrt_price, got {sqrt_price}"
-    );
-
-    // BisonFi's realized price on the same basis: quote received per base sold.
-    let size = u64::from_le_bytes(data[48..56].try_into().unwrap()) / 100;
-    let realized = |image: Option<Vec<u8>>| -> f64 {
-        let out = match image {
-            None => bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {}),
-            Some(img) => bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, move |d| *d = img),
-        }
-        .unwrap_or_else(|e| panic!("replay failed: {e}"));
-        assert!(
-            out > 0,
-            "BisonFi must fill for the comparison to mean anything"
-        );
-        out as f64 / size as f64
-    };
-
-    // 1. Undislocated, the two venues must agree. A proprietary market maker that disagreed with the
-    //    largest AMM on SOL by more than a fraction of a percent would be arbitraged instantly.
-    let quiet = realized(None);
-    let disagreement = (quiet - amm_price).abs() / amm_price;
-    assert!(
-        disagreement < 0.02,
-        "BisonFi and Orca should price SOL within 2% of each other before any override; got \
-         {quiet:.9} against {amm_price:.9} ({:.3}% apart). Either a layout offset is wrong or one \
-         venue is not live",
-        disagreement * 100.0
-    );
-
-    // 2. Now dislocate BisonFi upward by 10% through the shipped template, and the arbitrage appears:
-    //    buy SOL on Orca, sell it to BisonFi.
-    let mid = u128::from_le_bytes(data[832..848].try_into().unwrap());
-    let registry = TemplateRegistry::new();
-    let template = registry.get("bisonfi-fair-value").expect("template");
-    assert!(template.raw_layout, "fair value uses raw-layout writes");
-    let dislocated = template
-        .materialize_raw_layout(
-            data,
-            &HashMap::from([(
-                "fair_value".to_string(),
-                serde_json::json!((mid * 11 / 10).to_string()),
-            )]),
-            0,
-        )
-        .expect("price override");
-    let rich = realized(Some(dislocated));
-
-    let edge = (rich - amm_price) / amm_price;
-    assert!(
-        rich > quiet,
-        "the dislocated market must pay more than the quiet one, got {rich:.9} vs {quiet:.9}"
-    );
-    assert!(
-        edge > 0.05,
-        "a 10% dislocation should leave at least 5% of edge against the AMM after BisonFi's own \
-         spread and slippage; got {:.3}%",
-        edge * 100.0
-    );
-    assert!(
-        edge < 0.11,
-        "the edge cannot exceed the 10% dislocation that created it; got {:.3}%, which would mean \
-         the price override is scaling by more than it was asked to",
-        edge * 100.0
-    );
-}
-
-/// SCENARIO: the maker goes dark BETWEEN the quote and the fill.
-///
-/// This is the one that needed a real gap closing. Every other scenario applies its override once and
-/// asks what the program does. This one registers a scenario whose state CHANGES across slots, runs
-/// the scheduler slot by slot, and then feeds each slot's account image to the deployed program.
-///
-/// Why it matters: on Solana there is a gap of one or two slots between reading a price and the
-/// transaction executing. If the maker stops publishing inside that window, a caller who did
-/// everything right still gets no fill - and, as `bisonfi_scenario_silence_the_maker` shows, no error
-/// either. Reproducing that needs the override to fire on a LATER slot than the one quoted on, which
-/// exercises `register_scenario` and `materialize_overrides_for_slot` rather than a single write.
-#[tokio::test]
-async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
+async fn bisonfi_keep_alive_keeps_a_long_run_quoting() {
     use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-    const QUOTE_AT: u64 = 0; // scenario-relative slot the caller quotes on
-    const FILL_AT: u64 = 2; // and the slot the transaction actually lands on
-    const STALE_BY: i64 = 1_000_000;
+    const RUN_FOR: u64 = 64;
 
     let rig = bisonfi_rig().await;
     let (pool, data, tp) = rig.quoting.first().expect("a quoting market");
-    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
     let pool_key = pool.parse::<Pubkey>().expect("pool address");
+    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
     let size = BisonfiRig::sell_size(data);
 
+    // The surfnet starts at the pool's own slot, as a surfnet forked at that moment would.
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(base_slot);
     svm.inner
         .set_account(
             pool_key,
@@ -1361,204 +1339,105 @@ async fn bisonfi_scenario_maker_goes_dark_between_quote_and_fill() {
         )
         .expect("seed the pool account");
 
-    // Two steps on the same field: quoting normally when the caller looks, dark when it lands.
-    let mut scenario = Scenario::new(
-        "BisonFi maker goes dark mid-flight".to_string(),
-        "Quotes normally at the slot the caller prices on, then stops publishing before the \
-         transaction executes"
-            .to_string(),
-    );
-    for (relative, value) in [(QUOTE_AT, 0i64), (FILL_AT, -STALE_BY)] {
-        scenario.add_override(
-            OverrideInstance::new(
-                "bisonfi-freshness".to_string(),
-                relative,
-                AccountAddress::Pubkey(pool_key.to_string()),
-            )
-            .with_values(HashMap::from([(
-                "last_update_slot".to_string(),
-                serde_json::json!(value),
-            )])),
-        );
-    }
-    svm.register_scenario(scenario, Some(base_slot))
-        .expect("register scenario");
-
-    // Walk the slots and capture what the account looks like at each one.
-    let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
-    for slot in base_slot..=base_slot + FILL_AT {
-        svm.materialize_overrides_for_slot(&None, slot)
-            .await
-            .expect("materialize");
-        let account = svm
-            .inner
-            .get_account(&pool_key)
-            .expect("get_account")
-            .expect("account present");
-        images.insert(slot, account.data);
-    }
-
-    let field_at = |slot: u64| u64::from_le_bytes(images[&slot][72..80].try_into().unwrap());
-    // The lead is resolved against the slot each step materializes at, so the first step stamps
-    // its own slot and the second lands deliberately far behind its own.
-    assert_eq!(
-        field_at(base_slot),
-        base_slot,
-        "at the quoting slot the venue must still be publishing"
-    );
-    assert_eq!(
-        field_at(base_slot + 1),
-        base_slot,
-        "no override is scheduled for the intermediate slot, so the account must be untouched"
-    );
-    assert_eq!(
-        field_at(base_slot + FILL_AT),
-        (base_slot + FILL_AT)
-            .checked_sub(STALE_BY as u64)
-            .expect("live slot must exceed the deliberate stale age"),
-        "the second step must have fired by the slot the transaction lands on"
-    );
-
-    // Now the half that makes this more than a scheduling test: hand each slot's image to the real
-    // program. The clock is taken from the ORIGINAL account, so the simnet's notion of "now" stays at
-    // the publication slot while the field moves underneath it - which is what actually happens when
-    // the maker stops and the chain moves on.
-    let replay = |image: Vec<u8>| {
-        bisonfi_replay(
-            &rig.elf,
-            pool,
-            data,
-            *tp,
-            size,
-            0,
-            move |d: &mut Vec<u8>| {
-                *d = image;
-            },
-        )
-    };
-    let quoted = replay(images[&base_slot].clone()).expect("the quoting slot must fill");
-    assert!(
-        quoted > 0,
-        "the caller's quote has to be real, or the scenario proves nothing"
-    );
-    let filled = replay(images[&(base_slot + FILL_AT)].clone());
-    assert_eq!(
-        filled,
-        Ok(0),
-        "the maker went dark between the quote and the fill, so the swap must return nothing - and \
-         it must do so without erroring, which is what makes this a silent failure"
-    );
-}
-
-/// A long-running simulation keeps the maker available by scheduling another freshness
-/// write when it needs a quote. This is the explicit-scheduling replacement for persistence.
-#[tokio::test]
-async fn bisonfi_scenario_scheduled_refresh_keeps_a_long_run_quoting() {
-    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
-
-    const EXECUTE_AFTER: u64 = 4_096;
-
-    let rig = bisonfi_rig().await;
-    let (pool, data, tp) = rig.quoting.first().expect("a quoting market");
-    let pool_key = pool.parse::<Pubkey>().expect("pool address");
-    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
-    let execute_slot = base_slot
-        .checked_add(EXECUTE_AFTER)
-        .expect("live slot plus scenario duration");
-    let size = BisonfiRig::sell_size(data);
-
-    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
-    svm.inner
-        .set_account(
-            pool_key,
-            solana_account::Account {
-                lamports: 1_000_000,
-                data: data.clone(),
-                owner: Pubkey::from_str_const(BISONFI_PROGRAM),
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .expect("seed the pool account");
-
+    // Any BisonFi override keeps its pool alive; this one restates the mid the pool already quotes.
+    let fair_value = u128::from_le_bytes(data[832..848].try_into().unwrap());
     let mut scenario = Scenario::new(
         "BisonFi stays live during a long run".to_string(),
-        "Refreshes the maker again in the later slot where its quote is needed".to_string(),
+        "Restates the mid once; keep-alive republishes the quote every later slot".to_string(),
     );
-    for relative_slot in [0, EXECUTE_AFTER] {
-        scenario.add_override(
-            OverrideInstance::new(
-                "bisonfi-freshness".to_string(),
-                relative_slot,
-                AccountAddress::Pubkey(pool_key.to_string()),
-            )
-            .with_values(HashMap::from([(
-                "last_update_slot".to_string(),
-                serde_json::json!(0),
-            )])),
-        );
-    }
+    scenario.add_override(
+        OverrideInstance::new(
+            "bisonfi-fair-value".to_string(),
+            0,
+            AccountAddress::Pubkey(pool_key.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "fair_value".to_string(),
+            serde_json::json!(fair_value.to_string()),
+        )])),
+    );
     svm.register_scenario(scenario, Some(base_slot))
         .expect("register scenario");
-
     svm.materialize_overrides_for_slot(&None, base_slot)
         .await
-        .expect("materialize initial refresh");
-    let initial = svm
+        .expect("materialize the override");
+    for _ in 0..RUN_FOR {
+        svm.confirm_current_block().expect("produce a block");
+        svm.materialize_overrides(&None)
+            .await
+            .expect("materialize keep-alive");
+    }
+
+    let slot = svm.get_latest_absolute_slot();
+    assert!(slot >= base_slot + RUN_FOR, "the run must have advanced");
+    let kept = svm
         .inner
         .get_account(&pool_key)
         .expect("get_account")
         .expect("account present")
         .data;
     assert_eq!(
-        u64::from_le_bytes(initial[72..80].try_into().unwrap()),
-        base_slot,
-        "the first refresh must resolve relative to its own slot"
+        u64::from_le_bytes(kept[72..80].try_into().unwrap()),
+        slot,
+        "keep-alive must have republished the quote in the current slot"
     );
-
-    svm.materialize_overrides_for_slot(&None, execute_slot)
-        .await
-        .expect("materialize later refresh");
-    let refreshed = svm
-        .inner
-        .get_account(&pool_key)
-        .expect("get_account")
-        .expect("account present")
-        .data;
     assert_eq!(
-        u64::from_le_bytes(refreshed[72..80].try_into().unwrap()),
-        execute_slot,
-        "the later refresh must resolve relative to the slot where the quote is needed"
+        u64::from_le_bytes(kept[88..96].try_into().unwrap()),
+        svm.calculate_block_time_for_slot(slot) * 1_000_000
     );
 
-    // `bisonfi_replay` takes its clock before applying the mutation. Give it the later execution
-    // slot as the clock source, then install either account image to test the deployed program.
-    let mut clock_source = data.clone();
-    clock_source[72..80].copy_from_slice(&execute_slot.to_le_bytes());
-    let stale = bisonfi_replay(&rig.elf, pool, &clock_source, *tp, size, 0, {
-        let initial = initial.clone();
-        move |account| *account = initial
+    // A replay runs its clock at the pool's publication, so the kept image swaps at the surfnet's
+    // current slot, and the pool as fetched swaps at that same clock as a quote RUN_FOR slots old.
+    let live = bisonfi_replay(&rig.elf, pool, &kept, *tp, size, 0, |_| {})
+        .expect("the kept-alive market must execute");
+    assert!(live > 0, "a kept-alive market must keep quoting");
+    let stale = bisonfi_replay(&rig.elf, pool, &kept, *tp, size, 0, {
+        let fetched = data.clone();
+        move |account| *account = fetched
     });
     assert_eq!(
         stale,
         Ok(0),
-        "a quote refreshed only at the start must be stale {EXECUTE_AFTER} slots later"
+        "without keep-alive the quote must be stale {RUN_FOR} slots later"
     );
+}
 
-    let live = bisonfi_replay(
-        &rig.elf,
-        pool,
-        &clock_source,
-        *tp,
-        size,
-        0,
-        move |account| *account = refreshed,
-    )
-    .expect("the explicitly refreshed market must execute");
-    assert!(
-        live > 0,
-        "scheduling freshness again at the execution slot must keep the maker quoting"
-    );
+/// Plays a registered scenario on `svm` from `base` through `last` as the block producer does, and
+/// returns the pool's account image at each slot. Keep-alive republishes the pool in every slot, so
+/// each image swaps at its own clock.
+async fn bisonfi_play(
+    svm: &mut SurfnetSvm,
+    pool: Pubkey,
+    base: u64,
+    last: u64,
+) -> HashMap<u64, Vec<u8>> {
+    let mut images = HashMap::new();
+    for slot in base..=last {
+        if slot == base {
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize the first slot");
+        } else {
+            svm.confirm_current_block().expect("produce a block");
+            svm.materialize_overrides(&None)
+                .await
+                .expect("materialize the slot");
+        }
+        assert_eq!(svm.get_latest_absolute_slot(), slot);
+        let image = svm
+            .inner
+            .get_account(&pool)
+            .expect("get_account")
+            .expect("account present")
+            .data;
+        assert_eq!(
+            u64::from_le_bytes(image[72..80].try_into().unwrap()),
+            slot,
+            "keep-alive must republish the pool in every slot"
+        );
+        images.insert(slot, image);
+    }
+    images
 }
 
 /// SCENARIO: the mid MOVES between the quote and the fill - adverse selection.
@@ -1571,12 +1450,12 @@ async fn bisonfi_scenario_scheduled_refresh_keeps_a_long_run_quoting() {
 async fn bisonfi_scenario_mid_moves_between_quote_and_fill() {
     use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-    const BASE_SLOT: u64 = 2_000_000;
     const FILL_AT: u64 = 2;
 
     let rig = bisonfi_rig().await;
     let (pool, data, tp) = rig.quoting.first().expect("a quoting market");
     let pool_key = pool.parse::<Pubkey>().expect("pool address");
+    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
     let mid = u128::from_le_bytes(data[832..848].try_into().unwrap());
     let size = BisonfiRig::sell_size(data);
     let moved = mid * 9 / 10; // the maker marks the asset down 10% while the taker is in flight
@@ -1594,6 +1473,8 @@ async fn bisonfi_scenario_mid_moves_between_quote_and_fill() {
             },
         )
         .expect("seed the pool account");
+    // The surfnet starts at the pool's own slot, as a surfnet forked at that moment would.
+    svm.set_latest_absolute_slot(base_slot);
 
     let mut scenario = Scenario::new(
         "BisonFi reprices mid-flight".to_string(),
@@ -1614,60 +1495,38 @@ async fn bisonfi_scenario_mid_moves_between_quote_and_fill() {
             )])),
         );
     }
-    svm.register_scenario(scenario, Some(BASE_SLOT))
+    svm.register_scenario(scenario, Some(base_slot))
         .expect("register scenario");
 
-    let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
-    for slot in BASE_SLOT..=BASE_SLOT + FILL_AT {
-        svm.materialize_overrides_for_slot(&None, slot)
-            .await
-            .expect("materialize");
-        images.insert(
-            slot,
-            svm.inner
-                .get_account(&pool_key)
-                .expect("get_account")
-                .expect("account present")
-                .data,
-        );
-    }
+    let images = bisonfi_play(&mut svm, pool_key, base_slot, base_slot + FILL_AT).await;
     let mid_at = |slot: u64| u128::from_le_bytes(images[&slot][832..848].try_into().unwrap());
     assert_eq!(
-        mid_at(BASE_SLOT),
+        mid_at(base_slot),
         mid,
         "the quoting slot must carry the quoted price"
     );
     assert_eq!(
-        mid_at(BASE_SLOT + FILL_AT),
+        mid_at(base_slot + FILL_AT),
         moved,
         "the repricing step must have fired by the slot the transaction lands on"
     );
 
     // What the caller quoted, and therefore the minimum they would sign for.
-    let quoted = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, {
-        let image = images[&BASE_SLOT].clone();
-        move |d: &mut Vec<u8>| *d = image
-    })
-    .expect("the quoting slot must fill");
+    let quoted = bisonfi_replay(&rig.elf, pool, &images[&base_slot], *tp, size, 0, |_| {})
+        .expect("the quoting slot must fill");
     assert!(quoted > 0, "the caller's quote has to be real");
 
     // The same transaction, landing after the reprice. Without a minimum it fills at the worse price;
     // with the minimum the caller actually quoted, it reverts.
-    let image = images[&(BASE_SLOT + FILL_AT)].clone();
-    let unprotected = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, {
-        let image = image.clone();
-        move |d: &mut Vec<u8>| *d = image
-    })
-    .expect("a repriced market still quotes, just worse");
+    let image = images[&(base_slot + FILL_AT)].clone();
+    let unprotected = bisonfi_replay(&rig.elf, pool, &image, *tp, size, 0, |_| {})
+        .expect("a repriced market still quotes, just worse");
     assert!(
         unprotected < quoted,
         "a 10% markdown must pay the seller less: got {unprotected} against a quote of {quoted}"
     );
 
-    let protected = bisonfi_replay_min_out(&rig.elf, pool, data, *tp, size, quoted, 0, {
-        let image = image.clone();
-        move |d: &mut Vec<u8>| *d = image
-    });
+    let protected = bisonfi_replay_min_out(&rig.elf, pool, &image, *tp, size, quoted, 0, |_| {});
     assert!(
         protected.is_err(),
         "signing for the price that was quoted must REVERT once the maker has repriced, got \
@@ -1745,9 +1604,10 @@ async fn bisonfi_scenario_dislocated_price_behind_thin_depth() {
         );
         checked += 1;
     }
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the combined scenario"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the combined scenario"
     );
 }
 
@@ -1895,10 +1755,9 @@ async fn bisonfi_spread_lever_moves_the_quote_on_every_pool() {
                 best = (gap, div);
             }
 
-            // The 288-versus-528 question this test used to hedge about is settled: 288 and 1036 are
-            // working copies refreshed from 528 and 1196 by a watermark-gated memcpy (traced at
-            // 10310-10387). The template writes all four regions for that
-            // reason, so there is no longer an unmeasured case to leave un-asserted here.
+            // 288 and 1036 are working copies refreshed from 528 and 1196 by a watermark-gated
+            // memcpy (traced at 10310-10387), and the template writes all four regions, so there is
+            // no unmeasured case to leave un-asserted here.
             let _ = baseline;
         }
 
@@ -1916,15 +1775,18 @@ async fn bisonfi_spread_lever_moves_the_quote_on_every_pool() {
         }
     }
 
-    // Without this the whole test could pass while quoting on nothing at all. Six of the seventeen v3
-    // pools publish a current mid and can be replayed; two more are live but quote a Token-2022 base
-    // asset the harness cannot build accounts for (Custom(60)), and the rest are dormant, between 13
-    // and 30 million slots behind, and return no quote whatever is written to them.
+    // Without this the whole test could pass while quoting on nothing at all. Every pool the maker
+    // republishes and has not halted must have priced; dormant, halted and Token-2022 pools, which the
+    // harness cannot build accounts for (Custom(60)), return no quote whatever is written to them.
+    let silent: Vec<&str> = bisonfi_pools_expected_to_quote(&all, &programs)
+        .into_iter()
+        .map(|index| BISONFI_ALL_POOLS[index])
+        .filter(|pool| !peaks.iter().any(|(priced, _, _)| priced == pool))
+        .collect();
     assert!(
-        peaks.len() >= 6,
-        "only {} pools produced a quote at any size: {peaks:?}. This test proves nothing if the \
-         markets are not actually pricing",
-        peaks.len()
+        silent.is_empty() && !peaks.is_empty(),
+        "{silent:?} are republished and not halted but produced no quote at any size ({peaks:?}). \
+         This test proves nothing if the markets are not actually pricing"
     );
 }
 
@@ -2059,6 +1921,31 @@ fn bisonfi_replay_min_out(
     direction: u8,
     mutate: impl FnOnce(&mut Vec<u8>),
 ) -> Result<u64, String> {
+    bisonfi_replay_with_state(
+        elf,
+        pool_addr,
+        pool_bytes,
+        token_programs,
+        amount_in,
+        min_out,
+        direction,
+        mutate,
+    )
+    .map(|(out, _)| out)
+}
+
+/// As [`bisonfi_replay_min_out`], also returning the pool account as the swap left it.
+#[allow(clippy::too_many_arguments)]
+fn bisonfi_replay_with_state(
+    elf: &[u8],
+    pool_addr: &str,
+    pool_bytes: &[u8],
+    token_programs: (Pubkey, Pubkey),
+    amount_in: u64,
+    min_out: u64,
+    direction: u8,
+    mutate: impl FnOnce(&mut Vec<u8>),
+) -> Result<(u64, Vec<u8>), String> {
     use litesvm::LiteSVM;
     use solana_account::Account;
     use solana_instruction::{AccountMeta, Instruction};
@@ -2093,10 +1980,12 @@ fn bisonfi_replay_min_out(
         .with_blockhash_check(false);
     svm.add_program(program_id, elf)
         .map_err(|e| format!("add_program: {e:?}"))?;
+    let block_time_ms = publish_millis(pool_bytes);
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = pool_slot;
-    clock.unix_timestamp = 1_787_041_969;
+    clock.unix_timestamp = (block_time_ms / 1_000) as i64;
     svm.set_sysvar(&clock);
+    let tick = install_market_tick(&mut svm, pool_slot, block_time_ms);
     svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
         last_restart_slot: 246_464_040,
@@ -2185,6 +2074,8 @@ fn bisonfi_replay_min_out(
             data,
         },
     ];
+    let mut ixs = ixs;
+    ixs[1].accounts.extend(tick);
     let mut msg = solana_message::Message::new(&ixs, Some(&taker.pubkey()));
     msg.recent_blockhash = svm.latest_blockhash();
     let nsig = msg.header.num_required_signatures as usize;
@@ -2200,7 +2091,7 @@ fn bisonfi_replay_min_out(
             } else {
                 spl_amount(&svm.get_account(&src_ta).unwrap().data)
             };
-            Ok(out)
+            Ok((out, svm.get_account(&pool_key).unwrap().data))
         }
         Err(e) => Err(format!("{:?}", e.err)),
     }
@@ -2231,16 +2122,73 @@ async fn load_program_elf(cache_name: &str, programdata: &str) -> Vec<u8> {
 }
 
 /// The program ELF, fetched once per process and reused. Delete the file to pick up a redeploy.
+/// Also loads the market tick: anything that runs the program needs both.
 async fn bisonfi_elf() -> Vec<u8> {
     static ELF: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
+    load_market_tick().await;
     ELF.get_or_init(|| load_program_elf("surfpool-bisonfi-program.so", BISONFI_PROGRAMDATA))
         .await
         .clone()
 }
 
-/// Offsets of the live quote ladder. `LADDER` is the table the program actually prices from;
-/// `LADDER_INERT` is the mirrored table that writing has no effect on, kept here so the test that
-/// proves the difference cannot drift away from the template.
+/// BisonFi's market tick as upstream holds it, fetched once per process. Every replay restamps it to
+/// its own clock with the shipped keep-alive, as Surfpool does every slot.
+static BISONFI_TICK: std::sync::OnceLock<solana_account::Account> = std::sync::OnceLock::new();
+
+async fn load_market_tick() {
+    if BISONFI_TICK.get().is_some() {
+        return;
+    }
+    let (data, lamports) = fetch_with_lamports(&[&MARKET_TICK.to_string()])
+        .await
+        .remove(0);
+    let _ = BISONFI_TICK.set(solana_account::Account {
+        lamports,
+        data,
+        owner: MARKET_TICK_PROGRAM,
+        executable: false,
+        rent_epoch: 0,
+    });
+}
+
+thread_local! {
+    /// Set only by the test that pins what a swap without the tick does.
+    static OMIT_MARKET_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs the market tick stamped to `slot` and `block_time_ms` and returns the account a swap
+/// passes tenth, or `None` while a test is omitting it.
+fn install_market_tick(
+    svm: &mut litesvm::LiteSVM,
+    slot: u64,
+    block_time_ms: u64,
+) -> Option<solana_instruction::AccountMeta> {
+    if OMIT_MARKET_TICK.with(|omit| omit.get()) {
+        return None;
+    }
+    let tick = BISONFI_TICK
+        .get()
+        .expect("load the market tick (bisonfi_elf does) before replaying a swap");
+    let mut stamped = tick.clone();
+    stamped.data = bisonfi_keep_alive("bisonfi-market-tick", &tick.data, slot, block_time_ms);
+    svm.set_account(MARKET_TICK, stamped)
+        .expect("tick should install");
+    Some(solana_instruction::AccountMeta::new_readonly(
+        MARKET_TICK,
+        false,
+    ))
+}
+
+/// The pool's publication time in milliseconds. Replays run their clock at it, so a quote is exactly
+/// as fresh as the maker made it.
+fn publish_millis(pool: &[u8]) -> u64 {
+    u64::from_le_bytes(pool[88..96].try_into().unwrap()) / 1_000_000
+}
+
+/// Offsets of the quote ladder. `LADDER` is the source table the maker configures; `LADDER_MIRROR` is
+/// the working copy swaps price from and consume. The program copies the source over the working copy
+/// on the first swap of a slot the pool was published in, so the working copy only differs - and only
+/// matters - within a slot after that copy, or while the quote is one or two slots old.
 const BISONFI_LADDER: usize = 528;
 
 const BISONFI_LADDER_MIRROR: usize = 288;
@@ -2333,10 +2281,12 @@ fn bisonfi_run(
     svm.add_program(program_id, &fork.elf)
         .map_err(|e| format!("add_program: {e:?}"))?;
 
+    let block_time_ms = publish_millis(&fork.pool);
     let mut clock: solana_clock::Clock = svm.get_sysvar();
     clock.slot = pool_slot;
-    clock.unix_timestamp = 1_787_041_969;
+    clock.unix_timestamp = (block_time_ms / 1_000) as i64;
     svm.set_sysvar(&clock);
+    let tick = install_market_tick(&mut svm, pool_slot, block_time_ms);
     // Match Surfpool startup: this local VM begins at the account snapshot's slot.
     svm.set_sysvar(&LastRestartSlot {
         // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
@@ -2432,6 +2382,8 @@ fn bisonfi_run(
         data: cu_data,
     };
 
+    let mut ix = ix;
+    ix.accounts.extend(tick);
     let mut msg = solana_message::Message::new(&[cu_ix, ix], Some(&taker.pubkey()));
     msg.recent_blockhash = svm.latest_blockhash();
     let nsig = msg.header.num_required_signatures as usize;
@@ -2559,9 +2511,10 @@ async fn bisonfi_depth_lever_is_monotonic_on_every_quoting_market() {
 
     // Previously this test covered three hardcoded markets while the other three templates were proven
     // on every pool that quotes. Without this floor it could silently narrow back to one.
-    assert!(
-        checked >= 6,
-        "only {checked} quoting markets exercised the depth lever"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the depth lever"
     );
 }
 
@@ -2698,7 +2651,6 @@ async fn bisonfi_staleness_threshold_exists() {
 async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
     use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-    const BASE_SLOT: u64 = 2_000_000;
     const FILL_AT: u64 = 2;
     const TIGHT: i32 = -13; // about 5 ppm below mid
     const WIDE: i32 = -25_600; // 1% below mid
@@ -2741,6 +2693,7 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
          widening cannot be demonstrated. Investigate before relaxing this",
     );
     let pool_key = pool.parse::<Pubkey>().expect("pool address");
+    let base_slot = u64::from_le_bytes(data[72..80].try_into().unwrap());
 
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     svm.inner
@@ -2755,6 +2708,8 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
             },
         )
         .expect("seed the pool account");
+    // The surfnet starts at the pool's own slot, as a surfnet forked at that moment would.
+    svm.set_latest_absolute_slot(base_slot);
 
     let mut scenario = Scenario::new(
         "BisonFi widens mid-flight".to_string(),
@@ -2777,23 +2732,10 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
             ),
         );
     }
-    svm.register_scenario(scenario, Some(BASE_SLOT))
+    svm.register_scenario(scenario, Some(base_slot))
         .expect("register scenario");
 
-    let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
-    for slot in BASE_SLOT..=BASE_SLOT + FILL_AT {
-        svm.materialize_overrides_for_slot(&None, slot)
-            .await
-            .expect("materialize");
-        images.insert(
-            slot,
-            svm.inner
-                .get_account(&pool_key)
-                .expect("get_account")
-                .expect("account present")
-                .data,
-        );
-    }
+    let images = bisonfi_play(&mut svm, pool_key, base_slot, base_slot + FILL_AT).await;
 
     // The scheduled writes landed in the right slots, in every region the template covers.
     for (path, offset, count) in BISONFI_SPREAD_PROPS {
@@ -2805,12 +2747,12 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
             let read =
                 |slot: u64| i32::from_le_bytes(images[&slot][at..at + 4].try_into().unwrap());
             assert_eq!(
-                read(BASE_SLOT),
+                read(base_slot),
                 TIGHT,
                 "{path} rung {rung} at {at}: the quoting slot must carry the tight ladder"
             );
             assert_eq!(
-                read(BASE_SLOT + FILL_AT),
+                read(base_slot + FILL_AT),
                 WIDE,
                 "{path} rung {rung} at {at}: the widening step must have fired by the fill slot"
             );
@@ -2818,19 +2760,13 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
     }
 
     // What the caller quoted, and therefore the minimum they would sign for.
-    let quoted = bisonfi_replay(&rig.elf, pool, data, tp, size, 0, {
-        let image = images[&BASE_SLOT].clone();
-        move |d: &mut Vec<u8>| *d = image
-    })
-    .expect("the quoting slot must fill");
+    let quoted = bisonfi_replay(&rig.elf, pool, &images[&base_slot], tp, size, 0, |_| {})
+        .expect("the quoting slot must fill");
     assert!(quoted > 0, "the caller's quote has to be real");
 
-    let image = images[&(BASE_SLOT + FILL_AT)].clone();
-    let unprotected = bisonfi_replay(&rig.elf, pool, data, tp, size, 0, {
-        let image = image.clone();
-        move |d: &mut Vec<u8>| *d = image
-    })
-    .expect("a widened market still quotes, just worse");
+    let image = images[&(base_slot + FILL_AT)].clone();
+    let unprotected = bisonfi_replay(&rig.elf, pool, &image, tp, size, 0, |_| {})
+        .expect("a widened market still quotes, just worse");
     assert!(
         unprotected < quoted,
         "widening the ladder from 5 ppm to 1% must pay the seller less: got {unprotected} against \
@@ -2846,10 +2782,7 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
     );
 
     // And the case a consumer can actually detect: signing for the quoted price reverts.
-    let protected = bisonfi_replay_min_out(&rig.elf, pool, data, tp, size, quoted, 0, {
-        let image = image.clone();
-        move |d: &mut Vec<u8>| *d = image
-    });
+    let protected = bisonfi_replay_min_out(&rig.elf, pool, &image, tp, size, quoted, 0, |_| {});
     assert!(
         protected.is_err(),
         "signing for the price that was quoted must REVERT once the maker has widened, got \
@@ -2858,119 +2791,6 @@ async fn bisonfi_scenario_spread_widens_between_quote_and_fill() {
 }
 
 const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-
-/// Every account an Orca Whirlpool `swap` needs is derivable and present, so the AMM leg of the
-/// cross-venue arbitrage scenario can be executed rather than only priced.
-///
-/// `bisonfi_scenario_arbitrage_against_an_amm` currently compares BisonFi's quote against Whirlpool's
-/// published state. Making that leg atomic - both swaps in one transaction - needs three tick arrays
-/// and an oracle at PDAs that are only created lazily, so whether they exist is a fact about the
-/// market and not something to assume. This pins it, and pins the derivation itself: a `TickArray`
-/// stores its own `start_tick_index` and a back-pointer to its whirlpool, so if the seed scheme were
-/// wrong the addresses would either not resolve or resolve to another pool's arrays. An earlier
-/// hand-rolled derivation that skipped the off-curve bump search produced three addresses that all
-/// looked plausible and none of which existed, which is exactly the failure this guards against.
-#[tokio::test]
-async fn whirlpool_swap_account_graph_is_derivable_and_present() {
-    const TICK_ARRAY_LEN: usize = 9988;
-    const TICKS_PER_ARRAY: i32 = 88;
-
-    let prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
-    let wp_key = Pubkey::from_str_const(WHIRLPOOL_SOL_USDC);
-    let wp = fetch(&[WHIRLPOOL_SOL_USDC]).await.remove(0);
-
-    let spacing = u16::from_le_bytes(wp[41..43].try_into().unwrap());
-    let tick_current = i32::from_le_bytes(wp[81..85].try_into().unwrap());
-    let mint_a = Pubkey::try_from(&wp[101..133]).expect("token_mint_a");
-    let vault_a = Pubkey::try_from(&wp[133..165]).expect("token_vault_a");
-    let mint_b = Pubkey::try_from(&wp[181..213]).expect("token_mint_b");
-    let vault_b = Pubkey::try_from(&wp[213..245]).expect("token_vault_b");
-    assert!(spacing > 0, "tick_spacing must be positive, got {spacing}");
-
-    // The array a tick falls in starts at a multiple of spacing*88, rounded toward negative infinity.
-    // Integer division truncates toward zero, which is the wrong way for the negative ticks a SOL/USDC
-    // pool actually sits at, so this rounds explicitly.
-    let per_array = spacing as i32 * TICKS_PER_ARRAY;
-    let start = (tick_current as f32 / per_array as f32).floor() as i32 * per_array;
-    assert!(
-        start <= tick_current && tick_current < start + per_array,
-        "the current tick {tick_current} must fall inside its own array [{start}, {})",
-        start + per_array
-    );
-
-    let (oracle, _) = Pubkey::find_program_address(&[b"oracle", wp_key.as_ref()], &prog);
-    let starts: Vec<i32> = [-1i32, 0, 1]
-        .iter()
-        .map(|k| start + k * per_array)
-        .collect();
-    let arrays: Vec<Pubkey> = starts
-        .iter()
-        .map(|s| {
-            Pubkey::find_program_address(
-                &[b"tick_array", wp_key.as_ref(), s.to_string().as_bytes()],
-                &prog,
-            )
-            .0
-        })
-        .collect();
-
-    let mut addrs: Vec<String> = arrays.iter().map(|a| a.to_string()).collect();
-    addrs.push(vault_a.to_string());
-    addrs.push(vault_b.to_string());
-    addrs.push(oracle.to_string());
-    let refs: Vec<&str> = addrs.iter().map(|s| s.as_str()).collect();
-    let got = fetch_optional(&refs).await;
-
-    for ((s, addr), data) in starts.iter().zip(arrays.iter()).zip(got.iter()) {
-        let data = data.as_ref().unwrap_or_else(|| {
-            panic!(
-                "tick array for start {s} ({addr}) does not exist. A swap crossing into it would \
-                 fail, so the atomic leg needs a pool whose neighbouring arrays are initialized"
-            )
-        });
-        assert_eq!(data.len(), TICK_ARRAY_LEN, "{addr}: not a TickArray");
-        // start_tick_index sits right after the 8-byte Anchor discriminator.
-        assert_eq!(
-            i32::from_le_bytes(data[8..12].try_into().unwrap()),
-            *s,
-            "{addr}: the account's own start_tick_index disagrees with the seed it was derived \
-             from, so the derivation is wrong"
-        );
-        // ...and the trailing whirlpool back-pointer proves it belongs to THIS pool.
-        assert_eq!(
-            Pubkey::try_from(&data[TICK_ARRAY_LEN - 32..]).expect("whirlpool back-pointer"),
-            wp_key,
-            "{addr}: belongs to a different whirlpool"
-        );
-    }
-
-    for (label, mint, vault, data) in [
-        ("a", mint_a, vault_a, &got[3]),
-        ("b", mint_b, vault_b, &got[4]),
-    ] {
-        let data = data
-            .as_ref()
-            .unwrap_or_else(|| panic!("token_vault_{label} {vault} does not exist"));
-        assert_eq!(
-            data.len(),
-            165,
-            "token_vault_{label}: not an SPL token account"
-        );
-        assert_eq!(
-            Pubkey::try_from(&data[0..32]).expect("vault mint"),
-            mint,
-            "token_vault_{label} does not hold the mint the whirlpool declares"
-        );
-    }
-
-    // The oracle is only initialized for adaptive-fee pools. Classic `swap` takes it as an
-    // UncheckedAccount, so an absent one is passable as an empty account - but the address still has to
-    // be the right PDA, which is why it is derived here rather than faked.
-    assert!(
-        got[5].is_none() || got[5].as_ref().map(|d| !d.is_empty()).unwrap_or(false),
-        "oracle {oracle} resolved to a zero-length account, which is neither absent nor valid"
-    );
-}
 
 /// Orca's `swap`, transcribed from the IDL the program itself publishes on chain.
 ///
@@ -3265,7 +3085,7 @@ fn whirlpool_replay(
 
 /// A real Orca Whirlpool swap executes against state loaded from upstream, in both directions.
 ///
-/// This is the AMM leg the cross-venue arbitrage scenario needs, and it is also what validates the
+/// This is the AMM leg the cross-pair arbitrage scenario runs on, and it is also what validates the
 /// instruction layout transcribed in `whirlpool_swap`: the assertions below pin all four balances that
 /// move, so a wrong account order or argument encoding cannot pass by coincidence.
 #[tokio::test]
@@ -3307,7 +3127,7 @@ async fn whirlpool_swap_executes_against_loaded_upstream_state() {
         "round-tripping must return less than the 1 SOL it started with after fees, got {got_b}"
     );
 
-    // And the threshold argument is enforced, which the arbitrage test relies on for its profit floor.
+    // And the threshold argument is enforced.
     let greedy = whirlpool_replay(&fork, ONE_SOL, true, got + 1);
     assert!(
         greedy.is_err(),
@@ -3315,309 +3135,148 @@ async fn whirlpool_swap_executes_against_loaded_upstream_state() {
     );
 }
 
-/// Buys a fixed quantity of the base asset on Orca and sells it on BisonFi in ONE transaction.
+/// BisonFi's SOL/USDT pool, the second pair of the cross-pair arbitrage scenario.
+const BISONFI_SOL_USDT: &str = "FJnaiidSLXFweWkgbinxEHRykVHsnkzDcYbNDR3RF5LN";
+/// Orca's USDC/USDT Whirlpool, where the cross-pair arbitrage turns its USDT back into USDC.
+const WHIRLPOOL_USDC_USDT: &str = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4";
+
+/// SCENARIO: Studio's "Cross-Pair Arbitrage" example, end to end.
 ///
-/// `dislocation` scales BisonFi's published mid, so a value above 1.0 makes BisonFi the richer bid and
-/// the round trip profitable. Returns the taker's net change in the quote asset - negative is a loss.
-///
-/// The two legs are coupled by using an exact-OUTPUT swap on Orca: an instruction's amounts are fixed
-/// when the transaction is built, so a leg that bought "whatever N USDC gets" could not be followed by
-/// a leg that sells exactly that. Asking Orca for exactly N base tokens and paying whatever it costs
-/// makes the second leg's size known in advance, which is what lets both legs sit in one transaction.
-fn bisonfi_orca_atomic_arb(
-    orca: &WhirlpoolFork,
-    bf_elf: &[u8],
-    bisonfi_pool: &str,
-    bisonfi_snapshot: &[u8],
-    bf_programs: (Pubkey, Pubkey),
-    base_out: u64,
-    fair_value: u128,
-) -> Result<i64, String> {
-    use litesvm::LiteSVM;
-    use solana_account::Account;
-    use solana_instruction::{AccountMeta, Instruction};
-    use solana_keypair::Keypair;
-    use solana_signer::Signer;
-    use solana_transaction::Transaction;
+/// BisonFi's SOL/USDC pool is held at its price and its SOL/USDT pool set 1.5% higher through the
+/// shipped template and `SurfnetSvm`, then played for several slots so keep-alive republishes both
+/// pools. The cycle runs against the deployed programs: USDC buys SOL on BisonFi, the SOL sells for
+/// USDT on BisonFi, and Orca turns the USDT back into USDC - for more than was spent, while the same
+/// cycle on mainnet state does not pay.
+#[tokio::test]
+async fn bisonfi_scenario_cross_pair_arbitrage_pays_end_to_end() {
+    use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
-    let mut bf = bisonfi_snapshot.to_vec();
+    const PLAY_FOR: u64 = 10;
+    const USDC_IN: u64 = 1_000_000_000;
 
-    let g64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    let base_reserve = g64(&bf, 48);
-    let quote_reserve = g64(&bf, 56);
-    let bf_base_vault = Pubkey::new_from_array(bf[120..152].try_into().unwrap());
-    let bf_quote_vault = Pubkey::new_from_array(bf[152..184].try_into().unwrap());
-    let base_mint = Pubkey::new_from_array(bf[184..216].try_into().unwrap());
-    let quote_mint = Pubkey::new_from_array(bf[216..248].try_into().unwrap());
-    let bf_slot = g64(&bf, 72);
-
-    // Both venues have to be quoting the same pair in the same order, or the shared token accounts
-    // below would be silently routing two unrelated markets.
+    let elf = bisonfi_elf().await;
+    let pools = fetch(&[BISONFI_POOL, BISONFI_SOL_USDT]).await;
+    let programs = bisonfi_token_programs(&pools).await;
+    let (usdc_pool, usdt_pool) = (pools[0].clone(), pools[1].clone());
+    let (usdc_programs, usdt_programs) = (programs[0], programs[1]);
+    let orca = whirlpool_fork(WHIRLPOOL_USDC_USDT).await;
+    let mint = |data: &[u8], offset: usize| Pubkey::try_from(&data[offset..offset + 32]).unwrap();
+    assert_eq!(
+        mint(&usdc_pool, 184),
+        mint(&usdt_pool, 184),
+        "both BisonFi pools must trade the same base"
+    );
     assert_eq!(
         (orca.mint_a, orca.mint_b),
-        (base_mint, quote_mint),
-        "the Orca pool and the BisonFi market must quote the same base/quote pair"
+        (mint(&usdc_pool, 216), mint(&usdt_pool, 216)),
+        "the Whirlpool must trade the two pools' quote tokens, USDC as A and USDT as B"
     );
 
-    // Every run starts from the same external reference, not BisonFi's independently moving live
-    // price. This makes fair and dislocated runs differ only by the template value under test.
-    bisonfi_apply_template(
-        "bisonfi-fair-value",
-        &[("fair_value", serde_json::json!(fair_value.to_string()))],
-    )(&mut bf);
-
-    let bf_prog = Pubkey::from_str_const(BISONFI_PROGRAM);
-    let orca_prog = Pubkey::from_str_const(WHIRLPOOL_PROGRAM);
-    let spl = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-    let bf_key = Pubkey::from_str_const(bisonfi_pool);
-
-    let mut svm = LiteSVM::new()
-        .with_sigverify(false)
-        .with_blockhash_check(false);
-    svm.add_program(bf_prog, bf_elf)
-        .map_err(|e| format!("add bisonfi: {e:?}"))?;
-    svm.add_program(orca_prog, &orca.elf)
-        .map_err(|e| format!("add orca: {e:?}"))?;
-
-    // One clock satisfies both venues: BisonFi checks the SLOT against its own last_update_slot and
-    // Orca checks the TIMESTAMP against its reward accrual, so the two constraints do not collide.
-    let orca_ts = u64::from_le_bytes(orca.data[261..269].try_into().unwrap());
-    let mut clock: solana_clock::Clock = svm.get_sysvar();
-    clock.slot = bf_slot;
-    clock.unix_timestamp = orca_ts as i64;
-    svm.set_sysvar(&clock);
-    svm.set_sysvar(&LastRestartSlot {
-        // Captured from the upstream LastRestartSlot sysvar. Product startup fetches this value.
-        last_restart_slot: 246_464_040,
-    });
-
-    let owned = |data: Vec<u8>, owner: Pubkey| Account {
-        lamports: 10_000_000_000,
-        data,
-        owner,
-        executable: false,
-        rent_epoch: 0,
-    };
-    svm.set_account(orca.key, owned(orca.data.clone(), orca_prog))
-        .map_err(|e| format!("{e:?}"))?;
-    for (_, k, d) in &orca.arrays {
-        svm.set_account(*k, owned(d.clone(), orca_prog))
-            .map_err(|e| format!("{e:?}"))?;
-    }
-    for (k, d) in [&orca.vault_a, &orca.vault_b] {
-        svm.set_account(*k, owned(d.clone(), spl))
-            .map_err(|e| format!("{e:?}"))?;
-    }
-    svm.set_account(bf_key, owned(bf, bf_prog))
-        .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        bf_base_vault,
-        owned(
-            token_account(&base_mint, &bf_key, base_reserve),
-            bf_programs.0,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        bf_quote_vault,
-        owned(
-            token_account(&quote_mint, &bf_key, quote_reserve + 79_168),
-            bf_programs.1,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-
-    // The arbitrageur: funded in the quote asset, empty in the base. Both legs share these two
-    // accounts, which is what makes the profit measurable as a single balance change.
-    let taker = Keypair::new();
-    svm.airdrop(&taker.pubkey(), 10_000_000_000)
-        .map_err(|e| format!("{e:?}"))?;
-    let (base_ta, quote_ta) = (Pubkey::new_unique(), Pubkey::new_unique());
-    let quote_funding = quote_reserve / 4;
-    svm.set_account(
-        base_ta,
-        owned(token_account(&base_mint, &taker.pubkey(), 0), spl),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-    svm.set_account(
-        quote_ta,
-        owned(
-            token_account(&quote_mint, &taker.pubkey(), quote_funding),
-            spl,
-        ),
-    )
-    .map_err(|e| format!("{e:?}"))?;
-
-    let (oracle, _) = Pubkey::find_program_address(&[b"oracle", orca.key.as_ref()], &orca_prog);
-    let arrays = orca.tick_arrays(false); // buying base means B -> A
-    let buy_on_orca = Instruction {
-        program_id: orca_prog,
-        accounts: vec![
-            AccountMeta::new_readonly(spl, false),
-            AccountMeta::new_readonly(taker.pubkey(), true),
-            AccountMeta::new(orca.key, false),
-            AccountMeta::new(base_ta, false),
-            AccountMeta::new(orca.vault_a.0, false),
-            AccountMeta::new(quote_ta, false),
-            AccountMeta::new(orca.vault_b.0, false),
-            AccountMeta::new(arrays[0], false),
-            AccountMeta::new(arrays[1], false),
-            AccountMeta::new(arrays[2], false),
-            AccountMeta::new_readonly(oracle, false),
-            AccountMeta::new_readonly(orca_prog, false),
-        ],
-        // Exact output: `base_out` of token A, paying up to u64::MAX of token B.
-        data: whirlpool_swap::data(
-            base_out,
-            u64::MAX,
-            whirlpool_swap::MAX_SQRT_PRICE,
-            false,
-            false,
-        ),
-    };
-
-    let mut bf_data = Vec::with_capacity(19);
-    bf_data.push(0x07);
-    bf_data.extend_from_slice(&base_out.to_le_bytes());
-    bf_data.extend_from_slice(&0u64.to_le_bytes()); // min_out; profit is asserted on balances
-    bf_data.push(0); // direction 0 = sell base for quote
-    bf_data.push(0);
-    let sell_on_bisonfi = Instruction {
-        program_id: bf_prog,
-        accounts: vec![
-            AccountMeta::new(taker.pubkey(), true),
-            AccountMeta::new(bf_key, false),
-            AccountMeta::new(bf_base_vault, false),
-            AccountMeta::new(bf_quote_vault, false),
-            AccountMeta::new(base_ta, false),
-            AccountMeta::new(quote_ta, false),
-            AccountMeta::new_readonly(bf_programs.0, false),
-            AccountMeta::new_readonly(bf_programs.1, false),
-            AccountMeta::new_readonly(Pubkey::from_str_const(BISONFI_NINTH), true),
-        ],
-        data: bf_data,
-    };
-
-    let mut budget = vec![2u8];
-    budget.extend_from_slice(&1_800_000u32.to_le_bytes());
-    let ixs = vec![
-        Instruction {
-            program_id: Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"),
-            accounts: vec![],
-            data: budget,
-        },
-        buy_on_orca,
-        sell_on_bisonfi,
-    ];
-
-    let before = spl_amount(&svm.get_account(&quote_ta).expect("quote_ta").data);
-    let mut msg = solana_message::Message::new(&ixs, Some(&taker.pubkey()));
-    msg.recent_blockhash = svm.latest_blockhash();
-    let nsig = msg.header.num_required_signatures as usize;
-    let mut tx = Transaction::new_unsigned(msg);
-    tx.signatures = vec![solana_signature::Signature::default(); nsig];
-    tx.signatures[0] = taker.sign_message(&tx.message.serialize());
-    svm.send_transaction(tx)
-        .map_err(|e| format!("{:?}", e.err))?;
-
-    let after = spl_amount(&svm.get_account(&quote_ta).expect("quote_ta").data);
-    let leftover = spl_amount(&svm.get_account(&base_ta).expect("base_ta").data);
-    assert_eq!(
-        leftover, 0,
-        "the arbitrageur must end flat in the base asset, or the profit below is really an \
-         unrealized position: {leftover} left over"
-    );
-    Ok(after as i64 - before as i64)
-}
-
-/// SCENARIO: arbitrage between BisonFi and an AMM on the same pair, executed atomically.
-///
-/// The upgrade over `bisonfi_scenario_arbitrage_against_an_amm`, which compares the two venues' quotes
-/// without trading: here both legs run in a single transaction against upstream state loaded for both
-/// programs, and the profit is a real balance change in the arbitrageur's own account.
-///
-/// Self-validating in both directions. At the market's true mid the round trip must LOSE money, since
-/// the arbitrageur pays fees on both venues - if that leg showed a profit, the harness would be minting
-/// value and every number it produced would be suspect. Only once the fair-value template dislocates
-/// BisonFi does the same transaction become profitable, and the profit has to grow with the
-/// dislocation.
-#[tokio::test]
-async fn bisonfi_scenario_atomic_arbitrage_against_orca() {
-    const SOL_USDC: &str = "8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo";
-    const ONE_SOL: u64 = 1_000_000_000;
-
-    // Load both venues once so every point in the sweep executes against exactly the same state.
-    let orca = whirlpool_fork(WHIRLPOOL_SOL_USDC).await;
-    let bf_elf = bisonfi_elf().await;
-    let bf = fetch(&[SOL_USDC]).await.remove(0);
-    let bf_programs = bisonfi_token_programs(&[bf.clone()]).await.remove(0);
-
-    // Orca stores sqrt(raw quote/base) in Q64.64. SOL has 9 decimals and USDC has 6, while
-    // BisonFi stores the human quote/base price in Q40.88, hence the 1000 raw-unit adjustment.
-    let sqrt_price = u128::from_le_bytes(orca.data[65..81].try_into().unwrap());
-    let reference_fair_value = (sqrt_price
-        .checked_mul(sqrt_price)
-        .expect("the Orca square-root price must fit in u128")
-        >> 40)
-        .checked_mul(1_000)
-        .expect("the converted Orca price must fit in u128");
-
-    // No dislocation: both legs use Orca's snapshot price, so fees make the round trip a loss.
-    let fair = bisonfi_orca_atomic_arb(
-        &orca,
-        &bf_elf,
-        SOL_USDC,
-        &bf,
-        bf_programs,
-        ONE_SOL,
-        reference_fair_value,
-    )
-    .expect("the round trip must execute at the shared reference price");
-    assert!(
-        fair < 0,
-        "buying on Orca and selling on BisonFi at the true mid returned a profit of {fair}. Two \
-         venues both charging a fee cannot pay the taker, so the harness is not measuring a real \
-         round trip"
-    );
-
-    // Mark BisonFi up so it becomes the richer bid, and the same transaction becomes an arbitrage.
-    let mut last = fair;
-    let mut two_percent_profit = None;
-    for pct in [2u128, 5, 10] {
-        let dislocated = reference_fair_value
-            .checked_mul(100 + pct)
-            .expect("the dislocated price must fit in u128")
-            / 100;
-        let profit = bisonfi_orca_atomic_arb(
-            &orca,
-            &bf_elf,
-            SOL_USDC,
-            &bf,
-            bf_programs,
-            ONE_SOL,
-            dislocated,
+    // USDC gained by the cycle, in basis points of the USDC spent. Each replay runs at its pool's own
+    // publication, so a played image swaps at the slot keep-alive republished it in.
+    let cycle = |usdc_image: &[u8], usdt_image: &[u8]| -> i64 {
+        let sol = bisonfi_replay(
+            &elf,
+            BISONFI_POOL,
+            usdc_image,
+            usdc_programs,
+            USDC_IN,
+            1,
+            |_| {},
         )
-        .unwrap_or_else(|e| panic!("the round trip must execute with BisonFi {pct}% rich: {e}"));
-        assert!(
-            profit > last,
-            "marking BisonFi up {pct}% must pay better than the {last} the previous step returned, \
-             got {profit}"
+        .unwrap_or_else(|e| panic!("buy SOL for USDC on BisonFi: {e}"));
+        assert!(sol > 0, "BisonFi must sell SOL for USDC");
+        let usdt = bisonfi_replay(
+            &elf,
+            BISONFI_SOL_USDT,
+            usdt_image,
+            usdt_programs,
+            sol,
+            0,
+            |_| {},
+        )
+        .unwrap_or_else(|e| panic!("sell {sol} SOL for USDT on BisonFi: {e}"));
+        assert!(usdt > 0, "BisonFi must buy SOL for USDT");
+        let (_, usdc_out) = whirlpool_replay(&orca, usdt, false, 0)
+            .unwrap_or_else(|e| panic!("swap {usdt} USDT for USDC on Orca: {e}"));
+        (i128::from(usdc_out) - i128::from(USDC_IN)) as i64 * 10_000 / USDC_IN as i64
+    };
+    let control = cycle(&usdc_pool, &usdt_pool);
+
+    // What the AI writes for the prompt: SOL/USDC at the mid it quotes, SOL/USDT 1.5% above its own.
+    let fair_value = |data: &[u8]| u128::from_le_bytes(data[832..848].try_into().unwrap());
+    let published = |data: &[u8]| u64::from_le_bytes(data[72..80].try_into().unwrap());
+    let base_slot = published(&usdc_pool).max(published(&usdt_pool));
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(base_slot);
+    let mut scenario = Scenario::new(
+        "Cross-Pair Arbitrage".to_string(),
+        "BisonFi prices SOL 1.5% higher in USDT than in USDC".to_string(),
+    );
+    for (pool, data, fair_value) in [
+        (BISONFI_POOL, &usdc_pool, fair_value(&usdc_pool)),
+        (
+            BISONFI_SOL_USDT,
+            &usdt_pool,
+            fair_value(&usdt_pool) * 1_015 / 1_000,
+        ),
+    ] {
+        svm.inner
+            .set_account(
+                Pubkey::from_str_const(pool),
+                solana_account::Account {
+                    lamports: 1_000_000,
+                    data: data.clone(),
+                    owner: Pubkey::from_str_const(BISONFI_PROGRAM),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("seed {pool}: {e:?}"));
+        scenario.add_override(
+            OverrideInstance::new(
+                "bisonfi-fair-value".to_string(),
+                0,
+                AccountAddress::Pubkey(pool.to_string()),
+            )
+            .with_values(HashMap::from([(
+                "fair_value".to_string(),
+                serde_json::json!(fair_value.to_string()),
+            )])),
         );
-        if pct == 2 {
-            two_percent_profit = Some(profit);
-        }
-        last = profit;
     }
-    let two_percent_profit = two_percent_profit.expect("the 2% leg must run");
+    svm.register_scenario(scenario, Some(base_slot))
+        .expect("register the Cross-Pair Arbitrage scenario");
+    let last = base_slot + PLAY_FOR;
+    let usdt_image = bisonfi_play(
+        &mut svm,
+        Pubkey::from_str_const(BISONFI_SOL_USDT),
+        base_slot,
+        last,
+    )
+    .await
+    .remove(&last)
+    .expect("the SOL/USDT pool at the last slot");
+    let usdc_image = svm
+        .inner
+        .get_account(&Pubkey::from_str_const(BISONFI_POOL))
+        .expect("get_account")
+        .expect("the SOL/USDC pool")
+        .data;
+    assert_eq!(
+        published(&usdc_image),
+        last,
+        "keep-alive must republish the SOL/USDC pool too"
+    );
+
+    let profit = cycle(&usdc_image, &usdt_image);
     assert!(
-        two_percent_profit > 0,
-        "the documented scenario claims a 2% premium clears both venues' fees, got \
-         {two_percent_profit}"
+        control < 50,
+        "the same cycle on mainnet state must not hold an arbitrage: {control} bp"
     );
     assert!(
-        last > 0,
-        "a 10% dislocation must produce an outright profit, got {last}. The fair-value template's \
-         guidance claims this lever creates a cross-venue arbitrage, so it has to actually do so"
+        profit > 100,
+        "a 1.5% cross-pair gap less BisonFi's and Orca's costs must pay: {profit} bp (mainnet {control} bp)"
     );
 }
 
@@ -3707,8 +3366,569 @@ async fn bisonfi_staleness_suppresses_the_price_and_spread_levers() {
         checked += 1;
     }
 
-    assert!(
-        checked >= 6,
-        "only {checked} markets exercised the precedence of the freshness gate"
+    assert_eq!(
+        checked,
+        rig.quoting.len(),
+        "only {checked} of the quoting markets exercised the precedence of the freshness gate"
     );
+}
+
+/// The market tick is a tenth swap account. Without it a gated market succeeds and pays nothing.
+/// Pinned so a program upgrade that changes this is noticed.
+#[tokio::test]
+async fn bisonfi_a_swap_without_the_market_tick_pays_nothing() {
+    let rig = bisonfi_rig().await;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data);
+        let with_tick = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: control failed: {e}"));
+        assert!(with_tick > 0, "{pool}: the control must fill");
+
+        OMIT_MARKET_TICK.with(|omit| omit.set(true));
+        let without = bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |_| {});
+        OMIT_MARKET_TICK.with(|omit| omit.set(false));
+        assert_eq!(
+            without,
+            Ok(0),
+            "{pool}: a swap without the tick must succeed and pay nothing"
+        );
+    }
+}
+
+/// How the program uses the market tick: it grades a quote's age - the tick's time minus the pool's
+/// publication time (byte 88) - to the millisecond. Up to 150 ms it prices the full book, older it
+/// falls back to a thinner one, and either way it still fills. So a late quote must never fill
+/// better than a punctual one and must fill worse on most markets.
+#[tokio::test]
+async fn bisonfi_quote_age_grades_the_book() {
+    let rig = bisonfi_rig().await;
+    let mut thinner = 0usize;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data);
+        // Replays run their clock at the pool's own publication time, so moving byte 88 back by
+        // `late_ms` makes the quote exactly that old.
+        let at = |late_ms: u64| {
+            bisonfi_replay(&rig.elf, pool, data, *tp, size, 0, |d| {
+                let published = u64::from_le_bytes(d[88..96].try_into().unwrap());
+                d[88..96].copy_from_slice(&(published - late_ms * 1_000_000).to_le_bytes());
+            })
+            .unwrap_or_else(|e| panic!("{pool}: {e}"))
+        };
+        let (fresh, late, aged) = (at(0), at(250), at(500));
+        assert!(
+            fresh > 0 && late > 0 && aged > 0,
+            "{pool}: a late quote must still fill"
+        );
+        assert!(
+            late <= fresh && aged <= fresh,
+            "{pool}: a late quote filled better than a fresh one: {fresh} vs {late} / {aged}"
+        );
+        if late < fresh {
+            thinner += 1;
+        }
+    }
+    assert!(
+        thinner * 2 >= rig.quoting.len(),
+        "only {thinner} of {} markets thinned a 250 ms old quote; the program's quote-age grading \
+         seems to have changed",
+        rig.quoting.len()
+    );
+}
+
+/// A pool fetched while the surfnet is behind mainnet carries mainnet's later rebuild slot (byte
+/// 688), and the program refills a consumed book only while that slot is in the past. Keep-alive's
+/// publication moves it back, so a republished slot refills such a pool too - and a publication of
+/// the slot alone would not.
+#[tokio::test]
+async fn bisonfi_keep_alive_refills_a_pool_fetched_ahead_of_the_surfnet() {
+    let rig = bisonfi_rig().await;
+    let mut refilled_somewhere = false;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data) / 2;
+        let (first, after) =
+            bisonfi_replay_with_state(&rig.elf, pool, data, *tp, size, 0, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: first sell failed: {e}"));
+
+        // The next slot, with the reserves put back so only the book differs, and a rebuild slot
+        // from mainnet's future, as a fetch behind mainnet leaves it.
+        let slot = u64::from_le_bytes(after[72..80].try_into().unwrap()) + 1;
+        let mut next = after.clone();
+        next[48..64].copy_from_slice(&data[48..64]);
+        next[688..696].copy_from_slice(&(slot + 30).to_le_bytes());
+
+        let mut slot_only = next.clone();
+        slot_only[72..80].copy_from_slice(&slot.to_le_bytes());
+        let kept_alive = bisonfi_keep_alive(
+            "bisonfi-quote-publication",
+            &next,
+            slot,
+            publish_millis(&next),
+        );
+        let sell = |published: Vec<u8>| {
+            bisonfi_replay(&rig.elf, pool, &published, *tp, size, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: republished sell failed: {e}"))
+        };
+        let (stuck, refilled) = (sell(slot_only), sell(kept_alive));
+
+        let drift_bps = (refilled as f64 / first as f64 - 1.0).abs() * 1e4;
+        assert!(
+            refilled >= stuck && drift_bps < 5.0,
+            "{pool}: a kept-alive slot should fill like the first swap: first {first}, slot only \
+             {stuck}, kept alive {refilled} ({drift_bps:.2} bps)"
+        );
+        refilled_somewhere |= refilled > stuck;
+    }
+    assert!(
+        refilled_somewhere,
+        "no market refilled better with the rebuild slot moved back; the program's rebuild gate \
+         seems to have changed"
+    );
+}
+
+/// Swaps consume the working ladder, so a second swap in the same slot fills worse. The program
+/// refills the ladder from its source on the first swap of a slot the pool was published in, which on
+/// a surfnet means every slot keep-alive republishes it in.
+#[tokio::test]
+async fn bisonfi_a_fresh_slot_refills_what_a_swap_consumed() {
+    let rig = bisonfi_rig().await;
+    let mut consumed_somewhere = false;
+    for (pool, data, tp) in &rig.quoting {
+        let size = BisonfiRig::sell_size(data) / 2;
+        let (first, after) =
+            bisonfi_replay_with_state(&rig.elf, pool, data, *tp, size, 0, 0, |_| {})
+                .unwrap_or_else(|e| panic!("{pool}: first sell failed: {e}"));
+        assert!(first > 0, "{pool}: the first sell must fill");
+
+        // Put the reserves back so only the ladder state differs from the first swap's.
+        let mut same_slot = after.clone();
+        same_slot[48..64].copy_from_slice(&data[48..64]);
+        let second = bisonfi_replay(&rig.elf, pool, &same_slot, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: second sell failed: {e}"));
+        assert!(
+            second <= first,
+            "{pool}: a second sell in the same slot filled better ({second} > {first})"
+        );
+        consumed_somewhere |= second < first;
+
+        // The next slot, republished by keep-alive: the replay's clock follows the publication.
+        let slot = u64::from_le_bytes(same_slot[72..80].try_into().unwrap());
+        let next_slot = bisonfi_keep_alive(
+            "bisonfi-quote-publication",
+            &same_slot,
+            slot + 1,
+            publish_millis(&same_slot) + 400,
+        );
+        let refilled = bisonfi_replay(&rig.elf, pool, &next_slot, *tp, size, 0, |_| {})
+            .unwrap_or_else(|e| panic!("{pool}: refreshed sell failed: {e}"));
+        let drift_bps = (refilled as f64 / first as f64 - 1.0).abs() * 1e4;
+        assert!(
+            refilled >= second && drift_bps < 5.0,
+            "{pool}: a refreshed slot should fill like the first swap: first {first}, same slot \
+             {second}, refreshed {refilled} ({drift_bps:.2} bps)"
+        );
+    }
+    assert!(
+        consumed_somewhere,
+        "no market filled a second swap worse; the ladder is no longer consumed by swaps"
+    );
+}
+
+// ---------------------------------------------------------------- live surfnet
+
+mod live_surfnet {
+    //! The same swaps, end to end: a surfnet forking mainnet, driven only over JSON-RPC. The
+    //! replay tests above prove what the program does with given bytes; these prove Surfpool
+    //! produces those bytes on its own - the pool's publication and the tick, kept alive every block
+    //! by a registered scenario - with nothing written into the fork by hand.
+
+    use std::time::{Duration, Instant};
+
+    use base64::Engine;
+    use crossbeam_channel::unbounded;
+    use solana_client::{nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest};
+    use solana_commitment_config::CommitmentConfig;
+    use solana_compute_budget_interface::ComputeBudgetInstruction;
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_signer::Signer;
+    use solana_transaction::Transaction;
+    use surfpool_types::{
+        AccountAddress, OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig,
+    };
+
+    use super::{BISONFI_NINTH, BISONFI_PROGRAM, DEFAULT_RPC_URL, MARKET_TICK, RPC_URL_ENV};
+    use crate::{
+        storage::tests::TestType,
+        surfnet::locker::SurfnetSvmLocker,
+        tests::{
+            helpers::get_free_port,
+            integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
+        },
+    };
+
+    /// SOL-USDC-Pool2: live, tick-gated, and both mints are plain SPL tokens.
+    const POOL: Pubkey = Pubkey::from_str_const("8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo");
+    const TOKENKEG: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    const ATA_PROGRAM: Pubkey =
+        Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    const CLOCK_SYSVAR: Pubkey =
+        Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111");
+    /// Ten USDC per purchase: small against the pool, so every fill sits on the inner book.
+    const QUOTE_IN: u64 = 10_000_000;
+
+    fn start_surfnet() -> (RpcClient, RunloopGuard) {
+        let bind_host = "127.0.0.1";
+        let bind_port = get_free_port().unwrap();
+        let ws_port = get_free_port().unwrap();
+        let config = SurfpoolConfig {
+            simnets: vec![SimnetConfig {
+                remote_rpc_url: Some(
+                    std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+                ),
+                ..SimnetConfig::default()
+            }],
+            rpc: RpcConfig {
+                bind_host: bind_host.to_string(),
+                bind_port,
+                ws_port,
+                ..RpcConfig::default()
+            },
+            ..SurfpoolConfig::default()
+        };
+        let (svm, events_rx, geyser_rx) = TestType::no_db().initialize_svm();
+        let (commands_tx, commands_rx) = unbounded();
+        let runloop = spawn_runloop(
+            SurfnetSvmLocker::new(svm),
+            config,
+            (commands_tx, commands_rx),
+            geyser_rx,
+        )
+        .expect("the runloop should start");
+        wait_for_ready_and_connected(&events_rx)
+            .expect("surfnet should be ready and connected to the datasource");
+        let rpc = RpcClient::new_with_commitment(
+            format!("http://{bind_host}:{bind_port}"),
+            CommitmentConfig::processed(),
+        );
+        (rpc, runloop)
+    }
+
+    async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Value) {
+        rpc.send::<serde_json::Value>(RpcRequest::Custom { method }, params)
+            .await
+            .unwrap_or_else(|e| panic!("{method} failed: {e}"));
+    }
+
+    fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        Pubkey::find_program_address(
+            &[owner.as_ref(), TOKENKEG.as_ref(), mint.as_ref()],
+            &ATA_PROGRAM,
+        )
+        .0
+    }
+
+    fn u64_at(data: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+    }
+
+    async fn wait_for_slot(rpc: &RpcClient, slot: u64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rpc.get_slot().await.expect("slot") < slot {
+            assert!(
+                Instant::now() < deadline,
+                "the surfnet stopped producing blocks"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Registers a scenario that restates the pool's mid once, which keeps the pool and the tick
+    /// alive every later slot, and waits until the pool shows it. Nothing is written into the pool
+    /// except through the scenario.
+    ///
+    /// No base slot is sent. Surfpool never applies an override scheduled for a slot that has
+    /// already begun, so a base read here and sent in a later request loses its first slot whenever
+    /// a block boundary falls between the two; without one the server uses its own current slot.
+    async fn keep_alive(rpc: &RpcClient) {
+        let before = rpc.get_slot().await.expect("slot");
+        let pool = rpc.get_account(&POOL).await.expect("pool").data;
+        let fair_value = u128::from_le_bytes(pool[832..848].try_into().unwrap());
+        let mut scenario = Scenario::new(
+            "BisonFi keep-alive".to_string(),
+            "Keeps SOL-USDC-Pool2 quoting".to_string(),
+        );
+        scenario.add_override(
+            OverrideInstance::new(
+                "bisonfi-fair-value".to_string(),
+                1,
+                AccountAddress::Pubkey(POOL.to_string()),
+            )
+            .with_values(
+                [(
+                    "fair_value".to_string(),
+                    serde_json::json!(fair_value.to_string()),
+                )]
+                .into(),
+            ),
+        );
+        cheatcode(
+            rpc,
+            "surfnet_registerScenario",
+            serde_json::json!([scenario]),
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pool = rpc.get_account(&POOL).await.expect("pool").data;
+            let republished_at = u64_at(&pool, 72);
+            if republished_at > before && republished_at <= rpc.get_slot().await.expect("slot") {
+                assert_publication_follows_the_clock(rpc).await;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scenario never kept the pool alive"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Keep-alive republished the pool: its publication time follows the surfnet clock, and its last
+    /// book rebuild is in the past, so the next swap refills it.
+    async fn assert_publication_follows_the_clock(rpc: &RpcClient) {
+        let accounts = rpc
+            .get_multiple_accounts(&[POOL, CLOCK_SYSVAR])
+            .await
+            .expect("pool and clock");
+        let pool = accounts[0].as_ref().expect("pool");
+        let clock = accounts[1].as_ref().expect("clock sysvar");
+        assert!(
+            u64_at(&pool.data, 688) < u64_at(&clock.data, 0),
+            "the pool's last book rebuild must be in the past for the next swap to refill it"
+        );
+        let published_seconds = u64_at(&pool.data, 88) / 1_000_000_000;
+        let clock_seconds = i64::from_le_bytes(clock.data[32..40].try_into().unwrap()) as u64;
+        assert!(
+            published_seconds.abs_diff(clock_seconds) <= 1,
+            "the pool reads published at {published_seconds}s, the Clock {clock_seconds}s"
+        );
+    }
+
+    /// The tick and the Clock read in one request, so they describe the same moment.
+    async fn assert_tick_matches_clock(rpc: &RpcClient, when: &str) {
+        let accounts = rpc
+            .get_multiple_accounts(&[MARKET_TICK, CLOCK_SYSVAR])
+            .await
+            .expect("tick and clock");
+        let tick = accounts[0]
+            .as_ref()
+            .unwrap_or_else(|| panic!("{when}: the surfnet holds no market tick"));
+        let clock = accounts[1].as_ref().expect("clock sysvar");
+        let (clock_slot, clock_seconds) = (
+            u64_at(&clock.data, 0),
+            i64::from_le_bytes(clock.data[32..40].try_into().unwrap()),
+        );
+        assert_eq!(
+            u64_at(&tick.data, 40),
+            clock_slot,
+            "{when}: the tick must name the Clock's slot"
+        );
+        let tick_seconds = (u64_at(&tick.data, 56) + 500_000_000) / 1_000_000_000;
+        assert!(
+            tick_seconds.abs_diff(clock_seconds as u64) <= 1,
+            "{when}: the tick reads {tick_seconds}s, the Clock {clock_seconds}s"
+        );
+    }
+
+    struct Taker {
+        keypair: Keypair,
+        base_vault: Pubkey,
+        quote_vault: Pubkey,
+        user_base: Pubkey,
+        user_quote: Pubkey,
+    }
+
+    /// Buys SOL with `QUOTE_IN` USDC through `sendTransaction`, returning the SOL received. The
+    /// ninth account is a signer the program requires and no test holds, so the swap is sent with
+    /// `skipSigVerify` - the surfnet's way of acting for an account without its key.
+    async fn buy(rpc: &RpcClient, taker: &Taker) -> u64 {
+        let before = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+
+        let mut data = vec![0x07];
+        data.extend_from_slice(&QUOTE_IN.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&[1, 0]); // direction 1 buys the base token
+        let swap = Instruction {
+            program_id: Pubkey::from_str_const(BISONFI_PROGRAM),
+            accounts: vec![
+                AccountMeta::new(taker.keypair.pubkey(), true),
+                AccountMeta::new(POOL, false),
+                AccountMeta::new(taker.base_vault, false),
+                AccountMeta::new(taker.quote_vault, false),
+                AccountMeta::new(taker.user_base, false),
+                AccountMeta::new(taker.user_quote, false),
+                AccountMeta::new_readonly(TOKENKEG, false),
+                AccountMeta::new_readonly(TOKENKEG, false),
+                AccountMeta::new_readonly(Pubkey::from_str_const(BISONFI_NINTH), true),
+                AccountMeta::new_readonly(MARKET_TICK, false),
+            ],
+            data,
+        };
+        let budget = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+        let blockhash = rpc.get_latest_blockhash().await.expect("blockhash");
+        let message = solana_message::Message::new_with_blockhash(
+            &[budget, swap],
+            Some(&taker.keypair.pubkey()),
+            &blockhash,
+        );
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures =
+            vec![Signature::default(); tx.message.header.num_required_signatures as usize];
+        tx.signatures[0] = taker.keypair.sign_message(&tx.message.serialize());
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let signature: String = rpc
+            .send(
+                RpcRequest::SendTransaction,
+                serde_json::json!([encoded, {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "skipSigVerify": true,
+                }]),
+            )
+            .await
+            .expect("the swap should be accepted");
+        let signature: Signature = signature.parse().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = rpc
+                .get_signature_statuses(&[signature])
+                .await
+                .expect("signature status")
+                .value
+                .remove(0);
+            if let Some(status) = status {
+                assert!(status.err.is_none(), "the swap failed: {:?}", status.err);
+                break;
+            }
+            assert!(Instant::now() < deadline, "the swap was never processed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let after = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        after - before
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bisonfi_swaps_on_a_live_surfnet_across_blocks_and_time_travel() {
+        let (rpc, _runloop) = start_surfnet();
+
+        // Reading the pool through the surfnet forks it from mainnet.
+        let pool = rpc.get_account(&POOL).await.expect("pool").data;
+        let base_mint = Pubkey::new_from_array(pool[184..216].try_into().unwrap());
+        let quote_mint = Pubkey::new_from_array(pool[216..248].try_into().unwrap());
+        let keypair = Keypair::new();
+        let owner = keypair.pubkey();
+        cheatcode(
+            &rpc,
+            "surfnet_setAccount",
+            serde_json::json!([owner.to_string(), { "lamports": 10_000_000_000u64 }]),
+        )
+        .await;
+        for (mint, amount) in [(base_mint, 0u64), (quote_mint, 1_000_000_000)] {
+            cheatcode(
+                &rpc,
+                "surfnet_setTokenAccount",
+                serde_json::json!([
+                    owner.to_string(),
+                    mint.to_string(),
+                    { "amount": amount },
+                    TOKENKEG.to_string()
+                ]),
+            )
+            .await;
+        }
+        let taker = Taker {
+            base_vault: Pubkey::new_from_array(pool[120..152].try_into().unwrap()),
+            quote_vault: Pubkey::new_from_array(pool[152..184].try_into().unwrap()),
+            user_base: ata(&owner, &base_mint),
+            user_quote: ata(&owner, &quote_mint),
+            keypair,
+        };
+
+        // 1. A registered scenario keeps the pool and the tick alive, so the pool fills. Keep-alive
+        //    loads the tick from upstream itself; no swap has named it yet.
+        keep_alive(&rpc).await;
+        assert_tick_matches_clock(&rpc, "before the first swap").await;
+        let first = buy(&rpc, &taker).await;
+        assert!(first > 0, "a kept-alive pool must fill on a surfnet");
+
+        // 2. Many blocks later it still fills, with nothing scheduled after the first override.
+        let later = rpc.get_slot().await.expect("slot") + 20;
+        wait_for_slot(&rpc, later).await;
+        assert_tick_matches_clock(&rpc, "many blocks later").await;
+        let kept = buy(&rpc, &taker).await;
+        assert!(kept > 0, "a kept-alive pool must keep filling");
+
+        // 3. Time travel with the clock paused: keep-alive republishes the pool and the tick for the
+        //    slot the jump lands on, before any block is produced.
+        cheatcode(&rpc, "surfnet_pauseClock", serde_json::json!([])).await;
+        let target = rpc.get_slot().await.expect("slot") + 10_000;
+        cheatcode(
+            &rpc,
+            "surfnet_timeTravel",
+            serde_json::json!([{ "absoluteSlot": target }]),
+        )
+        .await;
+        let landed = rpc.get_slot().await.expect("slot");
+        assert!(landed >= target);
+        assert_tick_matches_clock(&rpc, "right after time travel").await;
+        assert_publication_follows_the_clock(&rpc).await;
+        // A swap executes at once, but its status is only published with a block, so read the
+        // balance instead of waiting for the status.
+        let before = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        let _ = tokio::time::timeout(Duration::from_secs(3), buy(&rpc, &taker)).await;
+        let after = rpc
+            .get_account(&taker.user_base)
+            .await
+            .map(|a| u64_at(&a.data, 64))
+            .expect("base account");
+        assert_eq!(
+            rpc.get_slot().await.expect("slot"),
+            landed,
+            "the clock is paused, so no block can have refreshed anything"
+        );
+        let travelled = after - before;
+        assert!(
+            travelled > 0,
+            "a kept-alive pool must fill right after time travel"
+        );
+        cheatcode(&rpc, "surfnet_resumeClock", serde_json::json!([])).await;
+
+        // The same purchase against the same price should buy about the same SOL each time.
+        for fill in [kept, travelled] {
+            let drift_bps = (fill as f64 / first as f64 - 1.0).abs() * 1e4;
+            assert!(
+                drift_bps < 50.0,
+                "fills drifted {drift_bps:.1} bps from the first: {first} vs {fill}"
+            );
+        }
+    }
 }
