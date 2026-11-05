@@ -192,7 +192,7 @@ impl TemplateRegistry {
             for import in &template.keep_alive {
                 let fail = |reason: String| {
                     Err(format!(
-                        "template '{}' imports keep-alive '{}': {reason}",
+                        "template '{}' failed to import keep-alive '{}': {reason}",
                         template.id, import.template
                     ))
                 };
@@ -1017,7 +1017,7 @@ templates:
                 "template: example-fresh\n    address",
                 "template: nowhere\n    address",
             ),
-            "imports keep-alive 'nowhere': no keep-alive file defines it",
+            "failed to import keep-alive 'nowhere': no keep-alive file defines it",
         );
         refused(
             KEEP_ALIVE_OVERRIDES.replace("values: { slot: $slot }", "values: { size: 1 }"),
@@ -1402,6 +1402,30 @@ templates: []
             1,
             "Should find 1 aggregator template (Jupiter)"
         );
+    }
+
+    #[test]
+    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_template() {
+        let registry = TemplateRegistry::new();
+        let tagged: Vec<&str> = registry
+            .by_tags(&["clock-sensitive".to_string()])
+            .iter()
+            .map(|template| template.id.as_str())
+            .collect();
+
+        let phoenix = registry.by_protocol("Phoenix Eternal");
+        assert!(
+            !phoenix.is_empty(),
+            "the Phoenix Eternal templates are registered"
+        );
+        for template in std::iter::once("pyth-price-feed-v2")
+            .chain(phoenix.iter().map(|template| template.id.as_str()))
+        {
+            assert!(
+                tagged.contains(&template),
+                "{template} must be clock-sensitive"
+            );
+        }
     }
 
     #[test]
