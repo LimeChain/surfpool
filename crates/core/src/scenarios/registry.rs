@@ -51,6 +51,7 @@ pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
 
 pub const TESSERA_OVERRIDES_CONTENT: &str = include_str!("./protocols/tessera/v1/overrides.yaml");
+pub const TESSERA_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/tessera/v1/keep-alive.yaml");
 
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
@@ -298,6 +299,7 @@ impl TemplateRegistry {
 
     pub fn load_tessera_overrides(&mut self) {
         self.load_raw_layout_overrides(TESSERA_OVERRIDES_CONTENT, "tessera");
+        self.load_keep_alive(None, TESSERA_KEEP_ALIVE_CONTENT, "tessera");
     }
 
     pub fn load_drift_overrides(&mut self) {
@@ -764,12 +766,12 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Tessera (5) + Phoenix Eternal (19)
-        // = 86
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Tessera (4) + Phoenix Eternal (19)
+        // = 85
         assert_eq!(
             registry.count(),
-            86,
-            "Registry should load 86 templates total"
+            85,
+            "Registry should load 85 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -841,7 +843,10 @@ templates:
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
         assert!(registry.contains("tessera-price"));
-        assert!(registry.contains("tessera-freshness"));
+        assert!(
+            !registry.contains("tessera-freshness"),
+            "keep-alive republishes the Tessera quote"
+        );
         assert!(registry.contains("tessera-depth"));
         assert!(registry.contains("tessera-curve"));
         assert!(registry.contains("tessera-halt"));
@@ -1392,8 +1397,8 @@ templates: []
         let tessera_templates = registry.by_protocol("Tessera");
         assert_eq!(
             tessera_templates.len(),
-            5,
-            "Should have 5 Tessera templates"
+            4,
+            "Should have 4 Tessera templates"
         );
 
         let phoenix_templates = registry.by_protocol("Phoenix Eternal");
@@ -2136,7 +2141,6 @@ templates: []
         let mut checked = 0;
         for id in [
             "tessera-price",
-            "tessera-freshness",
             "tessera-depth",
             "tessera-curve",
             "tessera-halt",
@@ -2165,7 +2169,7 @@ templates: []
             }
         }
         assert_eq!(
-            checked, 85,
+            checked, 84,
             "every shipped Tessera property must be checked"
         );
     }
@@ -2174,7 +2178,7 @@ templates: []
     fn tessera_templates_require_caller_selected_accounts() {
         let registry = TemplateRegistry::new();
         let templates = registry.by_protocol("Tessera");
-        assert_eq!(templates.len(), 5);
+        assert_eq!(templates.len(), 4);
         for template in templates {
             let id = &template.id;
             assert_eq!(
@@ -2191,6 +2195,15 @@ templates: []
                     |context| context.contains("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH")
                 ),
                 "{id} must say how to find its account on the program"
+            );
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{id} must keep its market quoting");
+            };
+            assert_eq!(import.template, "tessera-quote-publication");
+            assert_eq!(
+                import.address,
+                surfpool_types::KeepAliveAddress::Override,
+                "{id}"
             );
         }
     }

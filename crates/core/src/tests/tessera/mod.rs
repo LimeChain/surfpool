@@ -16,10 +16,10 @@ use solana_program_runtime::{
 };
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+use surfpool_types::{AccountAddress, KeepAliveClock, OverrideInstance, Scenario};
 
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, template_registry},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
     tests::helpers::diff_indices,
 };
@@ -266,6 +266,18 @@ fn swap(
     route: Route,
     market_data: Vec<u8>,
 ) -> Result<u64, String> {
+    swap_and_market(fixture, market, amount_in, direction, route, market_data).map(|(out, _)| out)
+}
+
+/// The swap's output and the market account as the swap left it.
+fn swap_and_market(
+    fixture: &TesseraFixture,
+    market: &MarketFixture,
+    amount_in: u64,
+    direction: u8,
+    route: Route,
+    market_data: Vec<u8>,
+) -> Result<(u64, Vec<u8>), String> {
     let spec = market.spec;
     let mut market_account = market.market.clone();
     market_account.data = market_data;
@@ -386,9 +398,12 @@ fn swap(
     transaction.signatures[0] = taker.sign_message(&transaction.message.serialize());
     svm.send_transaction(transaction)
         .map_err(|e| format!("{:?}", e.err))?;
-    Ok(read_u64(
-        &svm.get_account(&destination).expect("destination").data,
-        64,
+    Ok((
+        read_u64(
+            &svm.get_account(&destination).expect("destination").data,
+            64,
+        ),
+        svm.get_account(&spec.address).expect("market").data,
     ))
 }
 
@@ -415,6 +430,26 @@ fn apply_raw(id: &str, data: &[u8], values: &[(String, serde_json::Value)], slot
     let map = values.iter().cloned().collect::<HashMap<_, _>>();
     t.materialize_raw_layout(data, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
+}
+
+/// What keep-alive writes to a market republished in `slot`: tessera-price's shipped import.
+fn tessera_keep_alive(market: &[u8], slot: u64) -> Vec<u8> {
+    let registry = template_registry();
+    let import = registry
+        .get("tessera-price")
+        .and_then(|template| template.keep_alive.first())
+        .expect("tessera-price keeps its market quoting");
+    let values = import
+        .values_at(&KeepAliveClock {
+            slot,
+            unix_time_ms: 0,
+        })
+        .expect("keep-alive values");
+    registry
+        .keep_alive_template(&import.template)
+        .expect("keep-alive template")
+        .materialize_raw_layout(market, &values, slot)
+        .unwrap_or_else(|e| panic!("{}: {e}", import.template))
 }
 
 fn values<const N: usize>(
@@ -586,7 +621,7 @@ async fn tessera_featured_markets_match_their_market_accounts() {
 async fn tessera_templates_write_only_proven_bytes_on_every_market() {
     let registry = TemplateRegistry::new();
     let all_templates = registry.by_protocol("Tessera");
-    assert_eq!(all_templates.len(), 5);
+    assert_eq!(all_templates.len(), 4);
     let addresses = ALL_MARKETS.map(pubkey);
     let markets = fetch(&addresses).await;
 
@@ -594,11 +629,6 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
         let data = &account.data;
         assert_eq!(account.owner, PROGRAM, "{address}");
         assert_eq!(data.len(), MARKET_SIZE, "{address}");
-        assert!(
-            read_u64(data, 88) < 10_000,
-            "{address} freshness limit must stay below the -10000 the guidance uses for a stale quote"
-        );
-
         for template in &all_templates {
             assert_eq!(
                 apply_raw(&template.id, data, &[], 0),
@@ -630,6 +660,18 @@ async fn tessera_templates_write_only_proven_bytes_on_every_market() {
         );
         assert_eq!(read_u128(&priced, 128), 1_000_000_000_000_000);
         assert_eq!(read_u128(&priced, 144), 1_000_000_000_000_000);
+        let republished = tessera_keep_alive(data, 1_000_000);
+        assert!(
+            diff_indices(data, &republished)
+                .iter()
+                .all(|i| (0..16).contains(i) || (120..128).contains(i)),
+            "{address} escaped the keep-alive write set"
+        );
+        assert_eq!(read_u64(&republished, 120), 1_000_000);
+        assert_eq!(
+            (read_u64(&republished, 0), read_u64(&republished, 8)),
+            (0, 0)
+        );
         let halted = apply_raw(
             "tessera-halt",
             data,
@@ -655,18 +697,15 @@ async fn tessera_scenario_materializes_once_through_surfnet_svm() {
     let target = AccountAddress::Pubkey(market_key.to_string());
 
     let price = price_values(100_000_000_000_000);
-    let mut scenario = Scenario::new("Tessera SOL at 100".into(), "price and freshness".into());
+    // Keep-alive republishes the quote from the slot the price plays: no freshness override.
+    let mut scenario = Scenario::new("Tessera SOL at 100".into(), "price".into());
     scenario.add_override(
-        OverrideInstance::new("tessera-price".into(), 0, target.clone())
+        OverrideInstance::new("tessera-price".into(), 0, target)
             .with_values(price.iter().cloned().collect()),
-    );
-    scenario.add_override(
-        OverrideInstance::new("tessera-freshness".into(), 0, target).with_values(HashMap::from([
-            ("last_update_slot".to_string(), serde_json::json!(0)),
-        ])),
     );
 
     let (mut svm, _events, _geyser) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(BASE_SLOT);
     svm.inner
         .set_account(market_key, fixture.sol.market.clone())
         .unwrap();
@@ -677,13 +716,17 @@ async fn tessera_scenario_materializes_once_through_surfnet_svm() {
     let read = |svm: &SurfnetSvm| svm.inner.get_account(&market_key).unwrap().unwrap().data;
     let materialized = read(&svm);
     assert_eq!(read_u64(&materialized, 120), BASE_SLOT);
+    assert_eq!(
+        (read_u64(&materialized, 0), read_u64(&materialized, 8)),
+        (0, 0)
+    );
     assert_eq!(read_u128(&materialized, 128), 100_000_000_000_000);
     assert_eq!(read_u128(&materialized, 144), 10_000_000_000_000_000);
     assert!(
         diff_indices(&original, &materialized)
             .iter()
-            .all(|i| (120..160).contains(i)),
-        "materialization escaped the price and freshness write set"
+            .all(|i| (0..16).contains(i) || (120..160).contains(i)),
+        "materialization escaped the price and keep-alive write set"
     );
 
     svm.materialize_overrides_for_slot(&None, BASE_SLOT + 1)
@@ -771,37 +814,24 @@ async fn tessera_price_formula_reprices_both_directions() {
     assert_eq!(u128::from(buy(at_100).unwrap()), expected_buy);
 }
 
+/// Tessera rejects a quote as old as the market's limit. A republication one slot younger still
+/// fills, so keep-alive writing the current slot every slot is what keeps a market quoting.
 #[tokio::test]
-async fn tessera_freshness_boundary_follows_each_market_limit() {
+async fn tessera_keep_alive_boundary_follows_each_market_limit() {
     let mut fixture = fixture().await;
     set_quote_start(&mut fixture.sol.market.data, 0);
     pin_ladder(&mut fixture.sol.market.data, SOL_SELL_UNIT, SOL_BUY_UNIT);
     let sol = &fixture.sol;
     let upstream_limit = read_u64(&sol.market.data, 88);
     let slot = clock_slot(sol);
-    let aged = |data: &[u8], lead: i64| {
-        apply_raw(
-            "tessera-freshness",
-            data,
-            &values([("last_update_slot", serde_json::json!(lead))]),
-            slot,
-        )
-    };
 
     for limit in [upstream_limit, 25, 55] {
         let mut configured = sol.market.data.clone();
         write_u64(&mut configured, 88, limit);
-        let fresh = aged(&configured, 0);
+        let fresh = tessera_keep_alive(&configured, slot);
         assert_eq!(read_u64(&fresh, 120), slot);
-        assert!(
-            diff_indices(&configured, &fresh)
-                .iter()
-                .all(|i| (120..128).contains(i))
-        );
-        let lead = -(limit as i64);
-        let just_fresh = aged(&configured, lead + 1);
-        let stale = aged(&configured, lead);
-        assert_eq!(read_u64(&stale, 120), slot - limit);
+        let just_fresh = tessera_keep_alive(&configured, slot - (limit - 1));
+        let stale = tessera_keep_alive(&configured, slot - limit);
         for (direction, amount) in [(1, SOL_SELL), (0, SOL_BUY)] {
             let run = |data: Vec<u8>| swap(&fixture, sol, amount, direction, Route::DFlow, data);
             assert!(run(fresh.clone()).expect("a fresh quote fills") > 0);
@@ -813,6 +843,41 @@ async fn tessera_freshness_boundary_follows_each_market_limit() {
             );
         }
     }
+}
+
+/// Every swap adds its input to the side's used depth, so a second equal sale in the same slot fills
+/// further down the ladder. A republication clears it, as the maker's does, so the next slot's sale
+/// fills like the first.
+#[tokio::test]
+async fn tessera_keep_alive_restores_the_depth_swaps_use_up() {
+    let mut fixture = fixture().await;
+    set_quote_start(&mut fixture.sol.market.data, 0);
+    pin_ladder(&mut fixture.sol.market.data, SOL_SELL_UNIT, SOL_BUY_UNIT);
+    let sol = &fixture.sol;
+    let slot = clock_slot(sol);
+    let sell = |data: Vec<u8>| {
+        swap_and_market(&fixture, sol, SOL_SELL_UNIT, 1, Route::DFlow, data).expect("sale")
+    };
+
+    let (first, after_first) = sell(tessera_keep_alive(&sol.market.data, slot));
+    assert_eq!(
+        read_u64(&after_first, 8),
+        SOL_SELL_UNIT,
+        "the sale must add its input to the used sell depth"
+    );
+    let (second, _) = sell(after_first.clone());
+    assert!(
+        second < first,
+        "a second sale in the same slot must fill lower on the ladder: {second} vs {first}"
+    );
+
+    let republished = tessera_keep_alive(&after_first, slot);
+    assert_eq!(read_u64(&republished, 8), 0);
+    let (after_republication, _) = sell(republished);
+    assert_eq!(
+        after_republication, first,
+        "after a republication a sale must fill like the first"
+    );
 }
 
 #[tokio::test]
