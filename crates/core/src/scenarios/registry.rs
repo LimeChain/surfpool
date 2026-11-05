@@ -50,6 +50,14 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
 
+pub const GOONFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/oracle-overrides.yaml");
+pub const GOONFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/market-overrides.yaml");
+pub const GOONFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/goonfi/v2/vault-overrides.yaml");
+pub const GOONFI_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/goonfi/v2/keep-alive.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -129,6 +137,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_goonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -291,6 +300,13 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
         );
+    }
+
+    pub fn load_goonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(GOONFI_ORACLE_OVERRIDES_CONTENT, "goonfi-oracle");
+        self.load_raw_layout_overrides(GOONFI_MARKET_OVERRIDES_CONTENT, "goonfi-market");
+        self.load_raw_layout_overrides(GOONFI_VAULT_OVERRIDES_CONTENT, "goonfi-vault");
+        self.load_keep_alive(None, GOONFI_KEEP_ALIVE_CONTENT, "goonfi");
     }
 
     pub fn load_drift_overrides(&mut self) {
@@ -473,6 +489,42 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -721,11 +773,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + Phoenix Eternal (19)
+        // = 85
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            85,
+            "Registry should load 85 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -796,6 +849,14 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("goonfi-price"));
+        assert!(
+            !registry.contains("goonfi-freshness"),
+            "the quote stays current by keep-alive"
+        );
+        assert!(registry.contains("goonfi-reference-band"));
+        assert!(registry.contains("goonfi-size-impact"));
+        assert!(registry.contains("goonfi-vault-balance"));
 
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
@@ -1258,6 +1319,12 @@ templates: []
             "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
         );
 
+        assert_eq!(
+            registry.by_protocol("GoonFi").len(),
+            4,
+            "Should have 4 GoonFi templates (price, band, size impact, vault)"
+        );
+
         let kamino_templates = registry.by_protocol("kamino");
         assert_eq!(
             kamino_templates.len(),
@@ -1355,8 +1422,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            5,
+            "Should find 5 oracle templates (Pyth + 3 Kamino Scope + 1 GoonFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -2096,5 +2163,83 @@ templates: []
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn test_every_goonfi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "goonfi-price",
+            "goonfi-reference-band",
+            "goonfi-size-impact",
+            "goonfi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing GoonFi template {id}"));
+            assert!(template.raw_layout, "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6
+                        && context.contains("fetchBeforeUse")),
+                "{id} needs substantive LLM guidance"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 28, "every shipped GoonFi property must be checked");
+    }
+
+    #[test]
+    fn goonfi_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        for template_id in [
+            "goonfi-price",
+            "goonfi-reference-band",
+            "goonfi-size-impact",
+            "goonfi-vault-balance",
+        ] {
+            let template = registry.get(template_id).expect("GoonFi template");
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{template_id} must require an explicit target account"
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{template_id} must not embed a backend account catalog"
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE")
+                ),
+                "{template_id} must say how to find its account on the program"
+            );
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{template_id} must keep its market's oracle alive");
+            };
+            assert_eq!(import.template, "goonfi-quote-publication");
+            let expected = if template_id == "goonfi-price" {
+                surfpool_types::KeepAliveAddress::Override
+            } else {
+                surfpool_types::KeepAliveAddress::Input("oracle".to_string())
+            };
+            assert_eq!(
+                import.address, expected,
+                "{template_id} keeps alive the oracle it writes or the one it is given"
+            );
+        }
     }
 }
