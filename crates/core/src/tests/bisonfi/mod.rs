@@ -1383,7 +1383,8 @@ async fn bisonfi_keep_alive_keeps_a_long_run_quoting() {
     );
     assert_eq!(
         u64::from_le_bytes(kept[88..96].try_into().unwrap()),
-        svm.calculate_block_time_for_slot(slot) * 1_000_000
+        svm.updated_at * 1_000_000,
+        "keep-alive must have stamped the quote with the Clock's time"
     );
 
     // A replay runs its clock at the pool's publication, so the kept image swaps at the surfnet's
@@ -3650,9 +3651,8 @@ mod live_surfnet {
     ///
     /// No base slot is sent. Surfpool never applies an override scheduled for a slot that has
     /// already begun, so a base read here and sent in a later request loses its first slot whenever
-    /// a block boundary falls between the two; without one the server uses its own current slot.
+    /// a block boundary falls between the two; without one the server schedules from its next slot.
     async fn keep_alive(rpc: &RpcClient) {
-        let before = rpc.get_slot().await.expect("slot");
         let pool = rpc.get_account(&POOL).await.expect("pool").data;
         let fair_value = u128::from_le_bytes(pool[832..848].try_into().unwrap());
         let mut scenario = Scenario::new(
@@ -3680,20 +3680,13 @@ mod live_surfnet {
         )
         .await;
 
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let pool = rpc.get_account(&POOL).await.expect("pool").data;
-            let republished_at = u64_at(&pool, 72);
-            if republished_at > before && republished_at <= rpc.get_slot().await.expect("slot") {
-                assert_publication_follows_the_clock(rpc).await;
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the scenario never kept the pool alive"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // The override sits one slot past the server's next slot, so at most two slots past the slot
+        // read here, and keep-alive runs in every slot from it on: once the surfnet reaches it the
+        // pool holds keep-alive's image. The pool's own publication slot proves nothing: fetched
+        // from a mainnet running ahead of the surfnet, it already reads newer than the surfnet's.
+        let scheduled = rpc.get_slot().await.expect("slot") + 2;
+        wait_for_slot(rpc, scheduled).await;
+        assert_publication_follows_the_clock(rpc).await;
     }
 
     /// Keep-alive republished the pool: its publication time follows the surfnet clock, and its last
