@@ -10,6 +10,11 @@ tags:
   - prop-amm
   - swap
 
+keep_alive:
+  - template: humidifi-quote-publication
+    address: { type: override }
+    values: { last_update_slot: $slot }
+
 llm_context: |
   FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
   mint needs those masked bytes, which you cannot compute. Work from a market address the user
@@ -59,9 +64,9 @@ templates:
           Quote atoms per base atom times 2^48, before HumidiFi's fixed XOR encoding. Pass it as a
           decimal string.
     llm_context: |
-      PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote older than the market's
-      staleness limit before pricing, and nothing in the local VM republishes it. Apply
-      humidifi-freshness with a current quote in the same slot as this override.
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, as the maker does on mainnet, so this price keeps filling in later
+      slots.
 
       fair_value is a raw ratio, not a human price, so the number the user gives is never
       fair_value itself:
@@ -76,55 +81,6 @@ templates:
       DIRECTION: raising fair_value makes the base token more expensive, so a quote-to-base swap
       returns proportionally less base. Halving it doubles that output, subject to the market's own
       spread and inventory.
-
-  - id: humidifi-freshness
-    name: Override Quote Freshness
-    description: Keep a HumidiFi quote current or make the market reject it as stale
-    idl_account_name: MarketState
-    address:
-      type: pubkey
-    properties:
-      - path: last_update_slot
-        offset: 616
-        encoding:
-          slot_xor:
-            lead: 0
-            mask: 7970776174128919018
-        label: Quote-slot offset
-        description: Relative to the slot where the override materializes; 0 means quoted now.
-      - path: max_staleness_slots
-        offset: 608
-        encoding:
-          u64_xor:
-            mask: 7970776174128919018
-        label: Staleness limit
-        description: Oldest quote age in slots that HumidiFi still fills; 200 emulates a current maker.
-    llm_context: |
-      HumidiFi fills only while clock_slot - last_update_slot <= max_staleness_slots. Both words are
-      stored XORed with the same fixed key; the values you pass stay plaintext.
-
-      last_update_slot is a relative slot offset even though the stored word is an absolute slot.
-
-      CURRENT QUOTE: set last_update_slot to 0 and max_staleness_slots to 200 to emulate a current
-      maker. The market then quotes the price it already holds, or the price humidifi-price just
-      wrote, for 200 slots from the materialization slot. The limits stored in market accounts are
-      only a few slots, so without max_staleness_slots the quote expires almost at once. For a
-      longer scenario, schedule this template again in a later slot with fetchBeforeUse: false, so
-      the later write keeps earlier overrides.
-
-      STALE QUOTE: set last_update_slot to -1000 and leave max_staleness_slots unset. -1000 is past
-      every market's limit, so every swap on that market reverts with custom error 0xfaded
-      (1027565). Do not apply a fresh override afterwards.
-
-      EXACT BOUNDARY: also set max_staleness_slots. For a swap in the slot the override
-      materializes, last_update_slot -(max_staleness_slots + 1) rejects and one slot younger still
-      fills: the boundary is inclusive.
-
-      HOW TO USE:
-      1. For a current quote set last_update_slot to 0 and max_staleness_slots to 200
-      2. For a stale quote set last_update_slot to -1000
-      3. If a swap happens after that, schedule this template again in that later slot with
-         fetchBeforeUse: false
 
   - id: humidifi-spread
     name: Override Spread
@@ -162,9 +118,9 @@ templates:
         label: Third size tier spread
         description: Basis points times 2^48 for the largest trade sizes, as a decimal string; 0 removes it.
     llm_context: |
-      PRECONDITION - THE QUOTE MUST BE FRESH. HumidiFi rejects a quote older than the market's
-      staleness limit before pricing. Apply humidifi-freshness with a current quote in the same
-      slot as this override.
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, as the maker does on mainnet, so this spread keeps filling in later
+      slots.
 
       HumidiFi widens each side of its fair value by S basis points: a buy pays
       fair * (1 + S / 10000) per base token and a sell receives fair / (1 + S / 10000). S adds up

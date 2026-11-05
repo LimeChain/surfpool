@@ -19,10 +19,10 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
-use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+use surfpool_types::{AccountAddress, KeepAliveClock, OverrideInstance, Scenario};
 
 use crate::{
-    scenarios::TemplateRegistry,
+    scenarios::{TemplateRegistry, template_registry},
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
     tests::helpers::diff_indices,
 };
@@ -48,7 +48,6 @@ const STALE_QUOTE_ERROR: u32 = 0xfaded;
 // transfer, which fails with InsufficientFunds instead.
 const EMPTY_PAYOUT_ERROR: u32 = 49;
 const FAIR_VALUE: std::ops::Range<usize> = 576..584;
-const MAX_STALENESS: std::ops::Range<usize> = 608..616;
 const LAST_UPDATE: std::ops::Range<usize> = 616..624;
 const AMOUNT: std::ops::Range<usize> = 64..72;
 const MAKER_SPREAD_MASK: u64 = 0x5041_56a2_2548_f8dd;
@@ -124,6 +123,26 @@ fn apply_raw(id: &str, data: &[u8], values: &[(&str, serde_json::Value)], slot: 
         .collect::<HashMap<_, _>>();
     t.materialize_raw_layout(data, &map, slot)
         .unwrap_or_else(|e| panic!("{id}: {e}"))
+}
+
+/// What keep-alive writes to a market republished in `slot`: humidifi-price's shipped import.
+fn humidifi_keep_alive(market: &[u8], slot: u64) -> Vec<u8> {
+    let registry = template_registry();
+    let import = registry
+        .get("humidifi-price")
+        .and_then(|template| template.keep_alive.first())
+        .expect("humidifi-price keeps its market quoting");
+    let values = import
+        .values_at(&KeepAliveClock {
+            slot,
+            unix_time_ms: 0,
+        })
+        .expect("keep-alive values");
+    registry
+        .keep_alive_template(&import.template)
+        .expect("keep-alive template")
+        .materialize_raw_layout(market, &values, slot)
+        .unwrap_or_else(|e| panic!("{}: {e}", import.template))
 }
 
 // A masked write can leave a byte equal to the original, so only "nothing outside moved" holds.
@@ -784,12 +803,7 @@ fn priced_market(fixture: &HumidifiFixture, fair_value: u64) -> Vec<u8> {
         &[("fair_value", serde_json::json!(fair_value.to_string()))],
         fixture.slot,
     );
-    apply_raw(
-        "humidifi-freshness",
-        &priced,
-        &[("last_update_slot", serde_json::json!(0))],
-        fixture.slot,
-    )
+    humidifi_keep_alive(&priced, fixture.slot)
 }
 
 /// Every template writes only its own bytes on every schema-8 market, active or stopped, and every
@@ -811,10 +825,6 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
         assert_eq!(data.len(), MARKET_SIZE, "{address}");
         assert_eq!(&data[8..16], &LAYOUT_TAG, "{address} lost the layout tag");
         assert_eq!(word(data, 1720), 8, "{address} is no longer schema 8");
-        assert!(
-            word(data, 608) ^ SLOT_MASK < 1000,
-            "{address} staleness limit must stay below the -1000 the guidance uses for a stale quote"
-        );
         for (vault_offset, mint_offset, vault, account) in [
             (480, 416, base_vault, &fetched[1]),
             (448, 384, quote_vault, &fetched[2]),
@@ -836,7 +846,7 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
             );
         }
 
-        for template in ["humidifi-price", "humidifi-freshness", "humidifi-spread"] {
+        for template in ["humidifi-price", "humidifi-spread"] {
             assert_eq!(
                 apply_raw(template, data, &[], 0),
                 *data,
@@ -853,27 +863,9 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
         assert_only_within(data, &priced, &[FAIR_VALUE], address);
         assert_eq!(word(&priced, 576) ^ FAIR_VALUE_MASK, 58_546_795_155_816);
 
-        let fresh = apply_raw(
-            "humidifi-freshness",
-            data,
-            &[
-                ("last_update_slot", serde_json::Value::Null),
-                ("max_staleness_slots", serde_json::json!(40)),
-            ],
-            slot,
-        );
-        assert_only_within(data, &fresh, &[MAX_STALENESS, LAST_UPDATE], address);
-        assert_eq!(word(&fresh, 616) ^ SLOT_MASK, slot);
-        assert_eq!(word(&fresh, 608) ^ SLOT_MASK, 40);
-
-        let aged = apply_raw(
-            "humidifi-freshness",
-            data,
-            &[("last_update_slot", serde_json::json!(-3))],
-            slot,
-        );
-        assert_only_within(data, &aged, &[LAST_UPDATE], address);
-        assert_eq!(word(&aged, 616) ^ SLOT_MASK, slot - 3);
+        let republished = humidifi_keep_alive(data, slot);
+        assert_only_within(data, &republished, &[LAST_UPDATE], address);
+        assert_eq!(word(&republished, 616) ^ SLOT_MASK, slot);
 
         for (offset, mask) in TIER_SPREADS {
             assert!(
@@ -1007,35 +999,29 @@ async fn humidifi_spread_widens_the_executed_fill_on_the_fixture_markets() {
 #[tokio::test]
 async fn humidifi_price_scenario_materializes_through_surfnet() {
     let fixture = &fixtures().await[0];
+    let slot = fixture.slot + 500;
     let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(slot);
     svm.inner
         .set_account(fixture.def.market, fixture.market.clone())
         .expect("seed market");
 
+    // Keep-alive republishes the quote from the slot the price plays: no freshness override.
     let mut scenario = Scenario::new(
         "HumidiFi SOL/USDC at 208".to_string(),
-        "Reprice SOL to 208 USDC and keep the quote fresh".to_string(),
+        "Reprice SOL to 208 USDC".to_string(),
     );
-    for (template_id, override_values) in [
-        (
-            "humidifi-price",
-            values(&[("fair_value", serde_json::json!("58546795155816"))]),
-        ),
-        (
-            "humidifi-freshness",
-            values(&[("last_update_slot", serde_json::json!(0))]),
-        ),
-    ] {
-        scenario.add_override(
-            OverrideInstance::new(
-                template_id.to_string(),
-                0,
-                AccountAddress::Pubkey(fixture.def.market.to_string()),
-            )
-            .with_values(override_values),
-        );
-    }
-    let slot = fixture.slot + 500;
+    scenario.add_override(
+        OverrideInstance::new(
+            "humidifi-price".to_string(),
+            0,
+            AccountAddress::Pubkey(fixture.def.market.to_string()),
+        )
+        .with_values(values(&[(
+            "fair_value",
+            serde_json::json!("58546795155816"),
+        )])),
+    );
     svm.register_scenario(scenario, Some(slot))
         .expect("register the price scenario");
     svm.materialize_overrides_for_slot(&None, slot)
@@ -1065,56 +1051,94 @@ async fn humidifi_price_scenario_materializes_through_surfnet() {
     );
 }
 
+/// HumidiFi fills while the Clock's slot is at most the market's stored staleness limit past the
+/// quote's slot. A republication that old still fills and one slot older rejects, so keep-alive
+/// writing the current slot every slot is what keeps a market quoting.
 #[tokio::test]
-async fn humidifi_freshness_boundary_is_real_program_behavior_on_the_fixture_markets() {
+async fn humidifi_keep_alive_staleness_boundary_is_real_program_behavior_on_the_fixture_markets() {
     for fixture in fixtures().await.iter() {
         let clock = fixture.slot + 100;
-        for limit in [fixture.max_staleness, fixture.max_staleness + 8] {
-            for age in [limit, limit + 1] {
-                let staged = apply_raw(
-                    "humidifi-freshness",
-                    &fixture.market.data,
-                    &[
-                        ("last_update_slot", serde_json::json!(-(age as i64))),
-                        ("max_staleness_slots", serde_json::json!(limit)),
-                    ],
-                    clock,
+        let limit = fixture.max_staleness;
+        for age in [0, limit, limit + 1] {
+            let republished = humidifi_keep_alive(&fixture.market.data, clock - age);
+            let result = run(fixture, clock, republished);
+            let context = format!("{} limit {limit}, age {age}", fixture.def.pair);
+            if age > limit {
+                assert_eq!(
+                    result,
+                    Err(TransactionError::InstructionError(
+                        1,
+                        InstructionError::Custom(STALE_QUOTE_ERROR)
+                    )),
+                    "{context}"
                 );
-                let result = run(fixture, clock, staged);
-                let context = format!("{} limit {limit}, age {age}", fixture.def.pair);
-                if age > limit {
-                    assert_eq!(
-                        result,
-                        Err(TransactionError::InstructionError(
-                            1,
-                            InstructionError::Custom(STALE_QUOTE_ERROR)
-                        )),
-                        "{context}"
-                    );
-                } else {
-                    assert!(
-                        result.unwrap_or_else(|e| panic!("{context}: {e:?}")) > 0,
-                        "{context}: a quote at the limit must fill"
-                    );
-                }
+            } else {
+                assert!(
+                    result.unwrap_or_else(|e| panic!("{context}: {e:?}")) > 0,
+                    "{context}: a quote within the limit must fill"
+                );
             }
         }
-        let stale = apply_raw(
-            "humidifi-freshness",
-            &fixture.market.data,
-            &[("last_update_slot", serde_json::json!(-1000))],
-            clock,
-        );
-        assert_eq!(
-            run(fixture, clock, stale),
-            Err(TransactionError::InstructionError(
-                1,
-                InstructionError::Custom(STALE_QUOTE_ERROR)
-            )),
-            "{}: the documented stale offset must reject",
-            fixture.def.pair
-        );
     }
+}
+
+/// A vault override names its market as an input, and keep-alive republishes that market's quote
+/// from the slot the override plays, writing nothing else of the market.
+#[tokio::test]
+async fn humidifi_vault_override_keeps_its_market_quoting() {
+    let fixture = &fixtures().await[0];
+    let slot = fixture.slot + 500;
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_latest_absolute_slot(slot);
+    for (address, seeded) in [
+        (fixture.def.market, fixture.market.clone()),
+        (fixture.def.quote_vault, fixture.quote_vault.clone()),
+    ] {
+        svm.inner
+            .set_account(address, seeded)
+            .expect("seed account");
+    }
+    let mut scenario = Scenario::new(
+        "HumidiFi vault inventory".to_string(),
+        "Lower the quote vault and keep its market quoting".to_string(),
+    );
+    scenario.add_override(
+        OverrideInstance::new(
+            "humidifi-vault-balance".to_string(),
+            0,
+            AccountAddress::Pubkey(fixture.def.quote_vault.to_string()),
+        )
+        .with_values(values(&[
+            ("amount", serde_json::json!(1_000_000u64)),
+            ("market", serde_json::json!(fixture.def.market.to_string())),
+        ])),
+    );
+    svm.register_scenario(scenario, Some(slot))
+        .expect("register the vault scenario");
+    svm.materialize_overrides_for_slot(&None, slot)
+        .await
+        .expect("materialize the vault scenario");
+
+    let vault = svm
+        .inner
+        .get_account(&fixture.def.quote_vault)
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(amount(&vault), 1_000_000);
+    let market = svm
+        .inner
+        .get_account(&fixture.def.market)
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_only_within(
+        &fixture.market.data,
+        &market,
+        &[LAST_UPDATE],
+        "kept-alive market",
+    );
+    assert_eq!(word(&market, 616) ^ SLOT_MASK, slot);
 }
 
 async fn materialized_vault(slot: u64, address: Pubkey, seeded: Account, balance: u64) -> Vec<u8> {
