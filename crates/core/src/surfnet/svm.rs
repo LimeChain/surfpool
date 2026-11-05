@@ -58,6 +58,7 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
+use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
@@ -104,16 +105,15 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
+        keep_alive::{KeepAliveBinding, KeepAliveSource},
         protocols::phoenix_eternal::v1::state_builder::{
             prepare_phoenix_override, write_all_or_none,
         },
         template_registry,
     },
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{OverlayStorage, ProfileFifoMap, Storage, StorageBackend},
     surfnet::{
-        BlockSubscriptionData, LogsSubscriptionData,
-        keep_alive::{KeepAliveBinding, KeepAliveSource},
-        locker::is_supported_token_program,
+        BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
@@ -172,6 +172,12 @@ pub(crate) enum AccountUpdatePolicy {
     /// Keep any live LiteSVM state and rehydrate database-only state instead
     /// of replacing it with a fetched result.
     HydrateIfAbsent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HydrationMode {
+    BestEffort,
+    StrictSnapshot,
 }
 
 impl AccountUpdatePolicy {
@@ -543,9 +549,21 @@ pub struct SurfnetSvm {
     pub logs_subscriptions: Vec<LogsSubscriptionData>,
     pub block_subscriptions: Vec<BlockSubscriptionData>,
     pub snapshot_subscriptions: Vec<super::SnapshotSubscriptionData>,
+    /// Signalled after subscription notifications are sent, so WebSocket tasks can wait for
+    /// them instead of polling their channels.
+    pub(crate) subscription_wake: Arc<tokio::sync::Notify>,
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
+    /// Clock-mode ticks the clock dropped because block production was
+    /// behind: each is a slot that came later than `slot_time` promised,
+    /// instead of arriving in a burst. Shared with the clock thread.
+    pub coalesced_slots: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether blocks are produced in `BlockProductionMode::Clock`, so a
+    /// dropped tick is a late slot. Set by block production, read by the
+    /// clock thread: ticks dropped in other modes produce no block and
+    /// aren't counted in `coalesced_slots`.
+    pub clock_driven: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub accounts_by_owner: Box<dyn Storage<String, Vec<String>>>,
     pub account_associated_data: Box<dyn Storage<String, SerializableAccountAdditionalData>>,
     pub token_accounts: Box<dyn Storage<String, TokenAccount>>,
@@ -658,11 +676,14 @@ fn add_pubkey_to_index(
     key: String,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let mut accounts = index.get(&key).ok().flatten().unwrap_or_default();
-    if !accounts.iter().any(|pk| pk == pubkey_str) {
+    index.modify(key, &mut |accounts| {
+        let accounts = accounts.get_or_insert_with(Vec::new);
+        if accounts.iter().any(|pk| pk == pubkey_str) {
+            return false;
+        }
         accounts.push(pubkey_str.to_string());
-        index.store(key, accounts)?;
-    }
+        true
+    })?;
     Ok(())
 }
 
@@ -674,15 +695,16 @@ fn remove_pubkey_from_index(
     key: &str,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let key_owned = key.to_string();
-    if let Some(mut accounts) = index.get(&key_owned).ok().flatten() {
+    index.modify(key.to_string(), &mut |entry| {
+        let Some(accounts) = entry else {
+            return false;
+        };
         accounts.retain(|pk| pk != pubkey_str);
         if accounts.is_empty() {
-            index.take(&key_owned)?;
-        } else {
-            index.store(key_owned, accounts)?;
+            *entry = None;
         }
-    }
+        true
+    })?;
     Ok(())
 }
 
@@ -897,10 +919,13 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
 
             updated_at: self.updated_at,
             slot_time: self.slot_time,
             start_time: self.start_time,
+            coalesced_slots: self.coalesced_slots.clone(),
+            clock_driven: self.clock_driven.clone(),
 
             total_supply: self.total_supply,
             circulating_supply: self.circulating_supply,
@@ -959,9 +984,29 @@ impl SurfnetSvm {
         for template in templates.chain(registry.keep_alive_templates.into_values()) {
             // Templates for programs with no IDL have nothing to register; they write through
             // `raw_layout` instead.
-            if let Some(idl) = template.idl {
-                let _ = self.register_idl(idl, None);
+            let Some(idl) = template.idl else {
+                continue;
+            };
+            // Templates of one program share its IDL, and a persistent store keeps the IDLs of
+            // earlier starts. Skip the IDL when it is already the one every lookup resolves to
+            // now: the versions sharing the newest slot not after the current one.
+            let slot = self.latest_epoch_info.absolute_slot;
+            let versions = self
+                .registered_idls
+                .get(&Pubkey::from_str_const(&idl.address).to_string())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let mut effective = versions.iter().skip_while(|v| v.0 > slot).peekable();
+            let newest = effective.peek().map(|v| v.0);
+            if newest.is_some()
+                && effective
+                    .take_while(|v| Some(v.0) == newest)
+                    .all(|v| v.1 == idl)
+            {
+                continue;
             }
+            let _ = self.register_idl(idl, None);
         }
     }
 
@@ -1257,18 +1302,21 @@ impl SurfnetSvm {
             storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
             storage_backend.open_store("profile_tag_map")?;
+        // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
+        let max_profiles = max(1, config.max_profiles);
+        // Without an on-disk DB, both profile stores are FIFO maps capped at max_profiles.
+        // ProfileFifoMap behind an Arc lets profiling sandboxes share the map, and a
+        // copy-on-write keeps the cap.
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            storage_backend.open_store("simulated_transaction_profiles")?;
-        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
-            // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
-            let max_profiles = max(1, config.max_profiles);
-            storage_backend.open_store_with_default(
-                "executed_transaction_profiles",
-                // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
-                // (when no on-disk DB is provided)
-                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
-            )?
-        };
+            storage_backend
+                .open_store_with_default("simulated_transaction_profiles", move || {
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
+                })?;
+        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
+            storage_backend
+                .open_store_with_default("executed_transaction_profiles", move || {
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
+                })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
@@ -1320,9 +1368,12 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
+            coalesced_slots: Default::default(),
+            clock_driven: Default::default(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
             token_accounts: token_accounts_db,
@@ -1750,17 +1801,21 @@ impl SurfnetSvm {
     /// is by now, lands on the open slot: only its time changes. If the landing can't be
     /// recorded, nothing changes in memory.
     pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
-        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
-        if let Err(e) = self.travel_to(clock.slot.max(self.get_latest_absolute_slot())) {
-            self.updated_at = previous;
-            return Err(e);
-        }
+        let slot = clock.slot.max(self.get_latest_absolute_slot());
         let clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
+            slot,
+            epoch: self.inner.get_sysvar::<EpochSchedule>().get_epoch(slot),
             ..clock
         };
+        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
+        let previous_clock = self.inner.get_sysvar::<Clock>();
+        // The Clock is set before the landing is announced, so Geyser streams the landing's.
         self.inner.set_sysvar(&clock);
+        if let Err(e) = self.travel_to(slot) {
+            self.updated_at = previous;
+            self.inner.set_sysvar(&previous_clock);
+            return Err(e);
+        }
         self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }
@@ -2958,14 +3013,37 @@ impl SurfnetSvm {
         account_update: GetAccountResult,
         policy: AccountUpdatePolicy,
     ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(account_update, policy, HydrationMode::BestEffort)
+    }
+
+    /// Snapshot hydration must surface installation failures and never synthesize ProgramData.
+    pub(crate) fn hydrate_snapshot_strict(
+        &mut self,
+        account_update: GetAccountResult,
+    ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(
+            account_update,
+            AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::StrictSnapshot,
+        )
+    }
+
+    fn apply_account_update_with_mode(
+        &mut self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+        mode: HydrationMode,
+    ) -> SurfpoolResult<()> {
         let account_update = self.account_update_for_policy(account_update, policy)?;
 
         match account_update {
             GetAccountResult::None(_) => {}
             GetAccountResult::FoundAccount(pubkey, account, source) => {
                 if source != AccountSource::Svm {
-                    self.apply_synthetic_programdata(&account)?;
-                    self.apply_account_component(pubkey, account, policy)?;
+                    if mode == HydrationMode::BestEffort {
+                        self.apply_synthetic_programdata(&account)?;
+                    }
+                    self.apply_account_component(pubkey, account, policy, mode)?;
                 }
             }
             GetAccountResult::FoundCoupledAccount(
@@ -2973,31 +3051,33 @@ impl SurfnetSvm {
                 CoupledAccount::ProgramData(_, None),
                 _,
             ) => {
-                self.apply_synthetic_programdata(&account)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                if mode == HydrationMode::BestEffort {
+                    self.apply_synthetic_programdata(&account)?;
+                }
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::ProgramData(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(_, None),
                 _,
             ) => {
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
         }
 
@@ -3043,6 +3123,7 @@ impl SurfnetSvm {
         pubkey: Pubkey,
         account: Account,
         policy: AccountUpdatePolicy,
+        mode: HydrationMode,
     ) -> SurfpoolResult<()> {
         let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
             match self.inner.get_account_result(&pubkey)? {
@@ -3066,6 +3147,9 @@ impl SurfnetSvm {
         // returned to the caller, with the insertion failure emitted as an
         // event for observability.
         if let Err(error) = self.set_account(&pubkey, account) {
+            if mode == HydrationMode::StrictSnapshot {
+                return Err(error);
+            }
             let _ = self.simnet_events_tx.error(error.to_string());
         }
         Ok(())
@@ -3104,6 +3188,7 @@ impl SurfnetSvm {
                 rent_epoch: 0,
             },
             AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::BestEffort,
         )
     }
 
@@ -3202,6 +3287,19 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
+
+        // Agave writes SlotHistory and RecentBlockhashes as it freezes a block. Yellowstone
+        // publishes a block only once it has seen them, along with the slot's Clock and SlotHashes.
+        let mut slot_history = self.inner.get_sysvar::<SlotHistory>();
+        slot_history.add(slot);
+        self.inner.set_sysvar(&slot_history);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::slot_history::ID,
+                solana_sdk_ids::sysvar::recent_blockhashes::ID,
+            ],
+        );
 
         // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
         // block whose entry arrives after it.
@@ -3345,7 +3443,7 @@ impl SurfnetSvm {
                 let touched = self
                     .apply_overrides(remote_ctx, target_slot, overrides, true)
                     .await?;
-                self.enrol_keep_alive(touched);
+                self.enroll_keep_alive(touched);
             }
             Ok::<_, SurfpoolError>(())
         }
@@ -3439,7 +3537,7 @@ impl SurfnetSvm {
             {
                 keep_alive_source = Some(KeepAliveSource {
                     template: template.id.clone(),
-                    account: account_pubkey,
+                    address: account_pubkey,
                     values: override_instance.values.clone(),
                 });
             }
@@ -3459,10 +3557,22 @@ impl SurfnetSvm {
                         account_pubkey
                     );
 
-                    let fetched = match client
+                    let result = client
                         .get_account(&account_pubkey, CommitmentConfig::confirmed())
                         .await
-                    {
+                        .map(|result| {
+                            if scheduled {
+                                return result;
+                            }
+                            // Keep-alive fetches its target unasked, so it honours an owner marked
+                            // offline with its owned accounts, as an ordinary read does.
+                            Self::filter_downloaded_account_result(
+                                &account_pubkey,
+                                result,
+                                &self.offline_account_owners(),
+                            )
+                        });
+                    let fetched = match result {
                         Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
                             Some((remote_account, None))
                         }
@@ -3546,6 +3656,8 @@ impl SurfnetSvm {
                 Ok(account) => account,
                 Err(e) => {
                     restore_unprocessed(self, index);
+                    // The overrides before this one wrote their accounts, so they still join.
+                    self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                     return Err(e);
                 }
             };
@@ -3694,6 +3806,8 @@ impl SurfnetSvm {
                             target_slot,
                         ) {
                             restore_unprocessed(self, index);
+                            // The overrides before this one wrote their accounts, so they still join.
+                            self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                             return Err(e);
                         }
                         keep_alive_touched.extend(keep_alive_source.take());
@@ -3803,28 +3917,28 @@ impl SurfnetSvm {
     }
 
     /// Adds the accounts that `touched` makes keep-alive imports rewrite.
-    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
+    fn enroll_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
             let Some(template) = template_registry().get(&source.template) else {
                 continue;
             };
             for (index, import) in template.keep_alive.iter().enumerate() {
-                let Some(account) = import.account(source.account, &source.values) else {
+                let Some(address) = import.address(source.address, &source.values) else {
                     warn!(
                         "Keep-alive '{}' of override template '{}' has no address for {}",
-                        import.template, template.id, source.account
+                        import.template, template.id, source.address
                     );
                     continue;
                 };
                 let binding = KeepAliveBinding {
                     template: template.id.clone(),
                     import: index,
-                    account,
+                    address,
                 };
                 if self.keep_alive_bindings.insert(binding) {
                     info!(
                         "Keep-alive '{}' rewrites {} every slot",
-                        import.template, account
+                        import.template, address
                     );
                 }
             }
@@ -3834,13 +3948,12 @@ impl SurfnetSvm {
     /// The keep-alive overrides for every binding at `slot`. A missing account is fetched first when
     /// `can_fetch` and not offline, otherwise skipped.
     fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
-        // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
-        // the block's time.
+        // The time the open slot's Clock sysvar holds. The Clock advances by each slot's own
+        // interval, so recomputing it from the slot would apply a changed slot interval to every
+        // slot since the last time travel or restart.
         let clock = KeepAliveClock {
             slot,
-            unix_time_ms: self
-                .calculate_block_time_for_slot(slot)
-                .saturating_sub(self.block_time_lag()),
+            unix_time_ms: self.updated_at,
         };
         let mut instances = Vec::new();
         for binding in &self.keep_alive_bindings {
@@ -3850,23 +3963,23 @@ impl SurfnetSvm {
             else {
                 continue;
             };
-            let missing = match self.get_account(&binding.account) {
+            let missing = match self.get_account(&binding.address) {
                 Ok(Some(_)) => false,
                 Ok(None)
                     if can_fetch
                         && !self
                             .offline_accounts
-                            .contains_key(&binding.account.to_string())
+                            .contains_key(&binding.address.to_string())
                             .unwrap_or(false) =>
                 {
                     true
                 }
                 Ok(None) => {
-                    debug!("Keep-alive skips {}: not in this surfnet", binding.account);
+                    debug!("Keep-alive skips {}: not in this surfnet", binding.address);
                     continue;
                 }
                 Err(e) => {
-                    warn!("Keep-alive cannot read {}: {}", binding.account, e);
+                    warn!("Keep-alive cannot read {}: {}", binding.address, e);
                     continue;
                 }
             };
@@ -3875,7 +3988,7 @@ impl SurfnetSvm {
                 Err(e) => {
                     warn!(
                         "Keep-alive '{}' skips {}: {}",
-                        import.template, binding.account, e
+                        import.template, binding.address, e
                     );
                     continue;
                 }
@@ -3883,15 +3996,51 @@ impl SurfnetSvm {
             let mut instance = OverrideInstance::new(
                 import.template.clone(),
                 0,
-                surfpool_types::AccountAddress::Pubkey(binding.account.to_string()),
+                surfpool_types::AccountAddress::Pubkey(binding.address.to_string()),
             )
             .with_values(values)
             .with_label(format!("keep-alive {}", import.template));
-            instance.id = format!("keep-alive:{}:{}", import.template, binding.account);
+            instance.id = format!("keep-alive:{}:{}", import.template, binding.address);
             instance.fetch_before_use = missing;
             instances.push(instance);
         }
         instances
+    }
+
+    /// Filters the downloaded account result to remove accounts owned by offline owners.
+    pub(crate) fn filter_downloaded_account_result(
+        requested_pubkey: &Pubkey,
+        result: GetAccountResult,
+        offline_owners: &[Pubkey],
+    ) -> GetAccountResult {
+        match result {
+            GetAccountResult::FoundAccount(_, account, _)
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
+                if offline_owners.contains(&account.owner) =>
+            {
+                GetAccountResult::None(*requested_pubkey)
+            }
+            other => other,
+        }
+    }
+
+    /// The owners marked offline with their owned accounts, whose accounts are never downloaded.
+    pub(crate) fn offline_account_owners(&self) -> Vec<Pubkey> {
+        self.offline_accounts
+            .into_iter()
+            .unwrap_or_else(|e| {
+                warn!("Failed to iterate offline_accounts: {}", e);
+                Box::new(std::iter::empty())
+            })
+            .filter(|(_, config)| config.include_owned_accounts)
+            .filter_map(|(key, _)| match key.parse() {
+                Ok(pubkey) => Some(pubkey),
+                Err(e) => {
+                    warn!("Invalid pubkey in offline_accounts: {}: {}", key, e);
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -4141,6 +4290,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.signature_subscriptions.insert(*signature, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4171,6 +4321,7 @@ impl SurfnetSvm {
                 self.account_subscriptions
                     .insert(*account_updated_pubkey, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4205,6 +4356,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.program_subscriptions.insert(program_id, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4497,8 +4649,12 @@ impl SurfnetSvm {
     }
 
     pub fn notify_slot_subscribers(&mut self, slot: Slot, parent: Slot, root: Slot) {
+        if self.slot_subscriptions.is_empty() {
+            return;
+        }
         self.slot_subscriptions
             .retain(|tx| tx.send(SlotInfo { slot, parent, root }).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a new sender for `slotsUpdatesSubscribe` notifications and
@@ -4526,6 +4682,7 @@ impl SurfnetSvm {
         let arc = Arc::new(update);
         self.slots_updates_subscriptions
             .retain(|tx| tx.send(arc.clone()).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
@@ -4563,14 +4720,37 @@ impl SurfnetSvm {
 
     /// Announces the open slot on its parent block, as Agave does when it creates the slot's
     /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
-    /// none.
+    /// none. Geyser first receives the Clock and SlotHashes sysvars as the open slot's account
+    /// writes, as Agave writes them while it creates the bank.
     pub fn announce_open_slot(&mut self) {
         let slot = self.get_latest_absolute_slot();
         let parent = self.parent_slot(slot);
         let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         self.notify_slot_subscribers(slot, parent, root);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::clock::ID,
+                solana_sdk_ids::sysvar::slot_hashes::ID,
+            ],
+        );
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
+    }
+
+    /// Sends the current accounts of `sysvars` to Geyser plugins as account writes in `slot`.
+    fn stream_sysvars(&mut self, slot: Slot, sysvars: [Pubkey; 2]) {
+        for pubkey in sysvars {
+            let Some(account) = self.inner.get_account_no_db(&pubkey) else {
+                continue;
+            };
+            let write_version = self.increment_write_version();
+            self.geyser_events_tx
+                .send(GeyserEvent::UpdateAccount(
+                    GeyserAccountUpdate::block_update(pubkey, account, slot, write_version),
+                ))
+                .ok();
+        }
     }
 
     pub fn write_simulated_profile_result(
@@ -4677,6 +4857,7 @@ impl SurfnetSvm {
                     logs: logs.clone(),
                 };
                 let _ = tx.send((self.get_latest_absolute_slot(), message));
+                self.subscription_wake.notify_waiters();
             }
         }
     }
@@ -4758,6 +4939,7 @@ impl SurfnetSvm {
                 tx.send(update).is_ok()
             })
             .collect();
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a snapshot subscription and returns a sender and receiver for notifications.
@@ -5276,17 +5458,22 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Every slot is checked before anything is stored, so a bad override leaves no partial plan.
+        let mut scheduled = Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
             let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
-                SurfpoolError::internal(format!(
+                SurfpoolError::invalid_params(format!(
                     "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+            scheduled.push((absolute_slot, override_instance));
+        }
 
+        for (absolute_slot, override_instance) in scheduled {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
                 absolute_slot, base_slot, scenario_relative_slot
@@ -5333,8 +5520,38 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+        storage::tests::TestType,
+        surfnet::locker::SurfnetSvmLocker,
+        tests::helpers::{UNHEALTHY_OFFSET, canned_rpc, scheduled_override_fixture},
     };
+
+    /// Keep-alive stamps the open slot with the time its Clock holds. After the slot interval
+    /// changes, a time recomputed from the slot applies the new interval to every slot since the
+    /// last time anchor and runs ahead of that Clock.
+    #[test]
+    fn keep_alive_stamps_the_clock_time_after_the_slot_interval_changes() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        for _ in 0..10 {
+            svm.confirm_current_block().unwrap();
+        }
+        svm.slot_time *= 3;
+        for _ in 0..10 {
+            svm.confirm_current_block().unwrap();
+        }
+
+        let slot = svm.get_latest_absolute_slot();
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(svm.updated_at / 1_000, clock.unix_timestamp as u64);
+        let recomputed = svm
+            .calculate_block_time_for_slot(slot)
+            .saturating_sub(svm.block_time_lag())
+            / 1_000;
+        assert!(
+            recomputed > clock.unix_timestamp as u64,
+            "the slot-based time {recomputed} should run ahead of the Clock {}",
+            clock.unix_timestamp
+        );
+    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -6677,6 +6894,27 @@ mod tests {
         assert_eq!(read(&svm, &[open])[0].0, height + 1);
     }
 
+    #[test]
+    fn test_builtin_idls_are_registered_once_across_restarts() {
+        let test_type = TestType::sqlite();
+        let TestType::OnDiskSqlite(database_url) = &test_type else {
+            unreachable!()
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id: "builtin-idls".to_string(),
+            ..SurfnetSvmConfig::default()
+        };
+        for _ in 0..2 {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            svm.confirm_current_block().unwrap();
+            for (program_id, versions) in svm.registered_idls.into_iter().unwrap() {
+                assert_eq!(versions.len(), 1, "{program_id}");
+            }
+            svm.shutdown();
+        }
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     fn test_new_with_db_restores_last_checkpoint_slot_from_block_only_recovery(
@@ -7234,6 +7472,23 @@ mod tests {
         );
     }
 
+    /// Garbage collection rebuilds LiteSVM as a block closes, just before the block records its
+    /// slot in SlotHistory, so the blocks recorded before it must survive the rebuild.
+    #[test]
+    fn slot_history_survives_garbage_collection() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let gc_slot = svm.garbage_collection_interval_slots();
+        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
+        svm.latest_epoch_info.slot_index = gc_slot - 1;
+        svm.confirm_current_block().unwrap();
+        let mut expected = svm.inner.get_sysvar::<SlotHistory>();
+        expected.add(gc_slot);
+
+        svm.confirm_current_block().unwrap();
+
+        assert!(svm.inner.get_sysvar::<SlotHistory>() == expected);
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
@@ -7588,6 +7843,58 @@ mod tests {
         let streamed: Vec<_> = blocks.iter().map(|block| block.block_time).collect();
         assert_eq!(streamed, expected);
         assert_blocks_read_as_streamed(&svm, &blocks);
+    }
+
+    /// Yellowstone gRPC v16 publishes a block only once Geyser has written its Clock,
+    /// SlotHashes, SlotHistory and RecentBlockhashes in that slot; without them its slot, block
+    /// and confirmed streams stay empty. A time travel's landing gets its own Clock.
+    #[test]
+    fn geyser_writes_the_sysvars_of_each_block() {
+        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
+        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
+                        Some((update.pubkey, update.account.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        let slot = svm.get_latest_absolute_slot();
+        svm.confirm_current_block().unwrap();
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+        assert_eq!(
+            written,
+            [
+                clock::ID,
+                slot_hashes::ID,
+                slot_history::ID,
+                recent_blockhashes::ID
+            ]
+        );
+        assert_eq!(svm.inner.get_sysvar::<SlotHistory>().next_slot, slot + 1);
+
+        let landing = svm.get_latest_absolute_slot() + 100;
+        let clock = svm.inner.get_sysvar::<Clock>();
+        svm.apply_time_travel(Clock {
+            slot: landing,
+            ..clock
+        })
+        .unwrap();
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
+        assert_eq!(*pubkey, clock::ID);
+        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
+        assert_eq!(streamed.slot, landing);
     }
 
     /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the
@@ -8977,62 +9284,10 @@ mod tests {
         assert_eq!(restored_account.lamports, 1_000_000);
     }
 
-    /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
-    const UNHEALTHY_OFFSET: usize = 2256;
-
-    /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
-    /// the bundled template IDLs, so klend's is resolvable by owner program.
-    fn scheduled_override_fixture() -> (
-        SurfnetSvm,
-        Pubkey,
-        surfpool_types::OverrideInstance,
-        Receiver<GeyserEvent>,
-    ) {
-        let (mut surfnet_svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
-
-        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
-        let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
-            .expect("kamino idl");
-        let obligation_disc = &idl
-            .accounts
-            .iter()
-            .find(|a| a.name == "Obligation")
-            .expect("Obligation account")
-            .discriminator;
-
-        let mut data = vec![0u8; 3344];
-        data[..8].copy_from_slice(obligation_disc);
-
-        let account_pubkey = Pubkey::new_unique();
-        surfnet_svm
-            .inner
-            .set_account(
-                account_pubkey,
-                Account {
-                    lamports: 1_000_000,
-                    data,
-                    owner: klend,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .expect("set obligation account");
-
-        let instance = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
-        )
-        .with_values(HashMap::from([(
-            "unhealthy_borrow_value_sf".to_string(),
-            serde_json::json!(1_234u64),
-        )]));
-        (surfnet_svm, account_pubkey, instance, geyser_events_rx)
-    }
-
     #[tokio::test]
     async fn test_scenario_relative_slot_overflow_is_an_error_not_a_wrap() {
-        let (mut svm, account_pubkey, _instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, _instance) = scheduled_override_fixture(&mut svm);
 
         let mut far = surfpool_types::OverrideInstance::new(
             "kamino-obligation-health".to_string(),
@@ -9057,7 +9312,8 @@ mod tests {
     #[tokio::test]
     async fn forged_scenario_override_notifies_subscribers_and_geyser_once() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let account_updates = svm.subscribe_for_account_updates(&account_pubkey, None);
         let program_updates = svm.subscribe_for_program_updates(
             &Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
@@ -9117,7 +9373,8 @@ mod tests {
         // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
         const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
 
-        let (mut svm, account_pubkey, first, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, first) = scheduled_override_fixture(&mut svm);
         let mut first = first;
         first.fetch_before_use = true;
 
@@ -9461,7 +9718,8 @@ mod tests {
     #[tokio::test]
     async fn an_idl_override_notifies_account_subscribers() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let updates =
             svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
         svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();
