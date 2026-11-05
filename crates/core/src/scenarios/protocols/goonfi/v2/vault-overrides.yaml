@@ -9,6 +9,11 @@ tags:
   - vault
   - inventory
 
+keep_alive:
+  - template: goonfi-quote-publication
+    address: { type: input, value: oracle }
+    values: { last_update_slot: $slot-1 }
+
 templates:
   - id: goonfi-vault-balance
     name: Override Vault Balance
@@ -22,6 +27,13 @@ templates:
         encoding: u64
         label: Vault token balance
         description: Raw token amount in the mint's smallest unit.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this vault's market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the vault.
     llm_context: |
       FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
       1. Resolve both token symbols with get_token_address, both calls at once.
@@ -59,6 +71,10 @@ templates:
       Lowering a payout vault below the requested output makes the token transfer fail with the SPL
       Token program's custom error 0x1 (insufficient funds).
       The opposite direction keeps filling.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this inventory change.
 
       UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
       returns each mint's decimals.

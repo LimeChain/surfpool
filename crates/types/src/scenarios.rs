@@ -1107,11 +1107,6 @@ pub enum RawEncoding {
     Slot {
         lead: i64,
     },
-    /// [`RawEncoding::Slot`] for programs that store the slot as a u32. A slot past `u32::MAX` is
-    /// refused instead of truncated.
-    Slot32 {
-        lead: i64,
-    },
 }
 
 impl RawEncoding {
@@ -1120,10 +1115,7 @@ impl RawEncoding {
         match self {
             RawEncoding::U8 => 1,
             RawEncoding::U16 => 2,
-            RawEncoding::U32
-            | RawEncoding::I32
-            | RawEncoding::I32Strided { .. }
-            | RawEncoding::Slot32 { .. } => 4,
+            RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
             RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
@@ -1141,8 +1133,7 @@ impl RawEncoding {
         }
     }
 
-    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`] and
-    /// [`RawEncoding::Slot32`].
+    /// The little-endian bytes for `value`. `target_slot` is only read by [`RawEncoding::Slot`].
     pub fn encode(&self, value: &serde_json::Value, target_slot: Slot) -> Result<Vec<u8>, String> {
         // Read the digits as text so nothing passes through f64, which cannot hold a u128
         // exactly. A decimal string is the only way to express values above u64::MAX in JSON.
@@ -1188,7 +1179,7 @@ impl RawEncoding {
                     .to_bytes()
                     .to_vec()
             }
-            RawEncoding::Slot { lead } | RawEncoding::Slot32 { lead } => {
+            RawEncoding::Slot { lead } => {
                 let lead = match value {
                     serde_json::Value::Null => *lead,
                     _ => {
@@ -1204,14 +1195,7 @@ impl RawEncoding {
                 } else {
                     target_slot.saturating_sub(lead.unsigned_abs())
                 };
-                if let RawEncoding::Slot32 { .. } = self {
-                    u32::try_from(slot)
-                        .map_err(|_| format!("slot {slot} does not fit a 4-byte slot field"))?
-                        .to_le_bytes()
-                        .to_vec()
-                } else {
-                    slot.to_le_bytes().to_vec()
-                }
+                slot.to_le_bytes().to_vec()
             }
         })
     }
@@ -2185,24 +2169,6 @@ templates:
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn slot32_writes_four_bytes_and_refuses_slots_past_u32() {
-        use super::RawEncoding;
-
-        let encoding: RawEncoding =
-            serde_json::from_value(json!({"slot32": {"lead": -2000}})).unwrap();
-        assert_eq!(encoding.width(), 4);
-        let bytes = encoding.encode(&json!(null), 450_000_000).unwrap();
-        assert_eq!(bytes, 449_998_000u32.to_le_bytes());
-        let bytes = encoding.encode(&json!(0), 450_000_000).unwrap();
-        assert_eq!(bytes, 450_000_000u32.to_le_bytes());
-
-        let err = encoding
-            .encode(&json!(1), u64::from(u32::MAX))
-            .expect_err("a 4-byte slot must not truncate");
-        assert!(err.contains("4-byte"), "unexpected error: {err}");
     }
 
     #[test]
