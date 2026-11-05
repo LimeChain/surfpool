@@ -1157,6 +1157,9 @@ async fn goonfi_size_impact_prices_larger_trades_worse_on_the_fixture_markets() 
 #[tokio::test]
 async fn goonfi_keep_alive_stamps_one_slot_back_because_the_update_slot_pays_one_decay_step() {
     let fixtures = fixtures().await;
+    // The maker sets each market's decay step and can set it to zero, as JUP / USDC has, so the
+    // update slot's cost is required of some market rather than of a named one.
+    let mut some_market_charges = false;
     for fixture in fixtures.iter() {
         // Well past the market's own last swaps, so only the quote's slot matters.
         let clock = fixture.slot + 50;
@@ -1187,14 +1190,13 @@ async fn goonfi_keep_alive_stamps_one_slot_back_because_the_update_slot_pays_one
                 "{} side {side}: keep-alive {one_slot_old} vs same slot {same_slot}",
                 fixture.def.pair
             );
-            if fixture.def.pair == "SOL / USDC" {
-                assert!(
-                    one_slot_old as f64 >= same_slot as f64 * 1.0005,
-                    "SOL / USDC side {side}: the update slot should cost about 8 bp"
-                );
-            }
+            some_market_charges |= one_slot_old > same_slot;
         }
     }
+    assert!(
+        some_market_charges,
+        "no featured market charges a swap in the update slot"
+    );
 }
 
 const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";

@@ -127,15 +127,16 @@ band again in the later scenario.
 Keep-alive keeps a market a scenario overrides one slot old. A market no override names is not
 republished, and ages like this. A quote fills best one to four slots after its update. From the
 fifth slot, each slot costs one decay step, whose size is set per market, until the quote rejects
-with `0x15`. Measured on the featured markets:
+with `0x15`. The maker can change a market's step; measured on the featured markets in November
+2026:
 
 | Slots since the update | SOL / USDC  | HYPE / USDC | JUP / USDC |
 | ---------------------- | ----------- | ----------- | ---------- |
-| 0 (same slot)          | -8 bp       | -30 bp      | 0          |
+| 0 (same slot)          | 0           | -30 bp      | 0          |
 | 1 to 4                 | best fill   | best fill   | best fill  |
-| 5                      | -8 bp       | -30 bp      | 0          |
-| 10                     | -48 bp      | -180 bp     | 0          |
-| 15                     | -88 bp      | -330 bp     | 0          |
+| 5                      | 0           | -30 bp      | 0          |
+| 10                     | 0           | -180 bp     | 0          |
+| 15                     | 0           | -330 bp     | 0          |
 | 16                     | `0x15`      | -360 bp     | 0          |
 | 20                     |             | -480 bp     | 0          |
 | 21                     |             | `0x15`      | `0x15`     |
