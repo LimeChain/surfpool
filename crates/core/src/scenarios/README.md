@@ -152,3 +152,7 @@ The following steps can be followed to natively support a protocol:
 If any part of these instructions are beyond your skill level or availability, but you'd like to see a specific protocol supported, feel free to [Open an Issue to Support a new Protocol](https://github.com/solana-foundation/surfpool/issues/new?template=native-scenario-support-for-protocol.md)!
 Opening an issue to signal interest is a big help.
 If you're able to find an IDL for the protocol, even better!
+
+## Templates Written at Runtime
+A program that publishes an Anchor IDL does not need a rebuild to get templates. From any MCP host (Claude Code, Codex, Cursor), the `author_override_template` prompt walks a model through `fetch_program_idl`, `validate_override_template` and `save_override_template`; the same guide is the `str:///template_authoring_guide` resource and [AUTHORING.md](./AUTHORING.md).
+Saved collections live in `~/.surfpool/templates/<protocol>/<version>/` (`SURFPOOL_TEMPLATES_DIR` overrides the root) in the layout of `protocols/`, are loaded on every start, and can be promoted into the repo by copying the folder and adding its `load_*` line.

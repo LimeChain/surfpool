@@ -64,7 +64,7 @@ pub async fn start_studio_and_scenario_server(
     let config_wrapped = Data::new(RwLock::new(config.clone()));
 
     // Initialize template registry and load templates
-    let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
+    let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::with_user_templates()));
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
     // Initialize MCP service

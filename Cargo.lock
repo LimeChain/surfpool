@@ -12112,6 +12112,7 @@ dependencies = [
  "convert_case 0.8.0",
  "crossbeam",
  "crossbeam-channel",
+ "dirs 6.0.0",
  "env_logger",
  "hex",
  "hiro-system-kit",
@@ -12225,8 +12226,10 @@ dependencies = [
 name = "surfpool-mcp"
 version = "1.7.0"
 dependencies = [
+ "anchor-lang-idl",
  "bs58",
  "crossbeam-channel",
+ "flate2",
  "hiro-system-kit",
  "reqwest",
  "rmcp",
@@ -12240,6 +12243,7 @@ dependencies = [
  "spl-token-interface 3.0.0",
  "surfpool-core",
  "surfpool-types",
+ "tempfile",
  "tokio",
  "tracing",
 ]

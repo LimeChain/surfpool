@@ -107,6 +107,7 @@ surfpool-db = { workspace = true }
 surfpool-types = { workspace = true }
 
 anchor-lang-idl = { workspace = true }
+dirs = { workspace = true }
 txtx-addon-kit = { workspace = true }
 txtx-addon-network-svm-types = { workspace = true }
 txtx-addon-network-svm = { workspace = true }

@@ -1,14 +1,18 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, RwLock},
 };
 
 use rmcp::{
     ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
     model::{ErrorData as McpError, *},
-    schemars, tool, tool_handler, tool_router,
+    prompt, prompt_handler, prompt_router, schemars, tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,7 +22,7 @@ use solana_pubkey::Pubkey;
 use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
-        TemplateRegistry,
+        AUTHORING_GUIDE, TemplateRegistry,
         protocols::{
             phoenix_eternal::v1::{
                 market::phoenix_markets,
@@ -35,12 +39,13 @@ use surfpool_core::{
     surfnet::remote::SurfnetRemoteClient,
 };
 use surfpool_types::{
-    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, DEFAULT_RPC_PORT, Scenario,
-    VERIFIED_TOKENS_BY_SYMBOL,
+    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED, DEFAULT_RPC_PORT, OverrideTemplate,
+    Scenario, VERIFIED_TOKENS_BY_SYMBOL, YamlOverrideTemplateCollection,
 };
 
 use crate::helpers::find_next_available_surfnet_port;
 
+mod idl;
 mod set_token_account;
 mod start_surfnet;
 
@@ -217,20 +222,185 @@ pub struct CallSurfnetRpcParams {
     pub params: Vec<JsonValue>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchProgramIdlParams {
+    #[schemars(description = "Program id whose IDL to fetch.")]
+    pub program_id: String,
+    #[schemars(
+        description = "Path to a local IDL file, used instead of the surfnet and the chain when the program publishes no Anchor IDL account."
+    )]
+    pub idl_path: Option<String>,
+    #[schemars(description = "Port of the surfnet to read through. Defaults to 8899.")]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OverrideTemplateCollectionParams {
+    #[schemars(
+        description = "The overrides.yaml text of one collection, in the shape the authoring guide shows."
+    )]
+    pub collection_yaml: String,
+    #[schemars(description = "Program id the collection's IDL belongs to.")]
+    pub program_id: String,
+    #[schemars(
+        description = "Path to a local IDL file, used instead of the surfnet and the chain when the program publishes no Anchor IDL account."
+    )]
+    pub idl_path: Option<String>,
+    #[schemars(
+        description = "Replace a collection saved earlier under the same protocol and version; its ids may be reused."
+    )]
+    #[serde(default)]
+    pub overwrite: bool,
+    #[schemars(description = "Port of the surfnet to read through. Defaults to 8899.")]
+    pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorTemplateArgs {
+    #[schemars(description = "Program id to write templates for.")]
+    pub program_id: String,
+    #[schemars(
+        description = "What the templates should let a user do, e.g. \"freeze swaps on a pool\"."
+    )]
+    pub goal: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Surfpool {
     pub surfnets: Arc<RwLock<HashMap<u16, u16>>>,
     pub template_registry: Arc<RwLock<TemplateRegistry>>,
+    templates_dir: PathBuf,
     tool_router: ToolRouter<Surfpool>,
+    prompt_router: PromptRouter<Surfpool>,
 }
 
 impl Surfpool {
     pub fn new() -> Self {
+        let templates_dir = TemplateRegistry::user_templates_dir();
+        let mut registry = TemplateRegistry::new();
+        // Tests must not depend on what the developer keeps in the home directory.
+        if !cfg!(test) {
+            registry.load_user_templates(&templates_dir);
+        }
         Self {
             surfnets: Arc::new(RwLock::new(HashMap::new())),
-            template_registry: Arc::new(RwLock::new(TemplateRegistry::new())),
+            template_registry: Arc::new(RwLock::new(registry)),
+            templates_dir,
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
+    }
+
+    async fn validated_collection(
+        &self,
+        params: &OverrideTemplateCollectionParams,
+        port: u16,
+    ) -> Result<ValidatedCollection, String> {
+        let idl = idl::resolve_idl(port, &params.program_id, params.idl_path.as_deref()).await?;
+        let registry = self
+            .template_registry
+            .read()
+            .map_err(|_| "Failed to read template registry".to_string())?;
+        let templates = registry.parse_user_collection(&params.collection_yaml, &idl.json)?;
+        let collection: YamlOverrideTemplateCollection =
+            serde_yaml::from_str(&params.collection_yaml).map_err(|e| e.to_string())?;
+        let folder = self
+            .templates_dir
+            .join(folder_name(&collection.protocol)?)
+            .join(folder_name(&collection.version)?);
+        // Only the ids the folder's current file declares may be reused with overwrite.
+        let replaced_ids = if params.overwrite {
+            saved_ids(&folder)
+        } else {
+            Vec::new()
+        };
+        for template in &templates {
+            let bundled = (registry.contains(&template.id)
+                && !registry.user_template_ids.contains(&template.id))
+                || registry.keep_alive_template(&template.id).is_some();
+            if bundled {
+                return Err(format!(
+                    "{}: a bundled template already uses this id; pick another",
+                    template.id
+                ));
+            }
+            if registry.contains(&template.id) && !replaced_ids.contains(&template.id) {
+                return Err(format!(
+                    "{}: a saved template already uses this id; pick another, or pass overwrite: true if it is the one saved in {}",
+                    template.id,
+                    folder.display()
+                ));
+            }
+        }
+        Ok(ValidatedCollection {
+            templates,
+            idl,
+            folder,
+            replaced_ids,
+        })
+    }
+}
+
+struct ValidatedCollection {
+    templates: Vec<OverrideTemplate>,
+    idl: idl::ResolvedIdl,
+    folder: PathBuf,
+    replaced_ids: Vec<String>,
+}
+
+fn saved_ids(folder: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(folder.join("overrides.yaml"))
+        .ok()
+        .and_then(|old| serde_yaml::from_str::<YamlOverrideTemplateCollection>(&old).ok())
+        .map(|old| old.templates.into_iter().map(|t| t.id).collect())
+        .unwrap_or_default()
+}
+
+/// `protocol` and `version` from the YAML become folder names on disk: lowercased, spaces to
+/// dashes, dots kept (`v1.23.0`), anything that could leave the directory refused.
+fn folder_name(value: &str) -> Result<String, String> {
+    let name = value.trim().to_lowercase().replace(' ', "-");
+    let safe = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if safe {
+        Ok(name)
+    } else {
+        Err(format!(
+            "{value:?} cannot name a folder; use letters, digits, '.', '-' and '_'"
+        ))
+    }
+}
+
+fn tool_result(result: Result<serde_json::Value, String>) -> CallToolResult {
+    match result {
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json.to_string())]),
+        Err(error) => CallToolResult::error(vec![ContentBlock::text(error)]),
+    }
+}
+
+#[prompt_router]
+impl Surfpool {
+    #[prompt(
+        name = "author_override_template",
+        description = "Write, validate and save override templates for a program from its IDL, for use in this and every later session."
+    )]
+    async fn author_override_template(
+        &self,
+        Parameters(args): Parameters<AuthorTemplateArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!(
+                "{AUTHORING_GUIDE}\n\nProgram: {}\nGoal: {}\n",
+                args.program_id, args.goal
+            ),
+        )]
     }
 }
 
@@ -1318,6 +1488,112 @@ impl Surfpool {
     }
 
     #[tool(
+        description = "Fetches a program's IDL for template authoring: the IDL the surfnet has registered, else the program's on-chain Anchor IDL account (then registered on the surfnet); a local file passed as idlPath is used instead of both. Returns where it came from and an index of the account types with their top-level fields; read a live account with call_surfnet_rpc getAccountInfo jsonParsed for nested shapes and real values. Start from the author_override_template prompt or the str:///template_authoring_guide resource."
+    )]
+    async fn fetch_program_idl(
+        &self,
+        Parameters(params): Parameters<FetchProgramIdlParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let port = params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let result = async {
+            let idl =
+                idl::resolve_idl(port, &params.program_id, params.idl_path.as_deref()).await?;
+            let registered = idl::register_idl(port, &idl.idl, params.idl_path.is_some()).await;
+            let mut index = idl::account_index(&idl.idl);
+            index["programId"] = serde_json::Value::String(params.program_id.clone());
+            index["source"] = serde_json::Value::String(idl.source.to_string());
+            index["surfnetRegistered"] = serde_json::Value::Bool(registered.is_ok());
+            index["error"] = serde_json::json!(registered.err());
+            Ok(index)
+        }
+        .await;
+        Ok(tool_result(result))
+    }
+
+    #[tool(
+        description = "Validates an overrides.yaml collection against the program's IDL before save_override_template: the YAML shape, every property path against the IDL account type, no raw_layout, no constants, an llm_context per template, and no id a bundled template already uses. Returns the templates as get_override_template will show them, or the first error."
+    )]
+    async fn validate_override_template(
+        &self,
+        Parameters(params): Parameters<OverrideTemplateCollectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let port = params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let result = self
+            .validated_collection(&params, port)
+            .await
+            .map(|validated| {
+                let templates: Vec<serde_json::Value> = validated
+                    .templates
+                    .iter()
+                    .map(compact_template_json)
+                    .collect();
+                serde_json::json!({"templates": templates})
+            });
+        Ok(tool_result(result))
+    }
+
+    #[tool(
+        description = "Validates and saves an overrides.yaml collection with its IDL to the user's templates directory (~/.surfpool/templates/<protocol>/<version>/, or SURFPOOL_TEMPLATES_DIR), adds its templates to this session's registry so create_scenario accepts their ids, and registers the IDL on the surfnet. Every later surfpool start loads the directory. Refuses to replace a saved collection unless overwrite is true."
+    )]
+    async fn save_override_template(
+        &self,
+        Parameters(params): Parameters<OverrideTemplateCollectionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let port = params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
+        let result = async {
+            let ValidatedCollection {
+                templates,
+                idl,
+                folder,
+                replaced_ids,
+            } = self.validated_collection(&params, port).await?;
+            if folder.join("overrides.yaml").exists() && !params.overwrite {
+                return Err(format!(
+                    "{} exists; pass overwrite: true to replace it",
+                    folder.display()
+                ));
+            }
+            let write = |name: &str, text: &str| {
+                std::fs::write(folder.join(name), text)
+                    .map_err(|e| format!("{}: {e}", folder.join(name).display()))
+            };
+            std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+            // The IDL goes first: a folder with a YAML and no IDL fails to load on every start.
+            write("idl.json", &idl.json)?;
+            write("overrides.yaml", &params.collection_yaml)?;
+
+            let ids: Vec<String> = templates.iter().map(|t| t.id.clone()).collect();
+            {
+                let mut registry = self
+                    .template_registry
+                    .write()
+                    .map_err(|_| "Failed to write template registry".to_string())?;
+                // Ids the replaced file carried and the new one drops would otherwise outlive it
+                // in this session.
+                for id in &replaced_ids {
+                    if registry.user_template_ids.remove(id) {
+                        registry.templates.remove(id);
+                    }
+                }
+                for template in templates {
+                    registry.user_template_ids.insert(template.id.clone());
+                    registry.templates.insert(template.id.clone(), template);
+                }
+            }
+            let registered = idl::register_idl(port, &idl.idl, params.idl_path.is_some()).await;
+            Ok(serde_json::json!({
+                "path": folder.display().to_string(),
+                "templateIds": ids,
+                "idlSource": idl.source,
+                "surfnetRegistered": registered.is_ok(),
+                "error": registered.err(),
+            }))
+        }
+        .await;
+        Ok(tool_result(result))
+    }
+
+    #[tool(
         description = "Searches the options of a template's constants (price feeds, markets, token mints). Use after get_override_templates to resolve a constant_ref value: pass the templateId, optionally the constant name, and a query like \"SOL/USD\". Returns matching options whose `value` field is what create_scenario expects."
     )]
     async fn search_constant_options(
@@ -1426,6 +1702,7 @@ impl Surfpool {
 }
 
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for Surfpool {
     /// Return information about the server, including its capabilities and description.
     fn get_info(&self) -> ServerConfig {
@@ -1433,6 +1710,7 @@ impl ServerHandler for Surfpool {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_prompts()
                 .build(),
         )
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
@@ -1457,6 +1735,10 @@ impl ServerHandler for Surfpool {
                 .with_title("Override Templates")
                 .with_description("A json file containing all the override templates available for scenario registration with account overrides")
                 .with_mime_type("application/json"),
+            Resource::new("str:///template_authoring_guide", "Template authoring guide")
+                .with_title("Template Authoring Guide")
+                .with_description("How to write, validate and save an override template collection for a program from its IDL with fetch_program_idl, validate_override_template and save_override_template")
+                .with_mime_type("text/markdown"),
         ]))
     }
     async fn read_resource(
@@ -1502,6 +1784,10 @@ impl ServerHandler for Surfpool {
                 ])
                 .into())
             }
+            "str:///template_authoring_guide" => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(AUTHORING_GUIDE, uri).with_mime_type("text/markdown"),
+            ])
+            .into()),
             _ => {
                 use std::borrow::Cow;
                 Err(McpError {
@@ -2256,5 +2542,259 @@ mod tests {
             text.contains("Invalid value"),
             "a case-flipped mint must be rejected, got: {text}"
         );
+    }
+
+    const KAMINO_IDL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../core/src/scenarios/protocols/kamino/v1/idl.json"
+    );
+    const KAMINO_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+    const USER_RESERVE_YAML: &str = r#"
+protocol: My Kamino
+version: v1
+templates:
+  - id: my-kamino-reserve
+    name: Drain a reserve
+    description: Zero the available liquidity
+    idl_account_name: Reserve
+    properties:
+      - "liquidity.total_available_amount"
+    address:
+      type: pubkey
+    llm_context: Set fetchBeforeUse true, then liquidity.total_available_amount 0.
+"#;
+
+    fn text_of(result: &CallToolResult) -> String {
+        result.content[0]
+            .as_text()
+            .expect("text content")
+            .text
+            .clone()
+    }
+
+    fn collection(yaml: &str, program_id: &str) -> Parameters<OverrideTemplateCollectionParams> {
+        Parameters(OverrideTemplateCollectionParams {
+            collection_yaml: yaml.to_string(),
+            program_id: program_id.to_string(),
+            idl_path: Some(KAMINO_IDL_PATH.to_string()),
+            overwrite: false,
+            surfnet_port: Some(1),
+        })
+    }
+
+    #[test]
+    fn the_anchor_idl_account_is_derived_the_way_anchor_does() {
+        let program = Pubkey::from_str("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq").unwrap();
+        assert_eq!(
+            idl::anchor_idl_address(&program).unwrap().to_string(),
+            "CAD7TZySgk4RkqyAkGu3bJFvf8itWsfTtpViRK8TJrKf"
+        );
+    }
+
+    #[test]
+    fn an_idl_account_is_inflated_after_its_header() {
+        use std::io::Write;
+        let json = br#"{"address":"x","metadata":{"spec":"0.1.0"}}"#;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(json).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut data = vec![0u8; 40];
+        data.extend((compressed.len() as u32).to_le_bytes());
+        data.extend(&compressed);
+        data.extend([0u8; 16]);
+
+        assert_eq!(idl::decode_anchor_idl_account(&data).unwrap(), json);
+        assert!(idl::decode_anchor_idl_account(&data[..30]).is_err());
+    }
+
+    #[test]
+    fn an_on_chain_idl_that_is_not_an_object_is_an_error_not_a_panic() {
+        let program = "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq";
+        assert!(idl::published_idl(b"[1, 2]".to_vec(), program).is_err());
+        let string_metadata =
+            br#"{"version":"0.1.0","name":"x","metadata":"v1","instructions":[]}"#;
+        assert!(idl::published_idl(string_metadata.to_vec(), program).is_err());
+        let current = br#"{"address":"x","metadata":{"spec":"0.1.0"}}"#;
+        assert!(
+            !idl::published_idl(current.to_vec(), program).unwrap().1,
+            "a spec-format IDL is kept as published"
+        );
+        let newer_spec = br#"{"address":"x","metadata":{"spec":"0.2.0"}}"#;
+        assert!(
+            !idl::published_idl(newer_spec.to_vec(), program).unwrap().1,
+            "any spec version is kept as published"
+        );
+    }
+
+    #[test]
+    fn the_idl_index_lists_accounts_with_their_top_level_fields() {
+        let idl: surfpool_types::Idl =
+            serde_json::from_str(&std::fs::read_to_string(KAMINO_IDL_PATH).unwrap()).unwrap();
+        let index = idl::account_index(&idl);
+        let reserve = index["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "Reserve")
+            .expect("Reserve is an account");
+        let fields: Vec<&str> = reserve["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(fields.contains(&"liquidity"), "{fields:?}");
+        let types = index["types"].as_array().unwrap();
+        assert!(types.iter().any(|t| t == "ReserveLiquidity"));
+    }
+
+    #[tokio::test]
+    async fn a_collection_is_validated_against_the_idl_and_the_bundled_ids() {
+        let surfpool = Surfpool::new();
+        let ok = surfpool
+            .validate_override_template(collection(USER_RESERVE_YAML, KAMINO_PROGRAM))
+            .await
+            .unwrap();
+        assert_ne!(ok.is_error, Some(true), "{}", text_of(&ok));
+        let json = json_of(&ok);
+        assert_eq!(json["templates"][0]["id"], "my-kamino-reserve");
+        assert_eq!(json["templates"][0]["accountType"], "Reserve");
+        assert!(json["templates"][0]["llmContext"].is_string());
+
+        let failures = [
+            (
+                USER_RESERVE_YAML.replace("total_available_amount", "no_such_field"),
+                KAMINO_PROGRAM,
+                "no_such_field",
+            ),
+            (
+                USER_RESERVE_YAML.replace("my-kamino-reserve", "kamino-reserve-state"),
+                KAMINO_PROGRAM,
+                "bundled",
+            ),
+            (
+                USER_RESERVE_YAML.to_string(),
+                "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq",
+                "belongs to program",
+            ),
+        ];
+        for (yaml, program, expected) in failures {
+            let result = surfpool
+                .validate_override_template(collection(&yaml, program))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+            assert!(text_of(&result).contains(expected), "{}", text_of(&result));
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_writes_the_folder_and_registers_the_ids_for_this_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut surfpool = Surfpool::new();
+        surfpool.templates_dir = dir.path().to_path_buf();
+
+        let saved = surfpool
+            .save_override_template(collection(USER_RESERVE_YAML, KAMINO_PROGRAM))
+            .await
+            .unwrap();
+        assert_ne!(saved.is_error, Some(true), "{}", text_of(&saved));
+        let json = json_of(&saved);
+        assert_eq!(
+            json["templateIds"],
+            serde_json::json!(["my-kamino-reserve"])
+        );
+        assert_eq!(
+            json["surfnetRegistered"], false,
+            "nothing listens on port 1"
+        );
+
+        let folder = dir.path().join("my-kamino").join("v1");
+        assert_eq!(json["path"], folder.display().to_string());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("overrides.yaml")).unwrap(),
+            USER_RESERVE_YAML
+        );
+        assert!(folder.join("idl.json").is_file());
+        assert!(
+            surfpool
+                .template_registry
+                .read()
+                .unwrap()
+                .contains("my-kamino-reserve")
+        );
+
+        let again = surfpool
+            .save_override_template(collection(USER_RESERVE_YAML, KAMINO_PROGRAM))
+            .await
+            .unwrap();
+        assert_eq!(again.is_error, Some(true));
+        assert!(text_of(&again).contains("overwrite"));
+
+        let mut next_session = TemplateRegistry::default();
+        next_session.load_user_templates(dir.path());
+        assert!(next_session.contains("my-kamino-reserve"));
+
+        let renamed = USER_RESERVE_YAML.replace("my-kamino-reserve", "my-kamino-reserve-2");
+        let mut replace = collection(&renamed, KAMINO_PROGRAM);
+        replace.0.overwrite = true;
+        let replaced = surfpool.save_override_template(replace).await.unwrap();
+        assert_ne!(replaced.is_error, Some(true), "{}", text_of(&replaced));
+        let registry = surfpool.template_registry.read().unwrap();
+        assert!(registry.contains("my-kamino-reserve-2"));
+        assert!(
+            !registry.contains("my-kamino-reserve"),
+            "the replaced file's id leaves the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saved_id_is_refused_unless_overwrite_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut surfpool = Surfpool::new();
+        surfpool.templates_dir = dir.path().to_path_buf();
+        surfpool
+            .save_override_template(collection(USER_RESERVE_YAML, KAMINO_PROGRAM))
+            .await
+            .unwrap();
+
+        let refused = surfpool
+            .validate_override_template(collection(USER_RESERVE_YAML, KAMINO_PROGRAM))
+            .await
+            .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(text_of(&refused).contains("saved template already uses this id"));
+
+        let mut allowed = collection(USER_RESERVE_YAML, KAMINO_PROGRAM);
+        allowed.0.overwrite = true;
+        let ok = surfpool.validate_override_template(allowed).await.unwrap();
+        assert_ne!(ok.is_error, Some(true), "{}", text_of(&ok));
+
+        let other_folder = USER_RESERVE_YAML.replace("protocol: My Kamino", "protocol: Other");
+        let mut elsewhere = collection(&other_folder, KAMINO_PROGRAM);
+        elsewhere.0.overwrite = true;
+        let refused = surfpool
+            .validate_override_template(elsewhere)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.is_error,
+            Some(true),
+            "overwrite only reuses the ids of the folder being replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_authoring_prompt_carries_the_guide_and_the_request() {
+        let messages = Surfpool::new()
+            .author_override_template(Parameters(AuthorTemplateArgs {
+                program_id: KAMINO_PROGRAM.to_string(),
+                goal: "drain a reserve".to_string(),
+            }))
+            .await;
+        let text = &messages[0].content.as_text().expect("a text message").text;
+        assert!(text.starts_with("# "), "the guide comes first");
+        assert!(text.contains(KAMINO_PROGRAM) && text.contains("drain a reserve"));
     }
 }

@@ -156,6 +156,7 @@ With Surfpool, every developer learns to deploy Solana programs the right way—
 ## 🤖 MCP
 
 - Surfpool is getting agentic friendly, thanks to a built-in MCP. We'll be adding more tools over time, the first use case we're covering is "Start a local network with 10 users loaded with SOL, USDC, JUP and TRUMP tokens" (#130 - @BretasArthur1, @lgalabru)
+- Templates for a program with an Anchor IDL can be written from the MCP host itself: the `author_override_template` prompt guides a model through fetching the IDL, validating a template and saving it under `~/.surfpool/templates`, where every later start loads it (see [crates/core/src/scenarios/AUTHORING.md](crates/core/src/scenarios/AUTHORING.md)).
 - To get started, make `surfpool` available globally by opening the command palette (Cmd/Ctrl + Shift + P) and selecting > Cursor Settings > MCP > Add new global MCP server:
 
 ```json
