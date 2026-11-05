@@ -14,9 +14,9 @@ use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::sysvar;
 use solana_slot_hashes::SlotHashes;
-use solana_sysvar::last_restart_slot::LastRestartSlot;
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::RecentBlockhashes;
+use solana_sysvar::{last_restart_slot::LastRestartSlot, slot_history::SlotHistory};
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
@@ -129,11 +129,13 @@ impl SurfnetLiteSvm {
         // - Clock: for time-dependent programs
         // - EpochSchedule: the surfnet's own (or the datasource's), not LiteSVM's default
         // - LastRestartSlot: the datasource's, not LiteSVM's 0
+        // - SlotHistory: the blocks produced so far, which Geyser plugins receive with each block
         let recent_blockhashes = self.svm.get_sysvar::<RecentBlockhashes>();
         let slot_hashes = self.svm.get_sysvar::<SlotHashes>();
         let clock = self.svm.get_sysvar::<Clock>();
         let epoch_schedule = self.svm.get_sysvar::<EpochSchedule>();
         let last_restart_slot = self.svm.get_sysvar::<LastRestartSlot>();
+        let slot_history = self.svm.get_sysvar::<SlotHistory>();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::litesvm_settings(feature_set);
@@ -146,6 +148,7 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&clock);
         self.svm.set_sysvar(&epoch_schedule);
         self.svm.set_sysvar(&last_restart_slot);
+        self.svm.set_sysvar(&slot_history);
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {
@@ -347,7 +350,6 @@ fn create_native_mint(svm: &mut SurfnetLiteSvm) {
 }
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::Signer as DalekSigner;
     use solana_compute_budget_interface::ComputeBudgetInstruction;
     use solana_ed25519_program::new_ed25519_instruction_with_signature;
     use solana_keypair::Keypair;
@@ -361,13 +363,11 @@ mod tests {
         payer: &Keypair,
         blockhash: solana_hash::Hash,
     ) -> VersionedTransaction {
-        let payer_dalek = ed25519_dalek::Keypair::from_bytes(&payer.to_bytes())
-            .expect("failed to create dalek keypair");
         let message = b"surfpool ed25519 precompile regression";
-        let signature = payer_dalek.sign(message);
+        let signature = payer.sign_message(message);
         let ed25519_ix = new_ed25519_instruction_with_signature(
             message,
-            &signature.to_bytes(),
+            signature.as_array(),
             payer.pubkey().as_array(),
         );
         let compute_budget_ixs = [
