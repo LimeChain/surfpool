@@ -1,10 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
+    str::FromStr,
     sync::OnceLock,
 };
 
+use solana_pubkey::Pubkey;
 use surfpool_types::{
-    KeepAliveAddress, OverrideInstance, OverrideTemplate, PropertyKind, RawEncoding,
+    Idl, KeepAliveAddress, OverrideInstance, OverrideTemplate, PropertyKind, RawEncoding,
     YamlOverrideTemplateCollection,
 };
 
@@ -79,12 +82,34 @@ pub struct TemplateRegistry {
     /// Keep-alive templates, which override templates import. [`TemplateRegistry::get`] finds them
     /// so overrides can apply them, but they are never listed: users do not pick them.
     pub keep_alive_templates: BTreeMap<String, OverrideTemplate>,
+    /// Ids of the templates loaded from the user's directory.
+    pub user_template_ids: BTreeSet<String>,
 }
 
 /// The bundled template registry, parsed once and reused by scenario execution.
 pub(crate) fn template_registry() -> &'static TemplateRegistry {
     static REGISTRY: OnceLock<TemplateRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TemplateRegistry::new)
+    // Tests must not depend on what the developer keeps in the home directory.
+    REGISTRY.get_or_init(|| {
+        if cfg!(test) {
+            TemplateRegistry::new()
+        } else {
+            TemplateRegistry::with_user_templates()
+        }
+    })
+}
+
+fn subdirectories(path: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
 }
 
 /// Returns only values that represent writable account fields, excluding address and catalog
@@ -416,6 +441,124 @@ impl TemplateRegistry {
             }
         }
         templates
+    }
+
+    /// The bundled templates plus the ones in the user's templates directory.
+    pub fn with_user_templates() -> Self {
+        let mut registry = Self::new();
+        registry.load_user_templates(&Self::user_templates_dir());
+        registry
+    }
+
+    /// Where user-written templates live, one `<protocol>/<version>/{overrides.yaml,idl.json}`
+    /// folder each, in the layout of `protocols/` here. `SURFPOOL_TEMPLATES_DIR` overrides it.
+    pub fn user_templates_dir() -> PathBuf {
+        match std::env::var_os("SURFPOOL_TEMPLATES_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::home_dir()
+                .unwrap_or_default()
+                .join(".surfpool")
+                .join("templates"),
+        }
+    }
+
+    /// A bad user file is skipped with a warning, never a panic, and a bundled id keeps its
+    /// bundled template.
+    pub fn load_user_templates(&mut self, dir: &Path) {
+        for protocol_dir in subdirectories(dir) {
+            // A protocol folder holds one collection or one folder per version, as `protocols/`
+            // does.
+            let mut folders = subdirectories(&protocol_dir);
+            folders.insert(0, protocol_dir);
+            for folder in folders {
+                if !folder.join("overrides.yaml").is_file() {
+                    continue;
+                }
+                let read = |name: &str| {
+                    std::fs::read_to_string(folder.join(name)).map_err(|e| format!("{name}: {e}"))
+                };
+                let templates = read("overrides.yaml").and_then(|overrides| {
+                    read("idl.json").and_then(|idl| self.parse_user_collection(&overrides, &idl))
+                });
+                let templates = match templates {
+                    Ok(templates) => templates,
+                    Err(e) => {
+                        log::warn!("skipping user templates in {}: {e}", folder.display());
+                        continue;
+                    }
+                };
+                for template in templates {
+                    if self.templates.contains_key(&template.id)
+                        || self.keep_alive_templates.contains_key(&template.id)
+                    {
+                        log::warn!(
+                            "skipping user template {} in {}: the id is already registered",
+                            template.id,
+                            folder.display()
+                        );
+                        continue;
+                    }
+                    self.user_template_ids.insert(template.id.clone());
+                    self.templates.insert(template.id.clone(), template);
+                }
+            }
+        }
+    }
+
+    /// The one validator for user-written IDL collections, shared by the directory loader and the
+    /// MCP authoring tools. Catalogs are refused because `constant_ref` selectors are only
+    /// filtered out of a write when the surfnet knows the template, which a running surfnet does
+    /// not for a template saved during its session.
+    pub fn parse_user_collection(
+        &self,
+        overrides_yaml: &str,
+        idl_json: &str,
+    ) -> Result<Vec<OverrideTemplate>, String> {
+        let idl: Idl = serde_json::from_str(idl_json).map_err(|e| format!("idl.json: {e}"))?;
+        Pubkey::from_str(&idl.address)
+            .map_err(|e| format!("idl.json: address {:?} is not a pubkey: {e}", idl.address))?;
+        let collection: YamlOverrideTemplateCollection =
+            serde_yaml::from_str(overrides_yaml).map_err(|e| format!("overrides.yaml: {e}"))?;
+        if collection.raw_layout {
+            return Err("overrides.yaml: raw_layout collections cannot be added at runtime".into());
+        }
+        if !collection.constants.is_empty() {
+            return Err("overrides.yaml: constants are not supported in user templates".into());
+        }
+        if let Some(entry) = collection
+            .templates
+            .iter()
+            .find(|t| t.llm_context.is_none())
+        {
+            return Err(format!(
+                "overrides.yaml: template {} needs an llm_context",
+                entry.id
+            ));
+        }
+        let templates = collection.to_override_templates(Some(idl.clone()))?;
+        for template in &templates {
+            if !idl.accounts.iter().any(|a| a.name == template.account_type) {
+                return Err(format!(
+                    "{}: the IDL has no account named {:?}",
+                    template.id, template.account_type
+                ));
+            }
+            for property in template.properties.iter().filter(|p| p.is_field()) {
+                surfpool_types::resolve_idl_type(&idl, &template.account_type, &property.path)
+                    .map_err(|e| format!("{}: {}: {e}", template.id, property.path))?;
+            }
+        }
+        // Imports of the bundled keep-alive templates are checked as the bundled templates' are.
+        let probe = TemplateRegistry {
+            templates: templates
+                .iter()
+                .map(|t| (t.id.clone(), t.clone()))
+                .collect(),
+            keep_alive_templates: self.keep_alive_templates.clone(),
+            ..Default::default()
+        };
+        probe.check_keep_alive_imports()?;
+        Ok(templates)
     }
 
     /// Get a template by ID
@@ -2096,5 +2239,117 @@ templates: []
             described,
             missing.join("\n  ")
         );
+    }
+
+    const USER_RESERVE_YAML: &str = r#"
+protocol: my-kamino
+version: v1
+templates:
+  - id: my-kamino-reserve
+    name: Drain a reserve
+    description: Zero the available liquidity
+    idl_account_name: Reserve
+    properties:
+      - "liquidity.total_available_amount"
+    address:
+      type: pubkey
+    llm_context: Set fetchBeforeUse true, then liquidity.total_available_amount 0.
+"#;
+
+    fn write_user_collection(dir: &Path, protocol: &str, version: &str, yaml: &str) {
+        let folder = dir.join(protocol).join(version);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("overrides.yaml"), yaml).unwrap();
+        std::fs::write(folder.join("idl.json"), KAMINO_V1_IDL_CONTENT).unwrap();
+    }
+
+    #[test]
+    fn user_templates_load_from_the_directory_and_bad_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_user_collection(dir.path(), "my-kamino", "v1", USER_RESERVE_YAML);
+        write_user_collection(dir.path(), "broken", "v1", "templates: [");
+
+        let single_level = USER_RESERVE_YAML
+            .replace("my-kamino-reserve", "flat-kamino-reserve")
+            .replace("protocol: my-kamino", "protocol: flat-kamino");
+        std::fs::create_dir_all(dir.path().join("flat-kamino")).unwrap();
+        std::fs::write(
+            dir.path().join("flat-kamino").join("overrides.yaml"),
+            single_level,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("flat-kamino").join("idl.json"),
+            KAMINO_V1_IDL_CONTENT,
+        )
+        .unwrap();
+
+        let mut registry = TemplateRegistry::default();
+        registry.load_user_templates(dir.path());
+
+        assert_eq!(
+            registry.list_ids(),
+            vec!["flat-kamino-reserve", "my-kamino-reserve"],
+            "one collection per protocol folder or one per version folder, like protocols/"
+        );
+        let template = registry.get("my-kamino-reserve").unwrap();
+        assert_eq!(template.protocol, "my-kamino");
+        assert_eq!(template.account_type, "Reserve");
+        assert!(
+            template.idl.is_some(),
+            "the loader attaches the IDL for the write path"
+        );
+    }
+
+    #[test]
+    fn a_user_template_never_replaces_a_bundled_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = USER_RESERVE_YAML.replace("my-kamino-reserve", "kamino-reserve-state");
+        write_user_collection(dir.path(), "my-kamino", "v1", &yaml);
+
+        let mut registry = TemplateRegistry::new();
+        let bundled = registry.get("kamino-reserve-state").unwrap().name.clone();
+        let count = registry.count();
+        registry.load_user_templates(dir.path());
+
+        assert_eq!(registry.count(), count);
+        assert_eq!(registry.get("kamino-reserve-state").unwrap().name, bundled);
+    }
+
+    #[test]
+    fn user_collections_are_checked_against_the_idl() {
+        let error = |yaml: &str, idl: &str| {
+            TemplateRegistry::default()
+                .parse_user_collection(yaml, idl)
+                .unwrap_err()
+        };
+        let idl = KAMINO_V1_IDL_CONTENT;
+
+        assert!(
+            TemplateRegistry::default()
+                .parse_user_collection(USER_RESERVE_YAML, idl)
+                .is_ok(),
+            "the reference collection is valid"
+        );
+        let bad_path = USER_RESERVE_YAML.replace("total_available_amount", "no_such_field");
+        assert!(error(&bad_path, idl).contains("no_such_field"));
+        let not_an_account = USER_RESERVE_YAML.replace("name: Reserve", "name: ReserveLiquidity");
+        assert!(error(&not_an_account, idl).contains("no account named"));
+        let raw = format!("raw_layout: true\n{USER_RESERVE_YAML}");
+        assert!(error(&raw, idl).contains("raw_layout"));
+        let keep_alive = USER_RESERVE_YAML.replace(
+            "    address:\n",
+            "    keep_alive:\n      - template: some-keep-alive\n        address: {type: override}\n        values: {}\n    address:\n",
+        );
+        assert!(
+            error(&keep_alive, idl).contains("keep-alive"),
+            "an import is checked like the bundled templates' imports"
+        );
+        let no_context = USER_RESERVE_YAML.replace("    llm_context:", "    # llm_context:");
+        assert!(error(&no_context, idl).contains("llm_context"));
+
+        let mut bad_idl: serde_json::Value = serde_json::from_str(idl).unwrap();
+        bad_idl["address"] = serde_json::Value::String("not-a-pubkey".into());
+        assert!(error(USER_RESERVE_YAML, &bad_idl.to_string()).contains("not a pubkey"));
     }
 }

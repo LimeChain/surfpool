@@ -13,8 +13,10 @@ categories = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+anchor-lang-idl = { workspace = true, features = ["convert"] }
 bs58 = { workspace = true }
 crossbeam-channel = { workspace = true }
+flate2 = "1.1.9"
 hiro-system-kit = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["transport-io", "server", "schemars"] }
@@ -22,7 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 solana-keypair = { workspace = true }
-solana-pubkey = { workspace = true }
+solana-pubkey = { workspace = true, features = ["curve25519", "sha2"] }
 solana-signer = { workspace = true }
 spl-associated-token-account-interface = { workspace = true }
 spl-token-interface = { workspace = true }
@@ -32,4 +34,5 @@ surfpool-core = { workspace = true }
 surfpool-types = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
