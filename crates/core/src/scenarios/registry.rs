@@ -50,8 +50,9 @@ pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
-pub const WHIRLPOOL_IDL_CONTENT: &str = include_str!("./protocols/whirlpool/idl.json");
-pub const WHIRLPOOL_OVERRIDES_CONTENT: &str = include_str!("./protocols/whirlpool/overrides.yaml");
+pub const WHIRLPOOL_IDL_CONTENT: &str = include_str!("./protocols/whirlpool/v1/idl.json");
+pub const WHIRLPOOL_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/whirlpool/v1/overrides.yaml");
 
 pub const SPL_TOKEN_IDL_CONTENT: &str = include_str!("./protocols/spl-token/idl.json");
 pub const SPL_TOKEN_OVERRIDES_CONTENT: &str = include_str!("./protocols/spl-token/overrides.yaml");
@@ -360,6 +361,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
+
+    #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
         let registry = TemplateRegistry::new();
         let template = registry
@@ -606,11 +643,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (2) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 66
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            66,
+            "Registry should load 66 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -665,12 +702,8 @@ mod tests {
         assert!(registry.contains("drift-user-state"));
         assert!(registry.contains("drift-global-state"));
 
-        assert!(registry.contains("whirlpool-sol-usdc"));
-        assert!(registry.contains("whirlpool-sol-usdt"));
-        assert!(registry.contains("whirlpool-msol-sol"));
-        assert!(registry.contains("whirlpool-orca-usdc"));
-        assert!(registry.contains("whirlpool-popcat-sol"));
-        assert!(registry.contains("whirlpool-custom"));
+        assert!(registry.contains("whirlpool-pool-state"));
+        assert!(registry.contains("whirlpools-config"));
 
         assert!(registry.contains("spl-token-account-balance"));
         assert!(registry.contains("spl-token-mint-supply"));
@@ -996,8 +1029,8 @@ templates: []
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
             whirlpool_templates.len(),
-            6,
-            "Should have 6 Whirlpool templates"
+            2,
+            "Should have 2 Whirlpool templates (whirlpool-pool-state, whirlpools-config)"
         );
 
         let pump_templates = registry.by_protocol("Pump");
@@ -1084,12 +1117,8 @@ templates: []
         assert!(ids.contains(&"kamino-scope-price".to_string()));
         assert!(ids.contains(&"kamino-farms-user-rewards".to_string()));
         assert!(ids.contains(&"drift-perp-market".to_string()));
-        assert!(ids.contains(&"whirlpool-sol-usdc".to_string()));
-        assert!(ids.contains(&"whirlpool-sol-usdt".to_string()));
-        assert!(ids.contains(&"whirlpool-msol-sol".to_string()));
-        assert!(ids.contains(&"whirlpool-orca-usdc".to_string()));
-        assert!(ids.contains(&"whirlpool-popcat-sol".to_string()));
-        assert!(ids.contains(&"whirlpool-custom".to_string()));
+        assert!(ids.contains(&"whirlpool-pool-state".to_string()));
+        assert!(ids.contains(&"whirlpools-config".to_string()));
     }
 
     #[test]
@@ -1741,6 +1770,42 @@ templates: []
             missing.len(),
             described,
             missing.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn every_whirlpool_property_has_a_label_and_description() {
+        let registry = TemplateRegistry::new();
+        let mut missing = Vec::new();
+
+        for template in registry.by_protocol("Whirlpool") {
+            for property in &template.properties {
+                if property.label.is_none() {
+                    missing.push(format!("{}:{} missing label", template.id, property.path));
+                }
+                match property.description.as_deref() {
+                    Some(text) if !text.trim().is_empty() => {}
+                    _ => missing.push(format!(
+                        "{}:{} missing description",
+                        template.id, property.path
+                    )),
+                }
+            }
+        }
+
+        assert!(missing.is_empty(), "{}", missing.join("\n  "));
+    }
+
+    #[test]
+    fn whirlpools_config_address_is_the_singleton() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("whirlpools-config")
+            .expect("whirlpools-config template should exist");
+        assert_eq!(template.account_type, "WhirlpoolsConfig");
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey("2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ".to_string())
         );
     }
 }

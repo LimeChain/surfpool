@@ -36,13 +36,13 @@
     },
     {
       "id": "whirlpool-popcat-sol-depth",
-      "templateId": "whirlpool-popcat-sol",
+      "templateId": "whirlpool-pool-state",
       "label": "Deepen POPCAT/SOL so the exit does not slip",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
       "account": {
-        "pubkey": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+        "pubkey": "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj"
       },
       "values": {
         "liquidity": 5000000000000000
@@ -50,13 +50,13 @@
     },
     {
       "id": "whirlpool-sol-usdc-depth",
-      "templateId": "whirlpool-sol-usdc",
+      "templateId": "whirlpool-pool-state",
       "label": "Deepen SOL/USDC to close the route back to USDC",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
       "account": {
-        "pubkey": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"
+        "pubkey": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
       },
       "values": {
         "liquidity": 50000000000000000
