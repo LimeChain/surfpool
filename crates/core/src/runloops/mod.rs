@@ -40,7 +40,11 @@ use surfpool_types::{
     SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
     SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
-type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
+// Matches the `extern "C"` export every geyser plugin provides. The trait-object
+// pointer is not FFI-safe, so host and plugin must be built with compatible
+// toolchains and interface versions.
+#[allow(improper_ctypes_definitions)]
+type PluginConstructor = unsafe extern "C" fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
 
 use crate::{
@@ -93,6 +97,15 @@ pub(crate) struct ManagedPlugin {
     pub(crate) plugin: Box<dyn GeyserPlugin>,
     pub(crate) _library: Library,
     pub(crate) config_path: String,
+}
+
+impl Drop for ManagedPlugin {
+    /// Calls the plugin's `on_unload` before the plugin and its library are
+    /// dropped, so plugin-owned workers can stop while the library's code is
+    /// still mapped.
+    fn drop(&mut self) {
+        self.plugin.on_unload();
+    }
 }
 
 pub(crate) fn load_plugin_from_config(
@@ -160,9 +173,7 @@ pub(crate) fn unload_plugin_by_name(
         .position(|p| p.name == name)
         .ok_or_else(|| format!("Plugin '{}' not found", name))?;
 
-    let mut plugin = managed_plugins.remove(idx);
-    plugin.plugin.on_unload();
-    // plugin and _library are dropped here in correct order
+    managed_plugins.remove(idx);
     Ok(())
 }
 
@@ -214,6 +225,21 @@ pub async fn start_local_surfnet_runloop(
         )?),
     };
 
+    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
+    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
+    // Drain startup events before initialization or snapshots can fill the bounded queue.
+    match start_geyser_runloop(
+        config.plugin_config_path.clone(),
+        simnet_events_tx_cc.clone(),
+        geyser_events_rx,
+        plugin_commands_rx,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
+        }
+    };
+
     svm_locker.initialize(&remote_rpc_client).await?;
     // Before the RPC servers start: `sendTransaction`'s preflight reads the skip flag.
     svm_locker.with_svm_writer(|svm_writer| {
@@ -237,10 +263,11 @@ pub async fn start_local_surfnet_runloop(
     // Load snapshot accounts if provided
     if !simnet.snapshot.is_empty() {
         match svm_locker
-            .load_snapshot(
+            .load_snapshot_with_options(
                 &simnet.snapshot,
                 remote_rpc_client.as_ref(),
                 CommitmentConfig::confirmed(),
+                simnet.strict_snapshot,
             )
             .await
         {
@@ -253,6 +280,9 @@ pub async fn start_local_surfnet_runloop(
                 });
             }
             Err(e) => {
+                if simnet.strict_snapshot {
+                    return Err(e.into());
+                }
                 let _ = svm_locker.with_svm_reader(|svm| {
                     svm.simnet_events_tx
                         .warn(format!("Error loading snapshot accounts: {}", e))
@@ -260,10 +290,6 @@ pub async fn start_local_surfnet_runloop(
             }
         }
     }
-
-    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
-
-    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
 
     // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
     // send data for a slot they don't track yet.
@@ -281,18 +307,6 @@ pub async fn start_local_surfnet_runloop(
     )?;
 
     let simnet_config = simnet.clone();
-
-    match start_geyser_runloop(
-        config.plugin_config_path.clone(),
-        simnet_events_tx_cc.clone(),
-        geyser_events_rx,
-        plugin_commands_rx,
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
-        }
-    };
 
     let (coalesced_slots, clock_driven) =
         svm_locker.with_svm_reader(|svm| (svm.coalesced_slots.clone(), svm.clock_driven.clone()));
@@ -524,7 +538,7 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        if let Err(e) = svm_locker.with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock)) {
+                        if let Err(e) = svm_locker.apply_time_travel(clock, &remote_client_with_commitment).await {
                             svm_locker.simnet_events_tx().error(format!("Failed to time travel: {e}"));
                         }
                     }
@@ -537,7 +551,8 @@ pub async fn start_block_production_runloop(
                         }
 
                         let epoch_info = svm_locker
-                            .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
+                            .apply_time_travel(clock, &remote_client_with_commitment)
+                            .await
                             .map_err(|e| e.to_string());
 
                         // Send confirmation back
