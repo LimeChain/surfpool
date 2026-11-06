@@ -90,5 +90,11 @@ Only pools created after the override copy it. For an existing pool set `protoco
 # IDL
 
 `v1/idl.json` is the IDL Orca publishes on chain in its Anchor IDL account
-`2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`, unchanged (sha256
-`7afddfe8766bd24d30ff9ee5b12c7ee89bff5bc3b7b0396620e021a97a7ef63f`), as written in slot 402013534.
+`2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`, as written in slot 402013534, indented with two
+spaces like the other bundled IDLs. Only whitespace changed: `jq -j -c . v1/idl.json` gives back the
+on-chain bytes.
+
+| IDL | sha256 |
+|---|---|
+| On chain (compact) | `7afddfe8766bd24d30ff9ee5b12c7ee89bff5bc3b7b0396620e021a97a7ef63f` |
+| Bundled `v1/idl.json` | `85f673775d33413bf322c31beaa1079d86649fc25f607b6a300a6fe860df2f5c` |
