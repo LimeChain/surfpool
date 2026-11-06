@@ -214,7 +214,7 @@ impl SurfnetSvmLocker {
     /// slot, epoch info, and blockhash along with the closure's result.
     fn with_contextualized_svm_reader<T, F>(&self, reader: F) -> SvmAccessContext<T>
     where
-        F: Fn(&SurfnetSvm) -> T + Send + Sync,
+        F: FnOnce(&SurfnetSvm) -> T + Send + Sync,
         T: Send + 'static,
     {
         let read_lock = self.0.clone();
@@ -287,23 +287,6 @@ impl SurfnetSvmLocker {
 
 /// Functions for getting accounts from the underlying SurfnetSvm instance or remote client
 impl SurfnetSvmLocker {
-    /// Filters the downloaded account result to remove accounts owned by offline owners.
-    fn filter_downloaded_account_result(
-        requested_pubkey: &Pubkey,
-        result: GetAccountResult,
-        offline_owners: &[Pubkey],
-    ) -> GetAccountResult {
-        match result {
-            GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
-                if offline_owners.contains(&account.owner) =>
-            {
-                GetAccountResult::None(*requested_pubkey)
-            }
-            other => other,
-        }
-    }
-
     /// Re-checks local state after an asynchronous fetch, returning the local
     /// account when another writer won the race.
     fn resolve_account_after_fetch(
@@ -379,9 +362,9 @@ impl SurfnetSvmLocker {
             return Ok(GetAccountResult::None(pubkey));
         };
 
-        let offline_owners = Self::offline_account_owners(svm_writer);
+        let offline_owners = svm_writer.offline_account_owners();
         let fetched_account =
-            Self::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
+            SurfnetSvm::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
 
         if !fetched_account.is_none() {
             svm_writer.apply_account_update(
@@ -431,25 +414,6 @@ impl SurfnetSvmLocker {
             coupled,
             source,
         ))
-    }
-
-    fn offline_account_owners(svm_writer: &SurfnetSvm) -> Vec<Pubkey> {
-        svm_writer
-            .offline_accounts
-            .into_iter()
-            .unwrap_or_else(|e| {
-                warn!("Failed to iterate offline_accounts: {}", e);
-                Box::new(std::iter::empty())
-            })
-            .filter(|(_, config)| config.include_owned_accounts)
-            .filter_map(|(key, _)| match key.parse() {
-                Ok(pubkey) => Some(pubkey),
-                Err(e) => {
-                    warn!("Invalid pubkey in offline_accounts: {}: {}", key, e);
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Retrieves a local account from the SVM cache, returning a contextualized result.
@@ -673,11 +637,25 @@ impl SurfnetSvmLocker {
         remote_client: Option<&SurfnetRemoteClient>,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolResult<usize> {
+        self.load_snapshot_with_options(snapshot, remote_client, commitment_config, false)
+            .await
+    }
+
+    /// Loads a snapshot, optionally failing if any requested account cannot be installed.
+    /// Strict loading can partially install accounts before returning an error.
+    pub async fn load_snapshot_with_options(
+        &self,
+        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
+        remote_client: Option<&SurfnetRemoteClient>,
+        commitment_config: CommitmentConfig,
+        strict: bool,
+    ) -> SurfpoolResult<usize> {
         use std::str::FromStr;
 
         use base64::{Engine, prelude::BASE64_STANDARD};
 
         let mut loaded_count = 0;
+        let mut errors = Vec::new();
 
         // Separate accounts into those with data and those needing remote fetch
         // The boolean records whether an entry was fetched because a snapshot
@@ -690,6 +668,9 @@ impl SurfnetSvmLocker {
             let pubkey = match Pubkey::from_str(pubkey_str) {
                 Ok(pk) => pk,
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("invalid snapshot pubkey '{}': {}", pubkey_str, e));
+                    }
                     self.with_svm_reader(|svm| {
                         svm.simnet_events_tx.warn(format!(
                             "Skipping invalid pubkey '{}' in snapshot: {}",
@@ -706,6 +687,12 @@ impl SurfnetSvmLocker {
                     let data = match BASE64_STANDARD.decode(&account_snapshot.data) {
                         Ok(d) => d,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid base64 data: {}",
+                                    pubkey_str, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': failed to decode base64 data: {}",
@@ -720,6 +707,12 @@ impl SurfnetSvmLocker {
                     let owner = match Pubkey::from_str(&account_snapshot.owner) {
                         Ok(pk) => pk,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid owner pubkey '{}': {}",
+                                    pubkey_str, account_snapshot.owner, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': invalid owner pubkey: {}",
@@ -745,6 +738,11 @@ impl SurfnetSvmLocker {
                     // Queue for remote fetch if client is available
                     if remote_client.is_some() {
                         pubkeys_to_fetch.push(pubkey);
+                    } else if strict {
+                        errors.push(format!(
+                            "account '{}': no upstream RPC configured for null snapshot entry",
+                            pubkey
+                        ));
                     }
                 }
             }
@@ -791,12 +789,23 @@ impl SurfnetSvmLocker {
                                     }
                                 }
                                 GetAccountResult::None(_) => {
-                                    // Account not found on remote, skip
+                                    if strict {
+                                        errors.push(format!(
+                                            "account '{}': absent from upstream RPC",
+                                            pubkey
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => {
+                        if strict {
+                            errors.push(format!(
+                                "upstream fetch failed for accounts {:?}: {}",
+                                pubkeys_to_fetch, e
+                            ));
+                        }
                         self.with_svm_reader(|svm| {
                             svm.simnet_events_tx
                                 .warn(format!("Failed to fetch some accounts from remote: {}", e));
@@ -807,6 +816,16 @@ impl SurfnetSvmLocker {
         }
 
         accounts_to_load.sort_by_key(|(_, account, _)| snapshot_load_priority(account));
+
+        // Validate required upgradeable program dependencies against the live SVM after loading.
+        let accounts_to_validate: Vec<_> = if strict {
+            accounts_to_load
+                .iter()
+                .map(|(pubkey, account, _)| (*pubkey, account.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Load all accounts into the SVM
         self.with_svm_writer(|svm| {
@@ -831,27 +850,37 @@ impl SurfnetSvmLocker {
                             loaded_count += 1;
                         }
                         None => {
-                            let _ = svm.simnet_events_tx.warn(format!(
+                            let message = format!(
                                 "Skipping LastRestartSlot in snapshot: {} bytes of data, expected 8",
                                 account.data.len()
-                            ));
+                            );
+                            if strict {
+                                errors.push(message.clone());
+                            }
+                            let _ = svm.simnet_events_tx.warn(message);
                         }
                     }
                     continue;
                 }
+                let requested_executable = account.executable;
                 let load_result = if fetched_from_remote {
-                    svm.apply_account_update(
-                        GetAccountResult::FoundAccount(
-                            pubkey,
-                            account.clone(),
-                            AccountSource::Remote,
-                        ),
-                        AccountUpdatePolicy::HydrateIfAbsent,
-                    )
+                    let update = GetAccountResult::FoundAccount(
+                        pubkey,
+                        account.clone(),
+                        AccountSource::Remote,
+                    );
+                    if strict {
+                        svm.hydrate_snapshot_strict(update)
+                    } else {
+                        svm.apply_account_update(update, AccountUpdatePolicy::HydrateIfAbsent)
+                    }
                 } else {
                     svm.set_account(&pubkey, account.clone())
                 };
                 if let Err(e) = load_result {
+                    if strict {
+                        errors.push(format!("account '{}': failed to set account: {}", pubkey, e));
+                    }
                     let _ = svm
                         .simnet_events_tx
                         .warn(format!("Failed to set account '{}': {}", pubkey, e));
@@ -864,12 +893,28 @@ impl SurfnetSvmLocker {
                 // A DB hit alone must not produce a Geyser startup update for an
                 // account that is not actually available in the live SVM.
                 let Some(account) = svm.inner.get_account_no_db(&pubkey) else {
+                    if strict {
+                        errors.push(format!(
+                            "account '{}': absent from live SVM after snapshot load",
+                            pubkey
+                        ));
+                    }
                     let _ = svm.simnet_events_tx.warn(format!(
                         "Account '{}' was not present after snapshot load",
                         pubkey
                     ));
                     continue;
                 };
+
+                // Hydration can retain an existing local account. An executable
+                // requested from upstream still needs a live executable account.
+                // Explicit snapshot entries are checked the same way.
+                if strict && requested_executable && !account.executable {
+                    errors.push(format!(
+                        "account '{}': requested executable is not executable in live SVM",
+                        pubkey
+                    ));
+                }
 
                 // Send startup account update to geyser
                 let write_version = svm.increment_write_version();
@@ -879,8 +924,64 @@ impl SurfnetSvmLocker {
 
                 loaded_count += 1;
             }
+
+            if !strict {
+                return;
+            }
+
+            for (program, requested_account) in accounts_to_validate {
+                // Preserve diagnostics for a program that could not be installed,
+                // while validating the actual account when hydration kept local state.
+                let account = svm.inner.get_account_no_db(&program).unwrap_or(requested_account);
+                if !account.executable
+                    || account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+                {
+                    continue;
+                }
+                let data_address =
+                    match bincode::deserialize::<UpgradeableLoaderState>(&account.data) {
+                        Ok(UpgradeableLoaderState::Program { programdata_address }) => {
+                            programdata_address
+                        }
+                        _ => {
+                            errors.push(format!(
+                                "upgradeable program '{}': invalid Program state",
+                                program
+                            ));
+                            continue;
+                        }
+                    };
+                match svm.inner.get_account_no_db(&data_address) {
+                    Some(data)
+                        if data.owner == solana_sdk_ids::bpf_loader_upgradeable::id()
+                            && !data.executable
+                            && data.data.len()
+                                >= UpgradeableLoaderState::size_of_programdata_metadata()
+                            && matches!(
+                                bincode::deserialize::<UpgradeableLoaderState>(
+                                    &data.data
+                                        [..UpgradeableLoaderState::size_of_programdata_metadata()]
+                                ),
+                                Ok(UpgradeableLoaderState::ProgramData { .. })
+                            ) => {}
+                    Some(_) => errors.push(format!(
+                        "upgradeable program '{}': invalid ProgramData account '{}' in live SVM",
+                        program, data_address
+                    )),
+                    None => errors.push(format!(
+                        "upgradeable program '{}': required ProgramData account '{}' absent from live SVM",
+                        program, data_address
+                    )),
+                }
+            }
         });
 
+        if strict && !errors.is_empty() {
+            return Err(SurfpoolError::invalid_params(format!(
+                "strict snapshot load failed: {}",
+                errors.join("; ")
+            )));
+        }
         Ok(loaded_count)
     }
 
@@ -2099,26 +2200,12 @@ impl SurfnetSvmLocker {
         let loaded_addresses = tx_loaded_addresses.as_ref().map(|l| l.loaded_addresses());
 
         let ix_profiles = if self.is_instruction_profiling_enabled() {
-            match self
-                .generate_instruction_profiles(
-                    &transaction,
-                    &transaction_accounts,
-                    &tx_loaded_addresses,
-                    &accounts_before,
-                    &token_accounts_before,
-                    &token_programs,
-                    pre_execution_capture.clone(),
-                    &status_tx,
-                )
-                .await
-            {
-                Ok(profiles) => profiles,
-                Err(e) => {
-                    self.simnet_events_tx()
-                        .error(format!("Failed to generate instruction profiles: {}", e));
-                    None
-                }
-            }
+            self.generate_instruction_profiles(
+                &transaction,
+                &transaction_accounts,
+                &tx_loaded_addresses,
+                pre_execution_capture.clone(),
+            )
         } else {
             None
         };
@@ -2148,22 +2235,17 @@ impl SurfnetSvmLocker {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn generate_instruction_profiles(
+    fn generate_instruction_profiles(
         &self,
         transaction: &VersionedTransaction,
         transaction_accounts: &[Pubkey],
         loaded_addresses: &Option<TransactionLoadedAddresses>,
-        accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
-        status_tx: &Sender<TransactionStatusEvent>,
-    ) -> SurfpoolResult<Option<Vec<ProfileResult>>> {
+    ) -> Option<Vec<ProfileResult>> {
         let instructions = transaction.message.instructions();
         let ix_count = instructions.len();
         if ix_count == 0 {
-            return Ok(None);
+            return None;
         }
         // Extract account categories from original transaction
 
@@ -2187,7 +2269,7 @@ impl SurfnetSvmLocker {
 
             let Some(partial_tx) = partial_transaction_res else {
                 debug!("Unable to create partial transaction");
-                return Ok(None);
+                return None;
             };
 
             let mut previous_execution_captures = ExecutionCapture::new();
@@ -2199,10 +2281,6 @@ impl SurfnetSvmLocker {
                 previous_log_count += result.log_messages.as_ref().map(|m| m.len()).unwrap_or(0);
             }
 
-            let skip_preflight = true;
-            let sigverify = false;
-            let do_propagate = false;
-
             let mut pre_execution_capture_cursor = pre_execution_capture.clone();
             // If a pre-execution capture was provided, any pubkeys that are in the capture
             // that we just took should be replaced with those from the pre-execution capture.
@@ -2213,35 +2291,50 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor.insert(pubkey, pre_account);
                 }
             }
-            let mut svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
-
-            let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
-            let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
-            svm_clone.simnet_events_tx = dummy_simnet_tx;
-            svm_clone.geyser_events_tx = dummy_geyser_tx;
-
-            let svm_locker = SurfnetSvmLocker::new(svm_clone);
-            let mut profile_result = svm_locker
-                .process_transaction_internal(
-                    partial_tx,
-                    skip_preflight,
-                    sigverify,
-                    transaction_accounts,
-                    &loaded_addresses.as_ref().map(|l| l.loaded_addresses()),
-                    accounts_before,
-                    token_accounts_before,
-                    token_programs,
-                    pre_execution_capture_cursor,
-                    status_tx,
-                    do_propagate,
-                )
-                .await?;
+            // Simulating runs the prefix against the live state without committing it, so no
+            // sandbox copy of the SVM is needed.
+            let mut profile_result = self.with_svm_reader(|svm_reader| {
+                match svm_reader.simulate_transaction(partial_tx, false) {
+                    Ok(SimulatedTransactionInfo {
+                        meta,
+                        post_accounts,
+                    }) => {
+                        // A committed run would store the writable accounts (dropping those left
+                        // with no lamports) and leave the others unchanged.
+                        let mut post_accounts =
+                            post_accounts.into_iter().collect::<HashMap<_, _>>();
+                        let post_execution_capture = ix_required_accounts
+                            .iter()
+                            .map(|pubkey| {
+                                let account = match post_accounts.remove(pubkey) {
+                                    Some(account) => {
+                                        (account.lamports() > 0).then(|| account.into())
+                                    }
+                                    None => svm_reader.inner.get_account_no_db(pubkey),
+                                };
+                                (*pubkey, account)
+                            })
+                            .collect();
+                        ProfileResult::new(
+                            pre_execution_capture_cursor,
+                            post_execution_capture,
+                            meta.compute_units_consumed,
+                            Some(meta.logs),
+                            None,
+                        )
+                    }
+                    Err(FailedTransactionMetadata { err, meta }) => ProfileResult::new(
+                        pre_execution_capture_cursor,
+                        BTreeMap::new(),
+                        meta.compute_units_consumed,
+                        Some(meta.logs),
+                        Some(err.to_string()),
+                    ),
+                }
+            });
 
             profile_result
                 .pre_execution_capture
-                .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
-            profile_result
-                .post_execution_capture
                 .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
 
             profile_result.compute_units_consumed = profile_result
@@ -2256,7 +2349,7 @@ impl SurfnetSvmLocker {
             ix_profile_results.push(profile_result);
         }
 
-        Ok(Some(ix_profile_results))
+        Some(ix_profile_results)
     }
 
     fn handle_simulation_failure(
@@ -2878,16 +2971,29 @@ impl SurfnetSvmLocker {
 
     /// Gets all owners whose accounts are marked offline.
     pub fn get_offline_account_owners(&self) -> Vec<Pubkey> {
-        self.with_svm_reader(Self::offline_account_owners)
+        self.with_svm_reader(SurfnetSvm::offline_account_owners)
     }
 
-    /// Registers a scenario for execution
+    /// Schedules a scenario's overrides from `slot`, or from the next slot when omitted.
+    /// A base slot that is already produced is rejected: nothing would ever apply it.
     pub fn register_scenario(
         &self,
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
     ) -> SurfpoolResult<()> {
-        self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
+        self.with_svm_writer(move |svm_writer| {
+            let current_slot = svm_writer.get_latest_absolute_slot();
+            let next_slot = current_slot
+                .checked_add(1)
+                .ok_or_else(|| SurfpoolError::internal("the slot counter overflowed"))?;
+            let base_slot = slot.unwrap_or(next_slot);
+            if base_slot <= current_slot {
+                return Err(SurfpoolError::invalid_params(format!(
+                    "base slot {base_slot} is already produced; the next slot is {next_slot}"
+                )));
+            }
+            svm_writer.register_scenario(scenario, Some(base_slot))
+        })
     }
 
     /// Materializes overrides for a specific slot (not necessarily the current slot)
@@ -3798,7 +3904,7 @@ impl SurfnetSvmLocker {
             Ok::<_, SurfpoolError>(filtered)
         })?;
 
-        Ok(self.with_contextualized_svm_reader(|_| res.clone()))
+        Ok(self.with_contextualized_svm_reader(move |_| res))
     }
 
     pub fn encode_ui_account(
@@ -4082,6 +4188,22 @@ impl SurfnetSvmLocker {
         svm_writer.materialize_overrides(remote_ctx).await
     }
 
+    /// Applies a time travel's `clock`, then keep-alive at the slot and time it lands on, so the
+    /// accounts keep-alive rewrites match the new Clock before anything reads them.
+    pub async fn apply_time_travel(
+        &self,
+        clock: Clock,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<EpochInfo> {
+        let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
+        let epoch_info = svm_writer.apply_time_travel(clock)?;
+        svm_writer
+            .apply_keep_alive(remote_ctx, epoch_info.absolute_slot)
+            .await;
+        Ok(epoch_info)
+    }
+
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
     pub fn subscribe_for_signature_updates(
         &self,
@@ -4163,6 +4285,11 @@ impl SurfnetSvmLocker {
         })
     }
 
+    /// The notifier signalled after subscription notifications are sent.
+    pub(crate) fn subscription_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.with_svm_reader(|svm_reader| svm_reader.subscription_wake.clone())
+    }
+
     /// Subscribes for snapshot import updates and returns a receiver of snapshot import notifications.
     /// This method spawns a background task that fetches the snapshot and loads it via `load_snapshot`.
     pub fn subscribe_for_snapshot_import_updates(
@@ -4179,9 +4306,14 @@ impl SurfnetSvmLocker {
         let snapshot_url = snapshot_url.to_string();
         let snapshot_id = snapshot_id.to_string();
 
+        let wake = self.subscription_wake();
+        let send = move |notification| {
+            let _ = tx.send(notification);
+            wake.notify_waiters();
+        };
         tokio::spawn(async move {
             // Send initial notification
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::Started,
                 accounts_loaded: 0,
@@ -4193,7 +4325,7 @@ impl SurfnetSvmLocker {
             let snapshot_data = match SurfnetSvm::fetch_snapshot_from_url(&snapshot_url).await {
                 Ok(data) => data,
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -4207,7 +4339,7 @@ impl SurfnetSvmLocker {
             let total_accounts = snapshot_data.len() as u64;
 
             // Send progress notification with total count
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::InProgress,
                 accounts_loaded: 0,
@@ -4221,7 +4353,7 @@ impl SurfnetSvmLocker {
                 .await
             {
                 Ok(loaded_count) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Completed,
                         accounts_loaded: loaded_count as u64,
@@ -4230,7 +4362,7 @@ impl SurfnetSvmLocker {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -5995,8 +6127,10 @@ mod tests {
 
     // Snapshot loading tests
 
+    #[test_case::test_case(false; "best effort")]
+    #[test_case::test_case(true; "strict")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_load_snapshot_basic() {
+    async fn test_load_snapshot_basic(strict: bool) {
         use base64::{Engine, engine::general_purpose};
 
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -6021,14 +6155,12 @@ mod tests {
         );
 
         let loaded = locker
-            .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), strict)
             .await
             .unwrap();
         assert_eq!(loaded, 1);
 
-        let account = locker
-            .with_svm_reader(|svm| svm.get_account(&pubkey))
-            .unwrap();
+        let account = locker.with_svm_reader(|svm| svm.inner.get_account_no_db(&pubkey));
         assert!(account.is_some());
         let account = account.unwrap();
         assert_eq!(account.lamports, 1_000_000);
@@ -6360,6 +6492,446 @@ mod tests {
                 .with_svm_reader(|svm| svm.get_account(&valid_pubkey))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    struct SnapshotSender {
+        accounts: BTreeMap<String, AccountSnapshot>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl RpcSender for SnapshotSender {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            if self.fail {
+                return Err(solana_rpc_client_api::client_error::ErrorKind::Custom(
+                    "provider unavailable".into(),
+                )
+                .into());
+            }
+            assert_eq!(request, RpcRequest::GetMultipleAccounts);
+            let values: Vec<_> = params[0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| {
+                    self.accounts.get(key.as_str().unwrap()).map(|a| {
+                        serde_json::json!({
+                            "lamports": a.lamports, "owner": a.owner, "executable": a.executable,
+                            "rentEpoch": a.rent_epoch, "data": [a.data, "base64"],
+                        })
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"context": {"slot": 1}, "value": values}))
+        }
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+        fn url(&self) -> String {
+            "http://snapshot.example".into()
+        }
+    }
+
+    fn snapshot_test_remote(
+        accounts: BTreeMap<String, AccountSnapshot>,
+        fail: bool,
+    ) -> SurfnetRemoteClient {
+        SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                SnapshotSender { accounts, fail },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        }
+    }
+
+    fn snapshot_test_locker() -> SurfnetSvmLocker {
+        let (svm, _, _) = SurfnetSvm::default();
+        SurfnetSvmLocker::new(svm)
+    }
+
+    fn snapshot_test_account() -> AccountSnapshot {
+        AccountSnapshot {
+            lamports: 1_000_000,
+            owner: Pubkey::new_unique().to_string(),
+            executable: false,
+            rent_epoch: 0,
+            data: "AQID".into(),
+            parsed_data: None,
+        }
+    }
+
+    fn snapshot_test_live(locker: &SurfnetSvmLocker, key: &str) -> Option<Account> {
+        let key = key.parse::<Pubkey>().unwrap();
+        locker.with_svm_reader(|svm| svm.inner.get_account_no_db(&key))
+    }
+
+    fn snapshot_test_fixture() -> BTreeMap<String, Option<AccountSnapshot>> {
+        serde_json::from_str(include_str!("../tests/assets/program_snapshot.json")).unwrap()
+    }
+
+    fn snapshot_test_fixture_keys(
+        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> (String, String) {
+        let program = snapshot
+            .iter()
+            .find(|(_, a)| a.as_ref().unwrap().executable)
+            .unwrap()
+            .0
+            .clone();
+        let data = snapshot
+            .iter()
+            .find(|(_, a)| !a.as_ref().unwrap().executable)
+            .unwrap()
+            .0
+            .clone();
+        (program, data)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_hydrates_complete_remote_map_and_rejects_missing_and_rpc_failure()
+     {
+        let first = Pubkey::new_unique().to_string();
+        let second = Pubkey::new_unique().to_string();
+        let snapshot = BTreeMap::from([(first.clone(), None), (second.clone(), None)]);
+        let values = BTreeMap::from([
+            (first.clone(), snapshot_test_account()),
+            (second.clone(), snapshot_test_account()),
+        ]);
+        let initial_locker = snapshot_test_locker();
+        assert_eq!(
+            initial_locker
+                .load_snapshot_with_options(
+                    &snapshot,
+                    Some(&snapshot_test_remote(values.clone(), false)),
+                    CommitmentConfig::confirmed(),
+                    true
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            snapshot_test_live(&initial_locker, &first).is_some()
+                && snapshot_test_live(&initial_locker, &second).is_some()
+        );
+        let missing = snapshot_test_remote(
+            BTreeMap::from([(first.clone(), values[&first].clone())]),
+            false,
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&missing),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&second) && error.to_lowercase().contains("absent"),
+            "{error}"
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(BTreeMap::new(), true)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&first) && error.contains("upstream fetch failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_null_without_remote_and_invalid_inputs() {
+        let key = Pubkey::new_unique().to_string();
+        let missing = BTreeMap::from([(key.clone(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&missing, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.to_lowercase().contains("upstream"),
+            "{error}"
+        );
+        let mut invalid_data = snapshot_test_account();
+        invalid_data.data = "%%%".into();
+        let mut invalid_owner = snapshot_test_account();
+        invalid_owner.owner = "bad-owner".into();
+        let data_key = Pubkey::new_unique().to_string();
+        let owner_key = Pubkey::new_unique().to_string();
+        let snapshot = BTreeMap::from([
+            ("invalid-key".into(), Some(snapshot_test_account())),
+            (data_key.clone(), Some(invalid_data)),
+            (owner_key.clone(), Some(invalid_owner)),
+        ]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        for part in ["invalid-key", &data_key, &owner_key, "base64", "owner"] {
+            assert!(error.contains(part), "missing {part}: {error}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_invalid_executable_installation() {
+        let key = Pubkey::new_unique().to_string();
+        let mut program = snapshot_test_account();
+        program.owner = solana_sdk_ids::bpf_loader::id().to_string();
+        program.executable = true;
+        let snapshot = BTreeMap::from([(key.clone(), Some(program))]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.contains("failed to set account"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_local_upgradeable_programdata() {
+        let snapshot = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&snapshot);
+        let missing = BTreeMap::from([(program.clone(), snapshot[&program].clone())]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&missing, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&program) && error.contains(&data), "{error}");
+        let locker = snapshot_test_locker();
+        assert_eq!(
+            locker
+                .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            snapshot_test_live(&locker, &program).is_some()
+                && snapshot_test_live(&locker, &data).is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_remote_upgradeable_programdata() {
+        let fixture = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&fixture);
+        let snapshot = BTreeMap::from([(program.clone(), None)]);
+        let values: BTreeMap<_, _> = fixture.into_iter().map(|(k, v)| (k, v.unwrap())).collect();
+        let missing = snapshot_test_remote(
+            BTreeMap::from([(program.clone(), values[&program].clone())]),
+            false,
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&missing),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&program) && error.contains(&data), "{error}");
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            snapshot_test_live(&locker, &program).is_some()
+                && snapshot_test_live(&locker, &data).is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_does_not_require_guessed_programdata_for_legacy_executable()
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let fixture = snapshot_test_fixture();
+        let (_, data_key) = snapshot_test_fixture_keys(&fixture);
+        let programdata = fixture[&data_key].as_ref().unwrap();
+        let data = STANDARD.decode(&programdata.data).unwrap();
+        let key = Pubkey::new_unique().to_string();
+        let program = AccountSnapshot {
+            lamports: 20_580_720,
+            owner: solana_sdk_ids::bpf_loader::id().to_string(),
+            executable: true,
+            rent_epoch: 0,
+            data: STANDARD.encode(&data[UpgradeableLoaderState::size_of_programdata_metadata()..]),
+            parsed_data: None,
+        };
+        let snapshot = BTreeMap::from([(key.clone(), None)]);
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(
+                    BTreeMap::from([(key.clone(), program)]),
+                    false,
+                )),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(snapshot_test_live(&locker, &key).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_reports_remote_executable_installation_failure() {
+        let key = Pubkey::new_unique().to_string();
+        let mut program = snapshot_test_account();
+        program.owner = solana_sdk_ids::bpf_loader::id().to_string();
+        program.executable = true;
+        let snapshot = BTreeMap::from([(key.clone(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(
+                    BTreeMap::from([(key.clone(), program)]),
+                    false,
+                )),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.contains("failed to set account"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_malformed_live_programdata() {
+        let mut snapshot = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&snapshot);
+        snapshot.insert(data.clone(), Some(snapshot_test_account()));
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&program)
+                && error.contains(&data)
+                && error.contains("invalid ProgramData"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_remote_executable_shadowed_by_live_non_executable() {
+        let fixture = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&fixture);
+        let local = snapshot_test_account();
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot(
+                &BTreeMap::from([(program.clone(), Some(local.clone()))]),
+                None,
+                CommitmentConfig::confirmed(),
+            )
+            .await
+            .unwrap();
+        let values = fixture
+            .into_iter()
+            .map(|(key, value)| (key, value.unwrap()))
+            .collect();
+        let error = locker
+            .load_snapshot_with_options(
+                &BTreeMap::from([(program.clone(), None)]),
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&program) && error.contains("requested executable is not executable"),
+            "{error}"
+        );
+        let live_program = snapshot_test_live(&locker, &program).unwrap();
+        assert!(!live_program.executable);
+        assert_eq!(live_program.data, vec![1, 2, 3]);
+        assert!(snapshot_test_live(&locker, &data).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_explicit_mint_but_not_implicitly_fetched_mint() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState};
+
+        let mint = Pubkey::new_unique();
+        let token = Pubkey::new_unique().to_string();
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        let mut token_account = snapshot_test_account();
+        token_account.owner = spl_token_interface::id().to_string();
+        token_account.data = STANDARD.encode(data);
+        let values = BTreeMap::from([(token.clone(), token_account)]);
+        let snapshot = BTreeMap::from([(token.clone(), None)]);
+        let first_locker = snapshot_test_locker();
+        first_locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(values.clone(), false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(snapshot_test_live(&first_locker, &token).is_some());
+        assert!(snapshot_test_live(&first_locker, &mint.to_string()).is_none());
+        let explicit = BTreeMap::from([(token.clone(), None), (mint.to_string(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &explicit,
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&mint.to_string()) && error.contains("absent from upstream"),
+            "{error}"
         );
     }
 
