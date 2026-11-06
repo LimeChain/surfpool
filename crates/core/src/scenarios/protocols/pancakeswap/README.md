@@ -93,5 +93,11 @@ Every pool on that tier shares the account, so the change reaches all of them.
 # IDL
 
 `v1/idl.json` is the IDL PancakeSwap publishes on chain in its Anchor IDL account
-`CAD7TZySgk4RkqyAkGu3bJFvf8itWsfTtpViRK8TJrKf`, unchanged (sha256
-`661eb632c441b2adb681ecd547fd8cea18e836be2305064e84b14bb90d7efb4c`), as written in slot 348011868.
+`CAD7TZySgk4RkqyAkGu3bJFvf8itWsfTtpViRK8TJrKf`, as written in slot 348011868, indented with two
+spaces like the other bundled IDLs. Only whitespace changed: `jq -j -c . v1/idl.json` gives back the
+on-chain bytes.
+
+| IDL | sha256 |
+|---|---|
+| On chain (compact) | `661eb632c441b2adb681ecd547fd8cea18e836be2305064e84b14bb90d7efb4c` |
+| Bundled `v1/idl.json` | `5ff647614c8f157ff00fbef92e4569e8a8bcfe0725641bb3a6d372024cc366ef` |
