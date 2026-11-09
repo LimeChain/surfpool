@@ -861,6 +861,7 @@
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
+                      "keepAlive": "bool (Optional, defaults to true. If false, keep-alive does not keep the account fresh after this override, and its fields age as the clock moves on)",
                       "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }

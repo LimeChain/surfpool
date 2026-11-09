@@ -3532,6 +3532,7 @@ impl SurfnetSvm {
             // if no scenario had touched it.
             let mut keep_alive_source = None;
             if scheduled
+                && override_instance.keep_alive
                 && let Some(template) = template_registry().get(&override_instance.template_id)
                 && !template.keep_alive.is_empty()
             {

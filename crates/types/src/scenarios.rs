@@ -592,11 +592,23 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
+    /// Whether keep-alive rewrites the account after this override, when its template imports
+    /// keep-alive. Off, the override writes once and its fields age as the clock moves on.
+    #[schemars(
+        description = "If false, the override writes once and keep-alive does not keep the account fresh afterwards. Defaults to true"
+    )]
+    #[serde(default = "default_keep_alive")]
+    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
+    pub keep_alive: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
     )]
     pub account: AccountAddress,
+}
+
+fn default_keep_alive() -> bool {
+    true
 }
 
 impl OverrideInstance {
@@ -609,6 +621,7 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
+            keep_alive: true,
             account,
         }
     }
@@ -1998,6 +2011,27 @@ mod tests {
         assert_eq!(values["slot"], json!(210));
         assert_eq!(values["ms"], json!(5_000));
         assert_eq!(values["fixed"], json!(3));
+    }
+
+    #[test]
+    fn an_override_keeps_its_account_alive_unless_it_opts_out() {
+        let instance = |extra: serde_json::Value| {
+            let mut value = json!({
+                "id": "o",
+                "templateId": "t",
+                "values": {},
+                "scenarioRelativeSlot": 0,
+                "enabled": true,
+                "account": { "pubkey": "11111111111111111111111111111111" },
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<super::OverrideInstance>(value).unwrap()
+        };
+        assert!(instance(json!({})).keep_alive);
+        assert!(!instance(json!({ "keepAlive": false })).keep_alive);
     }
 
     #[test]
