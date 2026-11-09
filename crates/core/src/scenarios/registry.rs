@@ -1734,11 +1734,16 @@ templates: []
     #[test]
     fn pyth_price_feeds_keep_their_price_published() {
         let registry = TemplateRegistry::new();
-        for (id, publication) in [
-            ("pyth-price-feed-v2", "pyth-price-publication"),
+        for (id, publication, receiver) in [
+            (
+                "pyth-price-feed-v2",
+                "pyth-price-publication",
+                "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+            ),
             (
                 "pyth-core-compatible-price-feed-v2",
                 "pyth-core-compatible-price-publication",
+                "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp",
             ),
         ] {
             let template = registry.get(id).unwrap();
@@ -1748,8 +1753,11 @@ templates: []
             assert_eq!(import.template, publication, "{id}");
             assert_eq!(
                 import.address,
-                surfpool_types::KeepAliveAddress::Override,
-                "{id}"
+                surfpool_types::KeepAliveAddress::Owned {
+                    owners: vec![receiver.to_string()],
+                    account: "PriceUpdateV2".to_string(),
+                },
+                "{id} must keep every price account of its receiver published"
             );
             let mut paths: Vec<&str> = import.values.keys().map(String::as_str).collect();
             paths.sort();
