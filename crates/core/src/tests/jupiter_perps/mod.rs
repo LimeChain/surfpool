@@ -1205,8 +1205,9 @@ fn usdc_deposit(locker: &SurfnetSvmLocker, graph: &PerpsGraph) -> Sent {
 
 /// Only keep-alive publishes Doves prices on a surfnet. A copied feed refuses a keeper fill on a
 /// request made after it (6045) and, 5 seconds on, a JLP deposit (6003), which reads every feed of
-/// the pool. A price override on each feed republishes it every slot at the Surfnet clock's time
-/// and the scenario's price, through produced slots and a time travel.
+/// the pool. A price override on one feed republishes every loaded feed every slot at the Surfnet
+/// clock's time and its own price, through produced slots and a time travel, until an override
+/// with keep-alive off lets its feed age.
 #[tokio::test(flavor = "multi_thread")]
 async fn price_overrides_keep_their_feeds_published_at_the_clock() {
     let graph = perps_graph(&[]).await;
@@ -1230,46 +1231,66 @@ async fn price_overrides_keep_their_feeds_published_at_the_clock() {
         "a deposit 5 seconds after the copy",
     );
 
-    // SOL 1% lower moves JLP well inside its 5% guard; the other feeds keep their live price.
+    // SOL 1% lower moves JLP well inside its 5% guard; no override names the other feeds, which
+    // keep their live price.
     let sol_feed = graph.feed_of(custody_address(SOL_MINT));
+    let sol_price = u64_at(graph.data(&sol_feed), feed::PRICE) * 99 / 100;
     let prices: Vec<(Pubkey, u64)> = graph
         .feeds
         .iter()
         .map(|feed| {
             let live = u64_at(graph.data(feed), feed::PRICE);
-            let price = if *feed == sol_feed {
-                live * 99 / 100
-            } else {
-                live
-            };
-            (*feed, price)
+            (*feed, if *feed == sol_feed { sol_price } else { live })
         })
         .collect();
-    let overrides = prices
-        .iter()
-        .map(|(feed, price)| price_override(*feed, *price));
-    play(&locker, overrides.collect()).await;
-    let published = |what: &str| {
+    play(&locker, vec![price_override(sol_feed, sol_price)]).await;
+    let timestamp = |feed: &Pubkey| {
+        let data = account(&locker, feed).data;
+        i64::from_le_bytes(
+            data[feed::TIMESTAMP..feed::TIMESTAMP + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let published = |what: &str, prices: &[(Pubkey, u64)]| {
         let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
-        for (feed, price) in &prices {
+        for (feed, price) in prices {
             let data = account(&locker, feed).data;
-            let timestamp = &data[feed::TIMESTAMP..feed::TIMESTAMP + 8];
-            let timestamp = i64::from_le_bytes(timestamp.try_into().unwrap());
-            assert_eq!(timestamp, clock.unix_timestamp, "{what}: {feed} timestamp");
+            assert_eq!(
+                timestamp(feed),
+                clock.unix_timestamp,
+                "{what}: {feed} timestamp"
+            );
             assert_eq!(u64_at(&data, feed::PRICE), *price, "{what}: {feed} price");
         }
     };
-    published("the slot the prices play");
+    published("the slot the SOL price plays", &prices);
     send(&locker, KEEPER, &[fill]).expect("the fill on a price published after the request");
     usdc_deposit(&locker, &graph).expect("a deposit on published prices");
 
     for slot in 1..=3 {
         locker.confirm_current_block(&None).await.unwrap();
-        published(&format!("{slot} slots on"));
+        published(&format!("{slot} slots on"), &prices);
     }
     travel(&locker, now + DAY).await;
-    published("a time travel a day on");
+    published("a time travel a day on", &prices);
     usdc_deposit(&locker, &graph).expect("a deposit a day on");
+
+    let btc_feed = graph.feed_of(custody_address(BTC_MINT));
+    let mut aging = price_override(btc_feed, u64_at(graph.data(&btc_feed), feed::PRICE));
+    aging.keep_alive = false;
+    play(&locker, vec![aging]).await;
+    let stopped_at = timestamp(&btc_feed);
+    travel(&locker, now + DAY + 20).await;
+    assert_eq!(timestamp(&btc_feed), stopped_at, "keep-alive off: BTC ages");
+    let others: Vec<_> = prices.into_iter().filter(|(f, _)| *f != btc_feed).collect();
+    published("20 seconds after BTC's keep-alive stops", &others);
+    let stale = usdc_deposit(&locker, &graph);
+    expect_error(
+        stale,
+        STALE_ORACLE_PRICE,
+        "a deposit on a 20-second-old BTC",
+    );
 }
 
 /// A USDC deposit that works on the live pool, refused by each lever that guards deposits.

@@ -63,16 +63,15 @@ every custody's feed; positions read their own feeds; liquidations do not check 
 ## Keep-alive (Surfpool handles it)
 
 On mainnet the Doves publisher republishes every feed's price within seconds. Nobody runs it
-against a surfnet, so Surfpool republishes each feed a `jupiter-perps-doves-price` override names
-every slot ([keep-alive](../../../README.md#keep-alive)): its `timestamp` follows the Surfnet clock
-and its price stays the scenario's. The feed never goes stale, and a keeper fill finds a price
-published after its request. Keep-alive starts in the slot the override plays and runs until the
-network is reset.
+against a surfnet, so from the slot a `jupiter-perps-doves-price` override plays, Surfpool
+republishes every Doves feed the surfnet has loaded every slot
+([keep-alive](../../../README.md#keep-alive)), including feeds a transaction loads later: each
+`timestamp` follows the Surfnet clock and each price stays the scenario's. A JLP deposit,
+withdrawal, swap or quote, or a position, finds every custody's feed fresh, and a keeper fill finds
+a price published after its request. Keep-alive runs until the network is reset.
 
-A feed no override names is not republished and goes stale. A JLP deposit, withdrawal, swap or
-quote reads every custody's feed, so write `jupiter-perps-doves-price` on each of them for those,
-at its live price where the scenario does not move it. A position reads the feeds of its market
-and collateral custodies.
+To keep one feed stale on purpose, override it with `keepAlive: false`; a later override of it with
+`keepAlive: true` republishes it again.
 
 ## Make a position liquidatable
 
@@ -153,7 +152,7 @@ deposits then fail with 6043.
 
 | Error | Meaning | Fix |
 |---|---|---|
-| 6003 `StaleOraclePrice` | a feed the instruction read is too old: 5 seconds for a deposit, 15 for a quote | expected on a feed no override names: write `jupiter-perps-doves-price` on every feed of the pool - see "Keep-alive" |
+| 6003 `StaleOraclePrice` | a feed the instruction read is too old: 5 seconds for a deposit, 15 for a quote | expected before any `jupiter-perps-doves-price` override plays, or on a feed overridden with `keepAlive: false`: override one feed, at its live price if the scenario does not move it - see "Keep-alive" |
 | 6009 `InvalidPositionState` | the position is not liquidatable | move the price further, or lower `pricing.max_leverage` |
 | 6014 `InvalidCustodyBalance` | a custody's vault and staked lamports hold less than its `assets.owned`: the two were copied from mainnet at different moments, as when Studio's market list or a lookup read the custody first, or `fetchBeforeUse` reloaded only the custody | `surfnet_resetAccount` on the custody and on its `token_account`; the next transaction loads them together |
 | 6022 `MaxLeverage` | the position would open past its leverage limit, as when its close fee exceeds its collateral | lower `decrease_position_bps` or add collateral |
@@ -161,7 +160,7 @@ deposits then fail with 6043.
 | 6027 `InstructionNotAllowed` | a `permissions` switch is off | set it back to `true` |
 | 6034 `InvalidKeeper` | the liquidator is not the keeper the program accepts | sign as the keeper |
 | 6043 `ExceedTokenWeightage` | the deposit leaves the token too far above its target weight | raise `limit.token_weightage_buffer_bps` |
-| 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override the position's feed, and fill in a later second than the request - see "Keep-alive" |
+| 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override a feed before the fill, and fill in a later second than the request - see "Keep-alive" |
 | 6066 `LpTokenPriceChangeLimitExceeded` | the JLP price moved past the guard | raise `max_lp_token_price_change_bps` |
 | 6000 `MathOverflow` on a stablecoin custody | its borrow-lend debt overflowed a large rate or time jump | lower the rate or the time step |
 | an earlier change to a custody, the pool or a feed is gone | a later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it | give later overrides of the same account `fetchBeforeUse: false` |

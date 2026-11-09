@@ -1142,7 +1142,13 @@ templates:
             panic!("jupiter-perps-doves-price must keep its feed published");
         };
         assert_eq!(import.template, "jupiter-perps-doves-publication");
-        assert_eq!(import.address, KeepAliveAddress::Override);
+        assert_eq!(
+            import.address,
+            KeepAliveAddress::Owned {
+                owners: vec!["DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e".to_string()],
+                account: "AgPriceFeed".to_string(),
+            }
+        );
         assert_eq!(
             import.values,
             HashMap::from([("timestamp".to_string(), serde_json::json!("$unix_s"))])

@@ -11,7 +11,7 @@ tags:
 
 keep_alive:
   - template: jupiter-perps-doves-publication
-    address: { type: override }
+    address: { type: owned, owner: DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e, account: AgPriceFeed }
     values: { timestamp: $unix_s }
 
 templates:
@@ -46,13 +46,12 @@ templates:
         on a later override of the same feed in another scenario or slot: a reload drops the
         earlier local change.
 
-      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays, Surfpool republishes
-      this feed every slot at the Surfnet clock's time, as the Doves publisher does on mainnet, so
-      the price never goes stale and a keeper fill finds it published after its request. Only the
-      feeds an override names are republished. A JLP deposit, withdrawal, swap or quote reads every
-      custody's feed and refuses a stale one, so write this template on every feed of the pool for
-      those, at its live price where the scenario does not move it. A position reads the feeds of
-      its market and collateral custodies.
+      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot an override of this template plays,
+      Surfpool republishes every Doves feed the surfnet has loaded every slot at the Surfnet clock's
+      time, as the Doves publisher does on mainnet, including feeds a transaction loads later. A
+      JLP deposit, withdrawal, swap, quote or position finds every custody's feed fresh, and a
+      keeper fill finds the price published after its request. To keep one feed stale on purpose,
+      override it with keepAlive: false.
 
       LIQUIDATIONS: a keeper liquidates a position once collateral + PnL - close and borrow
       fees falls below size x 10000 / the custody's pricing.max_leverage. Move a long's price
