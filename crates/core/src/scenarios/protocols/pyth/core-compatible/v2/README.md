@@ -11,6 +11,15 @@ listed on [Pyth's Solana contract addresses](https://docs.pyth.network/price-fee
 They hold separate price accounts for the same feeds, and a consumer reads the accounts of one of
 them. Take the price account from the consumer's own account that names it.
 
+# Keep-alive
+
+Nobody publishes Pyth prices on a surfnet, so both templates import a
+[keep-alive](../../../../README.md#keep-alive): from the slot an override plays until the network
+is reset, Surfpool writes the Clock's unix seconds to `price_message.publish_time` and the slot to
+`posted_slot` every slot, time travels included. The price, confidence and EMA fields stay as the
+scenario wrote them. A price account no override names is not republished and ages against the
+Surfnet clock.
+
 # IDL
 
 `idl.json` is the IDL the program publishes in its Anchor IDL account

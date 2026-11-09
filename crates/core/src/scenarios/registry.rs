@@ -10,10 +10,13 @@ use surfpool_types::{
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
+pub const PYTH_V2_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/pyth/v2/keep-alive.yaml");
 pub const PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT: &str =
     include_str!("./protocols/pyth/core-compatible/v2/idl.json");
 pub const PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pyth/core-compatible/v2/overrides.yaml");
+pub const PYTH_CORE_COMPATIBLE_V2_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/pyth/core-compatible/v2/keep-alive.yaml");
 
 pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/idl.json");
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
@@ -232,9 +235,18 @@ impl TemplateRegistry {
 
     pub fn load_pyth_overrides(&mut self) {
         self.load_protocol_overrides(PYTH_V2_IDL_CONTENT, PYTH_V2_OVERRIDES_CONTENT, "pyth");
+        let idl = serde_json::from_str(PYTH_V2_IDL_CONTENT).expect("pyth idl");
+        self.load_keep_alive(Some(idl), PYTH_V2_KEEP_ALIVE_CONTENT, "pyth");
         self.load_protocol_overrides(
             PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT,
             PYTH_CORE_COMPATIBLE_V2_OVERRIDES_CONTENT,
+            "pyth-core-compatible",
+        );
+        let idl = serde_json::from_str(PYTH_CORE_COMPATIBLE_V2_IDL_CONTENT)
+            .expect("pyth core compatible idl");
+        self.load_keep_alive(
+            Some(idl),
+            PYTH_CORE_COMPATIBLE_V2_KEEP_ALIVE_CONTENT,
             "pyth-core-compatible",
         );
     }
@@ -1685,6 +1697,40 @@ templates: []
             ),
             "the template must say which receiver owns its accounts"
         );
+    }
+
+    #[test]
+    fn pyth_price_feeds_keep_their_price_published() {
+        let registry = TemplateRegistry::new();
+        for (id, publication) in [
+            ("pyth-price-feed-v2", "pyth-price-publication"),
+            (
+                "pyth-core-compatible-price-feed-v2",
+                "pyth-core-compatible-price-publication",
+            ),
+        ] {
+            let template = registry.get(id).unwrap();
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{id} must keep its price published");
+            };
+            assert_eq!(import.template, publication, "{id}");
+            assert_eq!(
+                import.address,
+                surfpool_types::KeepAliveAddress::Override,
+                "{id}"
+            );
+            let mut paths: Vec<&str> = import.values.keys().map(String::as_str).collect();
+            paths.sort();
+            assert_eq!(
+                paths,
+                ["posted_slot", "price_message.publish_time"],
+                "{id} must leave the scenario's price alone"
+            );
+            assert!(
+                !registry.contains(publication),
+                "{publication} is never listed"
+            );
+        }
     }
 
     #[test]
