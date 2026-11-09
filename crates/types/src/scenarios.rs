@@ -592,11 +592,23 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
+    /// Whether keep-alive rewrites this account from this slot on. Off, keep-alive stops for the
+    /// account, so its fields age as the clock moves on, until a later override turns it on again.
+    #[schemars(
+        description = "If false, keep-alive stops rewriting this account from this slot on, so its fields age. A later override with true starts it again. Defaults to true"
+    )]
+    #[serde(default = "default_keep_alive")]
+    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
+    pub keep_alive: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
     )]
     pub account: AccountAddress,
+}
+
+fn default_keep_alive() -> bool {
+    true
 }
 
 impl OverrideInstance {
@@ -609,6 +621,7 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
+            keep_alive: true,
             account,
         }
     }
@@ -1570,6 +1583,20 @@ pub enum YamlKeepAliveAddress {
         program_id: String,
         seeds: Vec<YamlPdaSeed>,
     },
+    /// Every local account that `owner` owns and whose data starts with the discriminator of
+    /// `account` in the keep-alive template's IDL.
+    Owned {
+        owner: YamlOwners,
+        account: String,
+    },
+}
+
+/// One program ID or a list of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum YamlOwners {
+    One(String),
+    Many(Vec<String>),
 }
 
 impl From<YamlKeepAliveImport> for KeepAliveImport {
@@ -1586,6 +1613,13 @@ impl From<YamlKeepAliveImport> for KeepAliveImport {
                     seeds: seeds.into_iter().map(Into::into).collect(),
                 })
             }
+            YamlKeepAliveAddress::Owned { owner, account } => KeepAliveAddress::Owned {
+                owners: match owner {
+                    YamlOwners::One(owner) => vec![owner],
+                    YamlOwners::Many(owners) => owners,
+                },
+                account,
+            },
         };
         KeepAliveImport {
             template: yaml.template,
@@ -1620,10 +1654,18 @@ pub enum KeepAliveAddress {
     Input(String),
     /// A fixed or derived address. PDA seeds resolve against the importing override's values.
     Account(AccountAddress),
+    /// Every account in the surfnet that one of `owners` owns and whose data starts with the
+    /// discriminator of `account` in the keep-alive template's IDL, including accounts loaded after
+    /// the override played. Only local accounts are written, never fetched.
+    Owned {
+        owners: Vec<String>,
+        account: String,
+    },
 }
 
 impl KeepAliveImport {
-    /// The address to write, given the address the importing override wrote and its values.
+    /// The address to write, given the address the importing override wrote and its values. `None`
+    /// for an owned import, which names no single account.
     pub fn address(
         &self,
         written: Pubkey,
@@ -1636,6 +1678,7 @@ impl KeepAliveImport {
                 .as_str()
                 .and_then(|address| Pubkey::from_str(address).ok()),
             KeepAliveAddress::Account(address) => address.resolve(Some(values)),
+            KeepAliveAddress::Owned { .. } => None,
         }
     }
 
@@ -1670,6 +1713,16 @@ impl KeepAliveImport {
                 format!("keep-alive '{template}': invalid address '{address}': {e}")
             })?;
         }
+        if let KeepAliveAddress::Owned { owners, .. } = &self.address {
+            if owners.is_empty() {
+                return Err(format!("keep-alive '{template}' names no owner"));
+            }
+            for owner in owners {
+                Pubkey::from_str(owner).map_err(|e| {
+                    format!("keep-alive '{template}': invalid owner '{owner}': {e}")
+                })?;
+            }
+        }
         let clock = KeepAliveClock {
             slot: 0,
             unix_time_ms: 0,
@@ -1681,6 +1734,17 @@ impl KeepAliveImport {
 }
 
 impl OverrideTemplate {
+    /// The discriminator of `account` in this template's IDL, when it has one.
+    pub fn account_discriminator(&self, account: &str) -> Option<&[u8]> {
+        self.idl
+            .as_ref()?
+            .accounts
+            .iter()
+            .find(|idl_account| idl_account.name == account)
+            .map(|idl_account| idl_account.discriminator.as_slice())
+            .filter(|discriminator| !discriminator.is_empty())
+    }
+
     /// The input properties keep-alive imports read addresses from. They are never written.
     pub fn keep_alive_inputs(&self) -> impl Iterator<Item = &str> {
         self.keep_alive
@@ -2008,6 +2072,27 @@ mod tests {
     }
 
     #[test]
+    fn an_override_keeps_its_account_alive_unless_it_opts_out() {
+        let instance = |extra: serde_json::Value| {
+            let mut value = json!({
+                "id": "o",
+                "templateId": "t",
+                "values": {},
+                "scenarioRelativeSlot": 0,
+                "enabled": true,
+                "account": { "pubkey": "11111111111111111111111111111111" },
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<super::OverrideInstance>(value).unwrap()
+        };
+        assert!(instance(json!({})).keep_alive);
+        assert!(!instance(json!({ "keepAlive": false })).keep_alive);
+    }
+
+    #[test]
     fn a_file_level_keep_alive_is_inherited_unless_a_template_sets_its_own() {
         let file: super::YamlOverrideTemplateCollection = serde_yaml::from_str(
             r#"
@@ -2073,6 +2158,40 @@ templates:
         refused(
             "template: t\naddress: { type: pda, program_id: nope, seeds: [] }\nvalues: { slot: 1 }\n",
             "invalid address",
+        );
+        refused(
+            "template: t\naddress: { type: owned, owner: nope, account: A }\nvalues: { slot: 1 }\n",
+            "invalid owner 'nope'",
+        );
+        refused(
+            "template: t\naddress: { type: owned, owner: [], account: A }\nvalues: { slot: 1 }\n",
+            "names no owner",
+        );
+    }
+
+    #[test]
+    fn an_owned_import_takes_one_owner_or_a_list() {
+        use solana_pubkey::Pubkey;
+        let (first, second) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let owned = |owner: String| {
+            keep_alive(&format!(
+                "template: t\naddress: {{ type: owned, owner: {owner}, account: Price }}\nvalues: {{ slot: $slot }}\n"
+            ))
+        };
+        let expected = |owners: &[Pubkey]| super::KeepAliveAddress::Owned {
+            owners: owners.iter().map(Pubkey::to_string).collect(),
+            account: "Price".to_string(),
+        };
+        let one = owned(format!("\"{first}\""));
+        assert_eq!(one.address, expected(&[first]));
+        one.validate().unwrap();
+        let many = owned(format!("[\"{first}\", \"{second}\"]"));
+        assert_eq!(many.address, expected(&[first, second]));
+        many.validate().unwrap();
+        assert_eq!(
+            many.address(first, &HashMap::new()),
+            None,
+            "it names no single account"
         );
     }
 

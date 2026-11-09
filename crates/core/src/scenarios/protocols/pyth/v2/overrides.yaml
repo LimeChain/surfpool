@@ -11,7 +11,7 @@ tags:
 
 keep_alive:
   - template: pyth-price-publication
-    address: { type: override }
+    address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: PriceUpdateV2 }
     values: { price_message.publish_time: $unix_s, posted_slot: $slot }
 
 constants:
@@ -262,15 +262,18 @@ templates:
       - price_message.ema_price and price_message.ema_conf use the same scales as price and conf.
 
       THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays until the network is
-      reset, Surfpool republishes this price account every slot, as the Pyth publisher does on
-      mainnet: publish_time becomes the Surfnet clock's unix seconds and posted_slot the slot, also
-      after a time travel. Price, conf and the EMA fields keep the values this override wrote. A
-      value set for publish_time or posted_slot never takes effect, so leave both unset.
+      reset, Surfpool republishes every price account of the Pyth Core receiver the Surfnet has
+      loaded every slot, as the Pyth publisher does on mainnet: publish_time becomes the Surfnet
+      clock's unix seconds and posted_slot the slot, also after a time travel. This includes feeds
+      no override names and, from the next slot, feeds a transaction loads later, so a liquidation
+      that reads the borrower's other feeds finds them fresh. Price, conf and the EMA fields keep
+      their values. A value set for publish_time or posted_slot never takes effect, so leave both
+      unset.
 
-      STALE PRICE: a price account no override of this template names is not republished and ages
-      against the Surfnet clock. To test a consumer's staleness check, leave that feed without an
-      override and surfnet_timeTravel past the consumer's limit. Its absoluteTimestamp is in
-      MILLISECONDS, while publish_time and the Clock sysvar are in SECONDS.
+      STALE PRICE: to keep one feed stale on purpose, override it with keepAlive: false. It then
+      ages against the Surfnet clock. To test a consumer's staleness check, add that override and
+      surfnet_timeTravel past the consumer's limit. Its absoluteTimestamp is in MILLISECONDS, while
+      publish_time and the Clock sysvar are in SECONDS.
     address:
       type: pda
       program_id: pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT

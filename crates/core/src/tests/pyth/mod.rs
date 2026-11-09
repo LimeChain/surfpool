@@ -155,9 +155,11 @@ async fn core_compatible_price_feed_touches_only_price_fields() {
     }
 }
 
-/// Keep-alive republishes a price account a scenario overrides every slot, as the Pyth publisher
-/// does on mainnet, time travels included. Only the publication fields move with the Clock: the
-/// price stays the scenario's.
+/// Once a scenario overrides one price account, keep-alive republishes every price account of its
+/// receiver every slot, as the Pyth publisher does on mainnet, time travels included: the
+/// overridden one, and one loaded after the override played. Only the publication fields move with
+/// the Clock: each price stays as it was. An account overridden with keep-alive off is not
+/// republished.
 #[tokio::test(flavor = "multi_thread")]
 async fn price_feeds_stay_published_through_surfnet_svm() {
     const PRICE: i64 = 2_000_000_000;
@@ -178,11 +180,15 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
         );
 
         let target = Pubkey::from_str_const(address);
+        let stale = Pubkey::new_unique();
+        let loaded_later = Pubkey::new_unique();
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = SurfnetSvmLocker::new(svm);
-        locker.with_svm_writer(|svm| svm.set_account(&target, live.clone()).unwrap());
-        let mut scenario = Scenario::new("Pyth SOL at $20".to_string(), "Price only".to_string());
-        scenario.add_override(
+        locker.with_svm_writer(|svm| {
+            svm.set_account(&target, live.clone()).unwrap();
+            svm.set_account(&stale, live.clone()).unwrap();
+        });
+        let price_override = |address: &Pubkey| {
             OverrideInstance::new(
                 template_id.to_string(),
                 0,
@@ -191,43 +197,73 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
             .with_values(HashMap::from([(
                 "price_message.price".to_string(),
                 serde_json::json!(PRICE),
-            )])),
-        );
+            )]))
+        };
+        let mut scenario = Scenario::new("Pyth SOL at $20".to_string(), "Price only".to_string());
+        scenario.add_override(price_override(&target));
+        let mut stale_override = price_override(&stale);
+        stale_override.keep_alive = false;
+        scenario.add_override(stale_override);
         locker.register_scenario(scenario, None).unwrap();
 
-        let assert_published = |when: &str| {
-            let (data, clock) = locker.with_svm_reader(|svm| {
+        let read = |address: &Pubkey| {
+            locker.with_svm_reader(|svm| {
                 (
-                    svm.get_account(&target).unwrap().unwrap().data,
+                    svm.get_account(address).unwrap().unwrap().data,
                     svm.inner.get_sysvar::<Clock>(),
                 )
-            });
-            let word = |offset: usize| <[u8; 8]>::try_from(&data[offset..offset + 8]).unwrap();
-            assert_eq!(
-                i64::from_le_bytes(word(93)),
-                clock.unix_timestamp,
-                "{template_id} {when}: publish_time"
-            );
-            assert_eq!(
-                u64::from_le_bytes(word(125)),
-                clock.slot,
-                "{template_id} {when}: posted_slot"
-            );
-            assert_eq!(i64::from_le_bytes(word(73)), PRICE, "{template_id} {when}");
-            let diffs: Vec<usize> = (0..live.data.len())
-                .filter(|&i| data[i] != live.data[i])
-                .collect();
-            assert!(
-                diffs.iter().all(|i| [73..81, 93..101, 125..133]
-                    .iter()
-                    .any(|written| written.contains(i))),
-                "{template_id} {when}: changed {diffs:?}"
-            );
+            })
+        };
+        let word =
+            |data: &[u8], offset: usize| <[u8; 8]>::try_from(&data[offset..offset + 8]).unwrap();
+        let assert_published = |when: &str, with_loaded_later: bool| {
+            let mut published = vec![(target, "overridden", PRICE)];
+            if with_loaded_later {
+                published.push((
+                    loaded_later,
+                    "loaded later",
+                    i64::from_le_bytes(word(&live.data, 73)),
+                ));
+            }
+            for (address, name, price) in published {
+                let (data, clock) = read(&address);
+                let what = format!("{name} {when}");
+                assert_eq!(
+                    i64::from_le_bytes(word(&data, 93)),
+                    clock.unix_timestamp,
+                    "{template_id} {what}: publish_time"
+                );
+                assert_eq!(
+                    u64::from_le_bytes(word(&data, 125)),
+                    clock.slot,
+                    "{template_id} {what}: posted_slot"
+                );
+                assert_eq!(
+                    i64::from_le_bytes(word(&data, 73)),
+                    price,
+                    "{template_id} {what}"
+                );
+                let diffs: Vec<usize> = (0..live.data.len())
+                    .filter(|&i| data[i] != live.data[i])
+                    .collect();
+                assert!(
+                    diffs.iter().all(|i| [73..81, 93..101, 125..133]
+                        .iter()
+                        .any(|written| written.contains(i))),
+                    "{template_id} {what}: changed {diffs:?}"
+                );
+            }
+            let mut unpublished = live.data.clone();
+            unpublished[73..81].copy_from_slice(&PRICE.to_le_bytes());
+            assert_eq!(read(&stale).0, unpublished, "{template_id} stale {when}");
         };
 
-        for slot in 1..=3 {
+        locker.confirm_current_block(&None).await.unwrap();
+        assert_published("slot 1", false);
+        locker.with_svm_writer(|svm| svm.set_account(&loaded_later, live.clone()).unwrap());
+        for slot in 2..=3 {
             locker.confirm_current_block(&None).await.unwrap();
-            assert_published(&format!("slot {slot}"));
+            assert_published(&format!("slot {slot}"), true);
         }
         let clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
         locker
@@ -241,6 +277,6 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
             )
             .await
             .unwrap();
-        assert_published("after a time travel");
+        assert_published("after a time travel", true);
     }
 }

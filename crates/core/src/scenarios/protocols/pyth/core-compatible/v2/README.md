@@ -14,11 +14,13 @@ them. Take the price account from the consumer's own account that names it.
 # Keep-alive
 
 Nobody publishes Pyth prices on a surfnet, so both templates import a
-[keep-alive](../../../../README.md#keep-alive): from the slot an override plays until the network
-is reset, Surfpool writes the Clock's unix seconds to `price_message.publish_time` and the slot to
-`posted_slot` every slot, time travels included. The price, confidence and EMA fields stay as the
-scenario wrote them. A price account no override names is not republished and ages against the
-Surfnet clock.
+[keep-alive](../../../../README.md#keep-alive): from the slot an override of a template plays until
+the network is reset, Surfpool writes the Clock's unix seconds to `price_message.publish_time` and
+the slot to `posted_slot` every slot, time travels included. It does so for every price account of
+that template's receiver the surfnet has loaded, including feeds no override names and, from the
+next slot, feeds a transaction loads later, so a liquidation that reads the borrower's other feeds
+finds them fresh. The price, confidence and EMA fields keep their values. To keep one feed stale on
+purpose, override it with `keepAlive: false`; it then ages against the Surfnet clock.
 
 # IDL
 
