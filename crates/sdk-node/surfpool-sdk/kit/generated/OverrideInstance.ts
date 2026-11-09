@@ -37,8 +37,8 @@ enabled: boolean,
  */
 fetchBeforeUse?: boolean, 
 /**
- * Whether keep-alive rewrites the account after this override, when its template imports
- * keep-alive. Off, the override writes once and its fields age as the clock moves on.
+ * Whether keep-alive rewrites this account from this slot on. Off, keep-alive stops for the
+ * account, so its fields age as the clock moves on, until a later override turns it on again.
  */
 keepAlive?: boolean, 
 /**
