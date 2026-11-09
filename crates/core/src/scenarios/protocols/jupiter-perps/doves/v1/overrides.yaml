@@ -9,6 +9,11 @@ tags:
   - perpetuals
   - defi
 
+keep_alive:
+  - template: jupiter-perps-doves-publication
+    address: { type: override }
+    values: { timestamp: $unix_s }
+
 templates:
   - id: jupiter-perps-doves-price
     name: Override Perps Oracle Price
@@ -20,7 +25,7 @@ templates:
         description: "Price mantissa; the USD price is price x 10^expo. Example: 8000000000 is $80 at expo -8"
       - path: timestamp
         label: Publish time
-        description: "Unix seconds the price was published. Deposits and swaps refuse a feed 5 seconds older than the clock (quotes 15), and a keeper fill needs a time after its request; Perps accepts a time ahead of the clock"
+        description: Unix seconds the price was published. Keep-alive writes the Clock time every slot
     address:
       type: pubkey
     llm_context: |
@@ -40,12 +45,14 @@ templates:
       - Set fetchBeforeUse: true so the feed's other fields keep their live values, and false
         on a later override of the same feed in another scenario or slot: a reload drops the
         earlier local change.
-      - Set only the price for a liquidation: liquidations do not check a feed's age.
-      - Nothing publishes Doves prices on a surfnet. A JLP deposit, withdrawal, swap or quote
-        reads every custody's feed and refuses one older than 5 seconds (a quote 15), and a
-        keeper fill needs a price published after its request. For those, also write timestamp
-        on every feed the action reads, ahead of the Surfnet clock by as long as the test runs:
-        Perps accepts a time ahead of the clock and records only the clock.
+
+      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays, Surfpool republishes
+      this feed every slot at the Surfnet clock's time, as the Doves publisher does on mainnet, so
+      the price never goes stale and a keeper fill finds it published after its request. Only the
+      feeds an override names are republished. A JLP deposit, withdrawal, swap or quote reads every
+      custody's feed and refuses a stale one, so write this template on every feed of the pool for
+      those, at its live price where the scenario does not move it. A position reads the feeds of
+      its market and collateral custodies.
 
       LIQUIDATIONS: a keeper liquidates a position once collateral + PnL - close and borrow
       fees falls below size x 10000 / the custody's pricing.max_leverage. Move a long's price

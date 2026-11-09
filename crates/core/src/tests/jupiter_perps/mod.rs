@@ -387,7 +387,8 @@ fn local_vm(graph: &PerpsGraph) -> SurfnetSvmLocker {
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm| {
-        svm.inner.set_sysvar(&graph.clock);
+        // A time travel, not a Clock write: keep-alive stamps the time the surfnet keeps.
+        svm.apply_time_travel(graph.clock.clone()).unwrap();
         for (address, account) in &graph.accounts {
             svm.set_account(address, account.clone()).unwrap();
         }
@@ -417,10 +418,14 @@ fn fund(locker: &SurfnetSvmLocker, address: Pubkey) {
     set_account(locker, address, account);
 }
 
-fn set_clock(locker: &SurfnetSvmLocker, unix_timestamp: i64) {
-    let mut clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
-    clock.unix_timestamp = unix_timestamp;
-    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+/// A time travel to `unix_timestamp` in the open slot, which keep-alive republishes at.
+async fn travel(locker: &SurfnetSvmLocker, unix_timestamp: i64) {
+    let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+    let clock = Clock {
+        unix_timestamp,
+        ..clock
+    };
+    locker.apply_time_travel(clock, &None).await.unwrap();
 }
 
 fn local(locker: &SurfnetSvmLocker, address: &Pubkey) -> Option<Account> {
@@ -451,14 +456,14 @@ fn parsed(locker: &SurfnetSvmLocker, address: Pubkey) -> Value {
     parsed.parsed
 }
 
-/// Plays the overrides through the scenario materializer at the graph's slot, then reads each
+/// Plays the overrides through the scenario materializer at the next slot, then reads each
 /// pubkey-addressed target back as `jsonParsed` and checks the last value given for each field.
-async fn play(locker: &SurfnetSvmLocker, graph: &PerpsGraph, overrides: Vec<OverrideInstance>) {
+async fn play(locker: &SurfnetSvmLocker, overrides: Vec<OverrideInstance>) {
     let mut scenario = Scenario::new("Jupiter Perps".into(), "State a test prepares".into());
     for instance in &overrides {
         scenario.add_override(instance.clone());
     }
-    let slot = graph.clock.slot;
+    let slot = locker.get_latest_absolute_slot() + 1;
     locker.register_scenario(scenario, Some(slot)).unwrap();
     let materialized = locker.materialize_overrides_for_slot(&None, slot);
     materialized.await.unwrap();
@@ -493,10 +498,6 @@ fn price_override(feed: Pubkey, price: u64) -> OverrideInstance {
 fn live_price(graph: &PerpsGraph) -> OverrideInstance {
     let feed = graph.feed_of(custody_address(SOL_MINT));
     price_override(feed, u64_at(graph.data(&feed), feed::PRICE))
-}
-
-fn timestamp_override(feed: Pubkey, timestamp: i64) -> OverrideInstance {
-    template_override(PRICE, feed, json!({ "timestamp": timestamp }))
 }
 
 fn pyth_override() -> OverrideInstance {
@@ -786,10 +787,10 @@ async fn stressed(
     what: &str,
 ) -> SurfnetSvmLocker {
     let locker = perps_vm(graph).await;
-    play(&locker, graph, healthy).await;
+    play(&locker, healthy).await;
     let refused = liquidate(&locker, graph, KEEPER, at);
     expect_error(refused, INVALID_POSITION_STATE, what);
-    play(&locker, graph, stress).await;
+    play(&locker, stress).await;
     locker
 }
 
@@ -963,8 +964,9 @@ fn request_position(
 }
 
 /// Opens a position as the app does: the request, then the keeper's fill one second later, since
-/// a request cannot run in the second it was made, on a price the scenario publishes after the
-/// request. Returns the first failure or the keeper's transaction, and the position.
+/// a request cannot run in the second it was made, on a price published after the request. The
+/// scenario names the market's feed at its current price, so keep-alive republishes it. Returns
+/// the first failure or the keeper's transaction, and the position.
 async fn open_position(
     locker: &SurfnetSvmLocker,
     graph: &PerpsGraph,
@@ -972,19 +974,15 @@ async fn open_position(
     trader: Pubkey,
     size_usd: u64,
 ) -> (Sent, Pubkey) {
+    let feed = graph.feed_of(custody_address(market.mint));
+    let price = u64_at(&account(locker, &feed).data, feed::PRICE);
+    play(locker, vec![price_override(feed, price)]).await;
     let (requested, fill, at) = request_position(locker, graph, market, trader, size_usd);
     if requested.is_err() {
         return (requested, at);
     }
     let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
-    set_clock(locker, clock.unix_timestamp + 1);
-    let feed = graph.feed_of(custody_address(market.mint));
-    play(
-        locker,
-        graph,
-        vec![timestamp_override(feed, clock.unix_timestamp + 1)],
-    )
-    .await;
+    travel(locker, clock.unix_timestamp + 1).await;
     (send(locker, KEEPER, &[fill]), at)
 }
 
@@ -1069,7 +1067,7 @@ async fn doves_price_moves_the_jlp_quote_and_pyth_does_not() {
     let feed = graph.feed_of(sol);
     let pyth = pubkey_at(graph.data(&sol), custody::ORACLE_ACCOUNT);
     let locker = perps_vm(&graph).await;
-    play(&locker, &graph, vec![live_price(&graph)]).await;
+    play(&locker, vec![live_price(&graph)]).await;
     let quote_with = |pythnet: Pubkey| {
         let named = [("custody", sol), ("custody_pythnet_price_account", pythnet)];
         let params = json!({ "token_amount_in": ONE_SOL });
@@ -1078,7 +1076,7 @@ async fn doves_price_moves_the_jlp_quote_and_pyth_does_not() {
     };
     let baseline = quote_with(feed);
 
-    play(&locker, &graph, vec![pyth_override()]).await;
+    play(&locker, vec![pyth_override()]).await;
     let pyth_price = &parsed(&locker, pyth)["price_message"]["price"];
     assert_eq!(pyth_price, 1_000_000, "the Pyth override missed");
     for pythnet in [feed, pyth] {
@@ -1086,7 +1084,7 @@ async fn doves_price_moves_the_jlp_quote_and_pyth_does_not() {
     }
 
     let shocked = u64_at(graph.data(&feed), feed::PRICE) * 8 / 10;
-    play(&locker, &graph, vec![price_override(feed, shocked)]).await;
+    play(&locker, vec![price_override(feed, shocked)]).await;
     let quoted = quote_with(feed);
     assert!(
         amount(&quoted, "amount") < amount(&baseline, "amount"),
@@ -1176,7 +1174,7 @@ async fn custody_fees_set_the_opening_fee() {
     });
     let locker = perps_vm(&graph).await;
     let raised = template_override(TRADING_FEES, sol, raised);
-    play(&locker, &graph, vec![raised]).await;
+    play(&locker, vec![raised]).await;
 
     let trader = Pubkey::new_unique();
     let (sent, at) = open_position(&locker, &graph, &SOL_LONG, trader, SIZE).await;
@@ -1191,7 +1189,6 @@ async fn custody_fees_set_the_opening_fee() {
     let close_fee = json!({ "decrease_position_bps": 2_000 });
     play(
         &locker,
-        &graph,
         vec![template_override(TRADING_FEES, sol, close_fee)],
     )
     .await;
@@ -1206,12 +1203,12 @@ fn usdc_deposit(locker: &SurfnetSvmLocker, graph: &PerpsGraph) -> Sent {
     add_liquidity(locker, graph, wallet, USDC_MINT, DEPOSIT)
 }
 
-/// Nothing publishes Doves prices on a surfnet. A copied feed refuses a keeper fill on a request
-/// made after it (6045) and, 5 seconds on, a JLP deposit (6003), which reads every feed of the
-/// pool. A `timestamp` the scenario writes ahead of the clock serves both, since Perps records the
-/// clock and never the feed's time.
+/// Only keep-alive publishes Doves prices on a surfnet. A copied feed refuses a keeper fill on a
+/// request made after it (6045) and, 5 seconds on, a JLP deposit (6003), which reads every feed of
+/// the pool. A price override on each feed republishes it every slot at the Surfnet clock's time
+/// and the scenario's price, through produced slots and a time travel.
 #[tokio::test(flavor = "multi_thread")]
-async fn copied_prices_need_a_timestamp_the_scenario_writes() {
+async fn price_overrides_keep_their_feeds_published_at_the_clock() {
     let graph = perps_graph(&[]).await;
     let now = graph.clock.unix_timestamp;
     let locker = perps_vm(&graph).await;
@@ -1219,7 +1216,7 @@ async fn copied_prices_need_a_timestamp_the_scenario_writes() {
     let trader = Pubkey::new_unique();
     let (requested, fill, _) = request_position(&locker, &graph, &SOL_LONG, trader, 1_000_000_000);
     requested.expect("the request");
-    set_clock(&locker, now + 5);
+    travel(&locker, now + 5).await;
     let refused = send(&locker, KEEPER, &[fill.clone()]);
     expect_error(
         refused,
@@ -1233,10 +1230,45 @@ async fn copied_prices_need_a_timestamp_the_scenario_writes() {
         "a deposit 5 seconds after the copy",
     );
 
-    let ahead = |feed: &Pubkey| timestamp_override(*feed, now + DAY);
-    play(&locker, &graph, graph.feeds.iter().map(ahead).collect()).await;
+    // SOL 1% lower moves JLP well inside its 5% guard; the other feeds keep their live price.
+    let sol_feed = graph.feed_of(custody_address(SOL_MINT));
+    let prices: Vec<(Pubkey, u64)> = graph
+        .feeds
+        .iter()
+        .map(|feed| {
+            let live = u64_at(graph.data(feed), feed::PRICE);
+            let price = if *feed == sol_feed {
+                live * 99 / 100
+            } else {
+                live
+            };
+            (*feed, price)
+        })
+        .collect();
+    let overrides = prices
+        .iter()
+        .map(|(feed, price)| price_override(*feed, *price));
+    play(&locker, overrides.collect()).await;
+    let published = |what: &str| {
+        let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+        for (feed, price) in &prices {
+            let data = account(&locker, feed).data;
+            let timestamp = &data[feed::TIMESTAMP..feed::TIMESTAMP + 8];
+            let timestamp = i64::from_le_bytes(timestamp.try_into().unwrap());
+            assert_eq!(timestamp, clock.unix_timestamp, "{what}: {feed} timestamp");
+            assert_eq!(u64_at(&data, feed::PRICE), *price, "{what}: {feed} price");
+        }
+    };
+    published("the slot the prices play");
     send(&locker, KEEPER, &[fill]).expect("the fill on a price published after the request");
-    set_clock(&locker, now + DAY - 1);
+    usdc_deposit(&locker, &graph).expect("a deposit on published prices");
+
+    for slot in 1..=3 {
+        locker.confirm_current_block(&None).await.unwrap();
+        published(&format!("{slot} slots on"));
+    }
+    travel(&locker, now + DAY).await;
+    published("a time travel a day on");
     usdc_deposit(&locker, &graph).expect("a deposit a day on");
 }
 
@@ -1279,7 +1311,7 @@ async fn pool_limits_and_switches_refuse_a_deposit() {
 
     for (what, overrides, refused) in cases {
         let locker = perps_vm(&graph).await;
-        play(&locker, &graph, overrides).await;
+        play(&locker, overrides).await;
         let wallet = depositor(&locker, USDC_MINT, DEPOSIT);
         let sent = add_liquidity(&locker, &graph, wallet, USDC_MINT, DEPOSIT);
         match refused {
@@ -1316,7 +1348,7 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
         "fees.stable_swap_tax_bps": 0,
     });
     let locker = perps_vm(&graph).await;
-    play(&locker, &graph, fees(untaxed)).await;
+    play(&locker, fees(untaxed)).await;
 
     let named = [("custody", custody_address(USDC_MINT))];
     let params = json!({ "lp_amount_in": 10_000_000 });
@@ -1340,7 +1372,7 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     assert_eq!(stable_swap(), stable_bps, "USDC to JupUSD");
 
     let taxed = json!({ "fees.tax_bps": 1_000, "fees.stable_swap_tax_bps": 1_000 });
-    play(&locker, &graph, fees(taxed)).await;
+    play(&locker, fees(taxed)).await;
     let taxed = [USDC_MINT, SOL_MINT, BTC_MINT].map(|mint| {
         let deposit = graph.tokens_worth(mint, DEPOSIT as u128);
         let quoted = deposit_quote(&locker, &graph, mint, deposit).expect("taxed quote");

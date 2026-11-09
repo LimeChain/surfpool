@@ -79,6 +79,8 @@ pub const JUPITER_PERPS_DOVES_IDL_CONTENT: &str =
     include_str!("./protocols/jupiter-perps/doves/v1/idl.json");
 pub const JUPITER_PERPS_DOVES_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/jupiter-perps/doves/v1/overrides.yaml");
+pub const JUPITER_PERPS_DOVES_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/jupiter-perps/doves/v1/keep-alive.yaml");
 
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
@@ -349,6 +351,12 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             JUPITER_PERPS_DOVES_IDL_CONTENT,
             JUPITER_PERPS_DOVES_OVERRIDES_CONTENT,
+            "jupiter-perps-doves",
+        );
+        let idl = serde_json::from_str(JUPITER_PERPS_DOVES_IDL_CONTENT).expect("doves idl");
+        self.load_keep_alive(
+            Some(idl),
+            JUPITER_PERPS_DOVES_KEEP_ALIVE_CONTENT,
             "jupiter-perps-doves",
         );
     }
@@ -1092,6 +1100,21 @@ templates:
     #[test]
     fn the_bundled_registry_resolves_every_keep_alive_import() {
         TemplateRegistry::new().check_keep_alive_imports().unwrap();
+    }
+
+    #[test]
+    fn doves_price_keeps_its_feed_published() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("jupiter-perps-doves-price").unwrap();
+        let [import] = template.keep_alive.as_slice() else {
+            panic!("jupiter-perps-doves-price must keep its feed published");
+        };
+        assert_eq!(import.template, "jupiter-perps-doves-publication");
+        assert_eq!(import.address, KeepAliveAddress::Override);
+        assert_eq!(
+            import.values,
+            HashMap::from([("timestamp".to_string(), serde_json::json!("$unix_s"))])
+        );
     }
 
     #[test]
