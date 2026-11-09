@@ -509,6 +509,8 @@ fn confidence_scaled_to(data: &[u8], price: i64) -> [(String, serde_json::Value)
 #[derive(Debug)]
 struct Health {
     flags: u32,
+    asset_value: i128,
+    liability_value: i128,
     asset_value_maint: i128,
     liability_value_maint: i128,
 }
@@ -622,6 +624,8 @@ fn pulse_health(
                 .try_into()
                 .unwrap(),
         ),
+        asset_value: read_i128(&data, HEALTH_CACHE),
+        liability_value: read_i128(&data, HEALTH_CACHE + 16),
         asset_value_maint: read_i128(&data, HEALTH_CACHE + 32),
         liability_value_maint: read_i128(&data, HEALTH_CACHE + 48),
     }
@@ -696,8 +700,9 @@ fn forge(template_id: &str, data: &[u8], values: &[(String, serde_json::Value)])
 }
 
 /// The live account rebuilt with `project0-account-balance` into 10 SOL of collateral against a
-/// 500 USDC debt, every other slot empty.
-fn sol_backed_usdc_borrow(account: &[u8]) -> Vec<u8> {
+/// USDC debt, every other slot empty. The debt's initial-weight value is half the collateral's, as
+/// the program values both at live prices, so the account stays healthy whatever SOL trades at.
+fn sol_backed_usdc_borrow(fixture: &Fixture) -> Vec<u8> {
     // Balances are sorted by bank_pk, highest first.
     let sol = Pubkey::from_str_const(SOL_BANK);
     let usdc = Pubkey::from_str_const(USDC_BANK);
@@ -708,30 +713,36 @@ fn sol_backed_usdc_borrow(account: &[u8]) -> Vec<u8> {
 
     let one = 1i128 << 48;
     let empty = Pubkey::default().to_string();
-    let mut values = Vec::new();
-    let mut slot = |index: usize, bank: &str, tag: u8, asset: i128, liability: i128| {
-        let prefix = format!("lending_account.balances.{index}");
-        let active = u8::from(bank != empty);
-        values.extend([
-            (format!("{prefix}.active"), serde_json::json!(active)),
-            (format!("{prefix}.bank_pk"), serde_json::json!(bank)),
-            (format!("{prefix}.bank_asset_tag"), serde_json::json!(tag)),
-            (
-                format!("{prefix}.asset_shares.value"),
-                serde_json::json!(asset.to_string()),
-            ),
-            (
-                format!("{prefix}.liability_shares.value"),
-                serde_json::json!(liability.to_string()),
-            ),
-        ]);
+    let balances = |usdc_shares: i128| {
+        let mut values = Vec::new();
+        let mut slot = |index: usize, bank: &str, tag: u8, asset: i128, liability: i128| {
+            let prefix = format!("lending_account.balances.{index}");
+            let active = u8::from(bank != empty);
+            values.extend([
+                (format!("{prefix}.active"), serde_json::json!(active)),
+                (format!("{prefix}.bank_pk"), serde_json::json!(bank)),
+                (format!("{prefix}.bank_asset_tag"), serde_json::json!(tag)),
+                (
+                    format!("{prefix}.asset_shares.value"),
+                    serde_json::json!(asset.to_string()),
+                ),
+                (
+                    format!("{prefix}.liability_shares.value"),
+                    serde_json::json!(liability.to_string()),
+                ),
+            ]);
+        };
+        slot(0, SOL_BANK, 1, 10_000_000_000 * one, 0);
+        slot(1, USDC_BANK, 0, 0, usdc_shares * one);
+        for index in 2..16 {
+            slot(index, &empty, 0, 0, 0);
+        }
+        forge("project0-account-balance", fixture.data(ACCOUNT), &values)
     };
-    slot(0, SOL_BANK, 1, 10_000_000_000 * one, 0);
-    slot(1, USDC_BANK, 0, 0, 500_000_000 * one);
-    for index in 2..16 {
-        slot(index, &empty, 0, 0, 0);
-    }
-    forge("project0-account-balance", account, &values)
+
+    let remaining = [(SOL_BANK, SOL_BANK_ORACLE), (USDC_BANK, USDC_BANK_ORACLE)];
+    let measured = pulse_health(fixture, &balances(500_000_000), &[], &remaining);
+    balances(500_000_000 * measured.asset_value / (2 * measured.liability_value))
 }
 
 /// Differential check against the deployed program: a SOL-backed USDC borrow, built on the live
@@ -759,8 +770,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
         "the SOL bank reads a different price account"
     );
 
-    let one = 1i128 << 48;
-    let account = sol_backed_usdc_borrow(fixture.data(ACCOUNT));
+    let account = sol_backed_usdc_borrow(&fixture);
     let remaining = [(SOL_BANK, SOL_BANK_ORACLE), (USDC_BANK, USDC_BANK_ORACLE)];
 
     let baseline = pulse_health(&fixture, &account, &[], &remaining);
@@ -770,24 +780,23 @@ async fn risk_engine_honours_weight_and_price_overrides() {
     );
     assert!(baseline.asset_value_maint > baseline.liability_value_maint);
 
+    // Each lever goes halfway past the point where the program turns the account liquidatable.
+    // SOL is its only asset, so the SOL weight and price scale the asset value one-for-one.
+    let (assets, debt) = (baseline.asset_value_maint, baseline.liability_value_maint);
+    let live_weight = read_i128(fixture.data(SOL_BANK), 312);
+    let weight = serde_json::json!((live_weight * debt / (2 * assets)).to_string());
     let weakened_bank = forge(
         "project0-bank-risk-weights",
         fixture.data(SOL_BANK),
         &[
-            (
-                "config.asset_weight_init.value".to_string(),
-                serde_json::json!((one * 3 / 10).to_string()),
-            ),
-            (
-                "config.asset_weight_maint.value".to_string(),
-                serde_json::json!((one * 3 / 10).to_string()),
-            ),
+            ("config.asset_weight_init.value".to_string(), weight.clone()),
+            ("config.asset_weight_maint.value".to_string(), weight),
         ],
     );
     let weakened = pulse_health(&fixture, &account, &[(SOL_BANK, weakened_bank)], &remaining);
     assert!(
         weakened.engine_ran() && !weakened.healthy(),
-        "30% weight should be liquidatable: {weakened:?}"
+        "half the liquidation weight should be liquidatable: {weakened:?}"
     );
     assert!(weakened.asset_value_maint < baseline.asset_value_maint);
     assert_eq!(
@@ -797,7 +806,8 @@ async fn risk_engine_honours_weight_and_price_overrides() {
 
     let fresh = pyth_publish_time(fixture.data(&sol_feed))
         .max(pyth_publish_time(fixture.data(USDC_BANK_ORACLE)));
-    let crash_price = 20i64 * 100_000_000;
+    let live_price = i64::from_le_bytes(fixture.data(&sol_feed)[73..81].try_into().unwrap());
+    let crash_price = (live_price as i128 * debt / (2 * assets)) as i64;
     let [conf, ema_conf] = confidence_scaled_to(fixture.data(&sol_feed), crash_price);
     let crashed_oracle = forge(
         "pyth-core-compatible-price-feed-v2",
@@ -831,7 +841,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
     );
     assert!(
         crashed.engine_ran() && !crashed.healthy(),
-        "SOL at $20 should be liquidatable: {crashed:?}"
+        "SOL at half its liquidation price should be liquidatable: {crashed:?}"
     );
     assert!(crashed.asset_value_maint < baseline.asset_value_maint);
     assert_eq!(
@@ -853,7 +863,7 @@ async fn usdc_breaker_accepts_a_move_once_its_reference_prices_follow() {
     let authority = Keypair::new();
     let account = forge(
         "project0-account-authority",
-        &sol_backed_usdc_borrow(fixture.data(ACCOUNT)),
+        &sol_backed_usdc_borrow(&fixture),
         &[(
             "authority".to_string(),
             serde_json::json!(authority.pubkey().to_string()),
