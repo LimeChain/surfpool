@@ -189,8 +189,9 @@ impl TemplateRegistry {
     }
 
     /// Fails on a keep-alive import the registry cannot apply: its template must be a loaded
-    /// keep-alive template that has every property it sets, and an input address must name a
-    /// pubkey input of the importing template.
+    /// keep-alive template that has every property it sets, an input address must name a pubkey
+    /// input of the importing template, and an owned address an account of the keep-alive
+    /// template's IDL.
     pub fn check_keep_alive_imports(&self) -> Result<(), String> {
         for template in self.templates.values() {
             for import in &template.keep_alive {
@@ -219,6 +220,13 @@ impl TemplateRegistry {
                              not {value}"
                         ));
                     }
+                }
+                if let KeepAliveAddress::Owned { account, .. } = &import.address
+                    && keep_alive.account_discriminator(account).is_none()
+                {
+                    return fail(format!(
+                        "its IDL has no account '{account}' with a discriminator"
+                    ));
                 }
                 if let KeepAliveAddress::Input(name) = &import.address {
                     let is_pubkey_input = template.properties.iter().any(|property| {
@@ -1094,6 +1102,30 @@ templates:
                 "    keep_alive:\n      - { template: example-fresh, address: { type: override }, values: { slot: $slot } }\n    address: { type: pubkey }",
             ),
             "'example-fresh' is a keep-alive template and cannot import keep-alive",
+        );
+    }
+
+    #[test]
+    fn an_owned_import_needs_its_account_in_the_keep_alive_idl() {
+        use crate::scenarios::keep_alive::tests::{OWNED_OVERRIDES, owned_registry};
+
+        owned_registry(OWNED_OVERRIDES)
+            .check_keep_alive_imports()
+            .unwrap();
+        let error =
+            owned_registry(&OWNED_OVERRIDES.replace("account: PriceUpdateV2", "account: Nope"))
+                .check_keep_alive_imports()
+                .unwrap_err();
+        assert!(error.contains("its IDL has no account 'Nope'"), "{error}");
+        let error = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: State }",
+        ))
+        .check_keep_alive_imports()
+        .unwrap_err();
+        assert!(
+            error.contains("its IDL has no account 'State'"),
+            "a raw layout has no IDL: {error}"
         );
     }
 
