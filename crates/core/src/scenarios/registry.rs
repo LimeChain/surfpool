@@ -74,6 +74,8 @@ pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
 pub const VELOCITY_V1_IDL_CONTENT: &str = include_str!("./protocols/velocity/v1/idl.json");
 pub const VELOCITY_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/velocity/v1/overrides.yaml");
+pub const VELOCITY_V1_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/velocity/v1/keep-alive.yaml");
 
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
@@ -341,6 +343,8 @@ impl TemplateRegistry {
             VELOCITY_V1_OVERRIDES_CONTENT,
             "velocity",
         );
+        let idl = serde_json::from_str(VELOCITY_V1_IDL_CONTENT).expect("velocity idl");
+        self.load_keep_alive(Some(idl), VELOCITY_V1_KEEP_ALIVE_CONTENT, "velocity");
     }
 
     fn load_protocol_overrides(
@@ -1081,6 +1085,39 @@ templates:
     #[test]
     fn the_bundled_registry_resolves_every_keep_alive_import() {
         TemplateRegistry::new().check_keep_alive_imports().unwrap();
+    }
+
+    #[test]
+    fn velocity_oracle_price_keeps_its_oracle_posted() {
+        let registry = TemplateRegistry::new();
+        for template in registry.by_protocol("Velocity") {
+            let id = &template.id;
+            if id != "velocity-oracle-price" {
+                assert!(template.keep_alive.is_empty(), "{id} writes no oracle");
+                continue;
+            }
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{id} must keep its oracle posted");
+            };
+            assert_eq!(import.template, "velocity-oracle-publication");
+            assert_eq!(import.address, KeepAliveAddress::Override, "{id}");
+            let clock = surfpool_types::KeepAliveClock {
+                slot: 7,
+                unix_time_ms: 1_800_000_000_123,
+            };
+            let values = import.values_at(&clock).unwrap();
+            assert_eq!(values["posted_slot"], serde_json::json!(7));
+            // Pyth Lazer timestamps are microseconds.
+            assert_eq!(
+                values["publish_time"],
+                serde_json::json!(1_800_000_000_123_000u64)
+            );
+        }
+        let publication = registry.keep_alive_template("velocity-oracle-publication");
+        assert!(
+            publication.unwrap().idl.is_some(),
+            "written through the IDL"
+        );
     }
 
     #[test]

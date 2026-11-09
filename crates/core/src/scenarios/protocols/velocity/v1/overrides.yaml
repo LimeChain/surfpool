@@ -22,12 +22,16 @@ templates:
         description: Uncertainty band in the same scale as price; scale it with price so their ratio holds
       - path: posted_slot
         label: Posted Slot
-        description: Slot the price counts as posted at; the program ages the price from it. Write the current slot
+        description: Slot the price counts as posted at. Keep-alive writes the current slot every slot
       - path: publish_time
         label: Publish Time
-        description: Pyth Lazer timestamp in microseconds (unix seconds x 1000000)
+        description: Pyth Lazer timestamp in microseconds. Keep-alive writes the Clock time every slot
     address:
       type: pubkey
+    keep_alive:
+      - template: velocity-oracle-publication
+        address: { type: override }
+        values: { posted_slot: $slot, publish_time: $unix_us }
     llm_context: |
       Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. Each perp market reads
       the PythLazerOracle account named in its `oracle` field. A spot market can share it: SOL
@@ -44,30 +48,31 @@ templates:
       fetchBeforeUse false, since a reload drops earlier local changes to it; two overrides of it
       in the same slot can both keep true.
 
-      Write price, posted_slot and publish_time together. Read the oracle and the Clock in one
-      getMultipleAccounts call with encoding jsonParsed: [<oracle>,
-      "SysvarC1ock11111111111111111111111111111111"]. price is USD x 10^-exponent, with exponent
-      read from the same oracle; leave exponent alone. posted_slot is the Clock's slot. publish_time
-      is its unixTimestamp x 1000000 (microseconds). Scale conf by the same factor as price.
+      THE PRICE STAYS POSTED BY ITSELF. From the slot this override plays, Surfpool reposts this
+      oracle every slot, as Velocity's keeper does on mainnet: posted_slot becomes the slot and
+      publish_time the Clock time in microseconds, so the price never goes stale. Write price and
+      conf only. Read the oracle with getAccountInfo and encoding jsonParsed: price is USD x
+      10^-exponent, with exponent read from the same oracle; leave exponent alone. Scale conf by
+      the same factor as price.
 
-      Nothing republishes the price on a surfnet, so it ages as the clock moves past posted_slot.
-      Margin checks, such as withdrawals, orders that add risk and matched fills, refuse it once it
-      is older than the State's slots_before_stale_for_margin window: 240 slots, three times that
-      for the USDT price (InvalidOracle, 6035). Add velocity-exchange-risk with a higher
-      oracle_guard_rails.validity.slots_before_stale_for_margin to keep it usable longer. AMM fills,
-      and settling PnL right after a price move, need the price posted within the last 20 slots.
+      An account's margin also reads the oracles of its other markets and its collateral, such as
+      the USDT price, which nothing reposts unless an override names them. Margin checks, such as
+      withdrawals, orders that add risk and matched fills, refuse such a price once it is older than
+      the State's slots_before_stale_for_margin window: 240 slots, three times that for the USDT
+      price (InvalidOracle, 6035). Add velocity-exchange-risk with a higher
+      oracle_guard_rails.validity.slots_before_stale_for_margin to keep them usable longer.
       Liquidations ignore a price's age.
 
       Fills read the market's own MM oracle price instead of this one when the two are within 1%
-      and the market's market_stats.mm_oracle_sequence_id is newer than publish_time; for a move
-      under 1%, write publish_time above that sequence id.
+      and the market's market_stats.mm_oracle_sequence_id, also in microseconds, is newer than
+      publish_time. A fetched market keeps the id it had on mainnet, so for a move under 1% fills
+      read the MM price until the surfnet's clock passes it.
 
       Liquidation refuses a price more than 50% from the market's 5-minute TWAP
       (PriceBandsBreached, 6023) or more than 5x from its TWAP. For a deeper move add
       velocity-exchange-risk to the same scenario.
 
-      EXAMPLE - "SOL drops 20%": with the SOL-PERP oracle's live price p, price: p x 0.8,
-      posted_slot: the Clock's slot, publish_time: its unixTimestamp x 1000000.
+      EXAMPLE - "SOL drops 20%": with the SOL-PERP oracle's live price p, price: p x 0.8.
 
       If an action fails with ExchangePaused (6024), the copied State carries a mainnet pause:
       add velocity-exchange-risk with exchange_status: 0.
@@ -179,12 +184,12 @@ templates:
       immediate fills. A paused action fails with ExchangePaused (6024). The State comes with
       mainnet's pauses; exchange_status: 0 lifts them.
 
-      Nothing republishes Velocity prices on a surfnet. Margin checks, such as withdrawals, orders
-      that add risk and matched fills, refuse a price more than slots_before_stale_for_margin units
-      of 400 ms past its posted_slot. The program counts two slots per unit and gives the USDT price
-      three times the window; the live 120 is 240 slots. Raise it to keep moved prices usable
-      longer. The program's admin path allows up to 1000000 (2,000,000 slots); the program reads
-      any value.
+      Surfpool reposts only the oracles velocity-oracle-price writes. Margin checks, such as
+      withdrawals, orders that add risk and matched fills, also read other markets' oracles, and
+      refuse a price more than slots_before_stale_for_margin units of 400 ms past its posted_slot.
+      The program counts two slots per unit and gives the USDT price three times the window; the
+      live 120 is 240 slots. Raise it to keep those prices usable longer. The program's admin path
+      allows up to 1000000 (2,000,000 slots); the program reads any value.
 
       Liquidation refuses a price further from the market's 5-minute TWAP than
       oracle_twap_5min_percent_divergence (1000000 = 100%, never below 500000) with

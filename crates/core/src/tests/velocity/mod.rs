@@ -80,6 +80,7 @@ const PRICE: Range<usize> = 8..16;
 const PUBLISH_TIME: Range<usize> = 16..24;
 const POSTED_SLOT: Range<usize> = 24..32;
 const EXPONENT: Range<usize> = 32..36;
+const CONF: Range<usize> = 40..48;
 
 const STATE_SIGNER: Range<usize> = 488..520;
 const SLOTS_BEFORE_STALE_FOR_AMM: Range<usize> = 1304..1312;
@@ -591,13 +592,13 @@ impl Vm {
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = SurfnetSvmLocker::new(svm);
         locker.with_svm_writer(|svm| {
-            svm.inner.set_sysvar(&mainnet.clock);
             svm.inner.svm.add_program(PROGRAM, &mainnet.elf).unwrap();
             for (address, account) in &mainnet.accounts {
                 svm.set_account(address, account.clone()).unwrap();
             }
         });
         let vm = Self { locker, mainnet };
+        vm.set_clock(&mainnet.clock);
         vm.apply(EXCHANGE_RISK, STATE, json!({"exchange_status": 0}))
             .await;
         vm
@@ -615,8 +616,17 @@ impl Vm {
         let mut clock = self.clock();
         clock.unix_timestamp += (slot.saturating_sub(clock.slot) / 5) as i64;
         clock.slot = slot;
-        self.locker
-            .with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+        self.set_clock(&clock);
+    }
+
+    /// Sets the Clock, and the open slot and time keep-alive stamps from it, without producing a
+    /// block or running keep-alive, so a test can age a price.
+    fn set_clock(&self, clock: &Clock) {
+        self.locker.with_svm_writer(|svm| {
+            svm.inner.set_sysvar(clock);
+            svm.set_latest_absolute_slot(clock.slot);
+            svm.updated_at = clock.unix_timestamp as u64 * 1_000;
+        });
     }
 
     /// Applies one template to `address` through the scenario registry and materializer.
@@ -627,7 +637,11 @@ impl Vm {
         let values = values.as_object().unwrap().clone().into_iter().collect();
         let instance = OverrideInstance::new(template.to_string(), 0, address).with_values(values);
         scenario.add_override(instance);
-        self.locker.register_scenario(scenario, Some(slot)).unwrap();
+        // The locker only schedules from the next slot; this plays the override in the open one.
+        let registered = self
+            .locker
+            .with_svm_writer(|svm| svm.register_scenario(scenario, Some(slot)));
+        registered.unwrap();
         let materialized = self.locker.materialize_overrides_for_slot(&None, slot);
         materialized.await.unwrap();
     }
@@ -1300,4 +1314,87 @@ async fn amm_fills_and_settling_a_moved_price_need_a_price_within_the_amm_window
     vm.write(&STATE, SLOTS_BEFORE_STALE_FOR_AMM, &past_i8);
     let filled = book.matched_fill();
     expect_error(filled, CASTING_FAILURE, "an AMM window over 127");
+}
+
+/// velocity-oracle-price keeps its oracle posted, as Velocity's keeper does on mainnet: from the
+/// slot it plays, later slots and a time travel repost it at the open slot and Clock time, and the
+/// scenario's price and confidence stay.
+#[tokio::test]
+async fn the_oracle_price_stays_posted_through_later_slots_and_a_time_travel() {
+    let mainnet = mainnet().await;
+    let oracle = mainnet.oracle_of(SOL_PERP);
+    let original = mainnet.account(&oracle).data.clone();
+    let price = i64_at(&original, PRICE) / 10 * 8;
+    let conf = u64_at(&original, CONF) / 10 * 8;
+    let mut scenario = Scenario::new("SOL drops 20%".into(), "keep-alive".into());
+    let target = AccountAddress::Pubkey(oracle.to_string());
+    let values = HashMap::from([
+        ("price".to_string(), json!(price)),
+        ("conf".to_string(), json!(conf)),
+    ]);
+    scenario
+        .add_override(OverrideInstance::new(ORACLE_PRICE.into(), 0, target).with_values(values));
+
+    let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+    svm.apply_time_travel(mainnet.clock.clone()).unwrap();
+    svm.set_account(&oracle, mainnet.account(&oracle).clone())
+        .unwrap();
+    let slot = svm.get_latest_absolute_slot();
+    svm.register_scenario(scenario, Some(slot)).unwrap();
+    svm.materialize_overrides_for_slot(&None, slot)
+        .await
+        .unwrap();
+
+    let assert_posted = |svm: &SurfnetSvm, what: &str| {
+        let data = svm.get_account(&oracle).unwrap().unwrap().data;
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(clock.slot, svm.get_latest_absolute_slot(), "{what}");
+        assert_eq!(
+            u64_at(&data, POSTED_SLOT),
+            clock.slot,
+            "{what}: posted_slot"
+        );
+        let publish_time = u64_at(&data, PUBLISH_TIME);
+        assert_eq!(publish_time, svm.updated_at * 1_000, "{what}: publish_time");
+        assert_eq!(
+            publish_time / 1_000_000,
+            clock.unix_timestamp as u64,
+            "{what}"
+        );
+        assert_eq!(
+            (i64_at(&data, PRICE), u64_at(&data, CONF)),
+            (price, conf),
+            "{what}"
+        );
+        assert!(
+            diff_indices(&original, &data)
+                .iter()
+                .all(|i| (PRICE.start..POSTED_SLOT.end).contains(i) || CONF.contains(i)),
+            "{what}: escaped the price and keep-alive write set"
+        );
+        publish_time
+    };
+    assert_posted(&svm, "the slot the override plays");
+    for _ in 0..3 {
+        svm.confirm_current_block().unwrap();
+        svm.materialize_overrides(&None).await.unwrap();
+        assert_posted(&svm, "a later slot");
+    }
+
+    let clock = svm.inner.get_sysvar::<Clock>();
+    let landing = svm.apply_time_travel(Clock {
+        slot: clock.slot + 10_000,
+        unix_timestamp: clock.unix_timestamp + 3_600,
+        ..clock
+    });
+    let landing = landing.unwrap().absolute_slot;
+    svm.apply_keep_alive(&None, landing).await;
+    let published = assert_posted(&svm, "a time travel");
+    // Fills read the market's MM oracle price within 1% only while its sequence id is newer.
+    let mm_price = |market| u64_at(&mainnet.account(market).data, MM_ORACLE_SEQUENCE_ID);
+    let newest_mm_price = mainnet.perp_markets.iter().map(mm_price).max().unwrap();
+    assert!(
+        published > newest_mm_price,
+        "{published} vs {newest_mm_price}"
+    );
 }
