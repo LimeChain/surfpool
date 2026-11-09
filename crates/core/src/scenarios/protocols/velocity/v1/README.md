@@ -3,8 +3,8 @@
 Velocity is a perpetuals exchange built on the Drift v2 program. Surfpool bundles its IDL and five
 override templates, so a scenario can move a market's oracle price, tighten a market's margin
 requirements, change trading fees, collateral weights, borrow rates and liquidation fees, or pause
-actions across the exchange. Surfpool keeps an oracle a scenario moves posted on its own. The
-templates only prepare state: trades, withdrawals and
+actions across the exchange. Once a scenario moves an oracle, Surfpool keeps every Velocity oracle
+posted on its own. The templates only prepare state: trades, withdrawals and
 liquidations are sent by your own code. For how scenarios work in general see the
 [scenarios README](../../../README.md).
 
@@ -14,7 +14,7 @@ liquidations are sent by your own code. For how scenarios work in general see th
 
 | Template | Account | Overrides |
 |---|---|---|
-| `velocity-oracle-price` | `PythLazerOracle` | the price a market reads and its confidence; Surfpool keeps it posted |
+| `velocity-oracle-price` | `PythLazerOracle` | the price a market reads and its confidence; Surfpool then keeps every oracle posted |
 | `velocity-perp-market-risk` | `PerpMarket` | margin ratios, status, paused operations, the open interest cap and liquidation fees |
 | `velocity-exchange-risk` | `State` | exchange-wide pauses, how long margin checks accept a price, the price guard rails liquidation checks and the liquidation margin buffer |
 | `velocity-fees` | `State` | the taker fee and maker rebate every perp trader pays |
@@ -68,20 +68,21 @@ Set `fetchBeforeUse: true` to pull the account from upstream before the write.
 ## Prices on a fork
 
 On mainnet Velocity's keeper posts every oracle continuously. Nobody runs it against a surfnet, so
-Surfpool reposts an oracle `velocity-oracle-price` writes every slot
-([keep-alive](../../../README.md#keep-alive)): from the slot the override plays, `posted_slot` is
-the slot and `publish_time` the Clock time in microseconds, while the price and confidence stay as
-the scenario set them. The price stays 0 slots old, through later slots and time travel, until the
-network is reset. There is nothing to schedule.
+from the slot a `velocity-oracle-price` override plays, Surfpool reposts each slot every Velocity
+oracle the surfnet has loaded ([keep-alive](../../../README.md#keep-alive)), and from the next slot
+each one a transaction loads later: `posted_slot` is the slot and `publish_time` the Clock time in
+microseconds, while each price and confidence stay as they were or as the scenario set them. The
+prices stay 0 slots old, the USDT price and other markets' oracles among them, through later slots
+and time travel, until the network is reset. There is nothing to schedule.
 
-An oracle no override names is not reposted, and the program ages it in slots,
-`clock.slot - posted_slot`. An account's margin reads the oracles of all its markets and its
-collateral, the USDT price among them, so these windows still apply:
+Before such an override plays, and for an oracle an override writes with `keepAlive: false`, nothing
+reposts the price, and the program ages it in slots, `clock.slot - posted_slot`. An account's margin
+reads the oracles of all its markets and its collateral, so these windows apply to such a price:
 
 - Margin checks, such as withdrawals, orders that add risk and matched fills, refuse a price older
   than the State's `oracle_guard_rails.validity.slots_before_stale_for_margin` (`InvalidOracle`,
   6035). It is 120 units of 400 ms, which is 240 slots at the program's 200 ms slot clock, and
-  three times that for the USDT price. Raise it with `velocity-exchange-risk` to keep a moved price
+  three times that for the USDT price. Raise it with `velocity-exchange-risk` to keep such a price
   usable longer; the program's admin path allows up to `1000000` (2,000,000 slots).
 - AMM fills need a recent price. An order placed after the price fills from the AMM at once only
   within the market's `oracle_slot_delay_override` (the price's own slot when it is negative). An
@@ -96,8 +97,9 @@ collateral, the USDT price among them, so these windows still apply:
 read that instead when its `market_stats.mm_oracle_sequence_id`, also in microseconds, is newer than
 `publish_time` and the two prices are within 1% of each other. A fetched market keeps the id it had
 on mainnet, so for a move under 1% fills can read the MM price until the surfnet's clock passes it.
-To make such a move take effect at once, write `market_stats.mm_oracle_sequence_id: 0` on the market
-with `velocity-perp-market-risk`.
+Keep-alive writes the Clock time to every oracle, so once the clock passes a market's id, that
+market's fills read its oracle. To make such a move take effect at once, write
+`market_stats.mm_oracle_sequence_id: 0` on the market with `velocity-perp-market-risk`.
 
 # Recipes
 
@@ -211,11 +213,12 @@ fail with `MaxOpenInterest` (6154). `status: {"ReduceOnly": null}` refuses any o
 | `SufficientCollateral` (6004) on liquidation | the account still covers its maintenance requirement; move the price further, raise `margin_ratio_maintenance` or lower the collateral's `maintenance_asset_weight` |
 | `PriceBandsBreached` (6023) | the price is more than 50% (or `oracle_twap_5min_percent_divergence`) from the 5-minute TWAP |
 | `ExchangePaused` (6024) | the State is copied with mainnet's pause switches; write `exchange_status: 0` with `velocity-exchange-risk` |
-| `InvalidOracle` (6035) on a withdrawal | an oracle no override names, such as another market's or the USDT price, is older than the margin window (240 slots, 720 for USDT); name it in `velocity-oracle-price` or raise `slots_before_stale_for_margin` with `velocity-exchange-risk`. A fresh price is invalid for another reason, such as being more than `too_volatile_ratio` times from its TWAP |
-| `PlaceAndTakeOrderSuccessConditionFailed` (6289) | nothing filled the order: a matched fill met a price past the margin window, or the AMM refused a price older than its window; both happen only to an oracle no override names |
+| `InvalidOracle` (6035) on a withdrawal | an oracle nothing reposts, such as the USDT price before a `velocity-oracle-price` override plays or one written with `keepAlive: false`, is older than the margin window (240 slots, 720 for USDT); play `velocity-oracle-price`, turn keep-alive on for it again, or raise `slots_before_stale_for_margin` with `velocity-exchange-risk`. A fresh price is invalid for another reason, such as being more than `too_volatile_ratio` times from its TWAP |
+| `PlaceAndTakeOrderSuccessConditionFailed` (6289) | nothing filled the order: a matched fill met a price past the margin window, or the AMM refused a price older than its window; both happen only to an oracle nothing reposts |
 | `fill_perp_order` fills nothing and logs `taker does not cross amm` | the order's auction price has not reached the AMM's quote; on an oracle nothing reposts, a market order's auction can outlast the AMM's 20-slot window, so price a limit order through the quote |
+| `taker does not cross amm` right after a scenario moves a price | nobody repegs the AMM on a fork, so it still quotes the price it was fetched with; send the permissionless `update_amms` for the market first, while its oracle is under 10 slots old |
 | `AMMNotUpdatedInSameSlot` (6096) on `settle_pnl` | the price moved from the market's 5-minute TWAP; send `update_amms` for the market in the same transaction |
-| `OracleStaleForAMM` (6266) or `OracleStaleForMargin` (6264) on `settle_pnl` | the price is more than 20 slots old for a settle after a move: nothing reposts an oracle no override names, so move it with `velocity-oracle-price` |
+| `OracleStaleForAMM` (6266) or `OracleStaleForMargin` (6264) on `settle_pnl` | the price is more than 20 slots old for a settle after a move: nothing reposts the oracle yet, or an override turned keep-alive off for it; play `velocity-oracle-price` |
 | `MaxDeposit` (6038) | the spot market's deposits would pass `max_token_deposits` |
 | `status` override did nothing | it must be an object such as `{"Active": null}`, not a number or a bare string |
 | a `u64` override did nothing | `u64` fields such as `max_token_deposits` take JSON numbers; only 128-bit fields take decimal strings |

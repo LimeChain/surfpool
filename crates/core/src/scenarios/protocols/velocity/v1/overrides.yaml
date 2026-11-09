@@ -30,7 +30,10 @@ templates:
       type: pubkey
     keep_alive:
       - template: velocity-oracle-publication
-        address: { type: override }
+        address:
+          type: owned
+          owner: vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P
+          account: PythLazerOracle
         values: { posted_slot: $slot, publish_time: $unix_us }
     llm_context: |
       Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. Each perp market reads
@@ -56,18 +59,25 @@ templates:
       the same factor as price.
 
       An account's margin also reads the oracles of its other markets and its collateral, such as
-      the USDT price, which nothing reposts unless an override names them. Margin checks, such as
-      withdrawals, orders that add risk and matched fills, refuse such a price once it is older than
-      the State's slots_before_stale_for_margin window: 240 slots, three times that for the USDT
-      price (InvalidOracle, 6035). Add velocity-exchange-risk with a higher
-      oracle_guard_rails.validity.slots_before_stale_for_margin to keep them usable longer.
-      Liquidations ignore a price's age.
+      the USDT price. From the slot this override plays, Surfpool also reposts every other Velocity
+      oracle the surfnet has loaded, keeping its price, and from the next slot every one a
+      transaction loads later, so margin checks and fills find them fresh. To keep one oracle stale
+      on purpose, override it with this template and keepAlive: false. It then ages, and margin
+      checks, such as withdrawals, orders that add risk and matched fills, refuse it once it is
+      older than the State's slots_before_stale_for_margin window: 240 slots, three times that for
+      the USDT price (InvalidOracle, 6035). Liquidations ignore a price's age.
 
       Fills read the market's own MM oracle price instead of this one when the two are within 1%
       and the market's market_stats.mm_oracle_sequence_id, also in microseconds, is newer than
       publish_time. A fetched market keeps the id it had on mainnet, so for a move under 1% fills
-      read the MM price until the surfnet's clock passes it. To make such a move take effect at
-      once, add velocity-perp-market-risk on the market with market_stats.mm_oracle_sequence_id: 0.
+      read the MM price until the surfnet's clock passes it. Every reposted oracle carries the
+      Clock time, so once the clock passes a market's id, that market's fills read its oracle. To
+      make such a move take effect at once, add velocity-perp-market-risk on the market with
+      market_stats.mm_oracle_sequence_id: 0.
+
+      Nobody repegs the AMM on a fork, so after a move it still quotes the price it was fetched
+      with and an order that must fill against it fails with "taker does not cross amm" (6289).
+      Send the permissionless update_amms for the market first.
 
       Liquidation refuses a price more than 50% from the market's 5-minute TWAP
       (PriceBandsBreached, 6023) or more than 5x from its TWAP. For a deeper move add
@@ -169,7 +179,7 @@ templates:
         description: "Bit flags: 1 deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM immediate fills. 0 means everything runs"
       - path: oracle_guard_rails.validity.slots_before_stale_for_margin
         label: Margin Staleness Window
-        description: "Margin checks refuse a price older than this many 400 ms units, counted from its posted_slot at two slots per unit, and three times that for USDT. Live: 120 (240 slots). Raise it to keep a moved price usable longer. Example: 1000000"
+        description: "Margin checks refuse a price older than this many 400 ms units, counted from its posted_slot at two slots per unit, and three times that for USDT. Live: 120 (240 slots). Raise it to keep a price nothing reposts usable longer. Example: 1000000"
       - path: oracle_guard_rails.price_divergence.oracle_twap_5min_percent_divergence
         label: Max Distance From 5-Minute TWAP
         description: "How far a price may sit from the 5-minute TWAP for liquidation, 1000000 = 100%. Never below 50%. Example: 1000000"
@@ -194,12 +204,14 @@ templates:
       immediate fills. A paused action fails with ExchangePaused (6024). The State comes with
       mainnet's pauses; exchange_status: 0 lifts them.
 
-      Surfpool reposts only the oracles velocity-oracle-price writes. Margin checks, such as
-      withdrawals, orders that add risk and matched fills, also read other markets' oracles, and
-      refuse a price more than slots_before_stale_for_margin units of 400 ms past its posted_slot.
-      The program counts two slots per unit and gives the USDT price three times the window; the
-      live 120 is 240 slots. Raise it to keep those prices usable longer. The program's admin path
-      allows up to 1000000 (2,000,000 slots); the program reads any value.
+      Margin checks, such as withdrawals, orders that add risk and matched fills, read the oracles
+      of all an account's markets, and refuse a price more than slots_before_stale_for_margin units
+      of 400 ms past its posted_slot. The program counts two slots per unit and gives the USDT
+      price three times the window; the live 120 is 240 slots. From the slot a
+      velocity-oracle-price override plays, Surfpool reposts every Velocity oracle at the Clock, so
+      the window matters before that and for an oracle written with keepAlive: false. Raise it to
+      keep those prices usable longer. The program's admin path allows up to 1000000 (2,000,000
+      slots); the program reads any value.
 
       Liquidation refuses a price further from the market's 5-minute TWAP than
       oracle_twap_5min_percent_divergence (1000000 = 100%, never below 500000) with
