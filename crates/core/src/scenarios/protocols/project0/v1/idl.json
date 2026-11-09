@@ -9531,7 +9531,7 @@
           "name": "marginfi_account",
           "docs": [
             "marginfi account was closed.",
-            "The ownership check is checked in the handler or/and type checks are made in the handler."
+            "The handler validates ownership and layout unless the account is already closed."
           ],
           "writable": true,
           "relations": [
@@ -13123,6 +13123,19 @@
         199,
         68,
         51
+      ]
+    },
+    {
+      "name": "MarginfiAccountExecuteOrderEvent",
+      "discriminator": [
+        225,
+        224,
+        93,
+        157,
+        202,
+        84,
+        223,
+        107
       ]
     },
     {
@@ -17570,7 +17583,9 @@
               "ignore oracle issues if health is still satisfactory with some balance zeroed out).",
               "* EMODE BOOSTED = 8 - If set, an emode or same-asset entry weights every collateral balance",
               "above its own bank's maintenance weight. Only written by maintenance passes.",
-              "* 16, 32, 64, 128, etc - reserved for future use"
+              "* LIQUIDATION START = 16 - Cache was computed at the start of a liquidation.",
+              "* DELEVERAGE START = 32 - Cache was computed at the start of a deleverage.",
+              "* 64, 128, etc - reserved for future use"
             ],
             "type": "u32"
           },
@@ -19735,6 +19750,10 @@
           },
           {
             "name": "health_cache",
+            "docs": [
+              "Replace through `set_health_cache` or `set_receivership_start_health_cache` so that",
+              "ordinary updates cannot retain receivership-start provenance."
+            ],
             "type": {
               "defined": {
                 "name": "HealthCache"
@@ -19910,6 +19929,108 @@
                 "name": "AccountEventHeader"
               }
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarginfiAccountExecuteOrderEvent",
+      "docs": [
+        "Emitted after end-execution checks pass. Consumers must also verify transaction success."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "header",
+            "docs": [
+              "The signer is the executor."
+            ],
+            "type": {
+              "defined": {
+                "name": "AccountEventHeader"
+              }
+            }
+          },
+          {
+            "name": "order",
+            "type": "pubkey"
+          },
+          {
+            "name": "created_at",
+            "docs": [
+              "Unix timestamp (seconds) when the order was created; 0 for legacy orders."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "max_slippage",
+            "docs": [
+              "Configured slippage limit, encoded as a u32 fraction (u32::MAX = 100%)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "asset_bank",
+            "docs": [
+              "Bank of the surviving tagged asset balance."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "asset_shares_after",
+            "docs": [
+              "Position shares, not token amounts or swap proceeds."
+            ],
+            "type": {
+              "defined": {
+                "name": "WrappedI80F48"
+              }
+            }
+          },
+          {
+            "name": "triggered",
+            "docs": [
+              "The validated execution branch: StopLoss or TakeProfit, never Both."
+            ],
+            "type": {
+              "defined": {
+                "name": "OrderTriggerType"
+              }
+            }
+          },
+          {
+            "name": "equity_before_usd",
+            "docs": [
+              "Protocol-valued equity of the tagged order balances immediately before execution."
+            ],
+            "type": {
+              "defined": {
+                "name": "WrappedI80F48"
+              }
+            }
+          },
+          {
+            "name": "equity_after_usd",
+            "docs": [
+              "Protocol-valued equity after execution. The difference is not realized trading P/L."
+            ],
+            "type": {
+              "defined": {
+                "name": "WrappedI80F48"
+              }
+            }
+          },
+          {
+            "name": "closure_recipient",
+            "docs": [
+              "Recipient of the closed accounts' lamports; these proceeds are not trading fees."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "order_lamports_returned",
+            "type": "u64"
           }
         ]
       }

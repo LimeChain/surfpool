@@ -4,14 +4,15 @@ Surfpool bundles the IDL and override templates for **Project 0**, the lending p
 known as marginfi v2 (`MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`, v0.1.12), so a scenario can
 put a bank or a user account into whatever state you need before your code runs against it.
 
-The bundled IDL is the program's published 0.1.12 IDL with one change: `WrappedI80F48.value` is
+The bundled IDL is the program's published 0.1.12 IDL with two changes. `WrappedI80F48.value` is
 typed `i128` instead of `[u8; 16]`. The bytes are the same, read as the signed fixed-point integer
-(value x 2^48), so weights and shares take decimal strings instead of 16-byte arrays.
+(value x 2^48), so weights and shares take decimal strings instead of 16-byte arrays. And
+`address`, empty in the published IDL, holds the program's address.
 
 | IDL | Source | sha256 |
 |---|---|---|
-| Published | Program Metadata account `B66dYmjB9pJ3unjp3QMiEpySb8i44Zhev3qaYj5SfLPG` | `8bb1b2e4331b2f28e9d6d4a3d2c8e5996e371b5acfb102cfcf52175423e5eaf1` |
-| Bundled | `v1/idl.json` | `bcab696279320fc5b0aa18a5eb3f711e655b6ac2fc3c3d32d06fe8adf1d5e05c` |
+| Published | Program Metadata account `B66dYmjB9pJ3unjp3QMiEpySb8i44Zhev3qaYj5SfLPG` | `f621c9e4eb789084b088dbd61e5e086224546934b6f0859caea837241501d79f` |
+| Bundled | `v1/idl.json` | `7beb67e50b5ca9888f92b8326cc87ecbae2c06a50e28058f9c4f0e5bbf1716e7` |
 
 This is a how-to. For how scenarios work in general see the [scenarios README](../../README.md).
 Every field's own purpose and units are on the template itself, visible in Studio and via
