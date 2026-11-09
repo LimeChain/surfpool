@@ -116,14 +116,18 @@ templates:
 | `{ type: input, value: oracle }` | the pubkey given in that `input` property (`value_type: pubkey`, never written) |
 | `{ type: pubkey, value: <address> }` | a fixed account |
 | `{ type: pda, program_id, seeds }` | a derived account; seeds resolve against the override's values |
+| `{ type: owned, owner: <program id or list>, account: <IDL account> }` | every local account an owner owns whose data starts with that account's discriminator in the keep-alive template's IDL, including accounts loaded later; never fetched |
 
 `$slot`, `$slot±N` and `$unix_s`/`ms`/`us`/`ns` in `values` are filled from the slot and its Clock
 time; other values are written as given.
 
 Keep-alive starts in the slot the importing override plays and rewrites its fields every slot, after
 that slot's overrides, until the network is reset. An override of one of those fields therefore
-never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it,
-or its owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
+never takes effect. An override with `keepAlive: false` stops keep-alive for the account it writes
+from that slot on, so the account ages as the clock moves on, for example to test a stale price. A
+later override with `keepAlive: true`, the default, on that account starts it again. An account not
+yet in the surfnet is fetched from the remote first, unless it, or its owner with its owned accounts,
+is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
 until an importing override plays again.
 
 ### Override Templates
