@@ -96,6 +96,8 @@ collateral, the USDT price among them, so these windows still apply:
 read that instead when its `market_stats.mm_oracle_sequence_id`, also in microseconds, is newer than
 `publish_time` and the two prices are within 1% of each other. A fetched market keeps the id it had
 on mainnet, so for a move under 1% fills can read the MM price until the surfnet's clock passes it.
+To make such a move take effect at once, write `market_stats.mm_oracle_sequence_id: 0` on the market
+with `velocity-perp-market-risk`.
 
 # Recipes
 

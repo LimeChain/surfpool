@@ -66,7 +66,8 @@ templates:
       Fills read the market's own MM oracle price instead of this one when the two are within 1%
       and the market's market_stats.mm_oracle_sequence_id, also in microseconds, is newer than
       publish_time. A fetched market keeps the id it had on mainnet, so for a move under 1% fills
-      read the MM price until the surfnet's clock passes it.
+      read the MM price until the surfnet's clock passes it. To make such a move take effect at
+      once, add velocity-perp-market-risk on the market with market_stats.mm_oracle_sequence_id: 0.
 
       Liquidation refuses a price more than 50% from the market's 5-minute TWAP
       (PriceBandsBreached, 6023) or more than 5x from its TWAP. For a deeper move add
@@ -79,7 +80,7 @@ templates:
 
   - id: velocity-perp-market-risk
     name: Override Perp Market Risk
-    description: Change a Velocity perp market's margin ratios, status, paused operations, open interest cap and liquidation fees
+    description: Change a Velocity perp market's margin ratios, status, paused operations, open interest cap, liquidation fees and whether fills read its MM oracle price
     idl_account_name: PerpMarket
     properties:
       - path: margin_ratio_maintenance
@@ -103,6 +104,9 @@ templates:
       - path: if_liquidation_fee
         label: Insurance Fund Liquidation Fee
         description: "Share of the liquidated position's value the account pays the insurance fund, 1000000 = 100%. Example: 7500"
+      - path: market_stats.mm_oracle_sequence_id
+        label: MM Oracle Sequence ID
+        description: "Microsecond timestamp of the market's own MM oracle price. Fills read that price over a price within 1% posted before it; 0 makes fills read the oracle price. Example: 0"
     address:
       type: pubkey
     llm_context: |
@@ -140,6 +144,12 @@ templates:
       lower. if_liquidation_fee is what the account also pays the insurance fund, capped by the
       margin the account has left. Keep the two together below margin_ratio_maintenance x 100, as
       the program's admin path requires.
+
+      market_stats.mm_oracle_sequence_id is the time, in microseconds, of the market's own MM
+      oracle price. Fills read that price instead of the oracle's while the id is newer than the
+      oracle's publish_time and the two prices are within 1%. A fetched market keeps its mainnet
+      id, so a velocity-oracle-price move under 1% reaches fills only after the surfnet's clock
+      passes it. Write 0 with such a move and fills read the oracle price at once.
 
       EXAMPLE - "SOL-PERP needs 25% maintenance margin": margin_ratio_maintenance: 2500,
       margin_ratio_initial: 3000.

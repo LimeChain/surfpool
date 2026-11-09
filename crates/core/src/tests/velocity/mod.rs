@@ -73,6 +73,7 @@ const MARGIN_RATIO_MAINTENANCE: Range<usize> = 620..624;
 const PAUSED_OPERATIONS: usize = 645;
 const FEE_ADJUSTMENT: Range<usize> = 648..650;
 const IMMEDIATE_FILL_DELAY_OVERRIDE: usize = 674;
+const MM_ORACLE_PRICE: Range<usize> = 800..808;
 const MM_ORACLE_SEQUENCE_ID: Range<usize> = 816..824;
 const ORACLE_TWAP_5MIN: Range<usize> = 880..888;
 
@@ -116,6 +117,7 @@ const STABLE_COIN_STALENESS_SLOTS: u64 = 3 * MARGIN_STALENESS_SLOTS;
 const AMM_STALENESS_SLOTS: u64 = 20;
 /// How far the tests move the clock past a price.
 const FAR_PAST: u64 = 2000;
+const AMM_FILLS_PAUSED: u8 = 0b0000_0010;
 const LIQUIDATION_PAUSED: u8 = 0b0010_0000;
 const EXCHANGE_LIQUIDATIONS_PAUSED: u8 = 0b0001_0000;
 /// `PlaceAndTakeOrderSuccessCondition::FullFill`.
@@ -1397,4 +1399,55 @@ async fn the_oracle_price_stays_posted_through_later_slots_and_a_time_travel() {
         published > newest_mm_price,
         "{published} vs {newest_mm_price}"
     );
+}
+
+/// While a fetched market's mainnet `mm_oracle_sequence_id` is newer than the clock, fills read the
+/// market's MM oracle price over a price move under 1%. Writing the id to 0 makes them read the
+/// moved price.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_mm_oracle_sequence_id_makes_fills_read_a_move_under_one_percent() {
+    let mainnet = mainnet().await;
+    let market = SOL_PERP;
+    let (address, live) = (perp_market_address(market), mainnet.market(market));
+    let oracle = mainnet.oracle_of(market);
+    let mm_price = i128::from(i64_at(live, MM_ORACLE_PRICE));
+    let moved = mm_price / 1000 * 995;
+    let tick = i128::from(u64_at(live, ORDER_TICK_SIZE));
+    let offset = -(mm_price / 1000 / tick * tick);
+    let sequence_id = u64_at(live, MM_ORACLE_SEQUENCE_ID);
+    let vm = Vm::new(mainnet).await;
+    // The snapshot reads its clock after the markets, often a second past the id.
+    let before_id = i64::try_from((sequence_id - 1) / 1_000_000).unwrap();
+    vm.set_clock(&Clock {
+        unix_timestamp: before_id,
+        ..vm.clock()
+    });
+    let paused = json!({"paused_operations": live[PAUSED_OPERATIONS] | AMM_FILLS_PAUSED});
+    vm.apply(MARKET_RISK, address, paused).await;
+    let raw = i64::try_from(moved * oracle_scale(&mainnet.account(&oracle).data)).unwrap();
+    vm.apply(ORACLE_PRICE, oracle, oracle_values(raw, &vm.clock()))
+        .await;
+    let published = u64_at(&vm.data(&oracle), PUBLISH_TIME);
+    assert!(sequence_id > published, "{sequence_id} vs {published}");
+
+    // One whole unit, so the taker's quote entry is the fill price.
+    let base = 1_000_000_000;
+    let fill_price = || {
+        let [maker, taker] = std::array::from_fn(|_| vm.funded_trader());
+        let mut bid = order("Limit", "Long", base, 0, market, "MustPostOnly");
+        let fields = bid.as_object_mut().unwrap();
+        fields.insert("oracle_price_offset".into(), int(offset));
+        let place = mainnet.place_order(&maker, market, bid);
+        expect_success(vm.send(&maker, &[place]), "placing the oracle bid");
+        let floor = u64::try_from(moved * 98 / 100 / tick * tick).unwrap();
+        let sell = order("Limit", "Short", base, floor, market, "None");
+        let sell = mainnet.take_order(&taker, market, sell, Some(&maker));
+        expect_success(vm.send(&taker, &[sell]), "selling into the oracle bid");
+        position_field(&vm.data(&user_keys(&taker).0), market, POSITION_QUOTE_ENTRY)
+    };
+    let bid_at = |price: i128| i64::try_from((price + offset) / tick * tick).unwrap();
+    assert_eq!(fill_price(), bid_at(mm_price), "the MM price, mainnet id");
+    let reset = json!({"market_stats.mm_oracle_sequence_id": 0});
+    vm.apply(MARKET_RISK, address, reset).await;
+    assert_eq!(fill_price(), bid_at(moved), "the moved price, id at 0");
 }
