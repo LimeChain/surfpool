@@ -8,6 +8,11 @@ tags:
   - price-feed
   - defi
 
+keep_alive:
+  - template: pyth-core-compatible-price-publication
+    address: { type: override }
+    values: { price_message.publish_time: $unix_s, posted_slot: $slot }
+
 templates:
   - id: pyth-core-compatible-price-feed-v2
     name: Override Pyth Core Compatible Price Account
@@ -61,11 +66,12 @@ templates:
       by the same factor as the price: consumers refuse a price whose confidence is too wide a share
       of it, so a large drop that keeps the live conf can be refused.
 
-      TIME: leave publish_time, prev_publish_time and posted_slot unset. fetchBeforeUse: true
-      brings the upstream account's current values when the override plays, so the price is as
-      fresh as upstream's. A time written into the scenario is fixed when the scenario is created
-      and ages until it plays. To make a price stale on purpose, follow the TIME FIELDS steps of
-      pyth-price-feed-v2.
+      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays until the network is
+      reset, Surfpool republishes this price account every slot, as the Pyth publisher does on
+      mainnet: publish_time becomes the Surfnet clock's unix seconds and posted_slot the slot, also
+      after a time travel. Price, conf and the EMA fields keep the values this override wrote. A
+      value set for publish_time or posted_slot never takes effect, so leave both unset. A price
+      account no override names is not republished and ages against the Surfnet clock.
 
       EXAMPLE - "SOL drops to $20" on an account with exponent -8, live price p and ema_price q:
       price_message.price: 2000000000

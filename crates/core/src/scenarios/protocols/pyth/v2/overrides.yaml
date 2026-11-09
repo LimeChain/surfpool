@@ -9,6 +9,11 @@ tags:
   - defi
   - clock-sensitive
 
+keep_alive:
+  - template: pyth-price-publication
+    address: { type: override }
+    values: { price_message.publish_time: $unix_s, posted_slot: $slot }
+
 constants:
   price_feed:
     label: Price Feed
@@ -255,31 +260,17 @@ templates:
         unless the scenario is specifically about an exponent error. If you do change it, restate
         every scaled field to match.
       - price_message.ema_price and price_message.ema_conf use the same scales as price and conf.
-      - posted_slot is a slot number, not a timestamp. Some consumers measure freshness in slots
-        rather than in seconds.
 
-      TIME FIELDS - READ BEFORE SETTING publish_time:
-      publish_time and prev_publish_time are unix seconds interpreted against the SURFNET clock, not
-      the real-world clock. The two can differ by an arbitrary amount, so a timestamp taken from the
-      real current time will look far in the future inside the simulation and will NOT produce a
-      stale price.
+      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays until the network is
+      reset, Surfpool republishes this price account every slot, as the Pyth publisher does on
+      mainnet: publish_time becomes the Surfnet clock's unix seconds and posted_slot the slot, also
+      after a time travel. Price, conf and the EMA fields keep the values this override wrote. A
+      value set for publish_time or posted_slot never takes effect, so leave both unset.
 
-      Do not try to backdate the timestamp either - the Surfnet clock only moves forward. To build a
-      stale-price scenario, make the price fresh and then advance time past the consumer's limit:
-      1. surfnet_pauseClock so the elapsed time is exact rather than dependent on slot production.
-         It returns an EpochInfo, which carries no timestamp - step 2 is how you read the time.
-      2. read the Surfnet clock with getAccountInfo on
-         SysvarC1ock11111111111111111111111111111111 using the jsonParsed encoding, and take
-         result.value.data.parsed.info.unixTimestamp, which is in SECONDS. Set publish_time to
-         that value, which makes the price fresh.
-      3. surfnet_timeTravel forward by more than the consumer's staleness limit. Its
-         absoluteTimestamp is in MILLISECONDS, so multiply the value from step 2 by 1000 before
-         adding your offset.
-      4. send the transaction - the consumer now sees an aged price and should reject it
-
-      UNITS WARNING for step 3: surfnet_timeTravel's absoluteTimestamp is in MILLISECONDS, while
-      publish_time and the Clock sysvar are in SECONDS. Multiply by 1000 when passing a value read
-      from the clock, or the call fails with a "past timestamp" error.
+      STALE PRICE: a price account no override of this template names is not republished and ages
+      against the Surfnet clock. To test a consumer's staleness check, leave that feed without an
+      override and surfnet_timeTravel past the consumer's limit. Its absoluteTimestamp is in
+      MILLISECONDS, while publish_time and the Clock sysvar are in SECONDS.
     address:
       type: pda
       program_id: pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT
