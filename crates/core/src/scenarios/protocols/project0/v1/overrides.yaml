@@ -83,9 +83,11 @@ templates:
 
       THE PRICE LEVER: to crash a collateral price instead, use pyth-core-compatible-price-feed-v2 on the
       bank's price account (the lookup above returns it). Move price and ema_price together:
-      liquidation reads the spot price, borrows and withdrawals check the EMA. The bank refuses a
-      price older than config.oracle_max_age seconds, so keep fetchBeforeUse: true and leave the
-      time fields unset, as pyth-core-compatible-price-feed-v2 explains. Read the bank first: when its
+      liquidation reads the spot price, borrows and withdrawals check the EMA. That price account
+      stays published by itself, so leave its time fields unset. The bank refuses a price older
+      than config.oracle_max_age seconds, and a health check also reads the prices of the other
+      banks the account uses, which are not kept alive: reload them with surfnet_resetAccount or
+      raise their oracle_max_age with project0-bank-oracle. Read the bank first: when its
       flags include 2048 (bit 11), the circuit breaker is on and the same scenario needs
       project0-bank-oracle on that bank with both breaker references moved with the price, as that
       template explains.
@@ -181,8 +183,10 @@ templates:
 
       A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
       publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
-      65535) to accept older prices. To move the price itself, use pyth-core-compatible-price-feed-v2 on the
-      bank's price account, config.oracle_keys.0.
+      65535) to accept older prices. A price account a pyth-core-compatible-price-feed-v2 override
+      wrote is republished every slot and never goes stale; the other banks' prices age. To move
+      the price itself, use pyth-core-compatible-price-feed-v2 on the bank's price account,
+      config.oracle_keys.0.
 
       CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
       tokens, BTC and ETH. It is on when the bank's flags include 2048 (bit 11). Such a bank

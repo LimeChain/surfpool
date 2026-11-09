@@ -94,9 +94,9 @@ pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBe
   price_message.ema_conf: <live ema_conf x 2000000000 / live ema_price>
 ```
 
-**Why:** the price must be fresh: `clock - publish_time <= config.oracle_max_age`. With
-`fetchBeforeUse: true` the account carries upstream's current `publish_time` when the scenario
-plays. Borrow and withdraw checks use the EMA price, liquidation the spot price, so move both.
+**Why:** the price must be fresh: `clock - publish_time <= config.oracle_max_age`. Keep-alive
+keeps the price account the override writes published, see [Prices on a fork](#prices-on-a-fork).
+Borrow and withdraw checks use the EMA price, liquidation the spot price, so move both.
 Scale `conf` and `ema_conf` by the same factor: Project 0 multiplies the confidence by 2.12 and
 refuses a price whose result is over the bank's `config.oracle_max_confidence` share of it (10%
 when the field is 0), so a crash that keeps the live confidence can be refused.
@@ -190,21 +190,21 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the Surfnet clock is its
 `config.oracle_max_age` seconds past the price's `publish_time`:
 
-- A price override with `fetchBeforeUse: true` loads upstream's current account when it plays.
-  Playing the scenario again loads it again.
-- A health check reads the price of every bank the account uses, not only the one the scenario
-  moves. Reload an older one with `surfnet_resetAccount` on its price account, or raise that bank's
-  `oracle_max_age` with `project0-bank-oracle`.
-- Studio's paused clock stops prices ageing after Play. A running clock or a time travel ages them.
-
-Keep-alive ([solana-foundation/surfpool#906](https://github.com/solana-foundation/surfpool/pull/906))
-will keep the prices published once it lands.
+- The price account a `pyth-core-compatible-price-feed-v2` override writes stays published. From
+  the slot the override plays until the network is reset, keep-alive writes the Clock's time to its
+  `publish_time` every slot, time travels included.
+- A health check or liquidation reads the price of every bank the account uses, not only the one
+  the scenario moves, and those other prices are not kept alive. Reload one with
+  `surfnet_resetAccount` on its price account, or raise that bank's `oracle_max_age` with
+  `project0-bank-oracle`.
+- Studio's paused clock stops those other prices ageing after Play. A running clock or a time travel
+  ages them.
 
 # Troubleshooting
 
 | Rejection | Fix |
 |---|---|
-| Stale oracle | Refetch the feed with `fetchBeforeUse: true`, or reload it with `surfnet_resetAccount` - see [Prices on a fork](#prices-on-a-fork) |
+| Stale oracle | The price of a bank the scenario did not reprice aged: it is not kept alive. Reload it with `surfnet_resetAccount` or raise that bank's `oracle_max_age` - see [Prices on a fork](#prices-on-a-fork) |
 | `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
 | `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
 | The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
