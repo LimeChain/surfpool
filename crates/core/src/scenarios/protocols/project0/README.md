@@ -95,7 +95,7 @@ pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBe
 ```
 
 **Why:** the price must be fresh: `clock - publish_time <= config.oracle_max_age`. Keep-alive
-keeps the price account the override writes published, see [Prices on a fork](#prices-on-a-fork).
+keeps every loaded Pyth Core Compatible price published, see [Prices on a fork](#prices-on-a-fork).
 Borrow and withdraw checks use the EMA price, liquidation the spot price, so move both.
 Scale `conf` and `ema_conf` by the same factor: Project 0 multiplies the confidence by 2.12 and
 refuses a price whose result is over the bank's `config.oracle_max_confidence` share of it (10%
@@ -190,21 +190,20 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the Surfnet clock is its
 `config.oracle_max_age` seconds past the price's `publish_time`:
 
-- The price account a `pyth-core-compatible-price-feed-v2` override writes stays published. From
-  the slot the override plays until the network is reset, keep-alive writes the Clock's time to its
-  `publish_time` every slot, time travels included.
-- A health check or liquidation reads the price of every bank the account uses, not only the one
-  the scenario moves, and those other prices are not kept alive. Reload one with
-  `surfnet_resetAccount` on its price account, or raise that bank's `oracle_max_age` with
-  `project0-bank-oracle`.
-- Studio's paused clock stops those other prices ageing after Play. A running clock or a time travel
-  ages them.
+- From the slot a `pyth-core-compatible-price-feed-v2` override plays until the network is reset,
+  keep-alive writes the Clock's time to every Pyth Core Compatible price account the surfnet has
+  loaded, every slot, time travels included. A health check or liquidation reads the price of every
+  bank the account uses, and those prices stay fresh too; a price a transaction loads for the first
+  time is kept from the next slot.
+- To keep one price stale on purpose, override it with `keepAlive: false`.
+- A bank priced by anything other than a Pyth Core Compatible feed is not kept alive. Raise its
+  `oracle_max_age` with `project0-bank-oracle`.
 
 # Troubleshooting
 
 | Rejection | Fix |
 |---|---|
-| Stale oracle | The price of a bank the scenario did not reprice aged: it is not kept alive. Reload it with `surfnet_resetAccount` or raise that bank's `oracle_max_age` - see [Prices on a fork](#prices-on-a-fork) |
+| Stale oracle | No `pyth-core-compatible-price-feed-v2` override has played yet, the price was overridden with `keepAlive: false`, or the bank is not priced by a Pyth Core Compatible feed. Override one price, or raise that bank's `oracle_max_age` - see [Prices on a fork](#prices-on-a-fork) |
 | `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
 | `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
 | The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |

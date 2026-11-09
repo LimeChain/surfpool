@@ -85,9 +85,10 @@ templates:
       bank's price account (the lookup above returns it). Move price and ema_price together:
       liquidation reads the spot price, borrows and withdrawals check the EMA. That price account
       stays published by itself, so leave its time fields unset. The bank refuses a price older
-      than config.oracle_max_age seconds, and a health check also reads the prices of the other
-      banks the account uses, which are not kept alive: reload them with surfnet_resetAccount or
-      raise their oracle_max_age with project0-bank-oracle. Read the bank first: when its
+      than config.oracle_max_age seconds; a health check also reads the prices of the other banks
+      the account uses, and once the override plays every loaded Pyth Core Compatible price stays
+      published too. A bank priced by another oracle is not: raise its oracle_max_age with
+      project0-bank-oracle. Read the bank first: when its
       flags include 2048 (bit 11), the circuit breaker is on and the same scenario needs
       project0-bank-oracle on that bank with both breaker references moved with the price, as that
       template explains.
