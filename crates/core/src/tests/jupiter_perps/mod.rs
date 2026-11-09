@@ -55,7 +55,7 @@ const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PERPS: Pubkey = Pubkey::from_str_const("PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu");
 const PERPS_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("C258LjtN8Q928yz2nJe5kwQycckGfWBSrhZBP2mTpLQt");
-const PERPS_DEPLOYED_SLOT: u64 = 413092478;
+const PERPS_DEPLOYED_SLOT: u64 = 465131236;
 const DOVES: Pubkey = Pubkey::from_str_const("DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e");
 const DOVES_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("4QRRLV8zvwvWDgPNWYXffcMLTS4M6UFCuj2pPMA1tg5D");
@@ -1368,8 +1368,11 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     assert_eq!(minted, amount(&quoted, "amount"), "JLP minted");
     let to_sol = swap_fee(&locker, &graph, USDC_MINT, SOL_MINT, SWAP_USD);
     assert_eq!(to_sol, swap_bps * multiplier / BPS as u64, "USDC to SOL");
-    let stable_swap = || swap_fee(&locker, &graph, USDC_MINT, JUPUSD_MINT, SWAP_USD);
-    assert_eq!(stable_swap(), stable_bps, "USDC to JupUSD");
+    let stable_swaps = || {
+        [(USDC_MINT, JUPUSD_MINT), (JUPUSD_MINT, USDC_MINT)]
+            .map(|(from, to)| swap_fee(&locker, &graph, from, to, SWAP_USD))
+    };
+    assert_eq!(stable_swaps(), [stable_bps; 2], "USDC and JupUSD swaps");
 
     let taxed = json!({ "fees.tax_bps": 1_000, "fees.stable_swap_tax_bps": 1_000 });
     play(&locker, fees(taxed)).await;
@@ -1380,5 +1383,7 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     });
     let moved = taxed.iter().any(|bps| *bps != liquidity_bps);
     assert!(moved, "taxed deposits: {taxed:?}");
-    assert_ne!(stable_swap(), stable_bps, "a taxed USDC to JupUSD swap");
+    let swapped = stable_swaps();
+    let moved = swapped.iter().any(|bps| *bps != stable_bps);
+    assert!(moved, "taxed USDC and JupUSD swaps: {swapped:?}");
 }
