@@ -199,7 +199,7 @@ constants:
 templates:
   - id: pyth-price-feed-v2
     name: Override Price Feed
-    description: Override any Pyth price feed with custom price data
+    description: Override any Pyth price feed with custom price data; keeps every loaded Pyth Core price account published
     idl_account_name: PriceUpdateV2
     properties:
       - path: feed_id

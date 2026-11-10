@@ -16,7 +16,7 @@ keep_alive:
 templates:
   - id: pyth-core-compatible-price-feed-v2
     name: Override Pyth Core Compatible Price Account
-    description: Override a price account of the Pyth Core Compatible receiver, found by address
+    description: Override a price account of the Pyth Core Compatible receiver, found by address; keeps every loaded one published
     idl_account_name: PriceUpdateV2
     properties:
       - path: price_message.price
