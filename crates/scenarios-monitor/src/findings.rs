@@ -89,10 +89,7 @@ pub fn failure_details(failed: &[Failure]) -> String {
 }
 
 /// Open findings and the keys whose issues can close.
-pub fn idl_findings(
-    results: &[IdlResult],
-    report_url: Option<&str>,
-) -> (Vec<Finding>, Vec<String>) {
+pub fn idl_findings(results: &[IdlResult], run_url: Option<&str>) -> (Vec<Finding>, Vec<String>) {
     let mut open = Vec::new();
     let mut resolved = Vec::new();
     for result in results {
@@ -145,12 +142,12 @@ pub fn idl_findings(
             if let Some(note) = &event.note {
                 body += &format!("  - {note}\n");
             }
-            if let (Some(url), Some(diff)) = (report_url, &event.diff_file) {
-                body += &format!("  - [diff]({url}/{diff})\n");
+            if let Some(diff) = &event.diff_file {
+                body += &format!("  - diff: `report/{diff}` in the run's artifact\n");
             }
         }
-        if let Some(url) = report_url {
-            body += &format!("\n[Report]({url}/report.md)\n");
+        if let Some(url) = run_url {
+            body += &format!("\n[Report]({url})\n");
         }
         let parts: Vec<String> = attention
             .iter()
@@ -178,7 +175,7 @@ pub fn idl_findings(
 
 pub fn test_findings(
     modules: &BTreeMap<String, ModuleResult>,
-    report_url: Option<&str>,
+    run_url: Option<&str>,
 ) -> (Vec<Finding>, Vec<String>) {
     let mut open = Vec::new();
     let mut resolved = Vec::new();
@@ -189,8 +186,8 @@ pub fn test_findings(
             Status::Fail => {
                 let mut body =
                     format!("The `{module}` integration tests fail against mainnet.\n\n");
-                if let Some(url) = report_url {
-                    body += &format!("[Report]({url}/report.md)\n\n");
+                if let Some(url) = run_url {
+                    body += &format!("[Report]({url})\n\n");
                 }
                 body += &failure_details(&result.failed);
                 open.push(Finding {

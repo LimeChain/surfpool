@@ -1,4 +1,4 @@
-//! The Markdown report each run commits.
+//! The Markdown report each run shows as its summary.
 
 use std::{collections::BTreeMap, fmt::Write};
 
@@ -61,7 +61,8 @@ impl Report<'_> {
         *out += "## IDLs\n\n\
                  Compared with the IDL each program publishes on chain (Anchor IDL account or Program \
                  Metadata). *Upstream change* is a change since the previous run; *committed vs upstream* \
-                 is what `idl.json` ships that the program no longer publishes the same way.\n\n\
+                 is what `idl.json` ships that the program no longer publishes the same way. The diffs are \
+                 files in the run's artifact.\n\n\
                  | Protocol | Upstream | Committed | Upstream change | Committed vs upstream |\n\
                  |---|---|---|---|---|\n";
         for result in self.idls {
@@ -97,12 +98,12 @@ impl Report<'_> {
                     } else {
                         "not comparable".into()
                     };
-                    let link = event
+                    let diff = event
                         .diff_file
                         .as_ref()
-                        .map(|file| format!(" ([diff]({file}))"))
+                        .map(|file| format!(" (`report/{file}`)"))
                         .unwrap_or_default();
-                    let _ = write!(change, "<br>{}: {detail}{link}", event.source);
+                    let _ = write!(change, "<br>{}: {detail}{diff}", event.source);
                 }
                 (upstream.join(", "), change)
             };

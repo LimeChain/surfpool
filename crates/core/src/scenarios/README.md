@@ -65,8 +65,9 @@ every test module under `crates/core/src/tests/protocols/`.
 Each run compares the IDL the program publishes (Anchor IDL account or Program Metadata, read
 through the [Solana IDL service](https://idl.solana.com/docs)) with the previous run and with the
 committed `idl.json`, over the entries the committed file ships. It also runs the integration
-tests. The report lands in a timestamped folder on the `scenarios/reports` branch, with the IDL and
-diff of every upstream change. An upstream change that touches a shipped entry, or a failing test
+tests. The report is the run's summary page. Nothing is committed: the run's `scenarios-monitoring`
+artifact holds the report, with the IDL and diff of every upstream change, and the state the next
+run compares against. An upstream change that touches a shipped entry, or a failing test
 module, opens one issue per protocol; later changes comment on it, and it closes once the committed
 IDL matches upstream again or the tests pass.
 

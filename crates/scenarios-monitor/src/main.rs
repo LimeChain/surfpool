@@ -37,7 +37,7 @@ struct Cli {
     /// The repository root.
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))]
     root: PathBuf,
-    /// The run's timestamp, which names its report folder.
+    /// The run's timestamp, which titles its report.
     #[arg(long)]
     stamp: String,
     /// A folder holding the previous run's `state/`.
@@ -48,9 +48,7 @@ struct Cli {
     /// The `cargo test` output of the integration tests, when they ran.
     #[arg(long)]
     tests_log: Option<PathBuf>,
-    /// Where the report folder will be published, for links in issues.
-    #[arg(long)]
-    report_url: Option<String>,
+    /// The run that publishes the report, for links to it.
     #[arg(long)]
     run_url: Option<String>,
 }
@@ -103,10 +101,10 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let report_url = args.report_url.as_deref();
-    let (mut open, mut resolved) = findings::idl_findings(&idls.results, report_url);
+    let run_url = args.run_url.as_deref();
+    let (mut open, mut resolved) = findings::idl_findings(&idls.results, run_url);
     if let Some(tests) = &tests {
-        let (test_open, test_resolved) = findings::test_findings(tests, report_url);
+        let (test_open, test_resolved) = findings::test_findings(tests, run_url);
         open.extend(test_open);
         resolved.extend(test_resolved);
     }
@@ -138,7 +136,7 @@ fn main() -> Result<()> {
     let report = Report {
         stamp: &args.stamp,
         verdict,
-        run_url: args.run_url.as_deref(),
+        run_url,
         findings: &open,
         idls: &idls.results,
         tests: tests.as_ref(),
