@@ -1,0 +1,21 @@
+protocol: Velocity
+version: v2.170.0
+account_type: PythLazerOracle
+idl_file_path: idl.json
+
+templates:
+  - id: velocity-oracle-publication
+    name: Oracle publication
+    description: The keeper reposting a market's oracle
+    idl_account_name: PythLazerOracle
+    address:
+      type: pubkey
+    properties:
+      - path: posted_slot
+        description: >-
+          Slot the price was posted in. The program ages the price from it: margin checks refuse it
+          past the State's slots_before_stale_for_margin and AMM fills past slots_before_stale_for_amm.
+      - path: publish_time
+        description: >-
+          Pyth Lazer timestamp in microseconds. Fills read the market's MM oracle price instead when
+          its market_stats.mm_oracle_sequence_id, on the same scale, is newer and within 1%.

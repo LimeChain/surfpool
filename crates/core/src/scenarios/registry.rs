@@ -71,6 +71,12 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const VELOCITY_V1_IDL_CONTENT: &str = include_str!("./protocols/velocity/v1/idl.json");
+pub const VELOCITY_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/velocity/v1/overrides.yaml");
+pub const VELOCITY_V1_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/velocity/v1/keep-alive.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -134,6 +140,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_velocity_overrides();
         if let Err(e) = default.check_keep_alive_imports() {
             panic!("unable to load the override templates: {e}");
         }
@@ -336,6 +343,16 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
         );
+    }
+
+    pub fn load_velocity_overrides(&mut self) {
+        self.load_protocol_overrides(
+            VELOCITY_V1_IDL_CONTENT,
+            VELOCITY_V1_OVERRIDES_CONTENT,
+            "velocity",
+        );
+        let idl = serde_json::from_str(VELOCITY_V1_IDL_CONTENT).expect("velocity idl");
+        self.load_keep_alive(Some(idl), VELOCITY_V1_KEEP_ALIVE_CONTENT, "velocity");
     }
 
     fn load_protocol_overrides(
@@ -729,11 +746,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19)
+        // + Velocity (5) = 86
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            86,
+            "Registry should load 86 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -808,6 +826,12 @@ mod tests {
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("velocity-oracle-price"));
+        assert!(registry.contains("velocity-perp-market-risk"));
+        assert!(registry.contains("velocity-exchange-risk"));
+        assert!(registry.contains("velocity-fees"));
+        assert!(registry.contains("velocity-spot-market-risk"));
     }
 
     #[test]
@@ -1096,6 +1120,55 @@ templates:
     }
 
     #[test]
+    fn velocity_oracle_price_keeps_its_oracle_posted() {
+        let registry = TemplateRegistry::new();
+        for template in registry.by_protocol("Velocity") {
+            let id = &template.id;
+            if id != "velocity-oracle-price" {
+                assert!(template.keep_alive.is_empty(), "{id} writes no oracle");
+                continue;
+            }
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{id} must keep its oracle posted");
+            };
+            assert_eq!(import.template, "velocity-oracle-publication");
+            let every_oracle = KeepAliveAddress::Owned {
+                owners: vec!["vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P".to_string()],
+                account: "PythLazerOracle".to_string(),
+            };
+            assert_eq!(import.address, every_oracle, "{id}");
+            let clock = surfpool_types::KeepAliveClock {
+                slot: 7,
+                unix_time_ms: 1_800_000_000_123,
+            };
+            let values = import.values_at(&clock).unwrap();
+            assert_eq!(values["posted_slot"], serde_json::json!(7));
+            // Pyth Lazer timestamps are microseconds.
+            assert_eq!(
+                values["publish_time"],
+                serde_json::json!(1_800_000_000_123_000u64)
+            );
+        }
+        let publication = registry.keep_alive_template("velocity-oracle-publication");
+        let publication = publication.unwrap();
+        let idl = publication.idl.as_ref().expect("written through the IDL");
+        let oracle = publication
+            .account_discriminator("PythLazerOracle")
+            .unwrap();
+        let sharing: Vec<&str> = idl
+            .accounts
+            .iter()
+            .filter(|account| account.discriminator == oracle)
+            .map(|account| account.name.as_str())
+            .collect();
+        assert_eq!(
+            sharing,
+            ["PythLazerOracle"],
+            "keep-alive writes only oracles"
+        );
+    }
+
+    #[test]
     fn raw_layout_collection_rejects_invalid_write_definitions_at_load_time() {
         fn rejected(yaml: &str, expected: &str) {
             let result = std::panic::catch_unwind(|| {
@@ -1377,6 +1450,13 @@ templates: []
             phoenix_templates.len(),
             19,
             "Should have 19 Phoenix Eternal templates"
+        );
+
+        let velocity_templates = registry.by_protocol("Velocity");
+        assert_eq!(
+            velocity_templates.len(),
+            5,
+            "Should have 5 Velocity templates"
         );
     }
 
