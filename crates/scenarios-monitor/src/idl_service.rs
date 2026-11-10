@@ -76,18 +76,17 @@ fn published_idls(reply: &Value) -> Result<PublishedIdls> {
 }
 
 fn read_source(entries: &[Value], source: &str) -> Result<Option<Published>> {
-    let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.get("content").is_some_and(|c| !c.is_null()))
-    else {
+    // The service lists a source's live IDL alone, or nothing where it publishes none.
+    let Some(entry) = entries.first() else {
         return Ok(None);
     };
     if entry.get("valid").and_then(Value::as_bool) == Some(false) {
         bail!("the {source} IDL does not decode");
     }
-    let raw = entry["content"]
-        .as_str()
-        .with_context(|| format!("the {source} IDL is not text"))?;
+    let raw = entry
+        .get("content")
+        .and_then(Value::as_str)
+        .with_context(|| format!("the {source} IDL has no content"))?;
     let document =
         serde_json::from_str(raw).with_context(|| format!("the {source} IDL is not JSON"))?;
     Ok(Some(Published {
@@ -165,6 +164,19 @@ mod tests {
         let published = published_idls(&reply).unwrap();
         let reason = published[ANCHOR].as_ref().unwrap_err();
         assert!(reason.starts_with("the anchor IDL is not JSON"), "{reason}");
+    }
+
+    #[test]
+    fn an_entry_without_content_is_not_taken_for_publishing_nothing() {
+        for entry in [
+            json!({"type": "pmp", "valid": true}),
+            json!({"type": "pmp", "valid": true, "content": null}),
+            json!({"type": "pmp", "valid": true, "idl": "{}"}),
+        ] {
+            let published = published_idls(&json!({"anchor": [], "pmp": [entry]})).unwrap();
+            let reason = published[PROGRAM_METADATA].as_ref().unwrap_err();
+            assert_eq!(reason, "the pmp IDL has no content");
+        }
     }
 
     #[test]
