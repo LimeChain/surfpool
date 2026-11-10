@@ -14,6 +14,10 @@ const ATTEMPTS: u32 = 3;
 /// Upstream IDLs are a few MB at most; anything far larger is not an IDL.
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// The two places a program publishes an IDL: its Anchor IDL account, and Program Metadata.
+pub const ANCHOR: &str = "anchor";
+pub const PROGRAM_METADATA: &str = "pmp";
+
 /// One published IDL: the text exactly as published, and the document it holds.
 #[derive(Debug)]
 pub struct Published {
@@ -32,7 +36,11 @@ pub struct PublishedIdls {
 
 impl PublishedIdls {
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, Option<&Published>)> {
-        [("anchor", self.anchor.as_ref()), ("pmp", self.pmp.as_ref())].into_iter()
+        [
+            (ANCHOR, self.anchor.as_ref()),
+            (PROGRAM_METADATA, self.pmp.as_ref()),
+        ]
+        .into_iter()
     }
 }
 
@@ -68,7 +76,7 @@ impl IdlService {
 /// cost the other. Fails only when nothing that is published can be read.
 fn published_idls(reply: &Value) -> Result<PublishedIdls> {
     let mut published = PublishedIdls::default();
-    for source in ["anchor", "pmp"] {
+    for source in [ANCHOR, PROGRAM_METADATA] {
         let read = match read_source(reply, source) {
             Ok(read) => read,
             Err(error) => {
@@ -77,7 +85,7 @@ fn published_idls(reply: &Value) -> Result<PublishedIdls> {
             }
         };
         match source {
-            "anchor" => published.anchor = read,
+            ANCHOR => published.anchor = read,
             _ => published.pmp = read,
         }
     }

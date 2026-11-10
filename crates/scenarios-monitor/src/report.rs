@@ -72,8 +72,10 @@ impl Report<'_> {
 
     fn idls_section(&self, out: &mut String) {
         *out += "## IDLs\n\n\
-                 Each committed `idl.json` against the IDL its program publishes on chain (Anchor IDL \
-                 account or Program Metadata), over the entries the committed file ships. For every \
+                 Each committed `idl.json` against the IDL its program publishes on chain, over the \
+                 entries the committed file ships. Where a program publishes two, the one compared \
+                 with is in bold: its Program Metadata (`pmp`) copy, since the one in its Anchor \
+                 IDL account is often left behind. For every \
                  protocol that differs, the run's artifact holds the diff and the published IDL \
                  under `idls/`.\n\n\
                  | Protocol | Published | Committed | Result |\n\
@@ -83,12 +85,13 @@ impl Report<'_> {
                 .upstream
                 .iter()
                 .map(|(source, upstream)| {
-                    format!(
-                        "{source} {}",
-                        upstream.version.as_deref().unwrap_or_default()
-                    )
-                    .trim_end()
-                    .to_owned()
+                    let version = upstream.version.as_deref().unwrap_or_default();
+                    let copy = format!("{source} {version}").trim_end().to_owned();
+                    let compared = result.compared_with.as_deref() == Some(source.as_str());
+                    match compared && result.upstream.len() > 1 {
+                        true => format!("**{copy}**"),
+                        false => copy,
+                    }
                 })
                 .collect();
             let published = match (&result.outcome, published.is_empty()) {

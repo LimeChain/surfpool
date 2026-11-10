@@ -126,24 +126,6 @@ pub fn compare(committed: &Idl, published: &Idl) -> Comparison {
     comparison
 }
 
-/// How many of the entries `committed` ships `published` has at all.
-pub fn coverage(committed: &Idl, published: &Idl) -> usize {
-    fn present<T>(shipped: &[T], published: &[T], name: fn(&T) -> &String) -> usize {
-        let published = by_name(published, shipped, name);
-        shipped
-            .iter()
-            .filter(|entry| published.contains_key(name(entry).as_str()))
-            .count()
-    }
-    present(&committed.accounts, &published.accounts, |e| &e.name)
-        + present(&committed.types, &published.types, |e| &e.name)
-        + present(&committed.instructions, &published.instructions, |e| {
-            &e.name
-        })
-        + present(&committed.events, &published.events, |e| &e.name)
-        + present(&committed.errors, &published.errors, |e| &e.name)
-}
-
 /// A name without its spelling: its letters and digits, in lower case.
 fn unspelled(name: &str) -> String {
     name.chars()
@@ -346,7 +328,6 @@ mod tests {
         let diff = comparison.render_diff();
         assert!(diff.contains("shared_accounts_route"), "{diff}");
         assert!(!diff.contains("no longer published"), "{diff}");
-        assert_eq!(coverage(&shipped, &published), 1);
     }
 
     #[test]
@@ -430,12 +411,5 @@ mod tests {
         )
         .unwrap();
         assert!(compare(&committed(), &published).differing().is_empty());
-    }
-
-    #[test]
-    fn coverage_counts_what_the_committed_idl_ships() {
-        let partial = parse(&current(json!([reserve()]), json!([])), ADDRESS).unwrap();
-        assert_eq!(coverage(&committed(), &committed()), 3);
-        assert_eq!(coverage(&committed(), &partial), 1);
     }
 }

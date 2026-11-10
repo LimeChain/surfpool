@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     idl::{self, Format},
-    idl_service::{Published, PublishedIdls},
+    idl_service::{ANCHOR, PROGRAM_METADATA, Published, PublishedIdls},
 };
 
 pub const PROTOCOLS_DIR: &str = "crates/core/src/scenarios/protocols";
@@ -192,8 +192,11 @@ pub fn check_idls(
         .collect()
 }
 
-/// The committed IDL against the published one that carries most of what it ships, and which
-/// source that is.
+/// The committed IDL against the one its program publishes, and which source that is.
+///
+/// Program Metadata is where a program publishes its IDL today, and the copy in its Anchor IDL
+/// account is often left behind. So the Program Metadata copy is the one compared with, and the
+/// Anchor one only where there is no other.
 fn compare<'a>(
     protocol: &Protocol,
     address: &str,
@@ -207,18 +210,17 @@ fn compare<'a>(
             return Ok((None, Outcome::Unchecked { error }));
         }
     };
-    let best = published
+    let parsed: Vec<_> = published
         .iter()
         .filter_map(|(source, published)| {
             let parsed = idl::parse(&published.document, address).ok()?;
             Some((*source, *published, parsed))
         })
-        .max_by_key(|(_, published, parsed)| {
-            (
-                idl::coverage(&committed, parsed),
-                Format::of(&published.document) == Format::Anchor,
-            )
-        });
+        .collect();
+    let best = parsed
+        .iter()
+        .find(|(source, ..)| *source == PROGRAM_METADATA)
+        .or_else(|| parsed.iter().find(|(source, ..)| *source == ANCHOR));
     let Some((source, published, parsed)) = best else {
         let formats: Vec<_> = published
             .iter()
@@ -227,17 +229,17 @@ fn compare<'a>(
         let reason = format!("published as {}", formats.join(" and "));
         return Ok((None, Outcome::NotComparable { reason }));
     };
-    let comparison = idl::compare(&committed, &parsed);
+    let comparison = idl::compare(&committed, parsed);
     let entries = comparison.differing();
     if entries.is_empty() {
-        return Ok((Some(source), Outcome::Matches));
+        return Ok((Some(*source), Outcome::Matches));
     }
     let diff_file = format!("idls/{}.diff", protocol.file_stem());
     write_text(&out.join(&diff_file), &comparison.render_diff())?;
     // Exactly as published, to update the committed IDL from.
     let published_file = format!("idls/{}.{source}.json", protocol.file_stem());
     write_text(&out.join(published_file), &published.raw)?;
-    Ok((Some(source), Outcome::Differs { entries, diff_file }))
+    Ok((Some(*source), Outcome::Differs { entries, diff_file }))
 }
 
 #[cfg(test)]
@@ -268,6 +270,22 @@ mod tests {
         };
         Ok(PublishedIdls {
             anchor: Some(published),
+            ..Default::default()
+        })
+    }
+
+    fn published(document: Value) -> Option<Published> {
+        Some(Published {
+            raw: document.to_string(),
+            document,
+        })
+    }
+
+    /// A program that publishes one IDL in its Anchor IDL account and another in Program Metadata.
+    fn both(anchor: Value, program_metadata: Value) -> Result<PublishedIdls> {
+        Ok(PublishedIdls {
+            anchor: published(anchor),
+            pmp: published(program_metadata),
             ..Default::default()
         })
     }
@@ -312,6 +330,32 @@ mod tests {
         assert!(diff.contains("\"u128\""), "{diff}");
         let copy = fs::read_to_string(out.path().join("idls/demo-v1.anchor.json")).unwrap();
         assert_eq!(copy, published.to_string());
+    }
+
+    #[test]
+    fn program_metadata_is_compared_with_before_the_anchor_idl_account() {
+        // The Anchor IDL account still holds what the committed IDL was made from.
+        let out = tempfile::tempdir().unwrap();
+        let result = check(both(idl("u64"), idl("u128")), out.path());
+        assert_eq!(result.compared_with.as_deref(), Some("pmp"));
+        assert!(matches!(result.outcome, Outcome::Differs { .. }));
+        assert!(out.path().join("idls/demo-v1.pmp.json").exists());
+    }
+
+    #[test]
+    fn a_program_replaced_by_another_no_longer_publishes_what_is_committed() {
+        // The Anchor IDL account still describes the program that used to live at the address.
+        let out = tempfile::tempdir().unwrap();
+        let mut replacement = idl("u64");
+        replacement["types"] = json!([]);
+        let result = check(both(idl("u64"), replacement), out.path());
+        assert_eq!(result.compared_with.as_deref(), Some("pmp"));
+        let Outcome::Differs { entries, diff_file } = result.outcome else {
+            panic!("{:?}", result.outcome);
+        };
+        assert_eq!(entries, ["types/LastUpdate"]);
+        let diff = fs::read_to_string(out.path().join(diff_file)).unwrap();
+        assert!(diff.contains("no longer published"), "{diff}");
     }
 
     #[test]

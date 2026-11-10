@@ -62,11 +62,13 @@ The `Scenarios monitoring` workflow checks every protocol here against mainnet o
 needs nothing per protocol: it finds each `idl.json` and the program its `address` names, and runs
 every test module under `crates/core/src/tests/protocols/`.
 
-Each run compares every committed `idl.json` with the IDL its program publishes (Anchor IDL account
-or Program Metadata, read through the [Solana IDL service](https://idl.solana.com/docs)), over the
-entries the committed file ships. It also runs the integration tests. The report is the run's
-summary page, and the run's `scenarios-monitoring` artifact also holds, for every protocol that
-differs, the diff and the published IDL. Nothing is committed, and no run depends on another.
+Each run compares every committed `idl.json` with the IDL its program publishes, over the entries
+the committed file ships. That is the program's Program Metadata copy, or the one in its Anchor IDL
+account when it publishes no Program Metadata copy; both are read through the
+[Solana IDL service](https://idl.solana.com/docs). It also runs the integration tests.
+The report is the run's summary page, and the run's `scenarios-monitoring` artifact also holds, for
+every protocol that differs, the diff and the published IDL. Nothing is committed, and no run
+depends on another.
 
 A run fails while a committed IDL differs from what its program publishes, while a test module
 fails, and when what a program publishes cannot be read. Updating the committed `idl.json` to what
