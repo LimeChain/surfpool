@@ -2,12 +2,11 @@ name: Scenarios monitoring
 
 # Checks the protocols the scenarios integrate against what is live on mainnet: the IDL each
 # program publishes, and the integration tests. Every run commits its report to the
-# scenarios/reports branch and opens, updates or closes one issue per protocol.
+# scenarios/reports branch.
 # SURFPOOL_TEST_RPC_URL is optional and used by the tests alone; the public endpoint rate-limits
 # them.
 on:
-  schedule:
-    - cron: "0 * * * *"
+  push:
   workflow_dispatch:
 
 # Every run is the same, so one waiting behind another may be dropped for a newer one.
@@ -20,7 +19,6 @@ permissions:
 
 env:
   REPORT_BRANCH: scenarios/reports
-  ISSUE_LABEL: scenarios-monitoring
 
 jobs:
   check:
@@ -108,71 +106,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The only job that can write. It runs no third-party action and no code from the check job:
-    # it reads the report with jq and acts with gh and git.
+    # it only commits the report with git.
     permissions:
       contents: write
-      issues: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: scenarios-monitoring
           path: out
-
-      - name: Open, update and close issues
-        # A GitHub API failure must not cost the run its report.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          findings=out/report/findings.json
-          state=out/state/issues.json
-          [ -f "$state" ] || echo '{}' > "$state"
-          # Records each action as it happens, so a failure part-way repeats nothing next run.
-          record() { jq "$@" "$state" > "$state.next" && mv "$state.next" "$state"; }
-          gh label create "$ISSUE_LABEL" --color D93F0B --force \
-            --description "Opened by the scenarios monitoring workflow"
-          open_issues=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 500 --json number,body)
-          issue_for() {
-            jq -r --arg marker "$1" \
-              'map(select((.body // "") | contains($marker))) | first | .number // empty' <<< "$open_issues"
-          }
-
-          jq -c '.open[]' "$findings" | while read -r finding; do
-            key=$(jq -r .key <<< "$finding")
-            fingerprint=$(jq -r .fingerprint <<< "$finding")
-            # Already reported as it is now, even if someone closed the issue since.
-            if [ "$(jq -r --arg key "$key" '.[$key].fingerprint // empty' "$state")" = "$fingerprint" ]; then
-              continue
-            fi
-            number=$(issue_for "$(jq -r .marker <<< "$finding")")
-            if [ -n "$number" ]; then
-              jq -r .body <<< "$finding" | gh issue comment "$number" --body-file -
-              echo "$key: commented on #$number"
-            else
-              url=$(jq -r '.marker + "\n" + .body' <<< "$finding" \
-                | gh issue create --title "$(jq -r .title <<< "$finding")" --label "$ISSUE_LABEL" --body-file -)
-              number=${url##*/}
-              echo "$key: opened #$number"
-            fi
-            record --arg key "$key" --arg fingerprint "$fingerprint" --argjson issue "$number" \
-              '.[$key] = {fingerprint: $fingerprint, issue: $issue}'
-          done
-
-          stamp=$(jq -r .stamp "$findings")
-          jq -c '.resolved[]' "$findings" | while read -r resolved; do
-            key=$(jq -r .key <<< "$resolved")
-            number=$(issue_for "$(jq -r .marker <<< "$resolved")")
-            if [ -n "$number" ]; then
-              case "$key" in
-                idl:*) what="the committed IDL matches upstream" ;;
-                *) what="the tests pass" ;;
-              esac
-              gh issue close "$number" --comment "Resolved: $what as of $stamp."
-              echo "$key: closed #$number"
-            fi
-            record --arg key "$key" 'del(.[$key])'
-          done
 
       - name: Commit the report
         env:
@@ -193,23 +134,8 @@ jobs:
           fi
           mkdir -p "$work/$STAMP"
           cp -R out/report/. "$work/$STAMP/"
-          # Only the run that sees an IDL change reports it. The IDL state moves on once every
-          # such finding is recorded against an issue; until then it stays, and the next run
-          # sees the change again.
-          issues=out/state/issues.json
-          [ -f "$issues" ] || echo '{}' > "$issues"
-          unrecorded=$(jq -r --slurpfile issues "$issues" '
-            [.open[] | select(.key | startswith("idl:"))
-              | select($issues[0][.key].fingerprint != .fingerprint) | .key] | join(", ")
-          ' out/report/findings.json)
-          if [ -n "$unrecorded" ]; then
-            echo "::warning::No issue is recorded for $unrecorded, so the IDL state stays as it was."
-            mkdir -p "$work/state"
-            cp "$issues" "$work/state/issues.json"
-          else
-            rm -rf "$work/state"
-            cp -R out/state "$work/state"
-          fi
+          rm -rf "$work/state"
+          cp -R out/state "$work/state"
           git -C "$work" add -A
           git -C "$work" commit -q -m "report $STAMP: $(cat out/verdict)"
           git -C "$work" -c http.extraheader="$auth" push -q origin "HEAD:$REPORT_BRANCH"
