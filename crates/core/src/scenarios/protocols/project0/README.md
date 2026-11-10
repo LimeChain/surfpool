@@ -190,12 +190,16 @@ project0-bank-limits   config.deposit_limit: 1                           # bank 
 Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the Surfnet clock is its
 `config.oracle_max_age` seconds past the price's `publish_time`:
 
-- From the slot a `pyth-core-compatible-price-feed-v2` override plays until the network is reset,
-  keep-alive writes the Clock's time to every Pyth Core Compatible price account the surfnet has
-  loaded, every slot, time travels included. A health check or liquidation reads the price of every
+- From the slot a `pyth-core-compatible-price-feed-v2` override with `keepAlive: true` plays until
+  the network is reset, keep-alive writes the Clock's time to every Pyth Core Compatible price
+  account the surfnet has loaded, every slot, time travels included. A health check or liquidation reads the price of every
   bank the account uses, and those prices stay fresh too; a price a transaction loads for the first
   time is kept from the next slot.
-- To keep one price stale on purpose, override it with `keepAlive: false`.
+- To keep one price stale while the others stay fresh, add two
+  `pyth-core-compatible-price-feed-v2` overrides that write each account's current price: one on
+  that bank's `config.oracle_keys.0` with `keepAlive: false`, and one on another bank's price
+  account with `keepAlive: true`. Keep-alive starts only when an override with `keepAlive: true`
+  writes, and an override with no values writes nothing.
 - A bank priced by anything other than a Pyth Core Compatible feed is not kept alive. Raise its
   `oracle_max_age` with `project0-bank-oracle`.
 
