@@ -124,11 +124,14 @@ Keep-alive starts in the slot the importing override plays and rewrites its fiel
 that slot's overrides, until the network is reset. An override of one of those fields therefore
 never takes effect. An override with `keepAlive: false` stops keep-alive for the account it writes
 from that slot on, so the account ages as the clock moves on, for example to test a stale price. A
-later override with `keepAlive: true`, the default, on that account starts it again, with every import
-that rewrites it, including imports bound by other templates' overrides. An account not
-yet in the surfnet is fetched from the remote first, unless it, or its owner with its owned accounts,
-is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
-until an importing override plays again.
+later override with `keepAlive: true`, the default, on that account starts it again, with every
+import that rewrites it, including imports bound by other templates' overrides. An override with
+`keepAlive: false` binds none of its template's imports, so on its own it starts no keep-alive, also
+not for the other accounts those imports rewrite: add an override with `keepAlive: true` when they
+must stay fresh. An override with no values writes nothing, so it neither starts nor stops
+keep-alive. An account not yet in the surfnet is fetched from the remote first, unless it, or its
+owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart
+on a persistent database it stops until an importing override plays again.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
