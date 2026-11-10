@@ -1,0 +1,226 @@
+name: Scenarios monitoring
+
+# Checks the protocols the scenarios integrate against what is live on mainnet: the IDL each
+# program publishes, and the integration tests. Every run commits its report to the
+# scenarios/reports branch and opens, updates or closes one issue per protocol.
+# SURFPOOL_TEST_RPC_URL is optional and used by the tests alone; the public endpoint rate-limits
+# them.
+on:
+  schedule:
+    # IDLs every 10 minutes; the integration tests as well at five past each hour.
+    - cron: "*/10 * * * *"
+    - cron: "5 * * * *"
+  workflow_dispatch:
+    inputs:
+      integration-tests:
+        description: Also run the integration tests
+        type: boolean
+        default: true
+
+concurrency:
+  group: scenarios-monitoring
+  cancel-in-progress: false
+
+env:
+  REPORT_BRANCH: scenarios/reports
+  TESTS_SCHEDULE: "5 * * * *"
+  ISSUE_LABEL: scenarios-monitoring
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Third-party actions run here, so this job's token stays read-only; publish has its own job.
+    permissions:
+      contents: read
+    outputs:
+      stamp: ${{ steps.plan.outputs.stamp }}
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Plan the run
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          DISPATCH_TESTS: ${{ inputs.integration-tests }}
+        run: |
+          echo "stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> "$GITHUB_OUTPUT"
+          if { [ "$EVENT" = workflow_dispatch ] && [ "$DISPATCH_TESTS" = true ]; } \
+              || [ "$SCHEDULE" = "$TESTS_SCHEDULE" ]; then
+            echo "tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read the previous state
+        run: |
+          mkdir -p previous
+          if git ls-remote --exit-code --heads origin "$REPORT_BRANCH" > /dev/null; then
+            git fetch -q --depth 1 origin "$REPORT_BRANCH"
+            git archive FETCH_HEAD state | tar -x -C previous
+          else
+            echo "No $REPORT_BRANCH branch yet: this run records the baseline."
+          fi
+
+      - name: Install build dependencies
+        if: steps.plan.outputs.tests == 'true'
+        # Only the tests need these, so a failure here must not cost the run its IDL report.
+        continue-on-error: true
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scenarios-monitoring
+
+      - name: Build the monitor
+        run: cargo build -p surfpool-scenarios-monitor
+
+      - name: Integration tests
+        if: steps.plan.outputs.tests == 'true'
+        # The tests add to the report and never stop it: whether they fail, do not build or hang,
+        # the check step still runs and reports the IDLs next to whatever the log holds.
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
+        run: |
+          # Every protocol's tests live under tests::protocols; without the filter the whole
+          # crate's tests would run. The check step reads the outcome from the log, so a failing
+          # test never fails this step.
+          cargo test -p surfpool-core --lib --features integration-tests --no-fail-fast \
+            -- tests::protocols:: > tests.log 2>&1 || true
+          grep -E '^test result:|^test .* FAILED$' tests.log || tail -n 40 tests.log
+
+      - name: Check
+        env:
+          # Makes no request here; it is passed so its key can be kept out of the published
+          # test output.
+          SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
+          STAMP: ${{ steps.plan.outputs.stamp }}
+          TESTS: ${{ steps.plan.outputs.tests }}
+          REPORT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ env.REPORT_BRANCH }}/${{ steps.plan.outputs.stamp }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          args=(--stamp "$STAMP" --previous previous --out out --report-url "$REPORT_URL" --run-url "$RUN_URL")
+          if [ "$TESTS" = true ]; then
+            args+=(--tests-log tests.log)
+          fi
+          target/debug/scenarios-monitor "${args[@]}"
+          cat out/report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scenarios-monitoring
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: check
+    if: always() && needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job that can write. It runs no third-party action and no code from the check job:
+    # it reads the report with jq and acts with gh and git.
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scenarios-monitoring
+          path: out
+
+      - name: Open, update and close issues
+        # A GitHub API failure must not cost the run its report.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          findings=out/report/findings.json
+          state=out/state/issues.json
+          [ -f "$state" ] || echo '{}' > "$state"
+          # Records each action as it happens, so a failure part-way repeats nothing next run.
+          record() { jq "$@" "$state" > "$state.next" && mv "$state.next" "$state"; }
+          gh label create "$ISSUE_LABEL" --color D93F0B --force \
+            --description "Opened by the scenarios monitoring workflow"
+          open_issues=$(gh issue list --label "$ISSUE_LABEL" --state open --limit 500 --json number,body)
+          issue_for() {
+            jq -r --arg marker "$1" \
+              'map(select((.body // "") | contains($marker))) | first | .number // empty' <<< "$open_issues"
+          }
+
+          jq -c '.open[]' "$findings" | while read -r finding; do
+            key=$(jq -r .key <<< "$finding")
+            fingerprint=$(jq -r .fingerprint <<< "$finding")
+            # Already reported as it is now, even if someone closed the issue since.
+            if [ "$(jq -r --arg key "$key" '.[$key].fingerprint // empty' "$state")" = "$fingerprint" ]; then
+              continue
+            fi
+            number=$(issue_for "$(jq -r .marker <<< "$finding")")
+            if [ -n "$number" ]; then
+              jq -r .body <<< "$finding" | gh issue comment "$number" --body-file -
+              echo "$key: commented on #$number"
+            else
+              url=$(jq -r '.marker + "\n" + .body' <<< "$finding" \
+                | gh issue create --title "$(jq -r .title <<< "$finding")" --label "$ISSUE_LABEL" --body-file -)
+              number=${url##*/}
+              echo "$key: opened #$number"
+            fi
+            record --arg key "$key" --arg fingerprint "$fingerprint" --argjson issue "$number" \
+              '.[$key] = {fingerprint: $fingerprint, issue: $issue}'
+          done
+
+          stamp=$(jq -r .stamp "$findings")
+          jq -c '.resolved[]' "$findings" | while read -r resolved; do
+            key=$(jq -r .key <<< "$resolved")
+            number=$(issue_for "$(jq -r .marker <<< "$resolved")")
+            if [ -n "$number" ]; then
+              case "$key" in
+                idl:*) what="the committed IDL matches upstream" ;;
+                *) what="the tests pass" ;;
+              esac
+              gh issue close "$number" --comment "Resolved: $what as of $stamp."
+              echo "$key: closed #$number"
+            fi
+            record --arg key "$key" 'del(.[$key])'
+          done
+
+      - name: Commit the report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAMP: ${{ needs.check.outputs.stamp }}
+        run: |
+          work=$(mktemp -d)
+          git -C "$work" init -q
+          git -C "$work" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -C "$work" config user.name "github-actions[bot]"
+          git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          # The branch holds reports and state only, so the first run starts it as an orphan.
+          if git -C "$work" -c http.extraheader="$auth" fetch -q --depth 1 origin "$REPORT_BRANCH"; then
+            git -C "$work" checkout -q -B "$REPORT_BRANCH" FETCH_HEAD
+          else
+            git -C "$work" checkout -q --orphan "$REPORT_BRANCH"
+          fi
+          mkdir -p "$work/$STAMP"
+          cp -R out/report/. "$work/$STAMP/"
+          rm -rf "$work/state"
+          cp -R out/state "$work/state"
+          git -C "$work" add -A
+          git -C "$work" commit -q -m "report $STAMP: $(cat out/verdict)"
+          git -C "$work" -c http.extraheader="$auth" push -q origin "HEAD:$REPORT_BRANCH"
+          echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$REPORT_BRANCH/$STAMP"
+
+      # Last, so a red run still leaves its report and issues behind.
+      - name: Fail when a protocol needs attention
+        run: |
+          verdict=$(cat out/verdict)
+          echo "verdict: $verdict"
+          case "$verdict" in
+            attention|incomplete) exit 1 ;;
+          esac

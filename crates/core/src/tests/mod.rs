@@ -6,13 +6,9 @@ pub mod helpers;
 #[cfg(feature = "integration-tests")]
 pub mod humidifi;
 pub mod integration;
-#[cfg(feature = "integration-tests")]
-pub mod kamino;
-#[cfg(feature = "integration-tests")]
-pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
-pub mod pump;
+pub mod protocols;
 pub mod simnet_events;
 #[cfg(feature = "integration-tests")]
 pub mod solfi;

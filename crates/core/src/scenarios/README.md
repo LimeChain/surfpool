@@ -62,6 +62,26 @@ cargo test -p surfpool-core --features integration-tests bisonfi
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
 run needs no network.
 
+### Monitoring the integrated protocols
+
+The `Scenarios monitoring` workflow checks every protocol here against mainnet on a schedule and
+needs nothing per protocol: it finds each `idl.json` and the program its `address` names, and runs
+every test module under `crates/core/src/tests/protocols/`.
+
+Each run compares the IDL the program publishes (Anchor IDL account or Program Metadata, read
+through the [Solana IDL service](https://idl.solana.com/docs)) with the previous run and with the
+committed `idl.json`, over the entries the committed file ships. On the test schedule it also runs
+the integration tests. The report lands in a timestamped folder on the `scenarios/reports` branch,
+with the IDL and diff of every upstream change. An upstream change that touches a shipped entry, or
+a failing test module, opens one issue per protocol; later changes comment on it, and it closes
+once the committed IDL matches upstream again or the tests pass.
+
+The checks live in the `surfpool-scenarios-monitor` crate and run locally:
+
+```
+cargo run -p surfpool-scenarios-monitor -- --stamp local --previous <dir> --out <dir>
+```
+
 ### Programs with no IDL
 
 Programs that publish no usable IDL can describe their account bytes directly in an override
