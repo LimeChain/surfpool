@@ -2,7 +2,8 @@
 //! maker republishing its quote. Nobody runs those actors against a surfnet, so once a scenario's
 //! override touches an account, the surfnet applies the keep-alive templates its template imports
 //! every slot, as ordinary overrides, until the network is reset. An override with `keep_alive`
-//! off stops keep-alive for the account it writes, until an override with it on writes that account.
+//! off stops keep-alive for the account it writes, until an override with it on writes that account,
+//! which restarts every import that rewrites it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -52,18 +53,18 @@ pub struct KeepAliveKind {
 pub struct KeepAlive {
     pub bindings: BTreeSet<KeepAliveBinding>,
     pub kinds: BTreeSet<KeepAliveKind>,
-    /// Accounts an override with `keep_alive` off wrote last. Keep-alive skips them.
+    /// Accounts an override with `keep_alive` off wrote last. Keep-alive skips them but keeps
+    /// their bindings, so an override with it on restarts them all.
     pub excluded: HashSet<Pubkey>,
 }
 
 impl KeepAlive {
     /// Applies the overrides that wrote `touched`, in order: one with `keep_alive` off stops
     /// keep-alive for its account, one with it on starts it again and adds its template's imports.
+    /// An import that rewrites a stopped account is bound too, and starts when the account does.
     pub fn enroll(&mut self, registry: &TemplateRegistry, touched: Vec<KeepAliveSource>) {
         for source in touched {
             if !source.keep_alive {
-                self.bindings
-                    .retain(|binding| binding.address != source.address);
                 if self.excluded.insert(source.address) {
                     info!("Keep-alive stops rewriting {}", source.address);
                 }
@@ -94,9 +95,6 @@ impl KeepAlive {
                     );
                     continue;
                 };
-                if self.excluded.contains(&address) {
-                    continue;
-                }
                 let binding = KeepAliveBinding {
                     template: template.id.clone(),
                     import: index,
@@ -130,6 +128,7 @@ impl KeepAlive {
         let mut targets = Vec::new();
         for binding in &self.bindings {
             if let Some(import) = import_of(&binding.template, binding.import)
+                && !self.excluded.contains(&binding.address)
                 && seen.insert((import.template.as_str(), binding.address))
             {
                 targets.push((import, binding.address));
@@ -333,7 +332,7 @@ templates:
             &surfnet.registry,
             vec![source("pyth-price-feed-v2", oracle, oracle, false)],
         );
-        assert!(keep_alive.bindings.is_empty(), "its binding is dropped");
+        assert_eq!(keep_alive.bindings.len(), 1, "its binding is kept");
         assert_eq!(surfnet.targets(&keep_alive), [other_price]);
 
         keep_alive.enroll(
@@ -351,5 +350,86 @@ templates:
             vec![source("pyth-price-feed-v2", oracle, oracle, true)],
         );
         assert_eq!(surfnet.targets(&keep_alive), [oracle, other_price]);
+    }
+
+    const INPUT_OVERRIDES: &str = r#"
+protocol: Example
+version: v1
+account_type: State
+raw_layout: true
+templates:
+  - id: example-vault
+    name: Vault
+    description: Example vault
+    keep_alive:
+      - template: example-price-fresh
+        address: { type: input, value: oracle }
+        values: { posted_slot: $slot }
+    address: { type: pubkey }
+    properties:
+      - { path: balance, offset: 0, encoding: u64, description: Balance }
+      - { path: oracle, type: input, value_type: pubkey, description: The vault's oracle }
+  - id: example-oracle
+    name: Oracle
+    description: Example oracle
+    address: { type: pubkey }
+    properties:
+      - { path: price, offset: 0, encoding: u64, description: Price }
+"#;
+
+    #[test]
+    fn keep_alive_on_again_restores_another_templates_binding() {
+        let surfnet = LocalAccounts {
+            registry: owned_registry(INPUT_OVERRIDES),
+            ..LocalAccounts::new()
+        };
+        assert!(
+            surfnet
+                .registry
+                .get("example-oracle")
+                .unwrap()
+                .keep_alive
+                .is_empty(),
+            "re-enabling must not import anything itself"
+        );
+        let oracle = Pubkey::new_unique();
+        let mut keep_alive = KeepAlive::default();
+        keep_alive.enroll(
+            &surfnet.registry,
+            vec![source("example-vault", Pubkey::new_unique(), oracle, true)],
+        );
+        assert_eq!(surfnet.targets(&keep_alive), [oracle]);
+
+        keep_alive.enroll(
+            &surfnet.registry,
+            vec![source("example-oracle", oracle, oracle, false)],
+        );
+        assert!(surfnet.targets(&keep_alive).is_empty());
+
+        keep_alive.enroll(
+            &surfnet.registry,
+            vec![source("example-oracle", oracle, oracle, true)],
+        );
+        assert_eq!(surfnet.targets(&keep_alive), [oracle]);
+
+        let mut off_first = KeepAlive::default();
+        off_first.enroll(
+            &surfnet.registry,
+            vec![
+                source("example-oracle", oracle, oracle, false),
+                source("example-vault", Pubkey::new_unique(), oracle, true),
+            ],
+        );
+        assert!(surfnet.targets(&off_first).is_empty());
+
+        off_first.enroll(
+            &surfnet.registry,
+            vec![source("example-oracle", oracle, oracle, true)],
+        );
+        assert_eq!(
+            surfnet.targets(&off_first),
+            [oracle],
+            "a vault that played while the oracle was off still bound it"
+        );
     }
 }
