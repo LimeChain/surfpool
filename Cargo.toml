@@ -15,6 +15,7 @@ members = [
     "crates/core",
     "crates/db",
     "crates/mcp",
+    "crates/scenarios-monitor",
     "crates/sdk",
     "crates/sdk-node",
     "crates/studio",
@@ -181,6 +182,7 @@ uuid = "1.15.1"
 wincode = "0.6"
 zip = { version = "9.0.5", features = ["deflate-flate2-zlib-rs"], default-features = false }
 sha2 = { version = "0.10" }
+similar = { version = "2.7.0", default-features = false }
 
 surfpool-core = { path = "crates/core", default-features = false, version = "1.7.0"}
 surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.7.0" }
