@@ -122,6 +122,10 @@ const LIQUIDATION_PAUSED: u8 = 0b0010_0000;
 const EXCHANGE_LIQUIDATIONS_PAUSED: u8 = 0b0001_0000;
 /// `PlaceAndTakeOrderSuccessCondition::FullFill`.
 const FULL_FILL: u32 = 2;
+/// The second byte of `place_and_take_perp_order`'s optional params: how far into its auction a
+/// taker is priced, in percent. A crossing limit order's auction starts near the oracle price, from
+/// the live AMM spread; at its end the taker takes any resting order up to its limit price.
+const AT_AUCTION_END: u32 = 100 << 8;
 
 const SUFFICIENT_COLLATERAL: u32 = 6004;
 const PRICE_BANDS_BREACHED: u32 = 6023;
@@ -429,7 +433,8 @@ impl Mainnet {
         instruction("place_perp_order", &accounts, vec![params], remaining)
     }
 
-    /// An order that must fill in full at once, against `maker`'s orders or the AMM.
+    /// An order that must fill in full at once, up to its limit price, against `maker`'s orders or
+    /// the AMM.
     fn take_order(
         &self,
         taker: &Keypair,
@@ -444,7 +449,7 @@ impl Mainnet {
             remaining.push(AccountMeta::new(maker_stats, false));
         }
         let accounts = [STATE, user, stats, taker.pubkey()];
-        let args = vec![params, int(FULL_FILL)];
+        let args = vec![params, int(FULL_FILL | AT_AUCTION_END)];
         instruction("place_and_take_perp_order", &accounts, args, remaining)
     }
 
