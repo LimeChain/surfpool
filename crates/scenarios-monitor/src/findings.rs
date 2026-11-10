@@ -6,7 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    check::{EventKind, IdlResult},
+    check::IdlResult,
     tests_log::{Failure, ModuleResult, Status},
 };
 
@@ -121,21 +121,17 @@ pub fn idl_findings(
             links(address)
         );
         for event in &attention {
-            let versions = match (event.kind, &event.from_version, &event.to_version) {
-                (EventKind::Changed, from, to) if from == to => {
-                    format!("version stays {}", to.as_deref().unwrap_or("unset"))
-                }
-                (_, from, to) => format!(
+            let versions = if event.from_version == event.to_version {
+                let version = event.to_version.as_deref().unwrap_or("unset");
+                format!("version stays {version}")
+            } else {
+                format!(
                     "{} → {}",
-                    from.as_deref().unwrap_or("?"),
-                    to.as_deref().unwrap_or("—")
-                ),
+                    event.from_version.as_deref().unwrap_or("?"),
+                    event.to_version.as_deref().unwrap_or("?")
+                )
             };
-            let kind = match event.kind {
-                EventKind::Changed => "changed",
-                EventKind::Withdrawn => "withdrawn",
-            };
-            body += &format!("- **{}** IDL {kind}: {versions}\n", event.source);
+            body += &format!("- **{}** IDL changed: {versions}\n", event.source);
             if !event.breaking.is_empty() {
                 let entries: Vec<_> = event
                     .breaking
@@ -143,7 +139,7 @@ pub fn idl_findings(
                     .map(|entry| format!("`{entry}`"))
                     .collect();
                 body += &format!("  - changed or removed: {}\n", entries.join(", "));
-            } else if !event.comparable && event.kind == EventKind::Changed {
+            } else if !event.comparable {
                 body += "  - not an Anchor IDL Surfpool can compare entry by entry\n";
             }
             if let Some(note) = &event.note {
@@ -160,9 +156,8 @@ pub fn idl_findings(
             .iter()
             .map(|event| {
                 format!(
-                    "{}:{:?}:{}",
+                    "{}:{}",
                     event.source,
-                    event.kind,
                     event.to_hash.as_deref().unwrap_or_default()
                 )
             })

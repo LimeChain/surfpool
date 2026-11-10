@@ -253,11 +253,12 @@ leaves the other.
 ## Tests against mainnet
 
 ```sh
-cargo test -p surfpool-core --features integration-tests tests::phoenix
+cargo test -p surfpool-core --features integration-tests tests::protocols::phoenix
 ```
 
-Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. CI does not
-build this feature, so run them before a push (about half a minute).
+Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. The checks on
+a pull request do not build this feature; only the scheduled `Scenarios monitoring` workflow runs
+these tests. So run them before a push (about half a minute).
 
 - Each run copies mainnet's exchange accounts and every book once.
 - Each test runs Phoenix's mainnet programs on a fresh local copy and plays templates as Play does.

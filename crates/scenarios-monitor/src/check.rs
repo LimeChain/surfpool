@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::{
     idl::{self, Format},
-    idl_service::{IdlService, PublishedIdls},
+    idl_service::PublishedIdls,
 };
 
 pub const PROTOCOLS_DIR: &str = "crates/core/src/scenarios/protocols";
@@ -134,7 +134,8 @@ pub enum SourceStatus {
     Baseline,
     Unchanged,
     Changed,
-    Withdrawn,
+    /// Published before and absent from this run's answer; its last copy stays the baseline.
+    Missing,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,18 +145,10 @@ pub struct SourceResult {
     pub format: Option<Format>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EventKind {
-    Changed,
-    Withdrawn,
-}
-
 /// A source whose IDL changed since the previous run.
 #[derive(Debug, Serialize)]
 pub struct Event {
     pub source: String,
-    pub kind: EventKind,
     pub from_version: Option<String>,
     pub to_version: Option<String>,
     pub to_hash: Option<String>,
@@ -203,7 +196,7 @@ pub struct IdlCheck {
 /// Writes the next state's IDL copies under `out/state` and changed IDLs under `out/report`, each
 /// exactly as published.
 pub fn check_idls(
-    service: &IdlService,
+    latest: &dyn Fn(&str) -> Result<PublishedIdls>,
     protocols: &[Protocol],
     previous: &BTreeMap<String, IdlState>,
     previous_dir: &Path,
@@ -231,7 +224,7 @@ pub fn check_idls(
             check.results.push(result);
             continue;
         };
-        let published = match service.latest(address) {
+        let published = match latest(address) {
             Ok(published) => published,
             Err(error) => {
                 result.error = Some(error.to_string());
@@ -256,25 +249,27 @@ pub fn check_idls(
         let committed = idl::parse(&protocol.idl, address).ok();
 
         let mut sources = BTreeMap::new();
+        let mut missing = Vec::new();
         for (source, published) in published.iter() {
             let known = before.and_then(|before| before.sources.get(source));
             let Some(published) = published else {
                 if let Some(known) = known {
-                    let previous_copy = read_copy(previous_dir, known)?;
-                    result.events.push(event(
-                        source,
-                        EventKind::Withdrawn,
-                        previous_copy.as_ref(),
-                        None,
-                    ));
+                    // An IDL that was withdrawn and one the service missed for a run look the
+                    // same, so the last copy stays the baseline and the run counts as unverified.
+                    carry(
+                        &previous_dir.join(&known.file),
+                        &out.join("state").join(&known.file),
+                    )?;
                     result.sources.insert(
                         source.into(),
                         SourceResult {
-                            status: SourceStatus::Withdrawn,
-                            version: None,
-                            format: None,
+                            status: SourceStatus::Missing,
+                            version: known.version.clone(),
+                            format: Some(known.format),
                         },
                     );
+                    sources.insert(source.to_owned(), known.clone());
+                    missing.push(source);
                 }
                 continue;
             };
@@ -326,14 +321,25 @@ pub fn check_idls(
             sources.insert(source.to_owned(), state);
         }
 
-        if !sources.is_empty() {
+        if !missing.is_empty() {
+            result.error = Some(format!(
+                "the service returned no {} IDL, which it did before",
+                missing.join(" or ")
+            ));
+        }
+        let gap_file = format!("idls/{}.gap.diff", protocol.file_stem());
+        if published.iter().any(|(_, published)| published.is_some()) {
             let (mut gap, diff) = gap(committed.as_ref(), &published, address);
             if !diff.is_empty() {
-                let diff_file = format!("idls/{}.gap.diff", protocol.file_stem());
-                write_text(&out.join("state").join(&diff_file), &diff)?;
-                gap.diff_file = Some(diff_file);
+                write_text(&out.join("state").join(&gap_file), &diff)?;
+                gap.diff_file = Some(gap_file);
             }
             result.gap = Some(gap);
+        } else {
+            carry(
+                &previous_dir.join(&gap_file),
+                &out.join("state").join(&gap_file),
+            )?;
         }
         check.state.insert(
             protocol.name.clone(),
@@ -358,23 +364,6 @@ fn read_copy(previous_dir: &Path, known: &SourceState) -> Result<Option<Value>> 
     })?))
 }
 
-fn event(source: &str, kind: EventKind, before: Option<&Value>, after: Option<&Value>) -> Event {
-    Event {
-        source: source.into(),
-        kind,
-        from_version: before.and_then(idl::version_of),
-        to_version: after.and_then(idl::version_of),
-        to_hash: None,
-        comparable: false,
-        breaking: Vec::new(),
-        added: 0,
-        changed_elsewhere: 0,
-        attention: true,
-        note: None,
-        diff_file: None,
-    }
-}
-
 /// The event and its diff for a source whose IDL changed.
 fn changed(
     source: &str,
@@ -383,7 +372,19 @@ fn changed(
     after: &Value,
     committed: Option<&Idl>,
 ) -> (Event, String) {
-    let mut event = event(source, EventKind::Changed, before, Some(after));
+    let mut event = Event {
+        source: source.into(),
+        from_version: before.and_then(idl::version_of),
+        to_version: idl::version_of(after),
+        to_hash: None,
+        comparable: false,
+        breaking: Vec::new(),
+        added: 0,
+        changed_elsewhere: 0,
+        attention: true,
+        note: None,
+        diff_file: None,
+    };
     let Some(before) = before else {
         event.note = Some("the previous copy is missing from the state".into());
         return (event, String::new());
@@ -463,4 +464,104 @@ fn gap(committed: Option<&Idl>, published: &PublishedIdls, address: &str) -> (Ga
         gap,
         comparison.render_diff("committed", &format!("upstream {source}")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::idl_service::Published;
+
+    const ADDRESS: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+
+    fn idl(slot_type: &str) -> Value {
+        json!({
+            "address": ADDRESS,
+            "metadata": {"name": "demo", "version": "1.0.0", "spec": "0.1.0"},
+            "instructions": [],
+            "types": [{"name": "LastUpdate", "type": {"kind": "struct", "fields": [
+                {"name": "slot", "type": slot_type},
+            ]}}],
+        })
+    }
+
+    fn anchor(document: Value) -> Result<PublishedIdls> {
+        let published = Published {
+            raw: document.to_string(),
+            document,
+        };
+        Ok(PublishedIdls {
+            anchor: Some(published),
+            pmp: None,
+        })
+    }
+
+    /// Runs the check once per answer, each run starting from the state the one before left.
+    fn runs(answers: Vec<Result<PublishedIdls>>) -> Vec<IdlResult> {
+        let dir = tempfile::tempdir().unwrap();
+        let protocols = [Protocol {
+            name: "demo/v1".into(),
+            address: Some(ADDRESS.into()),
+            path: "protocols/demo/v1/idl.json".into(),
+            idl: idl("u64"),
+        }];
+        let mut state = BTreeMap::new();
+        let mut previous_dir = dir.path().join("none");
+        let mut results = Vec::new();
+        for (run, answer) in answers.into_iter().enumerate() {
+            let answer = RefCell::new(Some(answer));
+            let latest = |_: &str| answer.borrow_mut().take().unwrap();
+            let out = dir.path().join(run.to_string());
+            let check =
+                check_idls(&latest, &protocols, &state, &previous_dir, &out, "now").unwrap();
+            state = check.state;
+            previous_dir = out.join("state");
+            results.extend(check.results);
+        }
+        results
+    }
+
+    #[test]
+    fn an_upstream_change_to_a_shipped_entry_is_raised_once() {
+        let results = runs(vec![
+            anchor(idl("u64")),
+            anchor(idl("u128")),
+            anchor(idl("u128")),
+        ]);
+        assert_eq!(results[0].sources["anchor"].status, SourceStatus::Baseline);
+        assert!(results[0].events.is_empty());
+        assert_eq!(results[1].events[0].breaking, ["types/LastUpdate"]);
+        assert!(results[1].events[0].attention);
+        assert_eq!(results[2].sources["anchor"].status, SourceStatus::Unchanged);
+        assert!(results[2].events.is_empty());
+    }
+
+    #[test]
+    fn a_source_missing_for_one_run_keeps_its_baseline() {
+        let results = runs(vec![
+            anchor(idl("u64")),
+            Ok(PublishedIdls::default()),
+            anchor(idl("u128")),
+        ]);
+        // Nothing is raised for the run without an answer; it only counts as unverified.
+        assert_eq!(results[1].sources["anchor"].status, SourceStatus::Missing);
+        assert!(results[1].events.is_empty());
+        assert!(results[1].error.is_some());
+        // The change that happened meanwhile is still found against the last copy.
+        assert_eq!(results[2].events[0].breaking, ["types/LastUpdate"]);
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_the_baseline() {
+        let results = runs(vec![
+            anchor(idl("u64")),
+            Err(anyhow::anyhow!("IDL service: HTTP 500")),
+            anchor(idl("u128")),
+        ]);
+        assert_eq!(results[1].error.as_deref(), Some("IDL service: HTTP 500"));
+        assert_eq!(results[2].events[0].breaking, ["types/LastUpdate"]);
+    }
 }
