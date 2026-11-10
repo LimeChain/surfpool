@@ -22,10 +22,10 @@ templates:
         description: Uncertainty band in the same scale as price; scale it with price so their ratio holds
       - path: posted_slot
         label: Posted Slot
-        description: Slot the price counts as posted at. Keep-alive writes the current slot every slot
+        description: Slot the price counts as posted at. Keep-alive writes the current slot every slot, so a value set here holds only with keepAlive false
       - path: publish_time
         label: Publish Time
-        description: Pyth Lazer timestamp in microseconds. Keep-alive writes the Clock time every slot
+        description: Pyth Lazer timestamp in microseconds. Keep-alive writes the Clock time every slot, so a value set here holds only with keepAlive false
     address:
       type: pubkey
     keep_alive:
@@ -51,21 +51,25 @@ templates:
       fetchBeforeUse false, since a reload drops earlier local changes to it; two overrides of it
       in the same slot can both keep true.
 
-      THE PRICE STAYS POSTED BY ITSELF. From the slot this override plays, Surfpool reposts this
-      oracle every slot, as Velocity's keeper does on mainnet: posted_slot becomes the slot and
-      publish_time the Clock time in microseconds, so the price never goes stale. Write price and
-      conf only. Read the oracle with getAccountInfo and encoding jsonParsed: price is USD x
-      10^-exponent, with exponent read from the same oracle; leave exponent alone. Scale conf by
-      the same factor as price.
+      THE PRICE STAYS POSTED BY ITSELF. From the slot this override plays with keepAlive: true,
+      Surfpool reposts this oracle every slot, as Velocity's keeper does on mainnet: posted_slot
+      becomes the slot and publish_time the Clock time in microseconds, so the price never goes
+      stale. Write price and conf only. Read the oracle with getAccountInfo and encoding jsonParsed:
+      price is USD x 10^-exponent, with exponent read from the same oracle; leave exponent alone.
+      Scale conf by the same factor as price.
 
       An account's margin also reads the oracles of its other markets and its collateral, such as
       the USDT price. From the slot this override plays, Surfpool also reposts every other Velocity
       oracle the surfnet has loaded, keeping its price, and from the next slot every one a
-      transaction loads later, so margin checks and fills find them fresh. To keep one oracle stale
-      on purpose, override it with this template and keepAlive: false. It then ages, and margin
-      checks, such as withdrawals, orders that add risk and matched fills, refuse it once it is
-      older than the State's slots_before_stale_for_margin window: 240 slots, three times that for
-      the USDT price (InvalidOracle, 6035). Liquidations ignore a price's age.
+      transaction loads later, so margin checks and fills find them fresh. Keep-alive starts only
+      when an override with keepAlive: true writes an oracle, and an override with no values writes
+      nothing. To keep one oracle stale while the others stay fresh, add two overrides of this
+      template, both with fetchBeforeUse: true and price and conf set to the oracle's current
+      values, so no price changes: one on that oracle with keepAlive: false, and one on any other
+      oracle with keepAlive: true. The stale oracle then ages, and margin checks, such as
+      withdrawals, orders that add risk and matched fills, refuse it once it is older than the
+      State's slots_before_stale_for_margin window: 240 slots, three times that for the USDT price
+      (InvalidOracle, 6035). Liquidations ignore a price's age.
 
       Fills read the market's own MM oracle price instead of this one when the two are within 1%
       and the market's market_stats.mm_oracle_sequence_id, also in microseconds, is newer than
@@ -208,10 +212,10 @@ templates:
       of all an account's markets, and refuse a price more than slots_before_stale_for_margin units
       of 400 ms past its posted_slot. The program converts units with the State's slot_duration_ms
       (200 ms live, so two slots per unit) and gives the USDT price three times the window; the live
-      120 is 240 slots. From the slot a velocity-oracle-price override plays, Surfpool reposts every
-      Velocity oracle at the Clock, so the window matters before that and for an oracle written
-      with keepAlive: false. Raise it to keep those prices usable longer. The program's admin path
-      allows up to 1000000 (2,000,000 slots); the program reads any value.
+      120 is 240 slots. From the slot a velocity-oracle-price override with keepAlive: true plays,
+      Surfpool reposts every Velocity oracle at the Clock, so the window matters before that and for
+      an oracle written with keepAlive: false. Raise it to keep those prices usable longer. The
+      program's admin path allows up to 1000000 (2,000,000 slots); the program reads any value.
 
       Liquidation refuses a price further from the market's 5-minute TWAP than
       oracle_twap_5min_percent_divergence (1000000 = 100%, never below 500000) with
