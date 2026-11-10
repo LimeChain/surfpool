@@ -67,14 +67,15 @@ fn main() -> Result<()> {
     let args = Cli::parse();
     let service = IdlService::new()?;
     let out = &args.out;
-    // What an earlier run left here would sit beside a report that no longer mentions it.
+    let protocols = check::discover(&args.root)?;
+    // What an earlier run left here would sit beside a report that no longer mentions it. Cleared
+    // only once there are protocols to check, so that a run that cannot start leaves it alone.
     match fs::remove_dir_all(out.join("idls")) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => {
             return Err(error).context("clearing the output folder's idls/");
         }
         _ => {}
     }
-    let protocols = check::discover(&args.root)?;
     let deadline = Instant::now() + IDL_SERVICE_BUDGET;
     let latest = |address: &str| {
         if Instant::now() > deadline {
