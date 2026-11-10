@@ -75,8 +75,15 @@ templates:
       fields keep their values. A value set for publish_time or posted_slot never takes effect, so
       leave both unset.
 
-      STALE PRICE: to keep one feed stale on purpose, override it with keepAlive: false. It then
-      ages against the Surfnet clock.
+      STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a price
+      account, and an override with no values writes nothing. To keep one feed stale while the
+      others stay fresh, add two overrides of this template, both with fetchBeforeUse: true and
+      price_message.price set to the account's current price (getAccountInfo, encoding
+      "jsonParsed"), so no price changes:
+      - on the stale feed's price account, keepAlive: false. It then ages against the Surfnet
+        clock and turns stale once the consumer's age limit has passed;
+      - on any other price account the same consumer reads, keepAlive: true. This starts the
+        republishing of every loaded price account except the stale one.
 
       EXAMPLE - "SOL drops to $20" on an account with exponent -8, live price p and ema_price q:
       price_message.price: 2000000000
