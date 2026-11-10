@@ -134,8 +134,9 @@ impl Report<'_> {
             return;
         };
         if !tests.complete {
-            *out += "The tests did not finish, or ran nothing: they did not build, were cut short, \
-                     or no protocol test ran. What they reported until then is below.\n\n";
+            *out += "These results are not complete: the tests did not build, were cut short, ran \
+                     no protocol test, or count a different number of failures than their output \
+                     lists. What could be read is below.\n\n";
         }
         *out += "| Module | Passed | Failed | Ignored | Result |\n|---|---|---|---|---|\n";
         for (module, result) in &tests.modules {

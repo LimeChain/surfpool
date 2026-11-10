@@ -15,7 +15,7 @@ pub enum Verdict {
     /// A protocol needs attention: its committed IDL differs from what its program publishes, or
     /// its tests fail.
     Attention,
-    /// The tests were due and did not finish, or ran nothing.
+    /// The tests were due and their results are not complete: see [`TestRun::complete`].
     Incomplete,
     /// Nothing needs attention, but a comparison could not be made.
     Unverified,
