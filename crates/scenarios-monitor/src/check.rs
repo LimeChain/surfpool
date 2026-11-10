@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -37,6 +37,7 @@ pub fn discover(root: &Path) -> Result<Vec<Protocol>> {
     let base = root.join(PROTOCOLS_DIR);
     let mut files = Vec::new();
     collect_idls(&base, &mut files)?;
+    ensure!(!files.is_empty(), "no idl.json under {}", base.display());
     files.sort();
     files
         .into_iter()
@@ -313,6 +314,14 @@ mod tests {
 
     fn check(answer: Result<PublishedIdls>, out: &Path) -> IdlResult {
         check_committed(idl("u64"), answer, out)
+    }
+
+    #[test]
+    fn a_protocols_folder_with_no_idl_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(PROTOCOLS_DIR).join("demo/v1")).unwrap();
+        let error = discover(root.path()).err().unwrap().to_string();
+        assert!(error.starts_with("no idl.json under"), "{error}");
     }
 
     #[test]
