@@ -71,7 +71,8 @@ every protocol that differs, the diff and the published IDL. Nothing is committe
 depends on another.
 
 A run fails while a committed IDL differs from what its program publishes, while a test module
-fails, and when what a program publishes cannot be read. Updating the committed `idl.json` to what
+fails, and when a check could not be made: the IDL to compare with cannot be read or is not one
+Anchor accepts, or the tests' results are not complete. Updating the committed `idl.json` to what
 the program publishes, and the templates with it, is what makes it pass again.
 
 The checks live in the `surfpool-scenarios-monitor` crate and run locally:
