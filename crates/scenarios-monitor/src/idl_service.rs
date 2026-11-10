@@ -1,6 +1,6 @@
 //! Reads the IDLs a program publishes from the Solana IDL service (https://idl.solana.com/docs).
 
-use std::{io::Read, thread, time::Duration};
+use std::{collections::BTreeMap, io::Read, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder};
@@ -25,24 +25,9 @@ pub struct Published {
     pub document: Value,
 }
 
-/// The live IDL each source publishes for one program, `None` where it publishes none.
-#[derive(Debug, Default)]
-pub struct PublishedIdls {
-    pub anchor: Option<Published>,
-    pub pmp: Option<Published>,
-    /// Why a source that publishes something could not be read, one line per such source.
-    pub unreadable: Vec<String>,
-}
-
-impl PublishedIdls {
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, Option<&Published>)> {
-        [
-            (ANCHOR, self.anchor.as_ref()),
-            (PROGRAM_METADATA, self.pmp.as_ref()),
-        ]
-        .into_iter()
-    }
-}
+/// What one program publishes right now, by source (`ANCHOR` or `PROGRAM_METADATA`): the IDL,
+/// or why it could not be read. A source that publishes nothing is left out.
+pub type PublishedIdls = BTreeMap<&'static str, Result<Published, String>>;
 
 pub struct IdlService {
     client: Client,
@@ -73,10 +58,9 @@ impl IdlService {
 }
 
 /// Reads each source of a reply on its own, so that one source that cannot be read does not
-/// cost the other. Fails when nothing that is published can be read, and when the reply does not
-/// list both sources.
+/// cost the other. Fails when the reply does not list both sources.
 fn published_idls(reply: &Value) -> Result<PublishedIdls> {
-    let mut published = PublishedIdls::default();
+    let mut published = PublishedIdls::new();
     for source in [ANCHOR, PROGRAM_METADATA] {
         // The service lists both sources for every program, empty where it publishes none.
         // Taking a reply without one for "publishes nothing" would pass every protocol.
@@ -84,20 +68,9 @@ fn published_idls(reply: &Value) -> Result<PublishedIdls> {
             .get(source)
             .and_then(Value::as_array)
             .with_context(|| format!("IDL service: the reply has no `{source}` list"))?;
-        let read = match read_source(entries, source) {
-            Ok(read) => read,
-            Err(error) => {
-                published.unreadable.push(format!("{error:#}"));
-                None
-            }
-        };
-        match source {
-            ANCHOR => published.anchor = read,
-            _ => published.pmp = read,
+        if let Some(read) = read_source(entries, source).transpose() {
+            published.insert(source, read.map_err(|error| format!("{error:#}")));
         }
-    }
-    if published.anchor.is_none() && published.pmp.is_none() && !published.unreadable.is_empty() {
-        bail!("IDL service: {}", published.unreadable.join("; "));
     }
     Ok(published)
 }
@@ -175,26 +148,23 @@ mod tests {
     fn each_source_is_read_on_its_own() {
         let reply = json!({"anchor": entry("{\"version\":\"1.0.0\"}", true), "pmp": []});
         let published = published_idls(&reply).unwrap();
-        assert_eq!(published.anchor.unwrap().document["version"], "1.0.0");
-        assert!(published.pmp.is_none());
-        assert!(published.unreadable.is_empty());
+        let anchor = published[ANCHOR].as_ref().unwrap();
+        assert_eq!(anchor.document["version"], "1.0.0");
+        assert!(!published.contains_key(PROGRAM_METADATA));
     }
 
     #[test]
-    fn a_source_that_cannot_be_read_does_not_cost_the_other() {
+    fn a_source_that_cannot_be_read_keeps_its_reason_and_does_not_cost_the_other() {
         let reply = json!({"anchor": entry("{}", true), "pmp": entry("{}", false)});
         let published = published_idls(&reply).unwrap();
-        assert!(published.anchor.is_some());
-        assert!(published.pmp.is_none());
-        assert_eq!(published.unreadable, ["the pmp IDL does not decode"]);
-    }
+        assert!(published[ANCHOR].is_ok());
+        let reason = published[PROGRAM_METADATA].as_ref().unwrap_err();
+        assert_eq!(reason, "the pmp IDL does not decode");
 
-    #[test]
-    fn nothing_readable_among_what_is_published_is_an_error() {
-        let reply = json!({"anchor": entry("not json", true), "pmp": entry("{}", false)});
-        let error = published_idls(&reply).unwrap_err().to_string();
-        assert!(error.contains("the anchor IDL is not JSON"), "{error}");
-        assert!(error.contains("the pmp IDL does not decode"), "{error}");
+        let reply = json!({"anchor": entry("not json", true), "pmp": []});
+        let published = published_idls(&reply).unwrap();
+        let reason = published[ANCHOR].as_ref().unwrap_err();
+        assert!(reason.starts_with("the anchor IDL is not JSON"), "{reason}");
     }
 
     #[test]
@@ -212,7 +182,6 @@ mod tests {
     #[test]
     fn a_program_that_publishes_nothing_is_not_an_error() {
         let published = published_idls(&json!({"anchor": [], "pmp": []})).unwrap();
-        assert!(published.anchor.is_none() && published.pmp.is_none());
-        assert!(published.unreadable.is_empty());
+        assert!(published.is_empty());
     }
 }

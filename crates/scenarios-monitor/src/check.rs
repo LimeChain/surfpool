@@ -111,10 +111,10 @@ pub enum Outcome {
     },
     /// The program publishes no IDL to compare with.
     NotPublished,
-    /// What the program publishes is not an Anchor IDL, so the two cannot be compared entry by
-    /// entry.
+    /// What the program publishes is a Codama document, which has no Anchor entries to compare
+    /// the committed ones with.
     NotComparable { reason: String },
-    /// The comparison could not be made: what the program publishes could not be read, or the
+    /// The comparison could not be made: the IDL to compare with could not be read, or it or the
     /// committed IDL is not one Anchor accepts.
     Unchecked { error: String },
 }
@@ -125,11 +125,11 @@ pub struct IdlResult {
     pub address: Option<String>,
     pub path: String,
     pub committed_version: Option<String>,
-    /// What the program publishes, by source (`anchor` or `pmp`).
+    /// What the program publishes and could be read, by source (`anchor` or `pmp`).
     pub upstream: BTreeMap<String, Upstream>,
     /// The source the committed IDL was compared with.
     pub compared_with: Option<String>,
-    /// Why a source that publishes something could not be read, when another source could.
+    /// Why a published IDL other than the one to compare with could not be read.
     pub unreadable: Vec<String>,
     #[serde(flatten)]
     pub outcome: Outcome,
@@ -170,76 +170,89 @@ pub fn check_idls(
                     return Ok(result);
                 }
             };
-            result.unreadable = published.unreadable.clone();
-            let published: Vec<(&str, &Published)> = published
-                .iter()
-                .filter_map(|(source, published)| Some((source, published?)))
-                .collect();
             for (source, published) in &published {
-                let upstream = Upstream {
-                    version: idl::version_of(&published.document),
-                    format: Format::of(&published.document),
-                };
-                result.upstream.insert((*source).to_owned(), upstream);
+                if let Ok(published) = published {
+                    let upstream = Upstream {
+                        version: idl::version_of(&published.document),
+                        format: Format::of(&published.document),
+                    };
+                    result.upstream.insert((*source).to_owned(), upstream);
+                }
             }
-            if !published.is_empty() {
-                let (source, outcome) = compare(protocol, address, &published, out)?;
-                result.compared_with = source.map(str::to_owned);
-                result.outcome = outcome;
+            let Some((source, to_compare)) = idl_to_compare_with(&published) else {
+                return Ok(result);
+            };
+            result.unreadable = published
+                .iter()
+                .filter(|(other, _)| **other != source)
+                .filter_map(|(_, published)| published.as_ref().err().cloned())
+                .collect();
+            result.outcome = match to_compare {
+                Ok(published) => compare(protocol, address, source, published, out)?,
+                Err(error) => Outcome::Unchecked {
+                    error: error.clone(),
+                },
+            };
+            if matches!(result.outcome, Outcome::Matches | Outcome::Differs { .. }) {
+                result.compared_with = Some(source.to_owned());
             }
             Ok(result)
         })
         .collect()
 }
 
-/// The committed IDL against the one its program publishes, and which source that is.
+/// The published IDL a committed one is compared with, and its source.
 ///
 /// Program Metadata is where a program publishes its IDL today, and the copy in its Anchor IDL
 /// account is often left behind. So the Program Metadata copy is the one compared with, and the
-/// Anchor one only where there is no other.
-fn compare<'a>(
+/// Anchor one only where the program publishes no other. When that IDL cannot be read or compared
+/// with, the other one does not stand in for it: it can match long after the program moved on.
+fn idl_to_compare_with(
+    published: &PublishedIdls,
+) -> Option<(&'static str, &Result<Published, String>)> {
+    [PROGRAM_METADATA, ANCHOR]
+        .into_iter()
+        .find_map(|source| Some((source, published.get(source)?)))
+}
+
+/// The committed IDL against the IDL `source` publishes.
+fn compare(
     protocol: &Protocol,
     address: &str,
-    published: &[(&'a str, &Published)],
+    source: &str,
+    published: &Published,
     out: &Path,
-) -> Result<(Option<&'a str>, Outcome)> {
+) -> Result<Outcome> {
     let committed = match idl::parse(&protocol.idl, address) {
         Ok(committed) => committed,
         Err(error) => {
             let error = format!("the committed IDL is not one Anchor accepts: {error:#}");
-            return Ok((None, Outcome::Unchecked { error }));
+            return Ok(Outcome::Unchecked { error });
         }
     };
-    let parsed: Vec<_> = published
-        .iter()
-        .filter_map(|(source, published)| {
-            let parsed = idl::parse(&published.document, address).ok()?;
-            Some((*source, *published, parsed))
-        })
-        .collect();
-    let best = parsed
-        .iter()
-        .find(|(source, ..)| *source == PROGRAM_METADATA)
-        .or_else(|| parsed.iter().find(|(source, ..)| *source == ANCHOR));
-    let Some((source, published, parsed)) = best else {
-        let formats: Vec<_> = published
-            .iter()
-            .map(|(_, published)| Format::of(&published.document).name())
-            .collect();
-        let reason = format!("published as {}", formats.join(" and "));
-        return Ok((None, Outcome::NotComparable { reason }));
+    let format = Format::of(&published.document);
+    if format == Format::Codama {
+        let reason = format!("the {source} IDL is published as {}", format.name());
+        return Ok(Outcome::NotComparable { reason });
+    }
+    let parsed = match idl::parse(&published.document, address) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let error = format!("the {source} IDL is not one Anchor accepts: {error:#}");
+            return Ok(Outcome::Unchecked { error });
+        }
     };
-    let comparison = idl::compare(&committed, parsed);
+    let comparison = idl::compare(&committed, &parsed);
     let entries = comparison.differing();
     if entries.is_empty() {
-        return Ok((Some(*source), Outcome::Matches));
+        return Ok(Outcome::Matches);
     }
     let diff_file = format!("idls/{}.diff", protocol.file_stem());
     write_text(&out.join(&diff_file), &comparison.render_diff())?;
     // Exactly as published, to update the committed IDL from.
     let published_file = format!("idls/{}.{source}.json", protocol.file_stem());
     write_text(&out.join(published_file), &published.raw)?;
-    Ok((Some(*source), Outcome::Differs { entries, diff_file }))
+    Ok(Outcome::Differs { entries, diff_file })
 }
 
 #[cfg(test)]
@@ -263,31 +276,26 @@ mod tests {
         })
     }
 
-    fn anchor(document: Value) -> Result<PublishedIdls> {
-        let published = Published {
+    fn published(document: Value) -> Result<Published, String> {
+        Ok(Published {
             raw: document.to_string(),
             document,
-        };
-        Ok(PublishedIdls {
-            anchor: Some(published),
-            ..Default::default()
         })
     }
 
-    fn published(document: Value) -> Option<Published> {
-        Some(Published {
-            raw: document.to_string(),
-            document,
-        })
+    fn anchor(document: Value) -> Result<PublishedIdls> {
+        Ok(PublishedIdls::from([(ANCHOR, published(document))]))
     }
 
     /// A program that publishes one IDL in its Anchor IDL account and another in Program Metadata.
-    fn both(anchor: Value, program_metadata: Value) -> Result<PublishedIdls> {
-        Ok(PublishedIdls {
-            anchor: published(anchor),
-            pmp: published(program_metadata),
-            ..Default::default()
-        })
+    fn both(
+        anchor: Result<Published, String>,
+        program_metadata: Result<Published, String>,
+    ) -> Result<PublishedIdls> {
+        Ok(PublishedIdls::from([
+            (ANCHOR, anchor),
+            (PROGRAM_METADATA, program_metadata),
+        ]))
     }
 
     /// Checks one protocol that commits `committed` against what the program is said to publish.
@@ -336,10 +344,33 @@ mod tests {
     fn program_metadata_is_compared_with_before_the_anchor_idl_account() {
         // The Anchor IDL account still holds what the committed IDL was made from.
         let out = tempfile::tempdir().unwrap();
-        let result = check(both(idl("u64"), idl("u128")), out.path());
+        let answer = both(published(idl("u64")), published(idl("u128")));
+        let result = check(answer, out.path());
         assert_eq!(result.compared_with.as_deref(), Some("pmp"));
         assert!(matches!(result.outcome, Outcome::Differs { .. }));
         assert!(out.path().join("idls/demo-v1.pmp.json").exists());
+    }
+
+    #[test]
+    fn the_anchor_idl_account_never_stands_in_for_program_metadata() {
+        // The Anchor IDL account matches the committed IDL each time, and proves nothing.
+        let out = tempfile::tempdir().unwrap();
+        let unreadable = Err("the pmp IDL does not decode".to_owned());
+        let result = check(both(published(idl("u64")), unreadable), out.path());
+        let error = "the pmp IDL does not decode".to_owned();
+        assert_eq!(result.outcome, Outcome::Unchecked { error });
+        assert_eq!(result.compared_with, None);
+        assert!(result.unreadable.is_empty());
+        assert_eq!(result.upstream["anchor"].version.as_deref(), Some("1.0.0"));
+
+        let rejected = published(json!({"metadata": {"spec": "9.9.9"}, "instructions": []}));
+        let result = check(both(published(idl("u64")), rejected), out.path());
+        assert!(matches!(result.outcome, Outcome::Unchecked { .. }));
+
+        let codama = published(json!({"kind": "rootNode", "program": {"version": "3.3.0"}}));
+        let result = check(both(published(idl("u64")), codama), out.path());
+        let reason = "the pmp IDL is published as codama".to_owned();
+        assert_eq!(result.outcome, Outcome::NotComparable { reason });
     }
 
     #[test]
@@ -348,7 +379,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let mut replacement = idl("u64");
         replacement["types"] = json!([]);
-        let result = check(both(idl("u64"), replacement), out.path());
+        let answer = both(published(idl("u64")), published(replacement));
+        let result = check(answer, out.path());
         assert_eq!(result.compared_with.as_deref(), Some("pmp"));
         let Outcome::Differs { entries, diff_file } = result.outcome else {
             panic!("{:?}", result.outcome);
@@ -361,7 +393,7 @@ mod tests {
     #[test]
     fn a_program_that_publishes_nothing_has_nothing_to_compare_with() {
         let out = tempfile::tempdir().unwrap();
-        let result = check(Ok(PublishedIdls::default()), out.path());
+        let result = check(Ok(PublishedIdls::new()), out.path());
         assert_eq!(result.outcome, Outcome::NotPublished);
         assert!(result.upstream.is_empty());
     }
@@ -371,7 +403,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let codama = json!({"kind": "rootNode", "program": {"version": "3.3.0"}});
         let result = check(anchor(codama), out.path());
-        let reason = "published as codama".to_owned();
+        let reason = "the anchor IDL is published as codama".to_owned();
         assert_eq!(result.outcome, Outcome::NotComparable { reason });
         assert_eq!(result.upstream["anchor"].version.as_deref(), Some("3.3.0"));
     }
@@ -400,12 +432,26 @@ mod tests {
     }
 
     #[test]
-    fn a_source_that_could_not_be_read_is_noted_next_to_the_comparison() {
+    fn a_published_idl_anchor_does_not_accept_is_unchecked() {
         let out = tempfile::tempdir().unwrap();
-        let mut published = anchor(idl("u64")).unwrap();
-        published.unreadable = vec!["the pmp IDL does not decode".into()];
-        let result = check(Ok(published), out.path());
+        let rejected = json!({"metadata": {"spec": "9.9.9"}, "instructions": []});
+        let result = check(anchor(rejected), out.path());
+        let Outcome::Unchecked { error } = result.outcome else {
+            panic!("{:?}", result.outcome);
+        };
+        assert!(
+            error.starts_with("the anchor IDL is not one Anchor accepts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_idl_account_that_could_not_be_read_is_noted_next_to_the_comparison() {
+        let out = tempfile::tempdir().unwrap();
+        let unreadable = Err("the anchor IDL is not JSON".to_owned());
+        let result = check(both(unreadable, published(idl("u64"))), out.path());
         assert_eq!(result.outcome, Outcome::Matches);
-        assert_eq!(result.unreadable, ["the pmp IDL does not decode"]);
+        assert_eq!(result.compared_with.as_deref(), Some("pmp"));
+        assert_eq!(result.unreadable, ["the anchor IDL is not JSON"]);
     }
 }
