@@ -184,10 +184,24 @@ templates:
 
       A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
       publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
-      65535) to accept older prices. Once a pyth-core-compatible-price-feed-v2 override plays, every
-      loaded Pyth Core Compatible price account is republished every slot; a bank priced by another
-      oracle, or a price overridden with keepAlive: false, still ages. To move the price itself,
-      use pyth-core-compatible-price-feed-v2 on the bank's price account, config.oracle_keys.0.
+      65535) to accept older prices. Once a pyth-core-compatible-price-feed-v2 override with
+      keepAlive: true plays, every loaded Pyth Core Compatible price account is republished every
+      slot; a bank priced by another oracle, or a price overridden with keepAlive: false, still
+      ages. To move the price itself, use pyth-core-compatible-price-feed-v2 on the bank's price
+      account, config.oracle_keys.0.
+
+      ONE STALE PRICE, THE OTHERS FRESH: do not lower oracle_max_age for this, because a
+      republished price is never more than a second old. Find the bank, and one other bank the
+      scenario reads (SOL if no other is named), with the getProgramAccounts call above; each
+      result's data is that bank's config.oracle_keys.0. Read both price accounts with
+      getAccountInfo, encoding "jsonParsed". Then add two pyth-core-compatible-price-feed-v2
+      overrides, both with fetchBeforeUse: true and price_message.price set to the account's
+      current price, so no price changes:
+      - on the stale bank's config.oracle_keys.0, keepAlive: false. Its price ages and the bank
+        refuses it once config.oracle_max_age seconds have passed;
+      - on the other bank's config.oracle_keys.0, keepAlive: true. This starts the republishing
+        of every price except the stale one.
+      An override with no values writes nothing, so it starts or stops nothing.
 
       CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
       tokens, BTC and ETH. It is on when the bank's flags include 2048 (bit 11). Such a bank
