@@ -95,7 +95,8 @@ impl Report<'_> {
                 })
                 .collect();
             let published = match (&result.outcome, published.is_empty()) {
-                (Outcome::Unchecked { .. }, _) => "—".to_owned(),
+                // Nothing is known of a program whose reply could not be read.
+                (Outcome::Unchecked { .. }, true) => "—".to_owned(),
                 (_, true) => "nothing".to_owned(),
                 (_, false) => published.join(", "),
             };
@@ -156,5 +157,64 @@ impl Report<'_> {
         for result in tests.modules.values() {
             *out += &failure_details(&result.failed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{check::Upstream, idl::Format};
+
+    /// The table row of one protocol whose Anchor IDL account publishes `version`, if any.
+    fn row(version: Option<&str>, outcome: Outcome) -> String {
+        let upstream = version.map(|version| Upstream {
+            version: Some(version.to_owned()),
+            format: Format::Anchor,
+        });
+        let idls = [IdlResult {
+            protocol: "demo/v1".into(),
+            address: None,
+            path: String::new(),
+            committed_version: None,
+            upstream: upstream
+                .map(|upstream| ("anchor".to_owned(), upstream))
+                .into_iter()
+                .collect(),
+            compared_with: None,
+            unreadable: Vec::new(),
+            outcome,
+        }];
+        let report = Report {
+            stamp: "now",
+            verdict: Verdict::Unverified,
+            run_url: None,
+            attention: &[],
+            idls: &idls,
+            tests: None,
+        };
+        let rendered = report.render();
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("| `demo/v1`"));
+        row.unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_row_that_could_not_be_checked_still_shows_what_is_published() {
+        let unchecked = || Outcome::Unchecked {
+            error: "boom".into(),
+        };
+        assert_eq!(
+            row(Some("1.0.0"), unchecked()),
+            "| `demo/v1` | anchor 1.0.0 | — | could not check: boom |"
+        );
+        assert_eq!(
+            row(None, unchecked()),
+            "| `demo/v1` | — | — | could not check: boom |"
+        );
+        assert_eq!(
+            row(None, Outcome::NotPublished),
+            "| `demo/v1` | nothing | — | nothing to compare with |"
+        );
     }
 }
