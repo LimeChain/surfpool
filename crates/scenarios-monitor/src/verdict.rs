@@ -1,12 +1,12 @@
 //! What needs attention, and the run's verdict.
 
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 use serde::Serialize;
 
 use crate::{
     check::{IdlResult, Outcome},
-    tests_log::{ModuleResult, Status},
+    tests_log::TestRun,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -15,9 +15,9 @@ pub enum Verdict {
     /// A protocol needs attention: its committed IDL differs from what its program publishes, or
     /// its tests fail.
     Attention,
-    /// Tests were due but some module reported nothing.
+    /// The tests were due and did not finish, or ran nothing.
     Incomplete,
-    /// Nothing needs attention, but what a program publishes could not be read.
+    /// Nothing needs attention, but a comparison could not be made.
     Unverified,
     Clean,
 }
@@ -35,10 +35,7 @@ impl fmt::Display for Verdict {
 }
 
 /// One line for each thing that needs attention.
-pub fn attention(
-    idls: &[IdlResult],
-    modules: Option<&BTreeMap<String, ModuleResult>>,
-) -> Vec<String> {
+pub fn attention(idls: &[IdlResult], tests: Option<&TestRun>) -> Vec<String> {
     let mut lines = Vec::new();
     for result in idls {
         if let Outcome::Differs { entries, .. } = &result.outcome {
@@ -52,28 +49,19 @@ pub fn attention(
             ));
         }
     }
-    for (module, result) in modules.into_iter().flatten() {
-        if result.status == Status::Fail {
+    for (module, result) in tests.into_iter().flat_map(|tests| &tests.modules) {
+        if !result.failed.is_empty() {
             lines.push(format!("{module} integration tests fail"));
         }
     }
     lines
 }
 
-pub fn decide(
-    attention: &[String],
-    idls: &[IdlResult],
-    modules: Option<&BTreeMap<String, ModuleResult>>,
-) -> Verdict {
-    let incomplete = |modules: &BTreeMap<String, ModuleResult>| {
-        modules
-            .values()
-            .any(|result| result.status == Status::Incomplete)
-    };
+pub fn decide(attention: &[String], idls: &[IdlResult], tests: Option<&TestRun>) -> Verdict {
     let unchecked = |result: &IdlResult| matches!(result.outcome, Outcome::Unchecked { .. });
     if !attention.is_empty() {
         Verdict::Attention
-    } else if modules.is_some_and(incomplete) {
+    } else if tests.is_some_and(|tests| !tests.complete) {
         Verdict::Incomplete
     } else if idls.iter().any(unchecked) {
         Verdict::Unverified
@@ -84,22 +72,33 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tests_log::Failure;
+    use std::collections::BTreeMap;
 
-    fn module(status: Status) -> ModuleResult {
-        let failed = match status {
-            Status::Fail => vec![Failure {
+    use super::*;
+    use crate::tests_log::{Failure, ModuleResult};
+
+    fn module(failing: bool) -> ModuleResult {
+        let failed = match failing {
+            true => vec![Failure {
                 name: "tests::protocols::pump::a".into(),
                 message: "boom".into(),
             }],
-            _ => vec![],
+            false => vec![],
         };
         ModuleResult {
-            status,
             passed: 3,
             ignored: 0,
             failed,
+        }
+    }
+
+    fn run(complete: bool, modules: &[(&str, bool)]) -> TestRun {
+        TestRun {
+            complete,
+            modules: modules
+                .iter()
+                .map(|(name, failing)| ((*name).to_owned(), module(*failing)))
+                .collect(),
         }
     }
 
@@ -111,6 +110,7 @@ mod tests {
             committed_version: None,
             upstream: BTreeMap::new(),
             compared_with: None,
+            unreadable: Vec::new(),
             outcome,
         }
     }
@@ -127,11 +127,8 @@ mod tests {
                 },
             ),
         ];
-        let modules = BTreeMap::from([
-            ("pump".to_owned(), module(Status::Fail)),
-            ("kamino".to_owned(), module(Status::Pass)),
-        ]);
-        let lines = attention(&idls, Some(&modules));
+        let tests = run(true, &[("pump", true), ("kamino", false)]);
+        let lines = attention(&idls, Some(&tests));
         assert_eq!(
             lines,
             [
@@ -139,7 +136,14 @@ mod tests {
                 "pump integration tests fail",
             ]
         );
-        assert_eq!(decide(&lines, &idls, Some(&modules)), Verdict::Attention);
+        assert_eq!(decide(&lines, &idls, Some(&tests)), Verdict::Attention);
+    }
+
+    #[test]
+    fn a_failure_counts_even_when_the_run_was_cut_short() {
+        let tests = run(false, &[("pump", true)]);
+        let lines = attention(&[], Some(&tests));
+        assert_eq!(decide(&lines, &[], Some(&tests)), Verdict::Attention);
     }
 
     #[test]
@@ -153,13 +157,18 @@ mod tests {
         )];
         // Nothing to compare with is not a failure of the check.
         let unpublished = [idl("raydium/v4", Outcome::NotPublished)];
-        let passing = BTreeMap::from([("kamino".to_owned(), module(Status::Pass))]);
-        let unfinished = BTreeMap::from([("kamino".to_owned(), module(Status::Incomplete))]);
+        let passing = run(true, &[("kamino", false)]);
+        let unfinished = run(false, &[("kamino", false)]);
+        let nothing_ran = run(false, &[]);
         assert_eq!(decide(&[], &matching, Some(&passing)), Verdict::Clean);
         assert_eq!(decide(&[], &unpublished, Some(&passing)), Verdict::Clean);
         assert_eq!(decide(&[], &unchecked, Some(&passing)), Verdict::Unverified);
         assert_eq!(
-            decide(&[], &unchecked, Some(&unfinished)),
+            decide(&[], &matching, Some(&unfinished)),
+            Verdict::Incomplete
+        );
+        assert_eq!(
+            decide(&[], &matching, Some(&nothing_ran)),
             Verdict::Incomplete
         );
     }

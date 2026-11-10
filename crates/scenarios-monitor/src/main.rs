@@ -12,22 +12,27 @@ mod report;
 mod tests_log;
 mod verdict;
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    fs, io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::Serialize;
 use surfpool_types::sanitized_datasource_url;
 
 use crate::{
-    check::IdlResult, idl_service::IdlService, report::Report, tests_log::ModuleResult,
-    verdict::Verdict,
+    check::IdlResult, idl_service::IdlService, report::Report, tests_log::TestRun, verdict::Verdict,
 };
 
 /// The endpoint the integration tests use. Read only to keep its credentials out of the report.
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
-/// Declares one test module per protocol.
-const PROTOCOL_TESTS_MOD: &str = "crates/core/src/tests/protocols/mod.rs";
+/// How long the IDL service may take for all protocols together. It answers each in a second or
+/// two; past this the rest are reported as unchecked, so that a slow service cannot cost the run
+/// its report.
+const IDL_SERVICE_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Parser)]
 #[command(about = "Checks the protocols Surfpool's scenarios integrate against mainnet")]
@@ -55,15 +60,28 @@ struct FindingsFile<'a> {
     /// One line for each thing that needs attention.
     attention: &'a [String],
     idls: &'a [IdlResult],
-    tests: Option<&'a BTreeMap<String, ModuleResult>>,
+    tests: Option<&'a TestRun>,
 }
 
 fn main() -> Result<()> {
     let args = Cli::parse();
     let service = IdlService::new()?;
     let out = &args.out;
+    // What an earlier run left here would sit beside a report that no longer mentions it.
+    match fs::remove_dir_all(out.join("idls")) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(error).context("clearing the output folder's idls/");
+        }
+        _ => {}
+    }
     let protocols = check::discover(&args.root)?;
-    let latest = |address: &str| service.latest(address);
+    let deadline = Instant::now() + IDL_SERVICE_BUDGET;
+    let latest = |address: &str| {
+        if Instant::now() > deadline {
+            bail!("skipped: the IDL service took too long for the protocols before this one");
+        }
+        service.latest(address)
+    };
     let idls = check::check_idls(&latest, &protocols, out)?;
 
     let tests = match &args.tests_log {
@@ -76,11 +94,7 @@ fn main() -> Result<()> {
                 Ok(rpc_url) if !rpc_url.is_empty() => without_credentials(&log, &rpc_url),
                 _ => log,
             };
-            let declared = fs::read_to_string(args.root.join(PROTOCOL_TESTS_MOD))?;
-            Some(tests_log::parse(
-                &log,
-                &tests_log::protocol_modules(&declared),
-            ))
+            Some(tests_log::parse(&log))
         }
         None => None,
     };

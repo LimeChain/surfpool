@@ -111,9 +111,11 @@ pub enum Outcome {
     },
     /// The program publishes no IDL to compare with.
     NotPublished,
-    /// One side is not an Anchor IDL, so the two cannot be compared entry by entry.
+    /// What the program publishes is not an Anchor IDL, so the two cannot be compared entry by
+    /// entry.
     NotComparable { reason: String },
-    /// What the program publishes could not be read.
+    /// The comparison could not be made: what the program publishes could not be read, or the
+    /// committed IDL is not one Anchor accepts.
     Unchecked { error: String },
 }
 
@@ -127,6 +129,8 @@ pub struct IdlResult {
     pub upstream: BTreeMap<String, Upstream>,
     /// The source the committed IDL was compared with.
     pub compared_with: Option<String>,
+    /// Why a source that publishes something could not be read, when another source could.
+    pub unreadable: Vec<String>,
     #[serde(flatten)]
     pub outcome: Outcome,
 }
@@ -148,6 +152,7 @@ pub fn check_idls(
                 committed_version: idl::version_of(&protocol.idl),
                 upstream: BTreeMap::new(),
                 compared_with: None,
+                unreadable: Vec::new(),
                 outcome: Outcome::NotPublished,
             };
             let Some(address) = &protocol.address else {
@@ -160,11 +165,12 @@ pub fn check_idls(
                 Ok(published) => published,
                 Err(error) => {
                     result.outcome = Outcome::Unchecked {
-                        error: error.to_string(),
+                        error: format!("{error:#}"),
                     };
                     return Ok(result);
                 }
             };
+            result.unreadable = published.unreadable.clone();
             let published: Vec<(&str, &Published)> = published
                 .iter()
                 .filter_map(|(source, published)| Some((source, published?)))
@@ -197,8 +203,8 @@ fn compare<'a>(
     let committed = match idl::parse(&protocol.idl, address) {
         Ok(committed) => committed,
         Err(error) => {
-            let reason = format!("the committed IDL is not an Anchor IDL ({error})");
-            return Ok((None, Outcome::NotComparable { reason }));
+            let error = format!("the committed IDL is not one Anchor accepts: {error:#}");
+            return Ok((None, Outcome::Unchecked { error }));
         }
     };
     let best = published
@@ -262,21 +268,25 @@ mod tests {
         };
         Ok(PublishedIdls {
             anchor: Some(published),
-            pmp: None,
+            ..Default::default()
         })
     }
 
-    /// Checks one protocol that commits `idl("u64")` against what the program is said to publish.
-    fn check(answer: Result<PublishedIdls>, out: &Path) -> IdlResult {
+    /// Checks one protocol that commits `committed` against what the program is said to publish.
+    fn check_committed(committed: Value, answer: Result<PublishedIdls>, out: &Path) -> IdlResult {
         let protocols = [Protocol {
             name: "demo/v1".into(),
             address: Some(ADDRESS.into()),
             path: "protocols/demo/v1/idl.json".into(),
-            idl: idl("u64"),
+            idl: committed,
         }];
         let answer = RefCell::new(Some(answer));
         let latest = |_: &str| answer.borrow_mut().take().unwrap();
         check_idls(&latest, &protocols, out).unwrap().remove(0)
+    }
+
+    fn check(answer: Result<PublishedIdls>, out: &Path) -> IdlResult {
+        check_committed(idl("u64"), answer, out)
     }
 
     #[test]
@@ -323,10 +333,35 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_fetch_is_unchecked() {
+    fn a_failed_fetch_is_unchecked_and_keeps_its_cause() {
         let out = tempfile::tempdir().unwrap();
-        let result = check(Err(anyhow::anyhow!("IDL service: HTTP 500")), out.path());
-        let error = "IDL service: HTTP 500".to_owned();
+        let failure = anyhow::anyhow!("expected value at line 1").context("IDL service: not JSON");
+        let result = check(Err(failure), out.path());
+        let error = "IDL service: not JSON: expected value at line 1".to_owned();
         assert_eq!(result.outcome, Outcome::Unchecked { error });
+    }
+
+    #[test]
+    fn a_committed_idl_anchor_does_not_accept_is_unchecked() {
+        let out = tempfile::tempdir().unwrap();
+        let committed = json!({"metadata": {"spec": "9.9.9"}, "instructions": []});
+        let result = check_committed(committed, anchor(idl("u64")), out.path());
+        let Outcome::Unchecked { error } = result.outcome else {
+            panic!("{:?}", result.outcome);
+        };
+        assert!(
+            error.starts_with("the committed IDL is not one Anchor accepts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_that_could_not_be_read_is_noted_next_to_the_comparison() {
+        let out = tempfile::tempdir().unwrap();
+        let mut published = anchor(idl("u64")).unwrap();
+        published.unreadable = vec!["the pmp IDL does not decode".into()];
+        let result = check(Ok(published), out.path());
+        assert_eq!(result.outcome, Outcome::Matches);
+        assert_eq!(result.unreadable, ["the pmp IDL does not decode"]);
     }
 }

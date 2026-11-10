@@ -1,4 +1,4 @@
-//! Reads the protocol test modules and the output of `cargo test`.
+//! Reads the output of `cargo test` for the protocol tests.
 
 use std::collections::BTreeMap;
 
@@ -6,16 +6,9 @@ use serde::Serialize;
 
 /// The path every protocol test starts with, which is also the filter that runs them all.
 const PREFIX: &str = "tests::protocols::";
+/// Where a test that sits in no module of `tests::protocols` is counted.
+const NO_MODULE: &str = "protocols";
 const MAX_MESSAGE_LINES: usize = 40;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Pass,
-    Fail,
-    /// The run reported no result, or ran none of the module's tests.
-    Incomplete,
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Failure {
@@ -23,38 +16,35 @@ pub struct Failure {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// The results of one module of `tests::protocols`, which holds one protocol's tests.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ModuleResult {
-    pub status: Status,
     pub passed: usize,
     pub ignored: usize,
     pub failed: Vec<Failure>,
 }
 
-/// The modules `crates/core/src/tests/protocols/mod.rs` declares, one per protocol.
-pub fn protocol_modules(protocols_mod: &str) -> Vec<String> {
-    protocols_mod
-        .lines()
-        .filter_map(|line| {
-            let declaration = line
-                .trim()
-                .trim_start_matches("pub(crate)")
-                .trim_start_matches("pub")
-                .trim_start();
-            let name = declaration.strip_prefix("mod ")?.strip_suffix(';')?;
-            Some(name.trim().to_owned())
-        })
-        .collect()
+/// What a `cargo test` run of the protocol tests reported.
+#[derive(Clone, Debug, Serialize)]
+pub struct TestRun {
+    /// Whether the run reported its result and ran at least one protocol test. A run that did
+    /// not build, was cut short or ran nothing is not complete, and proves nothing by passing.
+    pub complete: bool,
+    /// By module, taken from the names of the tests that ran.
+    pub modules: BTreeMap<String, ModuleResult>,
 }
 
-/// The protocol module a test belongs to.
-pub fn module_of(test_name: &str) -> Option<&str> {
-    let (module, _) = test_name.strip_prefix(PREFIX)?.split_once("::")?;
-    Some(module)
+/// The module of `tests::protocols` a test belongs to, or `None` for any other test.
+fn module_of(test_name: &str) -> Option<&str> {
+    let rest = test_name.strip_prefix(PREFIX)?;
+    Some(
+        rest.split_once("::")
+            .map_or(NO_MODULE, |(module, _)| module),
+    )
 }
 
-/// Groups a `cargo test` log by integration-test module.
-pub fn parse(log: &str, modules: &[String]) -> BTreeMap<String, ModuleResult> {
+/// Groups a `cargo test` log by protocol test module.
+pub fn parse(log: &str) -> TestRun {
     let mut results: BTreeMap<&str, &str> = BTreeMap::new();
     let mut blocks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut current: Option<&str> = None;
@@ -86,53 +76,34 @@ pub fn parse(log: &str, modules: &[String]) -> BTreeMap<String, ModuleResult> {
         }
     }
 
-    modules
-        .iter()
-        .map(|module| {
-            let names: Vec<&str> = results
-                .keys()
-                .copied()
-                .filter(|name| module_of(name) == Some(module.as_str()))
-                .collect();
-            let failed: Vec<Failure> = names
-                .iter()
-                .filter(|name| results[*name] == "FAILED")
-                .map(|name| Failure {
-                    name: (*name).to_owned(),
-                    message: trim(blocks.get(name).map(Vec::as_slice).unwrap_or_default())
-                        .trim()
-                        .to_owned(),
-                })
-                .collect();
-            let status = if !summary_seen || names.is_empty() {
-                Status::Incomplete
-            } else if failed.is_empty() {
-                Status::Pass
-            } else {
-                Status::Fail
-            };
-            let count = |outcome: &str| {
-                names
-                    .iter()
-                    .filter(|name| results[*name] == outcome)
-                    .count()
-            };
-            (
-                module.clone(),
-                ModuleResult {
-                    status,
-                    passed: count("ok"),
-                    ignored: count("ignored"),
-                    failed,
-                },
-            )
-        })
-        .collect()
+    let mut modules: BTreeMap<String, ModuleResult> = BTreeMap::new();
+    for (name, outcome) in results {
+        let Some(module) = module_of(name) else {
+            continue;
+        };
+        let result = modules.entry(module.to_owned()).or_default();
+        match outcome {
+            "ok" => result.passed += 1,
+            "ignored" => result.ignored += 1,
+            _ => result.failed.push(Failure {
+                name: name.to_owned(),
+                message: trim(blocks.get(name).map(Vec::as_slice).unwrap_or_default())
+                    .trim()
+                    .to_owned(),
+            }),
+        }
+    }
+    TestRun {
+        complete: summary_seen && !modules.is_empty(),
+        modules,
+    }
 }
 
-/// `test NAME ... ok`, `... FAILED` or `... ignored[, reason]`.
+/// `test NAME ... ok`, `... FAILED` or `... ignored[, reason]`. A test that is expected to panic
+/// carries ` - should panic` after its name.
 fn result_line(line: &str) -> Option<(&str, &'static str)> {
     let (name, outcome) = line.strip_prefix("test ")?.split_once(" ... ")?;
+    let name = name.strip_suffix(" - should panic").unwrap_or(name);
     let word = outcome.split([',', ' ']).next()?;
     let outcome = ["ok", "FAILED", "ignored"]
         .into_iter()
@@ -169,11 +140,13 @@ mod tests {
     use super::*;
 
     const LOG: &str = "\
-running 4 tests
+running 6 tests
 test tests::protocols::kamino::round_trips ... ok
 test tests::protocols::kamino::reserve_price ... FAILED
 test tests::protocols::pump::lifecycle ... FAILED
 test tests::protocols::pump::old ... ignored, needs a validator
+test tests::protocols::pump::rejects_a_bad_curve - should panic ... FAILED
+test tests::protocols::shared_fixture_loads ... ok
 
 failures:
 
@@ -188,46 +161,69 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 thread 'tests::protocols::pump::lifecycle' panicked at crates/core/src/tests/protocols/pump/mod.rs:20:5:
 failed to fetch from mainnet: datasource request to https://rpc.example timed out
 
+---- tests::protocols::pump::rejects_a_bad_curve stdout ----
+note: test did not panic as expected
+
 
 failures:
     tests::protocols::kamino::reserve_price
     tests::protocols::pump::lifecycle
+    tests::protocols::pump::rejects_a_bad_curve
 
-test result: FAILED. 1 passed; 2 failed; 1 ignored; 0 measured; 900 filtered out; finished in 9.00s
+test result: FAILED. 2 passed; 3 failed; 1 ignored; 0 measured; 900 filtered out; finished in 9.00s
 ";
 
-    fn modules(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_owned()).collect()
-    }
-
     #[test]
-    fn lists_the_protocol_modules() {
-        let source = "//! One module per protocol.\n\npub mod kamino;\nmod pump;\n";
-        assert_eq!(protocol_modules(source), ["kamino", "pump"]);
-        assert_eq!(module_of("tests::protocols::pump::lifecycle"), Some("pump"));
-        assert_eq!(module_of("tests::integration::test_simnet_ticks"), None);
-    }
+    fn groups_results_by_the_module_each_test_names() {
+        let run = parse(LOG);
+        assert!(run.complete);
+        let modules: Vec<_> = run.modules.keys().map(String::as_str).collect();
+        assert_eq!(modules, ["kamino", "protocols", "pump"]);
 
-    #[test]
-    fn groups_results_by_module() {
-        let report = parse(LOG, &modules(&["kamino", "pump", "phoenix"]));
-        let kamino = &report["kamino"];
-        assert_eq!(kamino.status, Status::Fail);
+        let kamino = &run.modules["kamino"];
         assert_eq!(kamino.passed, 1);
         assert!(kamino.failed[0].message.contains("left: 1"));
         assert!(!kamino.failed[0].message.contains("RUST_BACKTRACE"));
+
         // A failure is a failure, whatever its output blames.
-        let pump = &report["pump"];
-        assert_eq!(pump.status, Status::Fail);
+        let pump = &run.modules["pump"];
         assert_eq!(pump.ignored, 1);
+        let failed: Vec<_> = pump.failed.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            failed,
+            [
+                "tests::protocols::pump::lifecycle",
+                "tests::protocols::pump::rejects_a_bad_curve",
+            ]
+        );
         assert!(pump.failed[0].message.contains("timed out"));
-        // Nothing of phoenix ran, so nothing says it passes.
-        assert_eq!(report["phoenix"].status, Status::Incomplete);
+        assert!(pump.failed[1].message.contains("did not panic"));
+
+        // A test in no module of its own is still counted.
+        assert_eq!(run.modules[NO_MODULE].passed, 1);
     }
 
     #[test]
-    fn a_run_without_a_result_is_incomplete() {
-        let report = parse("error[E0425]: cannot find value", &modules(&["kamino"]));
-        assert_eq!(report["kamino"].status, Status::Incomplete);
+    fn other_tests_of_the_crate_are_left_out() {
+        let log = "test tests::integration::test_simnet_ticks ... FAILED\n\
+                   test tests::protocols::kamino::round_trips ... ok\n\
+                   test result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        let run = parse(log);
+        let modules: Vec<_> = run.modules.keys().map(String::as_str).collect();
+        assert_eq!(modules, ["kamino"]);
+        assert!(run.modules["kamino"].failed.is_empty());
+    }
+
+    #[test]
+    fn a_run_that_reports_no_result_or_runs_nothing_is_not_complete() {
+        // It did not build.
+        assert!(!parse("error[E0425]: cannot find value").complete);
+        // It was cut short: what it reported so far is kept.
+        let cut_short = parse("test tests::protocols::kamino::round_trips ... ok\n");
+        assert!(!cut_short.complete);
+        assert_eq!(cut_short.modules["kamino"].passed, 1);
+        // It ran, but no protocol test matched.
+        let nothing = parse("running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n");
+        assert!(!nothing.complete);
     }
 }
