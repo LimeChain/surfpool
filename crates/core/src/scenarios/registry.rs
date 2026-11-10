@@ -71,6 +71,17 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const JUPITER_PERPS_IDL_CONTENT: &str = include_str!("./protocols/jupiter-perps/v1/idl.json");
+pub const JUPITER_PERPS_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/jupiter-perps/v1/overrides.yaml");
+
+pub const JUPITER_PERPS_DOVES_IDL_CONTENT: &str =
+    include_str!("./protocols/jupiter-perps/doves/v1/idl.json");
+pub const JUPITER_PERPS_DOVES_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/jupiter-perps/doves/v1/overrides.yaml");
+pub const JUPITER_PERPS_DOVES_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/jupiter-perps/doves/v1/keep-alive.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -134,6 +145,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_jupiter_perps_overrides();
         if let Err(e) = default.check_keep_alive_imports() {
             panic!("unable to load the override templates: {e}");
         }
@@ -335,6 +347,25 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_jupiter_perps_overrides(&mut self) {
+        self.load_protocol_overrides(
+            JUPITER_PERPS_IDL_CONTENT,
+            JUPITER_PERPS_OVERRIDES_CONTENT,
+            "jupiter-perps",
+        );
+        self.load_protocol_overrides(
+            JUPITER_PERPS_DOVES_IDL_CONTENT,
+            JUPITER_PERPS_DOVES_OVERRIDES_CONTENT,
+            "jupiter-perps-doves",
+        );
+        let idl = serde_json::from_str(JUPITER_PERPS_DOVES_IDL_CONTENT).expect("doves idl");
+        self.load_keep_alive(
+            Some(idl),
+            JUPITER_PERPS_DOVES_KEEP_ALIVE_CONTENT,
+            "jupiter-perps-doves",
         );
     }
 
@@ -729,11 +760,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19)
+        // + Jupiter Perps (5) + Doves (1) = 87
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            87,
+            "Registry should load 87 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -808,6 +840,13 @@ mod tests {
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("jupiter-perps-custody-risk"));
+        assert!(registry.contains("jupiter-perps-custody-borrow-rate"));
+        assert!(registry.contains("jupiter-perps-custody-fees"));
+        assert!(registry.contains("jupiter-perps-pool-limits"));
+        assert!(registry.contains("jupiter-perps-pool-fees"));
+        assert!(registry.contains("jupiter-perps-doves-price"));
     }
 
     #[test]
@@ -1096,6 +1135,27 @@ templates:
     }
 
     #[test]
+    fn doves_price_keeps_its_feed_published() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("jupiter-perps-doves-price").unwrap();
+        let [import] = template.keep_alive.as_slice() else {
+            panic!("jupiter-perps-doves-price must keep its feed published");
+        };
+        assert_eq!(import.template, "jupiter-perps-doves-publication");
+        assert_eq!(
+            import.address,
+            KeepAliveAddress::Owned {
+                owners: vec!["DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e".to_string()],
+                account: "AgPriceFeed".to_string(),
+            }
+        );
+        assert_eq!(
+            import.values,
+            HashMap::from([("timestamp".to_string(), serde_json::json!("$unix_s"))])
+        );
+    }
+
+    #[test]
     fn raw_layout_collection_rejects_invalid_write_definitions_at_load_time() {
         fn rejected(yaml: &str, expected: &str) {
             let result = std::panic::catch_unwind(|| {
@@ -1378,6 +1438,17 @@ templates: []
             19,
             "Should have 19 Phoenix Eternal templates"
         );
+
+        assert_eq!(
+            registry.by_protocol("jupiter-perps").len(),
+            5,
+            "Should have 5 Jupiter Perps templates"
+        );
+        assert_eq!(
+            registry.by_protocol("jupiter-perps-doves").len(),
+            1,
+            "Should have 1 Doves template"
+        );
     }
 
     #[test]
@@ -1387,8 +1458,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            4,
-            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+            5,
+            "Should find 5 oracle templates (Pyth + 3 Kamino Scope + Doves)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
