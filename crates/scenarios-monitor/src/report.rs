@@ -1,10 +1,10 @@
 //! The Markdown report each run shows as its summary.
 
-use std::{collections::BTreeMap, fmt::Write};
+use std::fmt::Write;
 
 use crate::{
     check::{IdlResult, Outcome},
-    tests_log::{Failure, ModuleResult},
+    tests_log::{Failure, TestRun},
     verdict::Verdict,
 };
 
@@ -17,7 +17,7 @@ pub struct Report<'a> {
     pub run_url: Option<&'a str>,
     pub attention: &'a [String],
     pub idls: &'a [IdlResult],
-    pub tests: Option<&'a BTreeMap<String, ModuleResult>>,
+    pub tests: Option<&'a TestRun>,
 }
 
 fn failure_details(failed: &[Failure]) -> String {
@@ -109,9 +109,14 @@ impl Report<'_> {
                 Outcome::NotComparable { reason } => format!("not comparable: {reason}"),
                 Outcome::Unchecked { error } => format!("could not check: {error}"),
             };
+            let unreadable: String = result
+                .unreadable
+                .iter()
+                .map(|reason| format!("<br>not read: {reason}"))
+                .collect();
             let _ = writeln!(
                 out,
-                "| `{}` | {published} | {} | {outcome} |",
+                "| `{}` | {published} | {} | {outcome}{unreadable} |",
                 result.protocol,
                 result.committed_version.as_deref().unwrap_or("—")
             );
@@ -121,23 +126,30 @@ impl Report<'_> {
 
     fn tests_section(&self, out: &mut String) {
         *out += "## Integration tests\n\n";
-        let Some(modules) = self.tests else {
+        let Some(tests) = self.tests else {
             *out += "Not run in this run.\n";
             return;
         };
-        *out += "| Module | Passed | Failed | Ignored | Status |\n|---|---|---|---|---|\n";
-        for (module, result) in modules {
-            let status = format!("{:?}", result.status).to_lowercase();
+        if !tests.complete {
+            *out += "The tests did not finish, or ran nothing: they did not build, were cut short, \
+                     or no protocol test ran. What they reported until then is below.\n\n";
+        }
+        *out += "| Module | Passed | Failed | Ignored | Result |\n|---|---|---|---|---|\n";
+        for (module, result) in &tests.modules {
+            let outcome = match result.failed.is_empty() {
+                true => "pass",
+                false => "fail",
+            };
             let _ = writeln!(
                 out,
-                "| `{module}` | {} | {} | {} | {status} |",
+                "| `{module}` | {} | {} | {} | {outcome} |",
                 result.passed,
                 result.failed.len(),
                 result.ignored
             );
         }
         out.push('\n');
-        for result in modules.values() {
+        for result in tests.modules.values() {
             *out += &failure_details(&result.failed);
         }
     }
