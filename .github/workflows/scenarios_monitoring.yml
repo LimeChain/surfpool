@@ -1,26 +1,17 @@
 name: Scenarios monitoring
 
-# Checks the protocols the scenarios integrate against what is live on mainnet: the IDL each
-# program publishes, and the integration tests. The report is the run's summary. Nothing is
-# committed: the report and the state the next run compares against are the run's artifact.
+# Checks the protocols the scenarios integrate against what is live on mainnet: each committed
+# IDL against the one its program publishes, and the integration tests. The report is the run's
+# summary; the run's artifact also holds the diff and the published IDL of every protocol that
+# differs. Nothing is committed, and no run depends on another.
 # SURFPOOL_TEST_RPC_URL is optional and used by the tests alone; the public endpoint rate-limits
 # them.
 on:
   push:
   workflow_dispatch:
 
-# Each run compares against the one before it, so they run one at a time.
-concurrency:
-  group: scenarios-monitoring
-  cancel-in-progress: false
-
 permissions:
   contents: read
-  # Reads the previous run's artifact.
-  actions: read
-
-env:
-  ARTIFACT: scenarios-monitoring
 
 jobs:
   check:
@@ -31,24 +22,6 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
-
-      - name: Read the previous state
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p previous
-          # GitHub lists artifacts newest first. This run's own is skipped, so a re-run compares
-          # against the same state its first attempt did.
-          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=20")
-          run=$(jq -r --argjson self "$GITHUB_RUN_ID" \
-            '[.artifacts[] | select(.expired | not) | .workflow_run.id | select(. != $self)][0] // empty' \
-            <<< "$artifacts")
-          if [ -n "$run" ]; then
-            gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir previous
-            echo "Comparing with run $run."
-          else
-            echo "No earlier run's state: this run records the baseline."
-          fi
 
       - name: Install build dependencies
         # Only the tests need these, so a failure here must not cost the run its IDL report.
@@ -86,21 +59,19 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           target/debug/scenarios-monitor --stamp "$(date -u +%Y-%m-%dT%H-%M-%SZ)" \
-            --previous previous --out out --tests-log tests.log --run-url "$RUN_URL"
-          cat out/report/report.md >> "$GITHUB_STEP_SUMMARY"
+            --out out --tests-log tests.log --run-url "$RUN_URL"
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
 
-      # Holds report/ for readers and state/ for the next run, which is why it is kept this long.
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT }}
+          name: scenarios-monitoring
           path: out
           if-no-files-found: error
-          retention-days: 90
           # A re-run replaces its first attempt's artifact.
           overwrite: true
 
-      # Anything short of clean fails the run: a protocol needs attention, the tests did not
-      # finish, or an IDL could not be fetched.
+      # Anything short of clean fails the run: a committed IDL differs from what its program
+      # publishes, tests fail or did not finish, or what a program publishes could not be read.
       - name: Fail unless every check is clean
         run: |
           verdict=$(cat out/verdict)
