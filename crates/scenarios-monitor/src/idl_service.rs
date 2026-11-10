@@ -73,11 +73,18 @@ impl IdlService {
 }
 
 /// Reads each source of a reply on its own, so that one source that cannot be read does not
-/// cost the other. Fails only when nothing that is published can be read.
+/// cost the other. Fails when nothing that is published can be read, and when the reply does not
+/// list both sources.
 fn published_idls(reply: &Value) -> Result<PublishedIdls> {
     let mut published = PublishedIdls::default();
     for source in [ANCHOR, PROGRAM_METADATA] {
-        let read = match read_source(reply, source) {
+        // The service lists both sources for every program, empty where it publishes none.
+        // Taking a reply without one for "publishes nothing" would pass every protocol.
+        let entries = reply
+            .get(source)
+            .and_then(Value::as_array)
+            .with_context(|| format!("IDL service: the reply has no `{source}` list"))?;
+        let read = match read_source(entries, source) {
             Ok(read) => read,
             Err(error) => {
                 published.unreadable.push(format!("{error:#}"));
@@ -95,12 +102,7 @@ fn published_idls(reply: &Value) -> Result<PublishedIdls> {
     Ok(published)
 }
 
-fn read_source(reply: &Value, source: &str) -> Result<Option<Published>> {
-    let entries = reply
-        .get(source)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+fn read_source(entries: &[Value], source: &str) -> Result<Option<Published>> {
     let Some(entry) = entries
         .iter()
         .find(|entry| entry.get("content").is_some_and(|c| !c.is_null()))
@@ -193,6 +195,18 @@ mod tests {
         let error = published_idls(&reply).unwrap_err().to_string();
         assert!(error.contains("the anchor IDL is not JSON"), "{error}");
         assert!(error.contains("the pmp IDL does not decode"), "{error}");
+    }
+
+    #[test]
+    fn a_reply_that_does_not_list_both_sources_is_an_error() {
+        for reply in [
+            json!({"anchor": entry("{}", true)}),
+            json!({"anchor": [], "pmp": null}),
+            json!({"error": "not found"}),
+        ] {
+            let error = published_idls(&reply).unwrap_err().to_string();
+            assert!(error.contains("the reply has no `"), "{error}");
+        }
     }
 
     #[test]
