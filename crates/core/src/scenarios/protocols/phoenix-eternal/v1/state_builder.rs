@@ -174,6 +174,11 @@ fn encode_instruction(
             .map_err(|e| SurfpoolError::internal(format!("{name} {}: {e}", arg.name)))?;
         data.extend(encoded);
     }
+    // The program also reads an optional clamp center, clamp band radius and divisor, which the
+    // published IDL leaves out. Three `None`s keep their current values.
+    if name == "UpdateFundingParameters" {
+        data.extend([0, 0, 0]);
+    }
 
     let mut metas = Vec::with_capacity(definition.accounts.len());
     for item in &definition.accounts {

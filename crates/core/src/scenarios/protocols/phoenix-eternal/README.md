@@ -241,7 +241,7 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `... is below its high-risk margin ...`                       | The collateral target is below the trader's high-risk margin; a liquidation can leave it underwater and fail.                    |
 | `the ... book stayed crossed after ... uncross cranks`        | `phoenix-market-uncross` left the book crossed after its cranks. Try a smaller move.                                              |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
-| `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
+| `Mark price of market N is unavailable or stale`              | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
 
 ## Tests against mainnet
 

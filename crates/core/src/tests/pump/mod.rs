@@ -93,9 +93,11 @@ const CURVE_REAL_TOKEN_RESERVES_OFFSET: usize = 24;
 const CURVE_REAL_QUOTE_RESERVES_OFFSET: usize = 32;
 const CURVE_COMPLETE_OFFSET: usize = 48;
 const CURVE_CREATOR_OFFSET: usize = 49;
+const CURVE_IS_MAYHEM_MODE_OFFSET: usize = 81;
 const CURVE_QUOTE_MINT_OFFSET: usize = 83;
 const GLOBAL_FEE_RECIPIENT_OFFSET: usize = 41;
 const GLOBAL_WITHDRAW_AUTHORITY_OFFSET: usize = 113;
+const GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET: usize = 483;
 const GLOBAL_BUYBACK_RECIPIENTS_OFFSET: usize = 741;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 const AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET: usize = 57;
@@ -395,10 +397,15 @@ impl GraduationFixture {
                 .expect("curve creator");
         let creator_vault =
             Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &PUMP).0;
-        let fee_recipient = Pubkey::try_from(
-            &global_data[GLOBAL_FEE_RECIPIENT_OFFSET..GLOBAL_FEE_RECIPIENT_OFFSET + 32],
-        )
-        .expect("global fee recipient");
+        // A mayhem-mode coin pays its fees to the reserved recipient; any other is NotAuthorized.
+        let fee_recipient_offset = if curve_data[CURVE_IS_MAYHEM_MODE_OFFSET] == 1 {
+            GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET
+        } else {
+            GLOBAL_FEE_RECIPIENT_OFFSET
+        };
+        let fee_recipient =
+            Pubkey::try_from(&global_data[fee_recipient_offset..fee_recipient_offset + 32])
+                .expect("global fee recipient");
         let buyback_recipient = Pubkey::try_from(
             &global_data[GLOBAL_BUYBACK_RECIPIENTS_OFFSET..GLOBAL_BUYBACK_RECIPIENTS_OFFSET + 32],
         )
