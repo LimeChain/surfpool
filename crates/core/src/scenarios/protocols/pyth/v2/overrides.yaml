@@ -9,6 +9,11 @@ tags:
   - defi
   - clock-sensitive
 
+keep_alive:
+  - template: pyth-price-publication
+    address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: PriceUpdateV2 }
+    values: { price_message.publish_time: $unix_s, posted_slot: $slot }
+
 constants:
   price_feed:
     label: Price Feed
@@ -194,7 +199,7 @@ constants:
 templates:
   - id: pyth-price-feed-v2
     name: Override Price Feed
-    description: Override any Pyth price feed with custom price data
+    description: Override any Pyth price feed with custom price data; keeps every loaded Pyth Core price account published
     idl_account_name: PriceUpdateV2
     properties:
       - path: feed_id
@@ -212,7 +217,7 @@ templates:
         description: Decimal exponent, normally -8 and -10 on some feeds. Rescales every price field
       - path: price_message.publish_time
         label: Publish Time
-        description: Unix seconds of this update, interpreted against the Surfnet clock
+        description: Unix seconds of this update, interpreted against the Surfnet clock. Keep-alive writes the Clock time every slot, so a value set here holds only with keepAlive false
       - path: price_message.prev_publish_time
         label: Previous Publish Time
         description: Unix seconds of the preceding update
@@ -224,10 +229,16 @@ templates:
         description: Exponential moving average confidence, in the same scale as conf
       - path: posted_slot
         label: Posted Slot
-        description: Slot the update was posted at, for consumers that measure freshness in slots
+        description: Slot the update was posted at, for consumers that measure freshness in slots. Keep-alive writes the current slot every slot, so a value set here holds only with keepAlive false
     llm_context: |
       CRITICAL: Always set fetchBeforeUse: true for Pyth price feeds!
       This fetches the current account data from mainnet before applying your price override.
+
+      WHICH RECEIVER: this template writes price accounts of the Pyth Core receiver
+      rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, which Save and Kamino read. Project 0 reads the
+      Pyth Core Compatible receiver instead: for a Project 0 price use
+      pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0. When a protocol's own
+      templates name the price account it reads, follow them.
 
       HOW TO USE THIS TEMPLATE:
       1. Select the correct price feed from the `feed_id` constant options (e.g., SOL/USD, BTC/USD)
@@ -255,31 +266,28 @@ templates:
         unless the scenario is specifically about an exponent error. If you do change it, restate
         every scaled field to match.
       - price_message.ema_price and price_message.ema_conf use the same scales as price and conf.
-      - posted_slot is a slot number, not a timestamp. Some consumers measure freshness in slots
-        rather than in seconds.
 
-      TIME FIELDS - READ BEFORE SETTING publish_time:
-      publish_time and prev_publish_time are unix seconds interpreted against the SURFNET clock, not
-      the real-world clock. The two can differ by an arbitrary amount, so a timestamp taken from the
-      real current time will look far in the future inside the simulation and will NOT produce a
-      stale price.
+      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays until the network is
+      reset, Surfpool republishes every price account of the Pyth Core receiver the Surfnet has
+      loaded every slot, as the Pyth publisher does on mainnet: publish_time becomes the Surfnet
+      clock's unix seconds and posted_slot the slot, also after a time travel. This includes feeds
+      no override names and, from the next slot, feeds a transaction loads later, so a liquidation
+      that reads the borrower's other feeds finds them fresh. Price, conf and the EMA fields keep
+      their values. With keepAlive: true, a value set for publish_time or posted_slot never takes
+      effect, so leave both unset.
 
-      Do not try to backdate the timestamp either - the Surfnet clock only moves forward. To build a
-      stale-price scenario, make the price fresh and then advance time past the consumer's limit:
-      1. surfnet_pauseClock so the elapsed time is exact rather than dependent on slot production.
-         It returns an EpochInfo, which carries no timestamp - step 2 is how you read the time.
-      2. read the Surfnet clock with getAccountInfo on
-         SysvarC1ock11111111111111111111111111111111 using the jsonParsed encoding, and take
-         result.value.data.parsed.info.unixTimestamp, which is in SECONDS. Set publish_time to
-         that value, which makes the price fresh.
-      3. surfnet_timeTravel forward by more than the consumer's staleness limit. Its
-         absoluteTimestamp is in MILLISECONDS, so multiply the value from step 2 by 1000 before
-         adding your offset.
-      4. send the transaction - the consumer now sees an aged price and should reject it
-
-      UNITS WARNING for step 3: surfnet_timeTravel's absoluteTimestamp is in MILLISECONDS, while
-      publish_time and the Clock sysvar are in SECONDS. Multiply by 1000 when passing a value read
-      from the clock, or the call fails with a "past timestamp" error.
+      STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a price
+      account, and an override with no values beyond feed_id writes nothing. To keep one feed
+      stale while the others stay fresh, add two overrides of this template, both with
+      fetchBeforeUse: true and price_message.price set to the feed's current price
+      (getAccountInfo, encoding "jsonParsed"), so no price changes:
+      - on the stale feed, keepAlive: false. It then ages against the Surfnet clock and turns
+        stale once the consumer's age limit has passed;
+      - on any other feed the same consumer reads, keepAlive: true. This starts the
+        republishing of every loaded price account except the stale one.
+      To make it stale at once, surfnet_timeTravel past the consumer's limit. Its
+      absoluteTimestamp is in MILLISECONDS, while publish_time and the Clock sysvar are in
+      SECONDS.
     address:
       type: pda
       program_id: pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT
