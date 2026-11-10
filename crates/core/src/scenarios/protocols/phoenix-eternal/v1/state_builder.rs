@@ -176,7 +176,22 @@ fn encode_instruction(
     }
     // The program also reads an optional clamp center, clamp band radius and divisor, which the
     // published IDL leaves out. Three `None`s keep their current values.
+    // An IDL that lists them would encode them above, so this holds only for its four fields.
     if name == "UpdateFundingParameters" {
+        let listed = definition
+            .args
+            .first()
+            .and_then(|arg| defined(&arg.ty, &idl.types));
+        if !matches!(
+            listed,
+            Some(IdlTypeDefTy::Struct {
+                fields: Some(IdlDefinedFields::Named(fields)),
+            }) if fields.len() == 4
+        ) {
+            return Err(SurfpoolError::internal(format!(
+                "the Phoenix IDL no longer gives {name} four fields; drop the three added options"
+            )));
+        }
         data.extend([0, 0, 0]);
     }
 

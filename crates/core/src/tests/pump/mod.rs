@@ -398,7 +398,7 @@ impl GraduationFixture {
         let creator_vault =
             Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &PUMP).0;
         // A mayhem-mode coin pays its fees to the reserved recipient; any other is NotAuthorized.
-        let fee_recipient_offset = if curve_data[CURVE_IS_MAYHEM_MODE_OFFSET] == 1 {
+        let fee_recipient_offset = if curve_data[CURVE_IS_MAYHEM_MODE_OFFSET] != 0 {
             GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET
         } else {
             GLOBAL_FEE_RECIPIENT_OFFSET
