@@ -7,7 +7,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::Value;
 
 const USER_AGENT: &str = "surfpool-scenarios-monitoring";
-const BASE_URL: &str = "https://idl-one.vercel.app";
+const BASE_URL: &str = "https://idl.solana.com";
 /// Upstream IDLs are a few MB at most; anything far larger is not an IDL.
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
