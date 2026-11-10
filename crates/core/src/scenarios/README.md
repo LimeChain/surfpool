@@ -71,9 +71,11 @@ every protocol that differs, the diff and the published IDL. Nothing is committe
 depends on another.
 
 A run fails while a committed IDL differs from what its program publishes, while a test module
-fails, and when a check could not be made: the IDL to compare with cannot be read or is not one
-Anchor accepts, or the tests' results are not complete. Updating the committed `idl.json` to what
-the program publishes, and the templates with it, is what makes it pass again.
+fails, and when a check could not be made: the IDL to compare with cannot be read, it is an Anchor
+IDL that Anchor's converter rejects, or the tests' results are not complete. A program that
+publishes no IDL, or a Codama document in place of an Anchor IDL, has nothing to compare with and
+does not fail the run. Updating the committed `idl.json` to what the program publishes, and the
+templates with it, is what makes it pass again.
 
 The checks live in the `surfpool-scenarios-monitor` crate and run locally:
 
