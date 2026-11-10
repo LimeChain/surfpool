@@ -33,7 +33,7 @@ liquidations are sent by your own code. For how scenarios work in general see th
 | perp `paused_operations` | bits: `1` funding, `2` AMM fills, `4` fills, `8` settle PnL, `16` settle PnL with position, `32` liquidation, `64` AMM immediate fills, `128` settle revenue pool | `32` |
 | `liquidator_fee`, `if_liquidation_fee` | share of the liquidated position's value, `1000000` = 100% | `7500` = 0.75% |
 | `exchange_status` | bits: `1` deposits, `2` withdrawals, `4` AMM, `8` fills, `16` liquidations, `32` funding, `64` settle PnL, `128` AMM immediate fills | `16` |
-| `slots_before_stale_for_margin` | units of 400 ms, two slots each at the program's 200 ms slot clock | `120` = 240 slots |
+| `slots_before_stale_for_margin` | units of 400 ms, converted with the State's `slot_duration_ms` (200 ms live, so two slots per unit) | `120` = 240 slots |
 | `oracle_twap_5min_percent_divergence` | `1000000` = 100%; the program never uses less than 50% | `1000000` |
 | `too_volatile_ratio` | a plain multiple of the market's TWAP | `5` |
 | `liquidation_margin_buffer_ratio` | margin above maintenance a liquidation restores, `10000` = 100% | `200` = 2% |
@@ -81,9 +81,10 @@ reads the oracles of all its markets and its collateral, so these windows apply 
 
 - Margin checks, such as withdrawals, orders that add risk and matched fills, refuse a price older
   than the State's `oracle_guard_rails.validity.slots_before_stale_for_margin` (`InvalidOracle`,
-  6035). It is 120 units of 400 ms, which is 240 slots at the program's 200 ms slot clock, and
-  three times that for the USDT price. Raise it with `velocity-exchange-risk` to keep such a price
-  usable longer; the program's admin path allows up to `1000000` (2,000,000 slots).
+  6035). It is 120 units of 400 ms, converted with the State's `slot_duration_ms` (200 ms live, so
+  two slots per unit): 240 slots, and three times that for the USDT price. Raise it with
+  `velocity-exchange-risk` to keep such a price usable longer; the program's admin path allows up
+  to `1000000` (2,000,000 slots).
 - AMM fills need a recent price. An order placed after the price fills from the AMM at once only
   within the market's `oracle_slot_delay_override` (the price's own slot when it is negative). An
   order placed in the price's slot or before it, and a PnL settle right after a price move, need

@@ -11,7 +11,7 @@ tags:
 templates:
   - id: velocity-oracle-price
     name: Override Oracle Price
-    description: Set the price a Velocity market reads from its PythLazerOracle account
+    description: Set the price a Velocity market reads from its PythLazerOracle account; keeps every loaded Velocity oracle posted
     idl_account_name: PythLazerOracle
     properties:
       - path: price
@@ -179,7 +179,7 @@ templates:
         description: "Bit flags: 1 deposits, 2 withdrawals, 4 AMM, 8 fills, 16 liquidations, 32 funding, 64 settle PnL, 128 AMM immediate fills. 0 means everything runs"
       - path: oracle_guard_rails.validity.slots_before_stale_for_margin
         label: Margin Staleness Window
-        description: "Margin checks refuse a price older than this many 400 ms units, counted from its posted_slot at two slots per unit, and three times that for USDT. Live: 120 (240 slots). Raise it to keep a price nothing reposts usable longer. Example: 1000000"
+        description: "Margin checks refuse a price older than this many 400 ms units past its posted_slot, converted with the State's slot_duration_ms (200 ms live, so two slots per unit), and three times that for USDT. Live: 120 (240 slots). Raise it to keep a price nothing reposts usable longer. Example: 1000000"
       - path: oracle_guard_rails.price_divergence.oracle_twap_5min_percent_divergence
         label: Max Distance From 5-Minute TWAP
         description: "How far a price may sit from the 5-minute TWAP for liquidation, 1000000 = 100%. Never below 50%. Example: 1000000"
@@ -206,12 +206,12 @@ templates:
 
       Margin checks, such as withdrawals, orders that add risk and matched fills, read the oracles
       of all an account's markets, and refuse a price more than slots_before_stale_for_margin units
-      of 400 ms past its posted_slot. The program counts two slots per unit and gives the USDT
-      price three times the window; the live 120 is 240 slots. From the slot a
-      velocity-oracle-price override plays, Surfpool reposts every Velocity oracle at the Clock, so
-      the window matters before that and for an oracle written with keepAlive: false. Raise it to
-      keep those prices usable longer. The program's admin path allows up to 1000000 (2,000,000
-      slots); the program reads any value.
+      of 400 ms past its posted_slot. The program converts units with the State's slot_duration_ms
+      (200 ms live, so two slots per unit) and gives the USDT price three times the window; the live
+      120 is 240 slots. From the slot a velocity-oracle-price override plays, Surfpool reposts every
+      Velocity oracle at the Clock, so the window matters before that and for an oracle written
+      with keepAlive: false. Raise it to keep those prices usable longer. The program's admin path
+      allows up to 1000000 (2,000,000 slots); the program reads any value.
 
       Liquidation refuses a price further from the market's 5-minute TWAP than
       oracle_twap_5min_percent_divergence (1000000 = 100%, never below 500000) with
