@@ -8,8 +8,8 @@ Templates for the Jupiter Perps exchange and the JLP pool behind it, across two 
 | Doves oracle | `DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e` | `jupiter-perps-doves` (`doves/v1`) |
 
 Perps reads every price from a Doves `AgPriceFeed`. It never reads the custody's Pyth account, so
-`pyth-price-feed-v2` does not move Perps prices. Surfpool keeps a feed published on its own once a
-scenario overrides it.
+`pyth-price-feed-v2` does not move Perps prices. Once a scenario overrides one Doves price, Surfpool
+keeps every loaded Doves feed published.
 
 # Template index
 
