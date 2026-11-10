@@ -29,6 +29,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A run that finds something to report ends as failed, and its build is still worth
+          # keeping.
+          cache-on-failure: true
 
       - name: Build the monitor
         run: cargo build -p surfpool-scenarios-monitor
