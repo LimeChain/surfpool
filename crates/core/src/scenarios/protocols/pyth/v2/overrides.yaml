@@ -217,7 +217,7 @@ templates:
         description: Decimal exponent, normally -8 and -10 on some feeds. Rescales every price field
       - path: price_message.publish_time
         label: Publish Time
-        description: Unix seconds of this update, interpreted against the Surfnet clock
+        description: Unix seconds of this update, interpreted against the Surfnet clock. Keep-alive writes the Clock time every slot, so a value set here holds only with keepAlive false
       - path: price_message.prev_publish_time
         label: Previous Publish Time
         description: Unix seconds of the preceding update
@@ -229,7 +229,7 @@ templates:
         description: Exponential moving average confidence, in the same scale as conf
       - path: posted_slot
         label: Posted Slot
-        description: Slot the update was posted at, for consumers that measure freshness in slots
+        description: Slot the update was posted at, for consumers that measure freshness in slots. Keep-alive writes the current slot every slot, so a value set here holds only with keepAlive false
     llm_context: |
       CRITICAL: Always set fetchBeforeUse: true for Pyth price feeds!
       This fetches the current account data from mainnet before applying your price override.
@@ -273,8 +273,8 @@ templates:
       clock's unix seconds and posted_slot the slot, also after a time travel. This includes feeds
       no override names and, from the next slot, feeds a transaction loads later, so a liquidation
       that reads the borrower's other feeds finds them fresh. Price, conf and the EMA fields keep
-      their values. A value set for publish_time or posted_slot never takes effect, so leave both
-      unset.
+      their values. With keepAlive: true, a value set for publish_time or posted_slot never takes
+      effect, so leave both unset.
 
       STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a price
       account, and an override with no values beyond feed_id writes nothing. To keep one feed
