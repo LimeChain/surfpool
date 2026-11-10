@@ -81,7 +81,8 @@ fn main() -> Result<()> {
     let protocols = check::discover(&args.root)?;
 
     let previous_idls: BTreeMap<String, IdlState> = check::load_json(&previous.join("idls.json"))?;
-    let idls = check::check_idls(&service, &protocols, &previous_idls, &previous, out, &now)?;
+    let latest = |address: &str| service.latest(address);
+    let idls = check::check_idls(&latest, &protocols, &previous_idls, &previous, out, &now)?;
 
     let tests = match &args.tests_log {
         Some(path) => {

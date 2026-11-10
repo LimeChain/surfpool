@@ -3,8 +3,13 @@
 //! Every IDL, committed or published, goes through Anchor's own converter into the current
 //! Anchor format first, so two documents describing the same program compare equal whichever
 //! format each was published in. Codama documents do not convert and are only diffed as text.
+//!
+//! IDLs of one program spell its names differently (`sharedAccountsRoute` and
+//! `shared_accounts_route`), so a shipped entry with no namesake is looked up without regard to
+//! case and underscores. That only finds the entry: next to a copy spelled differently it still
+//! compares as changed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anchor_lang_idl::{convert::convert_idl, types::Idl};
 use anyhow::Result;
@@ -149,9 +154,10 @@ pub fn compare(before: &Idl, after: &Idl, scope: Option<&Idl>) -> Comparison {
 /// How many of the entries `committed` ships `published` has at all.
 pub fn coverage(committed: &Idl, published: &Idl) -> usize {
     fn present<T>(shipped: &[T], published: &[T], name: fn(&T) -> &String) -> usize {
+        let published = by_name(published, shipped, name);
         shipped
             .iter()
-            .filter(|entry| published.iter().any(|other| name(other) == name(entry)))
+            .filter(|entry| published.contains_key(name(entry).as_str()))
             .count()
     }
     present(&committed.accounts, &published.accounts, |e| &e.name)
@@ -163,10 +169,36 @@ pub fn coverage(committed: &Idl, published: &Idl) -> usize {
         + present(&committed.errors, &published.errors, |e| &e.name)
 }
 
-fn by_name<T>(entries: &[T], name: fn(&T) -> &String) -> BTreeMap<&str, &T> {
+/// A name without its spelling: its letters and digits, in lower case.
+fn unspelled(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The entries by name. An entry `scope` spells differently is filed under the scope's spelling,
+/// unless the entries hold that very name as well: some IDLs publish two entries that differ in
+/// case alone.
+fn by_name<'a, T>(
+    entries: &'a [T],
+    scope: &'a [T],
+    name: fn(&T) -> &String,
+) -> BTreeMap<&'a str, &'a T> {
+    let own: BTreeSet<&str> = entries.iter().map(|entry| name(entry).as_str()).collect();
+    let spellings: BTreeMap<String, &str> = scope
+        .iter()
+        .map(|entry| (unspelled(name(entry)), name(entry).as_str()))
+        .collect();
     entries
         .iter()
-        .map(|entry| (name(entry).as_str(), entry))
+        .map(|entry| {
+            let own_name = name(entry).as_str();
+            match spellings.get(&unspelled(own_name)) {
+                Some(spelling) if !own.contains(spelling) => (*spelling, entry),
+                _ => (own_name, entry),
+            }
+        })
         .collect()
 }
 
@@ -180,9 +212,9 @@ impl Comparison {
         name: fn(&T) -> &String,
     ) {
         let (old, new, shipped) = (
-            by_name(before, name),
-            by_name(after, name),
-            by_name(scope, name),
+            by_name(before, scope, name),
+            by_name(after, scope, name),
+            by_name(scope, scope, name),
         );
         let mut summary = SectionSummary {
             shipped: shipped.len(),
@@ -379,6 +411,58 @@ mod tests {
         );
         // The instruction is upstream only: counted, never breaking.
         assert_eq!(comparison.sections["instructions"].added, 1);
+    }
+
+    fn route(name: &str, amount_type: &str) -> Value {
+        let mut idl = current(json!([]), json!([]));
+        idl["instructions"] = json!([{
+            "name": name,
+            "discriminator": [193, 32, 155, 51, 65, 214, 156, 129],
+            "accounts": [],
+            "args": [{"name": "in_amount", "type": amount_type}],
+        }]);
+        idl
+    }
+
+    #[test]
+    fn a_shipped_entry_is_found_however_upstream_spells_it() {
+        let shipped = parse(&route("sharedAccountsRoute", "u64"), ADDRESS).unwrap();
+        let upstream = |ty| parse(&route("shared_accounts_route", ty), ADDRESS).unwrap();
+
+        // An upstream change reaches the entry; an unchanged copy raises nothing.
+        let changed = compare(&upstream("u64"), &upstream("u128"), Some(&shipped));
+        assert_eq!(changed.breaking(), ["instructions/sharedAccountsRoute"]);
+        assert_eq!(changed.changed_elsewhere(), 0);
+        let unchanged = compare(&upstream("u64"), &upstream("u64"), Some(&shipped));
+        assert!(unchanged.breaking().is_empty());
+
+        // Next to the committed IDL it differs in spelling, and is not missing.
+        let gap = compare(&shipped, &upstream("u64"), None);
+        assert_eq!(
+            gap.sections["instructions"].changed,
+            ["sharedAccountsRoute"]
+        );
+        assert!(gap.sections["instructions"].removed.is_empty());
+        assert_eq!(gap.added(), 0);
+        assert_eq!(coverage(&shipped, &upstream("u64")), 1);
+    }
+
+    #[test]
+    fn entries_that_differ_in_case_alone_stay_apart() {
+        let errors = |names: &[&str]| {
+            let mut idl = current(json!([]), json!([]));
+            idl["errors"] = names
+                .iter()
+                .zip(6000..)
+                .map(|(name, code)| json!({"name": name, "code": code}))
+                .collect();
+            parse(&idl, ADDRESS).unwrap()
+        };
+        let shipped = errors(&["InvalidFeedID"]);
+        let upstream = errors(&["InvalidFeedID", "InvalidFeedId"]);
+        let comparison = compare(&shipped, &upstream, None);
+        assert!(comparison.breaking().is_empty());
+        assert_eq!(comparison.added(), 1);
     }
 
     #[test]

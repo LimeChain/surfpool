@@ -7,23 +7,19 @@ name: Scenarios monitoring
 # them.
 on:
   schedule:
-    # IDLs every 10 minutes; the integration tests as well at five past each hour.
-    - cron: "*/10 * * * *"
-    - cron: "5 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
-    inputs:
-      integration-tests:
-        description: Also run the integration tests
-        type: boolean
-        default: true
 
+# Every run is the same, so one waiting behind another may be dropped for a newer one.
 concurrency:
   group: scenarios-monitoring
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 env:
   REPORT_BRANCH: scenarios/reports
-  TESTS_SCHEDULE: "5 * * * *"
   ISSUE_LABEL: scenarios-monitoring
 
 jobs:
@@ -32,27 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     # Third-party actions run here, so this job's token stays read-only; publish has its own job.
-    permissions:
-      contents: read
     outputs:
-      stamp: ${{ steps.plan.outputs.stamp }}
+      stamp: ${{ steps.stamp.outputs.stamp }}
+      verdict: ${{ steps.check.outputs.verdict }}
     env:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
 
-      - name: Plan the run
-        id: plan
-        env:
-          EVENT: ${{ github.event_name }}
-          SCHEDULE: ${{ github.event.schedule }}
-          DISPATCH_TESTS: ${{ inputs.integration-tests }}
-        run: |
-          echo "stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> "$GITHUB_OUTPUT"
-          if { [ "$EVENT" = workflow_dispatch ] && [ "$DISPATCH_TESTS" = true ]; } \
-              || [ "$SCHEDULE" = "$TESTS_SCHEDULE" ]; then
-            echo "tests=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Stamp the run
+        id: stamp
+        run: echo "stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Read the previous state
         run: |
@@ -65,20 +51,16 @@ jobs:
           fi
 
       - name: Install build dependencies
-        if: steps.plan.outputs.tests == 'true'
         # Only the tests need these, so a failure here must not cost the run its IDL report.
         continue-on-error: true
         run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: scenarios-monitoring
 
       - name: Build the monitor
         run: cargo build -p surfpool-scenarios-monitor
 
       - name: Integration tests
-        if: steps.plan.outputs.tests == 'true'
         # The tests add to the report and never stop it: whether they fail, do not build or hang,
         # the check step still runs and reports the IDLs next to whatever the log holds.
         continue-on-error: true
@@ -86,6 +68,9 @@ jobs:
         env:
           SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
         run: |
+          # An unset secret arrives as an empty string, which the tests would take for their
+          # endpoint; unset, they use the public one.
+          [ -n "$SURFPOOL_TEST_RPC_URL" ] || unset SURFPOOL_TEST_RPC_URL
           # Every protocol's tests live under tests::protocols; without the filter the whole
           # crate's tests would run. The check step reads the outcome from the log, so a failing
           # test never fails this step.
@@ -94,28 +79,27 @@ jobs:
           grep -E '^test result:|^test .* FAILED$' tests.log || tail -n 40 tests.log
 
       - name: Check
+        id: check
         env:
           # Makes no request here; it is passed so its key can be kept out of the published
           # test output.
           SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
-          STAMP: ${{ steps.plan.outputs.stamp }}
-          TESTS: ${{ steps.plan.outputs.tests }}
-          REPORT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ env.REPORT_BRANCH }}/${{ steps.plan.outputs.stamp }}
+          STAMP: ${{ steps.stamp.outputs.stamp }}
+          REPORT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ env.REPORT_BRANCH }}/${{ steps.stamp.outputs.stamp }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          args=(--stamp "$STAMP" --previous previous --out out --report-url "$REPORT_URL" --run-url "$RUN_URL")
-          if [ "$TESTS" = true ]; then
-            args+=(--tests-log tests.log)
-          fi
-          target/debug/scenarios-monitor "${args[@]}"
+          target/debug/scenarios-monitor --stamp "$STAMP" --previous previous --out out \
+            --tests-log tests.log --report-url "$REPORT_URL" --run-url "$RUN_URL"
+          echo "verdict=$(cat out/verdict)" >> "$GITHUB_OUTPUT"
           cat out/report/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      # Only carries the report to the publish job.
       - uses: actions/upload-artifact@v4
         with:
           name: scenarios-monitoring
           path: out
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   publish:
     name: Publish
@@ -209,18 +193,41 @@ jobs:
           fi
           mkdir -p "$work/$STAMP"
           cp -R out/report/. "$work/$STAMP/"
-          rm -rf "$work/state"
-          cp -R out/state "$work/state"
+          # Only the run that sees an IDL change reports it. The IDL state moves on once every
+          # such finding is recorded against an issue; until then it stays, and the next run
+          # sees the change again.
+          issues=out/state/issues.json
+          [ -f "$issues" ] || echo '{}' > "$issues"
+          unrecorded=$(jq -r --slurpfile issues "$issues" '
+            [.open[] | select(.key | startswith("idl:"))
+              | select($issues[0][.key].fingerprint != .fingerprint) | .key] | join(", ")
+          ' out/report/findings.json)
+          if [ -n "$unrecorded" ]; then
+            echo "::warning::No issue is recorded for $unrecorded, so the IDL state stays as it was."
+            mkdir -p "$work/state"
+            cp "$issues" "$work/state/issues.json"
+          else
+            rm -rf "$work/state"
+            cp -R out/state "$work/state"
+          fi
           git -C "$work" add -A
           git -C "$work" commit -q -m "report $STAMP: $(cat out/verdict)"
           git -C "$work" -c http.extraheader="$auth" push -q origin "HEAD:$REPORT_BRANCH"
           echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$REPORT_BRANCH/$STAMP"
 
-      # Last, so a red run still leaves its report and issues behind.
-      - name: Fail when a protocol needs attention
+  # A job of its own, so that re-running a red run repeats this and not the publishing.
+  verdict:
+    name: Verdict
+    needs: [check, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Anything short of clean fails the run: a protocol needs attention, the tests did not
+      # finish, or an IDL could not be fetched.
+      - name: Fail unless every check is clean
+        env:
+          VERDICT: ${{ needs.check.outputs.verdict }}
         run: |
-          verdict=$(cat out/verdict)
-          echo "verdict: $verdict"
-          case "$verdict" in
-            attention|incomplete) exit 1 ;;
-          esac
+          echo "verdict: ${VERDICT:-none}"
+          [ "$VERDICT" = clean ]

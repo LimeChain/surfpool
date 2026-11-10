@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, fmt::Write};
 
 use crate::{
-    check::{EventKind, IdlResult},
+    check::IdlResult,
     findings::{Finding, Verdict, failure_details},
     tests_log::ModuleResult,
 };
@@ -65,10 +65,12 @@ impl Report<'_> {
                  | Protocol | Upstream | Committed | Upstream change | Committed vs upstream |\n\
                  |---|---|---|---|---|\n";
         for result in self.idls {
-            let (upstream, change) = if let Some(error) = &result.error {
-                ("—".to_owned(), format!("could not check: {error}"))
-            } else if result.sources.is_empty() {
-                ("none published".to_owned(), "—".to_owned())
+            let (upstream, mut change) = if result.sources.is_empty() {
+                let upstream = match result.error {
+                    Some(_) => "—",
+                    None => "none published",
+                };
+                (upstream.to_owned(), String::new())
             } else {
                 let upstream: Vec<_> = result
                     .sources
@@ -90,8 +92,6 @@ impl Report<'_> {
                 for event in &result.events {
                     let detail = if !event.breaking.is_empty() {
                         code_list(&event.breaking, usize::MAX)
-                    } else if event.kind == EventKind::Withdrawn {
-                        "no longer published".into()
                     } else if event.comparable {
                         "outside what Surfpool ships".into()
                     } else {
@@ -106,6 +106,13 @@ impl Report<'_> {
                 }
                 (upstream.join(", "), change)
             };
+            if let Some(error) = &result.error {
+                let separator = if change.is_empty() { "" } else { "<br>" };
+                let _ = write!(change, "{separator}could not check: {error}");
+            }
+            if change.is_empty() {
+                change.push('—');
+            }
             let gap = match &result.gap {
                 None => "—".to_owned(),
                 Some(gap) if !gap.comparable => {
