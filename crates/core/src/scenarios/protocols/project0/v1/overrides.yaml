@@ -184,10 +184,10 @@ templates:
 
       A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
       publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
-      65535) to accept older prices. A price account a pyth-core-compatible-price-feed-v2 override
-      wrote is republished every slot and never goes stale; the other banks' prices age. To move
-      the price itself, use pyth-core-compatible-price-feed-v2 on the bank's price account,
-      config.oracle_keys.0.
+      65535) to accept older prices. Once a pyth-core-compatible-price-feed-v2 override plays, every
+      loaded Pyth Core Compatible price account is republished every slot; a bank priced by another
+      oracle, or a price overridden with keepAlive: false, still ages. To move the price itself,
+      use pyth-core-compatible-price-feed-v2 on the bank's price account, config.oracle_keys.0.
 
       CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
       tokens, BTC and ETH. It is on when the bank's flags include 2048 (bit 11). Such a bank
