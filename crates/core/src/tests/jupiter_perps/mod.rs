@@ -1360,7 +1360,15 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     let (swap_bps, stable_bps) = (raised("swap_bps"), raised("stable_swap_bps"));
     let sol = graph.data(&custody_address(SOL_MINT));
     let multiplier = BPS as u64 + u64_at(sol, custody::EXTERNAL_SWAP_FEE_MULTIPLIER_BPS);
-    let fees = |values: Value| vec![template_override(POOL_FEES, POOL, values)];
+    // The test reads fees, so the pool limits must not refuse a swap that moves a token past its
+    // live target weight.
+    let any_weight = json!({ "limit.token_weightage_buffer_bps": "100000" });
+    let fees = |values: Value| {
+        vec![
+            template_override(POOL_FEES, POOL, values),
+            template_override(POOL_LIMITS, POOL, any_weight.clone()),
+        ]
+    };
     let untaxed = json!({
         "fees.add_remove_liquidity_bps": liquidity_bps,
         "fees.swap_bps": swap_bps,
