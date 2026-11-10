@@ -27,8 +27,9 @@ pub struct ModuleResult {
 /// What a `cargo test` run of the protocol tests reported.
 #[derive(Clone, Debug, Serialize)]
 pub struct TestRun {
-    /// Whether the run reported its result and ran at least one protocol test. A run that did
-    /// not build, was cut short or ran nothing is not complete, and proves nothing by passing.
+    /// Whether the run reported its result, ran at least one protocol test, and lists as many
+    /// failures as that result counts. A run that did not build, was cut short or ran nothing is
+    /// not complete, and proves nothing by passing; nor does one with a failure that was not read.
     pub complete: bool,
     /// By module, taken from the names of the tests that ran.
     pub modules: BTreeMap<String, ModuleResult>,
@@ -49,15 +50,18 @@ pub fn parse(log: &str) -> TestRun {
     let mut blocks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut current: Option<&str> = None;
     let mut in_failures = false;
-    let mut summary_seen = false;
+    // The failures each `test result:` line counts, to hold against the `FAILED` lines read.
+    let mut summaries: Vec<Option<usize>> = Vec::new();
+    let mut failed_lines = 0;
 
     for line in log.lines() {
-        if line.starts_with("test result: ") {
-            summary_seen = true;
+        if let Some(summary) = line.strip_prefix("test result: ") {
+            summaries.push(failed_in(summary));
             current = None;
             continue;
         }
         if let Some((name, outcome)) = result_line(line) {
+            failed_lines += usize::from(outcome == "FAILED");
             results.insert(name, outcome);
             continue;
         }
@@ -93,10 +97,19 @@ pub fn parse(log: &str) -> TestRun {
             }),
         }
     }
+    // `None` when a count cannot be read, which no number of lines read agrees with.
+    let counted: Option<usize> = summaries.iter().copied().sum();
     TestRun {
-        complete: summary_seen && !modules.is_empty(),
+        complete: !summaries.is_empty() && counted == Some(failed_lines) && !modules.is_empty(),
         modules,
     }
+}
+
+/// The failures a `test result:` line counts, as in `FAILED. 2 passed; 3 failed; 1 ignored`.
+fn failed_in(summary: &str) -> Option<usize> {
+    summary
+        .split([';', '.'])
+        .find_map(|count| count.trim().strip_suffix(" failed")?.parse().ok())
 }
 
 /// `test NAME ... ok`, `... FAILED` or `... ignored[, reason]`. A test that is expected to panic
@@ -225,5 +238,21 @@ test result: FAILED. 2 passed; 3 failed; 1 ignored; 0 measured; 900 filtered out
         // It ran, but no protocol test matched.
         let nothing = parse("running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n");
         assert!(!nothing.complete);
+    }
+
+    #[test]
+    fn a_run_with_a_failure_that_was_not_read_is_not_complete() {
+        // Its result counts a failure that no line reports.
+        let unread = "test tests::protocols::kamino::round_trips ... ok\n\
+                      test result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        assert!(!parse(unread).complete);
+        // Its result carries no count to hold the lines against.
+        let uncounted = "test tests::protocols::kamino::round_trips ... ok\ntest result: ok\n";
+        assert!(!parse(uncounted).complete);
+        // A failure outside the protocol tests is read too, so the counts agree.
+        let other = "test tests::integration::test_simnet_ticks ... FAILED\n\
+                     test tests::protocols::kamino::round_trips ... ok\n\
+                     test result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        assert!(parse(other).complete);
     }
 }
