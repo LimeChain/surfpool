@@ -234,6 +234,12 @@ templates:
       CRITICAL: Always set fetchBeforeUse: true for Pyth price feeds!
       This fetches the current account data from mainnet before applying your price override.
 
+      WHICH RECEIVER: this template writes price accounts of the Pyth Core receiver
+      rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, which Save and Kamino read. Project 0 reads the
+      Pyth Core Compatible receiver instead: for a Project 0 price use
+      pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0. When a protocol's own
+      templates name the price account it reads, follow them.
+
       HOW TO USE THIS TEMPLATE:
       1. Select the correct price feed from the `feed_id` constant options (e.g., SOL/USD, BTC/USD)
       2. Check the feed's `llm_context` field for its decimal precision (most use 8, some use 10)
