@@ -1,29 +1,27 @@
 //! Checks the protocols Surfpool's scenarios integrate against what is live on mainnet.
 //!
-//! Reads the previous state from `--previous` (empty on the first run) and writes `report/` (this
-//! run's folder), `state/` (the next run's baseline) and `verdict` to `--out`. It never writes
-//! outside `--out`; publishing the report and the issues is the workflow's job.
+//! Compares every committed IDL with what its program publishes, reads the integration tests'
+//! output, and writes `report.md`, `findings.json`, `verdict` and, for each protocol that differs,
+//! its diff and published IDL under `idls/`. It writes to `--out` alone; publishing the report is
+//! the workflow's job.
 
 mod check;
-mod findings;
 mod idl;
 mod idl_service;
 mod report;
 mod tests_log;
+mod verdict;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use serde::Serialize;
 use surfpool_types::sanitized_datasource_url;
 
 use crate::{
-    check::{IdlResult, IdlState},
-    findings::{Finding, Verdict},
-    idl_service::IdlService,
-    report::Report,
-    tests_log::ModuleResult,
+    check::IdlResult, idl_service::IdlService, report::Report, tests_log::ModuleResult,
+    verdict::Verdict,
 };
 
 /// The endpoint the integration tests use. Read only to keep its credentials out of the report.
@@ -40,9 +38,6 @@ struct Cli {
     /// The run's timestamp, which titles its report.
     #[arg(long)]
     stamp: String,
-    /// A folder holding the previous run's `state/`.
-    #[arg(long)]
-    previous: PathBuf,
     #[arg(long)]
     out: PathBuf,
     /// The `cargo test` output of the integration tests, when they ran.
@@ -57,30 +52,19 @@ struct Cli {
 struct FindingsFile<'a> {
     stamp: &'a str,
     verdict: Verdict,
-    open: &'a [Finding],
-    /// Findings whose issues can close.
-    resolved: Vec<Resolved>,
+    /// One line for each thing that needs attention.
+    attention: &'a [String],
     idls: &'a [IdlResult],
     tests: Option<&'a BTreeMap<String, ModuleResult>>,
 }
 
-#[derive(Serialize)]
-struct Resolved {
-    key: String,
-    marker: String,
-}
-
 fn main() -> Result<()> {
     let args = Cli::parse();
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let service = IdlService::new()?;
-    let previous = args.previous.join("state");
     let out = &args.out;
     let protocols = check::discover(&args.root)?;
-
-    let previous_idls: BTreeMap<String, IdlState> = check::load_json(&previous.join("idls.json"))?;
     let latest = |address: &str| service.latest(address);
-    let idls = check::check_idls(&latest, &protocols, &previous_idls, &previous, out, &now)?;
+    let idls = check::check_idls(&latest, &protocols, out)?;
 
     let tests = match &args.tests_log {
         Some(path) => {
@@ -101,49 +85,30 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let run_url = args.run_url.as_deref();
-    let (mut open, mut resolved) = findings::idl_findings(&idls.results, run_url);
-    if let Some(tests) = &tests {
-        let (test_open, test_resolved) = findings::test_findings(tests, run_url);
-        open.extend(test_open);
-        resolved.extend(test_resolved);
-    }
-    let verdict = findings::decide(&open, &idls.results, tests.as_ref());
+    let attention = verdict::attention(&idls, tests.as_ref());
+    let verdict = verdict::decide(&attention, &idls, tests.as_ref());
 
-    check::write_json(&out.join("state/idls.json"), &idls.state)?;
-    // The workflow owns the issue state; it only passes through here.
-    let issues = previous.join("issues.json");
-    if issues.exists() {
-        fs::copy(&issues, out.join("state/issues.json")).context("carrying the issue state")?;
-    }
     check::write_json(
-        &out.join("report/findings.json"),
+        &out.join("findings.json"),
         &FindingsFile {
             stamp: &args.stamp,
             verdict,
-            open: &open,
-            resolved: resolved
-                .iter()
-                .map(|key| Resolved {
-                    key: key.clone(),
-                    marker: findings::marker(key),
-                })
-                .collect(),
-            idls: &idls.results,
+            attention: &attention,
+            idls: &idls,
             tests: tests.as_ref(),
         },
     )?;
     let report = Report {
         stamp: &args.stamp,
         verdict,
-        run_url,
-        findings: &open,
-        idls: &idls.results,
+        run_url: args.run_url.as_deref(),
+        attention: &attention,
+        idls: &idls,
         tests: tests.as_ref(),
     };
-    check::write_text(&out.join("report/report.md"), &report.render())?;
+    check::write_text(&out.join("report.md"), &report.render())?;
     check::write_text(&out.join("verdict"), &format!("{verdict}\n"))?;
-    println!("verdict: {verdict}; {} need attention", open.len());
+    println!("verdict: {verdict}; {} need attention", attention.len());
     Ok(())
 }
 
