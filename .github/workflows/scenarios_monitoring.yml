@@ -1,51 +1,53 @@
 name: Scenarios monitoring
 
 # Checks the protocols the scenarios integrate against what is live on mainnet: the IDL each
-# program publishes, and the integration tests. Every run commits its report to the
-# scenarios/reports branch.
+# program publishes, and the integration tests. The report is the run's summary. Nothing is
+# committed: the report and the state the next run compares against are the run's artifact.
 # SURFPOOL_TEST_RPC_URL is optional and used by the tests alone; the public endpoint rate-limits
 # them.
 on:
   push:
   workflow_dispatch:
 
-# Every run is the same, so one waiting behind another may be dropped for a newer one.
+# Each run compares against the one before it, so they run one at a time.
 concurrency:
   group: scenarios-monitoring
   cancel-in-progress: false
 
 permissions:
   contents: read
+  # Reads the previous run's artifact.
+  actions: read
 
 env:
-  REPORT_BRANCH: scenarios/reports
+  ARTIFACT: scenarios-monitoring
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Third-party actions run here, so this job's token stays read-only; publish has its own job.
-    outputs:
-      stamp: ${{ steps.stamp.outputs.stamp }}
-      verdict: ${{ steps.check.outputs.verdict }}
     env:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stamp the run
-        id: stamp
-        run: echo "stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> "$GITHUB_OUTPUT"
-
       - name: Read the previous state
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p previous
-          if git ls-remote --exit-code --heads origin "$REPORT_BRANCH" > /dev/null; then
-            git fetch -q --depth 1 origin "$REPORT_BRANCH"
-            git archive FETCH_HEAD state | tar -x -C previous
+          # GitHub lists artifacts newest first. This run's own is skipped, so a re-run compares
+          # against the same state its first attempt did.
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=20")
+          run=$(jq -r --argjson self "$GITHUB_RUN_ID" \
+            '[.artifacts[] | select(.expired | not) | .workflow_run.id | select(. != $self)][0] // empty' \
+            <<< "$artifacts")
+          if [ -n "$run" ]; then
+            gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT" --dir previous
+            echo "Comparing with run $run."
           else
-            echo "No $REPORT_BRANCH branch yet: this run records the baseline."
+            echo "No earlier run's state: this run records the baseline."
           fi
 
       - name: Install build dependencies
@@ -77,83 +79,30 @@ jobs:
           grep -E '^test result:|^test .* FAILED$' tests.log || tail -n 40 tests.log
 
       - name: Check
-        id: check
         env:
           # Makes no request here; it is passed so its key can be kept out of the published
           # test output.
           SURFPOOL_TEST_RPC_URL: ${{ secrets.SURFPOOL_TEST_RPC_URL }}
-          STAMP: ${{ steps.stamp.outputs.stamp }}
-          REPORT_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ env.REPORT_BRANCH }}/${{ steps.stamp.outputs.stamp }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          target/debug/scenarios-monitor --stamp "$STAMP" --previous previous --out out \
-            --tests-log tests.log --report-url "$REPORT_URL" --run-url "$RUN_URL"
-          echo "verdict=$(cat out/verdict)" >> "$GITHUB_OUTPUT"
+          target/debug/scenarios-monitor --stamp "$(date -u +%Y-%m-%dT%H-%M-%SZ)" \
+            --previous previous --out out --tests-log tests.log --run-url "$RUN_URL"
           cat out/report/report.md >> "$GITHUB_STEP_SUMMARY"
 
-      # Only carries the report to the publish job.
+      # Holds report/ for readers and state/ for the next run, which is why it is kept this long.
       - uses: actions/upload-artifact@v4
         with:
-          name: scenarios-monitoring
+          name: ${{ env.ARTIFACT }}
           path: out
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
+          # A re-run replaces its first attempt's artifact.
+          overwrite: true
 
-  publish:
-    name: Publish
-    needs: check
-    if: always() && needs.check.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # The only job that can write. It runs no third-party action and no code from the check job:
-    # it only commits the report with git.
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: scenarios-monitoring
-          path: out
-
-      - name: Commit the report
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STAMP: ${{ needs.check.outputs.stamp }}
-        run: |
-          work=$(mktemp -d)
-          git -C "$work" init -q
-          git -C "$work" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git -C "$work" config user.name "github-actions[bot]"
-          git -C "$work" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
-          # The branch holds reports and state only, so the first run starts it as an orphan.
-          if git -C "$work" -c http.extraheader="$auth" fetch -q --depth 1 origin "$REPORT_BRANCH"; then
-            git -C "$work" checkout -q -B "$REPORT_BRANCH" FETCH_HEAD
-          else
-            git -C "$work" checkout -q --orphan "$REPORT_BRANCH"
-          fi
-          mkdir -p "$work/$STAMP"
-          cp -R out/report/. "$work/$STAMP/"
-          rm -rf "$work/state"
-          cp -R out/state "$work/state"
-          git -C "$work" add -A
-          git -C "$work" commit -q -m "report $STAMP: $(cat out/verdict)"
-          git -C "$work" -c http.extraheader="$auth" push -q origin "HEAD:$REPORT_BRANCH"
-          echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$REPORT_BRANCH/$STAMP"
-
-  # A job of its own, so that re-running a red run repeats this and not the publishing.
-  verdict:
-    name: Verdict
-    needs: [check, publish]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
       # Anything short of clean fails the run: a protocol needs attention, the tests did not
       # finish, or an IDL could not be fetched.
       - name: Fail unless every check is clean
-        env:
-          VERDICT: ${{ needs.check.outputs.verdict }}
         run: |
-          echo "verdict: ${VERDICT:-none}"
-          [ "$VERDICT" = clean ]
+          verdict=$(cat out/verdict)
+          echo "verdict: $verdict"
+          [ "$verdict" = clean ]
