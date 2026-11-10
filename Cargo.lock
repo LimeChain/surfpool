@@ -12245,6 +12245,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "surfpool-scenarios-monitor"
+version = "1.7.0"
+dependencies = [
+ "anchor-lang-idl",
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "similar",
+ "surfpool-types",
+]
+
+[[package]]
 name = "surfpool-sdk"
 version = "1.7.0"
 dependencies = [

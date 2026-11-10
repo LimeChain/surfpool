@@ -1,0 +1,24 @@
+[package]
+name = "surfpool-scenarios-monitor"
+description = "Checks the protocols Surfpool's scenarios integrate against what is live on mainnet"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[[bin]]
+name = "scenarios-monitor"
+path = "src/main.rs"
+
+[dependencies]
+anchor-lang-idl = { workspace = true, features = ["convert"] }
+anyhow = { workspace = true, features = ["std"] }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+similar = { workspace = true, features = ["text"] }
+surfpool-types = { workspace = true }
