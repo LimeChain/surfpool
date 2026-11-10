@@ -276,10 +276,18 @@ templates:
       their values. A value set for publish_time or posted_slot never takes effect, so leave both
       unset.
 
-      STALE PRICE: to keep one feed stale on purpose, override it with keepAlive: false. It then
-      ages against the Surfnet clock. To test a consumer's staleness check, add that override and
-      surfnet_timeTravel past the consumer's limit. Its absoluteTimestamp is in MILLISECONDS, while
-      publish_time and the Clock sysvar are in SECONDS.
+      STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a price
+      account, and an override with no values beyond feed_id writes nothing. To keep one feed
+      stale while the others stay fresh, add two overrides of this template, both with
+      fetchBeforeUse: true and price_message.price set to the feed's current price
+      (getAccountInfo, encoding "jsonParsed"), so no price changes:
+      - on the stale feed, keepAlive: false. It then ages against the Surfnet clock and turns
+        stale once the consumer's age limit has passed;
+      - on any other feed the same consumer reads, keepAlive: true. This starts the
+        republishing of every loaded price account except the stale one.
+      To make it stale at once, surfnet_timeTravel past the consumer's limit. Its
+      absoluteTimestamp is in MILLISECONDS, while publish_time and the Clock sysvar are in
+      SECONDS.
     address:
       type: pda
       program_id: pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT
