@@ -168,10 +168,8 @@ async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
     unplayed.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
     let refused = try_hawkeye_margin(&unplayed, &graph)
         .expect_err("with no Phoenix scenario played, the aged readings are refused");
-    assert!(
-        refused.contains("staleness or validity check failed"),
-        "{refused}"
-    );
+    // Hawkeye's OracleMarkPriceUnavailable; its message has been reworded, its code has not.
+    assert!(refused.contains("Custom(12289)"), "{refused}");
 
     let (locker, graph) = phoenix_behavior_locker().await;
     // Any Phoenix override keeps the markets usable; this one leaves SOL's fees as they are.
