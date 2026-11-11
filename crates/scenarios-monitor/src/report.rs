@@ -65,8 +65,8 @@ impl Report<'_> {
             }
             out.push('\n');
         }
-        self.idls_section(&mut out);
         self.tests_section(&mut out);
+        self.idls_section(&mut out);
         out
     }
 
