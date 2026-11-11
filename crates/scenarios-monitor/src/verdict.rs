@@ -36,7 +36,13 @@ impl fmt::Display for Verdict {
 
 /// One line for each thing that needs attention.
 pub fn attention(idls: &[IdlResult], tests: Option<&TestRun>) -> Vec<String> {
+    // In the order the report shows its sections: the tests, then the IDLs.
     let mut lines = Vec::new();
+    for (module, result) in tests.into_iter().flat_map(|tests| &tests.modules) {
+        if !result.failed.is_empty() {
+            lines.push(format!("{module} integration tests fail"));
+        }
+    }
     for result in idls {
         if let Outcome::Differs { entries, .. } = &result.outcome {
             let entries = match entries.len() {
@@ -47,11 +53,6 @@ pub fn attention(idls: &[IdlResult], tests: Option<&TestRun>) -> Vec<String> {
                 "{} IDL differs from what its program publishes ({entries})",
                 result.protocol
             ));
-        }
-    }
-    for (module, result) in tests.into_iter().flat_map(|tests| &tests.modules) {
-        if !result.failed.is_empty() {
-            lines.push(format!("{module} integration tests fail"));
         }
     }
     lines
@@ -132,8 +133,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "pump/v1 IDL differs from what its program publishes (1 entry)",
                 "pump integration tests fail",
+                "pump/v1 IDL differs from what its program publishes (1 entry)",
             ]
         );
         assert_eq!(decide(&lines, &idls, Some(&tests)), Verdict::Attention);
