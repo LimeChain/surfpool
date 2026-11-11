@@ -13,10 +13,10 @@
 //! creator fields and the `extend_account` tail past the Borsh layout, so a pump program
 //! upgrade that changes the on-chain layout shows up as a byte diff here and nowhere else.
 //!
-//! The lifecycle test starts a surfnet that forks mainnet and discovers a fresh, still-trading
-//! Token-2022 coin from the pump program's recent transactions — no fixed coin stays
-//! incomplete, so the candidate is found at test time and the fork freezes its state on first
-//! read. The pump and pAMM programs run live, so a behavior-changing upgrade fails here first.
+//! The lifecycle tests start a surfnet that forks mainnet and create their own Token-2022 coin
+//! on it with pump's `create_v2`, one ordinary and one in mayhem mode, so they do not depend on
+//! which coins trade on mainnet. The pump and pAMM programs run live, so a behavior-changing
+//! upgrade fails here first.
 
 use std::collections::HashMap;
 
@@ -60,6 +60,8 @@ const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PUMP: Pubkey = Pubkey::from_str_const("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const PAMM: Pubkey = Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 const FEE_PROGRAM: Pubkey = Pubkey::from_str_const("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+const MAYHEM_PROGRAM: Pubkey =
+    Pubkey::from_str_const("MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e");
 const TOKEN_2022: Pubkey = Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const TOKENKEG: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const WSOL: Pubkey = Pubkey::from_str_const("So11111111111111111111111111111111111111112");
@@ -85,6 +87,7 @@ const BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
 const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
+const CREATE_V2_DISCRIMINATOR: [u8; 8] = [214, 144, 76, 236, 95, 139, 49, 180];
 const MAX_SOL_COST: u64 = 1_000_000_000;
 
 const CURVE_VIRTUAL_TOKEN_RESERVES_OFFSET: usize = 8;
@@ -537,101 +540,94 @@ fn start_live_surfnet() -> (RpcClient, SurfnetSvmLocker, RunloopGuard) {
     (rpc, locker, runloop)
 }
 
-/// Finds a fresh, still-incomplete Token-2022 pump coin in the pump program's most recent
-/// mainnet transactions, reading its account graph through the surfnet (which also caches it
-/// for the Play that follows). The builder's own validation is the eligibility filter.
-async fn find_live_graduation_candidate(
+/// Creates the test's own Token-2022 coin on the fork with pump's `create_v2`, so the test does
+/// not depend on which coins trade on mainnet, and returns its graduation plan.
+async fn create_graduation_candidate(
     surfnet: &RpcClient,
+    mayhem: bool,
 ) -> (Pubkey, PumpGraduationPreparation) {
-    let mainnet =
-        RpcClient::new(std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()));
-    let signatures: serde_json::Value = mainnet
-        .send(
-            RpcRequest::GetSignaturesForAddress,
-            serde_json::json!([PUMP.to_string(), { "limit": 20 }]),
-        )
-        .await
-        .expect("recent pump transactions should be listable");
+    let creator = Keypair::new();
+    let mint = Keypair::new();
+    cheatcode(
+        surfnet,
+        "surfnet_setAccount",
+        serde_json::json!([creator.pubkey().to_string(), { "lamports": 1_000_000_000u64 }]),
+    )
+    .await;
 
-    let mut candidates: Vec<Pubkey> = Vec::new();
-    for entry in signatures.as_array().into_iter().flatten() {
-        let Some(signature) = entry["signature"].as_str() else {
-            continue;
-        };
-        let Ok(transaction) = mainnet
-            .send::<serde_json::Value>(
-                RpcRequest::GetTransaction,
-                serde_json::json!([
-                    signature,
-                    { "encoding": "json", "maxSupportedTransactionVersion": 0 }
-                ]),
-            )
-            .await
-        else {
-            continue;
-        };
-        for key in transaction["transaction"]["message"]["accountKeys"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let Some(key) = key.as_str() else { continue };
-            if key.ends_with("pump") && key != PUMP.to_string() {
-                if let Ok(mint) = key.parse::<Pubkey>() {
-                    if !candidates.contains(&mint) {
-                        candidates.push(mint);
-                    }
-                }
-            }
-        }
-        if candidates.len() >= 8 {
-            break;
-        }
+    let addresses = pump_graduation_addresses(&mint.pubkey()).unwrap();
+    let mayhem_pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &MAYHEM_PROGRAM).0;
+    let sol_vault = mayhem_pda(&[b"sol-vault"]);
+    let accounts = vec![
+        account_meta(mint.pubkey(), true, true), // 0 mint
+        account_meta(
+            Pubkey::find_program_address(&[b"mint-authority"], &PUMP).0,
+            false,
+            false,
+        ), // 1 mint_authority
+        account_meta(addresses.bonding_curve, false, true), // 2 bonding_curve
+        account_meta(addresses.curve_vault, false, true), // 3 associated_bonding_curve
+        account_meta(PUMP_GLOBAL, false, false), // 4 global
+        account_meta(creator.pubkey(), true, true), // 5 user
+        account_meta(SYSTEM_PROGRAM, false, false), // 6 system_program
+        account_meta(TOKEN_2022, false, false),  // 7 token_program
+        account_meta(ATA_PROGRAM, false, false), // 8 associated_token_program
+        account_meta(MAYHEM_PROGRAM, false, true), // 9 mayhem_program_id
+        account_meta(mayhem_pda(&[b"global-params"]), false, false), // 10 global_params
+        account_meta(sol_vault, false, true),    // 11 sol_vault
+        account_meta(
+            mayhem_pda(&[b"mayhem-state", mint.pubkey().as_ref()]),
+            false,
+            true,
+        ), // 12 mayhem_state
+        account_meta(
+            associated_token_address(&sol_vault, &mint.pubkey(), &TOKEN_2022),
+            false,
+            true,
+        ), // 13 mayhem_token_vault
+        account_meta(
+            Pubkey::find_program_address(&[b"__event_authority"], &PUMP).0,
+            false,
+            false,
+        ), // 14 event_authority
+        account_meta(PUMP, false, false),        // 15 program
+    ];
+    let mut data = CREATE_V2_DISCRIMINATOR.to_vec();
+    for text in ["Surfpool test", "SURF", ""] {
+        data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        data.extend_from_slice(text.as_bytes());
     }
+    data.extend_from_slice(creator.pubkey().as_ref());
+    data.extend_from_slice(&[mayhem as u8, 0]); // is_mayhem_mode, is_cashback_enabled
 
-    for mint in &candidates {
-        let Ok(addresses) = pump_graduation_addresses(mint) else {
-            continue;
-        };
-        let pubkeys = [
-            *mint,
-            addresses.bonding_curve,
-            addresses.curve_vault,
-            addresses.canonical_pool,
-            addresses.global,
-        ];
-        let Ok(accounts) = surfnet.get_multiple_accounts(&pubkeys).await else {
-            continue;
-        };
-        // A coin with a sharing config distributes creator fees to a shareholder
-        // list at migration; keep the test on the plain single-creator path.
-        let sharing_config =
-            Pubkey::find_program_address(&[b"sharing-config", mint.as_ref()], &FEE_PROGRAM).0;
-        if matches!(surfnet.get_account(&sharing_config).await, Ok(_)) {
-            continue;
-        }
-        let [
-            Some(mint_account),
-            Some(curve),
-            Some(vault),
-            pool,
-            Some(global),
-        ] = &accounts[..5]
-        else {
-            continue;
-        };
-        if let Ok(preparation) =
-            build_pump_graduation_scenario(*mint, mint_account, curve, vault, pool.as_ref(), global)
-        {
-            return (*mint, preparation);
-        }
-    }
-
-    panic!(
-        "no eligible live pump coin among {} candidates from the last 20 pump transactions; \
-         rerun the test",
-        candidates.len()
+    let create = Instruction {
+        program_id: PUMP,
+        accounts,
+        data,
+    };
+    let blockhash = surfnet.get_latest_blockhash().await.unwrap();
+    let transaction = Transaction::new_signed_with_payer(
+        &[create],
+        Some(&creator.pubkey()),
+        &[&creator, &mint],
+        blockhash,
     );
+    surfnet
+        .send_and_confirm_transaction(&transaction)
+        .await
+        .unwrap_or_else(|error| panic!("create_v2 failed: {error:?}"));
+
+    let account = |address: Pubkey| async move { surfnet.get_account(&address).await.unwrap() };
+    let preparation = build_pump_graduation_scenario(
+        mint.pubkey(),
+        &account(mint.pubkey()).await,
+        &account(addresses.bonding_curve).await,
+        &account(addresses.curve_vault).await,
+        None,
+        &account(PUMP_GLOBAL).await,
+    )
+    .unwrap();
+    (mint.pubkey(), preparation)
 }
 
 async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Value) {
@@ -825,12 +821,21 @@ fn build_migrate_v2(fixture: &GraduationFixture) -> Vec<Instruction> {
     ]
 }
 
-/// The fork freezes the discovered coin's accounts on first read while the pump and pAMM
-/// programs run live from mainnet.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pump_token2022_graduation_lifecycle() {
+    graduation_lifecycle(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pump_token2022_mayhem_graduation_lifecycle() {
+    graduation_lifecycle(true).await;
+}
+
+/// Graduates a coin the test creates on the fork, while the pump and pAMM programs run live from
+/// mainnet.
+async fn graduation_lifecycle(mayhem: bool) {
     let (rpc, locker, _runloop) = start_live_surfnet();
-    let (mint, preparation) = find_live_graduation_candidate(&rpc).await;
+    let (mint, preparation) = create_graduation_candidate(&rpc, mayhem).await;
     let completing_buy_amount = preparation.completing_buy_amount;
     let migration_reserve = preparation.migration_reserve;
 
@@ -840,6 +845,10 @@ async fn test_pump_token2022_graduation_lifecycle() {
         .get_account(&preparation.addresses.bonding_curve)
         .await
         .unwrap();
+    assert_eq!(
+        curve_account.data[CURVE_IS_MAYHEM_MODE_OFFSET], mayhem as u8,
+        "create_v2 should set the coin's mayhem mode"
+    );
     let mut scaled_curve = curve_account.clone();
     let virtual_quote = read_u64(&scaled_curve.data, CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET);
     scaled_curve.data[CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET..CURVE_VIRTUAL_QUOTE_RESERVES_OFFSET + 8]
