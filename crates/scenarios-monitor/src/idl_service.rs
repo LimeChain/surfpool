@@ -8,6 +8,7 @@ use serde_json::Value;
 
 const USER_AGENT: &str = "surfpool-scenarios-monitoring";
 const BASE_URL: &str = "https://idl.solana.com";
+const CLUSTER: &str = "mainnet-beta";
 /// The service answers in a second or two; a request that takes this long is not going to.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPTS: u32 = 3;
@@ -47,7 +48,7 @@ impl IdlService {
         let request = self
             .client
             .get(format!("{BASE_URL}/api/latest"))
-            .query(&[("programId", program_id), ("cluster", "mainnet-beta")]);
+            .query(&[("programId", program_id), ("cluster", CLUSTER)]);
         let (status, bytes) = send(request)?;
         if status != 200 {
             bail!("IDL service: HTTP {status}");
@@ -55,6 +56,11 @@ impl IdlService {
         let reply: Value = serde_json::from_slice(&bytes).context("IDL service: not JSON")?;
         published_idls(&reply)
     }
+}
+
+/// The service's page for `program_id`, which shows what each source publishes side by side.
+pub fn page_url(program_id: &str) -> String {
+    format!("{BASE_URL}/?programId={program_id}&mode=latest&cluster={CLUSTER}")
 }
 
 /// Reads each source of a reply on its own, so that one source that cannot be read does not

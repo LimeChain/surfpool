@@ -117,7 +117,6 @@ fn main() -> Result<()> {
         stamp: &args.stamp,
         verdict,
         run_url: args.run_url.as_deref(),
-        attention: &attention,
         idls: &idls,
         tests: tests.as_ref(),
     };

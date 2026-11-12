@@ -4,8 +4,9 @@ use std::fmt::Write;
 
 use crate::{
     check::{IdlResult, Outcome},
+    idl_service,
     tests_log::{Failure, TestRun},
-    verdict::Verdict,
+    verdict::{self, Verdict},
 };
 
 /// How many differing entries a row names before it counts the rest.
@@ -15,7 +16,6 @@ pub struct Report<'a> {
     pub stamp: &'a str,
     pub verdict: Verdict,
     pub run_url: Option<&'a str>,
-    pub attention: &'a [String],
     pub idls: &'a [IdlResult],
     pub tests: Option<&'a TestRun>,
 }
@@ -34,6 +34,15 @@ fn failure_details(failed: &[Failure]) -> String {
             )
         })
         .collect()
+}
+
+/// `text` as a link to the page of the IDL service that shows what the protocol's program
+/// publishes, where the program is known.
+fn linked(text: &str, result: &IdlResult) -> String {
+    match &result.address {
+        Some(address) => format!("[{text}]({})", idl_service::page_url(address)),
+        None => text.to_owned(),
+    }
 }
 
 fn code_list(entries: &[String]) -> String {
@@ -58,9 +67,12 @@ impl Report<'_> {
             let _ = write!(out, " · [Run]({url})");
         }
         out += "\n\n";
-        if !self.attention.is_empty() {
+        let attention = verdict::attention_naming(self.idls, self.tests, |result| {
+            linked(&result.protocol, result)
+        });
+        if !attention.is_empty() {
             out += "## Needs attention\n\n";
-            for line in self.attention {
+            for line in &attention {
                 let _ = writeln!(out, "- {line}");
             }
             out.push('\n');
@@ -75,7 +87,8 @@ impl Report<'_> {
                  Each committed `idl.json` against the IDL its program publishes on chain, over the \
                  entries the committed file ships. Where a program publishes two, the one compared \
                  with is in bold: its Program Metadata (`pmp`) copy, since the one in its Anchor \
-                 IDL account is often left behind. For every \
+                 IDL account is often left behind. What a program publishes links to its page on \
+                 the Solana IDL service, as does each protocol above whose IDL differs. For every \
                  protocol that differs, the run's artifact holds the diff and the published IDL \
                  under `idls/`.\n\n\
                  | Protocol | Published | Committed | Result |\n\
@@ -100,6 +113,7 @@ impl Report<'_> {
                 (_, true) => "nothing".to_owned(),
                 (_, false) => published.join(", "),
             };
+            let published = linked(&published, result);
             let outcome = match &result.outcome {
                 Outcome::Matches => "matches".to_owned(),
                 Outcome::Differs { entries, diff_file } => {
@@ -165,15 +179,30 @@ mod tests {
     use super::*;
     use crate::{check::Upstream, idl::Format};
 
+    const ADDRESS: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
+
     /// The table row of one protocol whose Anchor IDL account publishes `version`, if any.
     fn row(version: Option<&str>, outcome: Outcome) -> String {
+        row_of(None, version, outcome)
+    }
+
+    fn row_of(address: Option<&str>, version: Option<&str>, outcome: Outcome) -> String {
+        let rendered = render(address, version, outcome);
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("| `demo/v1`"));
+        row.unwrap().to_owned()
+    }
+
+    /// The report of one protocol.
+    fn render(address: Option<&str>, version: Option<&str>, outcome: Outcome) -> String {
         let upstream = version.map(|version| Upstream {
             version: Some(version.to_owned()),
             format: Format::Anchor,
         });
         let idls = [IdlResult {
             protocol: "demo/v1".into(),
-            address: None,
+            address: address.map(str::to_owned),
             path: String::new(),
             committed_version: None,
             upstream: upstream
@@ -188,15 +217,10 @@ mod tests {
             stamp: "now",
             verdict: Verdict::Unverified,
             run_url: None,
-            attention: &[],
             idls: &idls,
             tests: None,
         };
-        let rendered = report.render();
-        let row = rendered
-            .lines()
-            .find(|line| line.starts_with("| `demo/v1`"));
-        row.unwrap().to_owned()
+        report.render()
     }
 
     #[test]
@@ -216,5 +240,30 @@ mod tests {
             row(None, Outcome::NotPublished),
             "| `demo/v1` | nothing | — | nothing to compare with |"
         );
+    }
+
+    #[test]
+    fn what_a_program_publishes_links_to_its_page_on_the_idl_service() {
+        let page =
+            format!("https://idl.solana.com/?programId={ADDRESS}&mode=latest&cluster=mainnet-beta");
+        assert_eq!(
+            row_of(Some(ADDRESS), Some("1.0.0"), Outcome::Matches),
+            format!("| `demo/v1` | [anchor 1.0.0]({page}) | — | matches |")
+        );
+        assert_eq!(
+            row_of(Some(ADDRESS), None, Outcome::NotPublished),
+            format!("| `demo/v1` | [nothing]({page}) | — | nothing to compare with |")
+        );
+
+        // So does a protocol that needs attention for its IDL, where its program is known.
+        let differs = || Outcome::Differs {
+            entries: vec!["types/Pool".into()],
+            diff_file: "idls/demo-v1.diff".into(),
+        };
+        let line = "IDL differs from what its program publishes (1 entry)\n";
+        let linked = render(Some(ADDRESS), Some("1.0.0"), differs());
+        assert!(linked.contains(&format!("- [demo/v1]({page}) {line}")));
+        let plain = render(None, Some("1.0.0"), differs());
+        assert!(plain.contains(&format!("- demo/v1 {line}")));
     }
 }
