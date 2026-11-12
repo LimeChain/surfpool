@@ -36,6 +36,15 @@ impl fmt::Display for Verdict {
 
 /// One line for each thing that needs attention.
 pub fn attention(idls: &[IdlResult], tests: Option<&TestRun>) -> Vec<String> {
+    attention_naming(idls, tests, |result| result.protocol.clone())
+}
+
+/// The lines of [`attention`], with each protocol whose IDL differs written as `name` gives it.
+pub fn attention_naming(
+    idls: &[IdlResult],
+    tests: Option<&TestRun>,
+    name: impl Fn(&IdlResult) -> String,
+) -> Vec<String> {
     // In the order the report shows its sections: the tests, then the IDLs.
     let mut lines = Vec::new();
     for (module, result) in tests.into_iter().flat_map(|tests| &tests.modules) {
@@ -51,7 +60,7 @@ pub fn attention(idls: &[IdlResult], tests: Option<&TestRun>) -> Vec<String> {
             };
             lines.push(format!(
                 "{} IDL differs from what its program publishes ({entries})",
-                result.protocol
+                name(result)
             ));
         }
     }
