@@ -79,12 +79,12 @@ vaults instead, with the market as its `market` input. The price and spread temp
 
 Studio includes four featured markets:
 
-| Choice      | Best suited for                                                       |
-| ----------- | --------------------------------------------------------------------- |
-| SOL / USDC  | SOL price shocks, stale quotes and liquidity tests                    |
-| HYPE / USDC | Altcoin price and inventory stress tests                              |
-| JUP / USDC  | A second altcoin market with classic SPL-token vaults                 |
-| PUMP / USDC | Volatile-token price tests; its base vault is a Token-2022 account    |
+| Choice       | Best suited for                                                       |
+| ------------ | --------------------------------------------------------------------- |
+| SOL / USDC   | SOL price shocks, stale quotes and liquidity tests                    |
+| PENGU / USDC | Altcoin price and inventory stress tests; the deepest market          |
+| WET / USDC   | A second altcoin market with classic SPL-token vaults                 |
+| PUMP / USDC  | Volatile-token price tests; its base vault is a Token-2022 account    |
 
 HumidiFi stores each market's mints and vaults masked, and a search by mint needs those masked
 bytes, so start from a market address. When only a pair is named, each template's LLM guidance uses

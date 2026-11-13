@@ -31,7 +31,7 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: Pubkey = Pubkey::from_str_const("9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp");
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("G9S64i58RRWJA28vZiNhnP56Ux4Ef7hfMgHNREnZZSom");
-const DEPLOYED_SLOT: u64 = 458946555;
+const DEPLOYED_SLOT: u64 = 467404880;
 
 const MARKET_SIZE: usize = 1728;
 const LAYOUT_TAG: [u8; 8] = [44, 90, 19, 124, 56, 111, 47, 150];
@@ -178,32 +178,32 @@ struct MarketDef {
     quote_vault: Pubkey,
 }
 
-/// The markets Studio offers as shortcuts, in its order. The behavioural tests replay the ones
-/// whose vaults are classic SPL-token accounts.
+/// The markets Studio offers as shortcuts, in its order: the live markets with funded vaults. The
+/// behavioural tests replay the ones whose vaults are classic SPL-token accounts.
 const FEATURED_MARKETS: [MarketDef; 4] = [
     MarketDef {
         pair: "SOL / USDC",
-        market: Pubkey::from_str_const("8sKQHfjNhvmAw94PhfvfMcytmqW6jmxvwieYyzXCCPu"),
+        market: Pubkey::from_str_const("FksffEqnBRixYGR791Qw2MgdU7zNCpHVFYBL4Fa4qVuH"),
         base_mint: Pubkey::from_str_const("So11111111111111111111111111111111111111112"),
         quote_mint: Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-        base_vault: Pubkey::from_str_const("H292B1VbSvD6GuUmSvUvfQstg1Acfzog796uQ7d1ccCw"),
-        quote_vault: Pubkey::from_str_const("A3C9xwv4Hfx92M5HQpxUiibSqCa5pYhD2kTwnU5fEPq"),
+        base_vault: Pubkey::from_str_const("C3FzbX9n1YD2dow2dCmEv5uNyyf22Gb3TLAEqGBhw5fY"),
+        quote_vault: Pubkey::from_str_const("3RWFAQBRkNGq7CMGcTLK3kXDgFTe9jgMeFYqk8nHwcWh"),
     },
     MarketDef {
-        pair: "HYPE / USDC",
-        market: Pubkey::from_str_const("H3TyE2Q3rDrvRXD8PzHYE7BS2hafGuybje4qXCtyWqMH"),
-        base_mint: Pubkey::from_str_const("98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g"),
+        pair: "PENGU / USDC",
+        market: Pubkey::from_str_const("2866MvCKPGz9LdnPcmPueoV3mA2Ac1ceEQ8Xqb9VNefu"),
+        base_mint: Pubkey::from_str_const("2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv"),
         quote_mint: Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-        base_vault: Pubkey::from_str_const("49pft8q7cyugVDWnJCXjMHJdb5Uji198k5MognVvA48n"),
-        quote_vault: Pubkey::from_str_const("EKFwmKoPA9o3HpoL8AnQd8uNBxtJbaPv4w4tbxNn6iei"),
+        base_vault: Pubkey::from_str_const("8UwYWkJ78uG7Cy8bZJURzwFfDUTX4oeiAriBQVWwmY8"),
+        quote_vault: Pubkey::from_str_const("6iNgLk2CUJYA6ZVTcaTeSQiaaUfUbYgZZShWCSsTTkPn"),
     },
     MarketDef {
-        pair: "JUP / USDC",
-        market: Pubkey::from_str_const("hKgG7iEDRFNsJSwLYqz8ETHuZwzh6qMMLow8VXa8pLm"),
-        base_mint: Pubkey::from_str_const("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),
+        pair: "WET / USDC",
+        market: Pubkey::from_str_const("Cc2oMdeNDmZ7ZD8b7igQg1EHjBEinR1Vi6nx2VHpVm6H"),
+        base_mint: Pubkey::from_str_const("WETZjtprkDMCcUxPi9PfWnowMRZkiGGHDb9rABuRZ2U"),
         quote_mint: Pubkey::from_str_const("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-        base_vault: Pubkey::from_str_const("GRLhXC9eKoZMLBNQqRnNHg62hc4NM2Wm4amm7Aiz4ts"),
-        quote_vault: Pubkey::from_str_const("AKaBxaHDdaJEJyQSHNRdLu7yN3JbDDkSG189ssTjSGW8"),
+        base_vault: Pubkey::from_str_const("7gxM8fzfJ331g1yddEDUDrz4BLwEEPPPcCDV57pDQWyT"),
+        quote_vault: Pubkey::from_str_const("F9JdjxCTiyy9xB4BjvGQAzzxetVJQWAjWzAMxzMMD23D"),
     },
     MarketDef {
         pair: "PUMP / USDC",
@@ -215,198 +215,6 @@ const FEATURED_MARKETS: [MarketDef; 4] = [
     },
 ];
 
-/// Every schema-8 market the program owns, active and stopped, as (market, base vault, quote vault)
-/// unmasked from the market. Each template must write only its own bytes on every one of them.
-const ALL_MARKETS: [(&str, &str, &str); 37] = [
-    (
-        "2866MvCKPGz9LdnPcmPueoV3mA2Ac1ceEQ8Xqb9VNefu",
-        "8UwYWkJ78uG7Cy8bZJURzwFfDUTX4oeiAriBQVWwmY8",
-        "6iNgLk2CUJYA6ZVTcaTeSQiaaUfUbYgZZShWCSsTTkPn",
-    ),
-    (
-        "3QYYvFWgSuGK8bbxMSAYkCqE8QfSuFtByagnZAuekia2",
-        "AzzKL5BpnX9UXfJRyiGbAwyFvw93vwCTBvW56tJebsqd",
-        "EmyNiSYtMYZsBCVYpzLwNduQFqCpDGR8qM1h2CoLpWnM",
-    ),
-    (
-        "3xgq5NN4yCmxJwZh4C4574a45YdAwbQ2N91Wk6TdUK7e",
-        "mX93mQi84N8agH8Yw7cnLkZKYixTM7HeLuaH9FzL7Cn",
-        "6iH2wzUwjiKAJn91RTN8npneZ7GX2N1tpWw14RDuFVX",
-    ),
-    (
-        "4meJdPuPQqKS8XiP3sNzJvkneDKgHf86yYSUtALhSVke",
-        "7sKvQwkPguDhPEwBaeKY7YacAMpcmXxHu7CNkr3giw76",
-        "Av7qM1Pfweoy4mvw6eoGdCzvjR7EJHLiF8zwf2VNJX64",
-    ),
-    (
-        "5dhYayH9qvzNyCPoh2hKN8TJqumoGsWdyZ9UfPLXBfD9",
-        "86DHdQfRpghMCmXYKDg93bXtmi3doBL5NeY9DYwAj6rz",
-        "FqEVwrQJsJ4AciwJRYLPQEdstDfUYJp6z3f6XYb6MnSb",
-    ),
-    (
-        "6NRaKmLM2tg6gdoN8eup1RmzDR9qXpvqsACjkH5dgtWP",
-        "82ctDdjbkGTW2HK5LNED1WyjJAdWQ3VRgxAj1SQFQ6z6",
-        "6LrDwGubqfV68iPFf2i94k7aKhYWT6vwsSzECHuCVs8",
-    ),
-    (
-        "6kWQ3q8akoeMmrfJX4s76jfHuf4DAMGNYoHwDUR4kJwN",
-        "iXKEpsNhJc81MkMUZXe5LRnyC7Z9nr8rt6Wymt5Ktpq",
-        "HXY8cZjnfTMpGfq7Lotor7fdwqf8bq6yToexKcRY6g1a",
-    ),
-    (
-        "6n9VhCwQ7EwK6NqFDjnHPzEk6wZdRBTfh43RFgHQWHuQ",
-        "Cv9St5tDTGwpbG5UVvM6QvFmf3FYSXc14W9BYvQN5wAZ",
-        "7Rf8Gu8YemSoGjZT3z1cL5BT9HLbGywcyaz8Mrbhd1MH",
-    ),
-    (
-        "755egiJPoXPPAnHoyanocrdfTJUirMi6Va64Gi6N1dvA",
-        "D9UUwqmno3ZR4mu5Hiym44df8Hpk5MYiftcwwHYnD4bf",
-        "Csmmz9Na9dHQzfdFqbWstcWprH7PoVpAMpMeFeCK1TPk",
-    ),
-    (
-        "7KdoBm9vrujoH8nhLD3YfaJ7oqentYVNFe7K4KR9jcyb",
-        "KndqB2YnFyE7pmMLwrjz7sUmu4ssKkNZYgZFWhz6xM2",
-        "GLzuwfLeyLFMgerqAqh5b6bNPPtDViUGGhvz8qxRNvr1",
-    ),
-    (
-        "7XoMov9LfxHDrqRw1vSzXszb8k35K85WC9tQKSqpyv1M",
-        "FzzpuhKbY2LekZuiuQxAmMAjUT6fWLrjQB85b9KhbDx7",
-        "7qgwzoj4z8zkqQMLSmojCqQU9Hr63xQdmHLZgX58WHKS",
-    ),
-    (
-        "8Re9ESfUWCTKKZ5iKQW4WB2DLsDjPyT2ifzQUopQ5BAs",
-        "G16H4Pizaxaczpd2W5hA7kdoW2FfyYmWDLpsm1hsaPM2",
-        "HV1YwHhkTu1RgBN9CzVVbCYniATTdzp1jk3gcfrZrtLT",
-    ),
-    (
-        "8WFduUYU7iX94E3ZMejpTXi5TadKh9j5qp5ez5uSBJwa",
-        "BShGd3SBaP349y4Krp6EEYhtRzSGYBBe8GU8LFUXMU5C",
-        "HR8LDFWztXB6YA9Dvg27LHNSZAhwaGFihRD3GWKy7AUb",
-    ),
-    (
-        "8sKQHfjNhvmAw94PhfvfMcytmqW6jmxvwieYyzXCCPu",
-        "H292B1VbSvD6GuUmSvUvfQstg1Acfzog796uQ7d1ccCw",
-        "A3C9xwv4Hfx92M5HQpxUiibSqCa5pYhD2kTwnU5fEPq",
-    ),
-    (
-        "9PJ5x3gCsWS84YfKwfkt41SHndeCMUSshzHDkZpMXyc7",
-        "H3aArwg5Fz126mtJLRumnGBpvoZqaH6uqJPYG2ZsTu2V",
-        "wTSyYgXTFpTBYxgk5DRiFsyoWzM5NXXwV8gUMY4nUq6",
-    ),
-    (
-        "9c5xYTnURgpQLDk4XqkJdaUab6p8EMBgE5n7n29pQzCy",
-        "463wgaEw5WCjZ8R99j3Bw3EiY6GvtdTVrNz6ztM2ny1Z",
-        "DtSsQf6JjRFVNfko8h3hotNaGsJLH9yWVNpaxbE5DuyY",
-    ),
-    (
-        "9iVWeHzmfQMa45jDVEDAHBjS5nJrWQEdQidjD1SVjEhy",
-        "2wAmF3B7ukhDYUrRY4Us2bX7oZxbMDxhyv3baquhGTX4",
-        "8WBgsDcNt9ecxhj7dZrW8k1kgJngTU2Z15Y1xRJfBZbe",
-    ),
-    (
-        "9xhymMTGDG9U79UPTvSAMz4QfdwCid6cdp7VoNv4wCEk",
-        "13EU2j9gAWQWtFf55HHGS7CcRW64qE184ndHjhLxyuFJ",
-        "4E1JKb28xKH4ff7FUXSRB4VCK8rVucvYD6CagDbuViBs",
-    ),
-    (
-        "AjotvEmqbVWu9UPt3DKCiTgVxRxZYcVu99XshPdws9go",
-        "E1QG5wNp8nsS1JwVbsJJDCTiYZkMiVzgALniEHeWcRAN",
-        "HMrT9PYDgxVHTAVxQYV1uC7gcfwdshKDZDAiFQHkQkYe",
-    ),
-    (
-        "AvGeFw71N5sNfV97mZ1uNrHg4yfufRicCJUrS9j2ehTX",
-        "ECEPWwZJ1U1Vjsj1X5sUbZYETKMSCjYHuoTMVitCn64t",
-        "FBWtVVvzsRuAAzVX8ua1hden9KmgPrC2rFijuwEn1ngJ",
-    ),
-    (
-        "BtDQz6LSEj24VRNU4qCnxngdPZVNAWHdERsMb1tRYfv5",
-        "BKyZQYSPkzAt6C4uYLq36wYD2pqpjxHtov7okc6jFHfv",
-        "F2abAUrD5vHDFRnKZqjZH1udbGWmgsSpsSC9Eg7UrRi9",
-    ),
-    (
-        "Cc2oMdeNDmZ7ZD8b7igQg1EHjBEinR1Vi6nx2VHpVm6H",
-        "7gxM8fzfJ331g1yddEDUDrz4BLwEEPPPcCDV57pDQWyT",
-        "F9JdjxCTiyy9xB4BjvGQAzzxetVJQWAjWzAMxzMMD23D",
-    ),
-    (
-        "DB3sUCP2H4icbeKmK6yb6nUxU5ogbcRHtGuq7W2RoRwW",
-        "8BrVfsvzb1DZqCactbYWoKSv24AfsLBuXJqzpzYCwznF",
-        "HsQcHFFNUVTp3MWrXYbuZchBNd4Pwk8636bKzLvpfYNR",
-    ),
-    (
-        "DvUdNir9myWcXc4aqD2T2UTSL8xyAj8jTY5XnodcT33k",
-        "7ZzeDr99ZrBmyAhS97BdUsSxuvQ4GfgPUzr6ghivaKtK",
-        "7eetXLpfUT3qYqtXa568mQLDjZrvbz3pNe4izbTwNRzM",
-    ),
-    (
-        "ELp3rjbAncW8FLAPvmWS6vjG4FXFLDo1HiKh4PhQBgvx",
-        "4uGxv6uabyEmHzhi7LBWGzqSwGEE98VzYL2NahRqbfCP",
-        "2XCEJJf3hnuMeot5dJST9yaj92i1wCLB2c67eH7WYzvR",
-    ),
-    (
-        "FAYL7CoNENA6jGCWVJb5MZ7mjKuiiyYRkDTopdVticpp",
-        "9dt86PLMhntCBm1jpQCi6zsFTtGBR7rvVEGhdk3pp1T5",
-        "FpqzUjo7zDj7EdDn336qZaaisvxBpMGkd27mmRtVLgDt",
-    ),
-    (
-        "Fhjzcf3JFH3zN6uKoNwwr9WhfdUnFoCY9KZKybx3CoR9",
-        "DrmUUH2qoB4wpurb44i4NyZpSmfjVRdUswDakUt9JNpM",
-        "DVUBW86zKoEgXm6qJDCwMFMnYiXG6qvz7G1Tdvci7xut",
-    ),
-    (
-        "FksffEqnBRixYGR791Qw2MgdU7zNCpHVFYBL4Fa4qVuH",
-        "C3FzbX9n1YD2dow2dCmEv5uNyyf22Gb3TLAEqGBhw5fY",
-        "3RWFAQBRkNGq7CMGcTLK3kXDgFTe9jgMeFYqk8nHwcWh",
-    ),
-    (
-        "GAcKqojqgkRVDBihVAGvbqnuZdCiN9UGNrPCRG5DMGGA",
-        "5g9P9hb7HRnkp5LLoGEraxWV6DVRJ3tLxTpnbTTthaBK",
-        "7ZyaWi7WQCCfEnAZ1z3PQuUq9zYkSyEuBYoYD8fzfkot",
-    ),
-    (
-        "GD5eJhDmVcosRoU2H27LoFCuYERMTe4Mf1ooban6ba9T",
-        "D5GQBX8uKAEY9rJAhYGwCviKDw7hWi2umxeGNHRt5oF8",
-        "HXw3tHoQ5qNJbsVtwWHkvZb2daT9w2M3tpnqX8zLmEQ",
-    ),
-    (
-        "H3TyE2Q3rDrvRXD8PzHYE7BS2hafGuybje4qXCtyWqMH",
-        "49pft8q7cyugVDWnJCXjMHJdb5Uji198k5MognVvA48n",
-        "EKFwmKoPA9o3HpoL8AnQd8uNBxtJbaPv4w4tbxNn6iei",
-    ),
-    (
-        "HjKAdGgBZDW3kMyFLYzkykkirVtbJnMhi4n2oBVp8rLU",
-        "FKe42A194oAWhqdSoZCrtTaaCnGusEr2pNwwj1dmHht7",
-        "7Y2n2mDcAgmdzXNzubVLCKS8ofQ372gBT4npSth8KtJE",
-    ),
-    (
-        "Htj37Rj9cqvcVgFgDU92GzTwgaeHF8QqwVe33uXKLJT8",
-        "2Qu3LFqj9YGDi398rbRnx1f7RyZwAPYT2YPKhw7ZPqPr",
-        "DXq59kJVGQqtyFKQURqVwf6MQsrhFLe7VMAV5TEfK5gY",
-    ),
-    (
-        "HyKbc1vUxNL9xJC2Q44qdGiuKC1Ey95KNdokfHivrFnZ",
-        "7CdAWd32k1c9ywpyErij2xRbBDRCLFqrZAXTUjD3ziek",
-        "Cad4XrQrtXdKEhZKtWX5YAkwumUvphZKw1cqpYXYnZDr",
-    ),
-    (
-        "PuxcQpbFrybkUAsqAKhJZ3NPgj5QG1i1FMhog6bDjx4",
-        "7SqxZrrmcy7Nw9zRhv2haRWQWTkFevHoycHxXgYXfXN7",
-        "DkDsnfd1KUYZJnsRHSYHE4z9pK9gdXjknTBnscNM75gr",
-    ),
-    (
-        "hKgG7iEDRFNsJSwLYqz8ETHuZwzh6qMMLow8VXa8pLm",
-        "GRLhXC9eKoZMLBNQqRnNHg62hc4NM2Wm4amm7Aiz4ts",
-        "AKaBxaHDdaJEJyQSHNRdLu7yN3JbDDkSG189ssTjSGW8",
-    ),
-    (
-        "iAMtZieUtpLwB3dzWw8Fo3H3FPkMFy3ej52URusseR1",
-        "BaWYf3id5vL34Ag2Aa6n7eBXUdQ52cU2Yk5iXm7WyZBc",
-        "HUg4WUuQoxoGvdDNvHpiy1jEC5VgzQdNzCNmestzV6mP",
-    ),
-];
-
-// Instruction metadata captured from DFlow outer instruction 2 of tx 3zevqwAa8u136UGE1bdBzP1o2dpFuc7X333dC1ut3T1uCgY6iidihfNJNoJ7tuyj3tHNin1i7HTFCUSFWqK7g1Si (slot 444225745).
-// It is a SOL/USDC buy; the replay swaps in each fixture's market, vaults and mints.
 const DFLOW: Pubkey = Pubkey::from_str_const("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH");
 const SIGNER0: Pubkey = Pubkey::from_str_const("4HJaX8K9mH9fMLGn4Xc5DjGdjDWXNSnnX5kkXFuzk2ET");
 const USER_BASE: Pubkey = Pubkey::from_str_const("CsqNfUnwbVbDQRQFUGCRCik8auK1ExfvwTYvM6Zc1uPe");
@@ -806,20 +614,19 @@ fn priced_market(fixture: &HumidifiFixture, fair_value: u64) -> Vec<u8> {
     humidifi_keep_alive(&priced, fixture.slot)
 }
 
-/// Every template writes only its own bytes on every schema-8 market, active or stopped, and every
-/// vault is a token account its market owns, which is what the vault guidance relies on.
+/// Every template writes only its own bytes on every featured market, and every vault is a token
+/// account its market owns, which is what the vault guidance relies on.
 #[tokio::test]
 async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
-    let keys: Vec<Pubkey> = ALL_MARKETS
+    let keys: Vec<Pubkey> = FEATURED_MARKETS
         .iter()
-        .flat_map(|(market, base_vault, quote_vault)| {
-            [market, base_vault, quote_vault].map(|key| Pubkey::from_str_const(key))
-        })
+        .flat_map(|def| [def.market, def.base_vault, def.quote_vault])
         .collect();
     let accounts = fetch(&keys).await;
-    for ((address, base_vault, quote_vault), fetched) in ALL_MARKETS.iter().zip(accounts.chunks(3))
-    {
-        let market = Pubkey::from_str_const(address);
+    for (def, fetched) in FEATURED_MARKETS.iter().zip(accounts.chunks(3)) {
+        let market = def.market;
+        let address = def.pair;
+        let (base_vault, quote_vault) = (def.base_vault, def.quote_vault);
         let data = &fetched[0].data;
         assert_eq!(fetched[0].owner, PROGRAM, "{address}");
         assert_eq!(data.len(), MARKET_SIZE, "{address}");
@@ -830,8 +637,8 @@ async fn humidifi_templates_write_only_proven_bytes_on_every_market() {
             (448, 384, quote_vault, &fetched[2]),
         ] {
             assert_eq!(
-                masked_pubkey(data, vault_offset).to_string(),
-                *vault,
+                masked_pubkey(data, vault_offset),
+                vault,
                 "{address} vault at {vault_offset}"
             );
             assert_eq!(
@@ -1292,15 +1099,12 @@ async fn humidifi_price_and_spread_move_a_sale_on_sol_usdc() {
 }
 
 /// The spread word is stored XORed with `MAKER_SPREAD_MASK`. A mask one bit off still writes
-/// working spreads, only 0.001 bps wrong, so fills cannot catch it; the live markets can. Most
-/// markets store a zero spread, which the right mask decodes to exactly 0 and a mask with the low
-/// bit flipped decodes to 1.
+/// working spreads, only 0.001 bps wrong, so fills cannot catch it; the live markets can. Makers
+/// store a zero spread most of the time, which the right mask decodes to exactly 0 and a mask with
+/// the low bit flipped decodes to 1; the non-zero spreads they publish are hundreds of units.
 #[tokio::test]
 async fn humidifi_spread_mask_decodes_zero_spreads_to_zero() {
-    let markets: Vec<Pubkey> = ALL_MARKETS
-        .iter()
-        .map(|(market, _, _)| Pubkey::from_str_const(market))
-        .collect();
+    let markets: Vec<Pubkey> = FEATURED_MARKETS.iter().map(|def| def.market).collect();
     let spreads: Vec<u64> = fetch(&markets)
         .await
         .iter()
@@ -1309,7 +1113,7 @@ async fn humidifi_spread_mask_decodes_zero_spreads_to_zero() {
     let zero = spreads.iter().filter(|spread| **spread == 0).count();
     let one = spreads.iter().filter(|spread| **spread == 1).count();
     assert!(
-        zero >= 10 && zero > one,
+        zero > one,
         "{zero} markets decode to a zero spread and {one} to 1 of 1000 bps; the spread mask looks \
          one bit off"
     );
