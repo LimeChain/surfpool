@@ -20,8 +20,10 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
-            phoenix_eternal::v1::state_builder::{
-                PHOENIX_PERP_ASSET_MAP, build_phoenix_collateral_scenario, phoenix_markets,
+            phoenix_eternal::v1::{
+                market::phoenix_markets,
+                state_builder::PHOENIX_PERP_ASSET_MAP,
+                trader::{MarginView, TraderPositions, trader_positions},
             },
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
@@ -159,22 +161,35 @@ pub struct GetTemplateParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct CreatePhoenixCollateralScenarioParams {
-    #[schemars(description = "Phoenix Eternal Trader account pubkey.")]
-    pub trader: String,
-    #[schemars(
-        description = "Exact signed collateral target in quote lots, encoded as a decimal string."
-    )]
-    pub target_quote_lots: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ListPhoenixMarketsParams {
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
     pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPhoenixTraderPositionsParams {
+    #[schemars(description = "The address of the trader's Phoenix Trader account.")]
+    pub trader: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+    #[schemars(
+        description = "Markets to move for marginAfterMoves, each { symbol, targetTicks } with targetTicks a decimal string or a number, the ticks phoenix-market-move takes. Omit for none."
+    )]
+    #[serde(default)]
+    pub moves: Vec<PhoenixMove>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoenixMove {
+    pub symbol: String,
+    /// A decimal string or a JSON number.
+    pub target_ticks: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -315,6 +330,22 @@ pub struct StartSurfnetWithTokenAccountsResponse {
     pub error: Option<String>,
 }
 
+/// The successful token account updates and the failed ones' errors: a failure is
+/// reported, never dropped. With no success at all there is no success list.
+fn collect_token_results(
+    results: Vec<SetTokenAccountsResponse>,
+) -> (Option<Vec<SetAccountSuccess>>, Option<String>) {
+    let mut accounts = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        accounts.extend(result.success.into_iter().flatten());
+        errors.extend(result.error);
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    let accounts = (error.is_none() || !accounts.is_empty()).then_some(accounts);
+    (accounts, error)
+}
+
 impl StartSurfnetWithTokenAccountsResponse {
     pub fn success(data: StartSurfnetWithTokenAccountsSuccess) -> Self {
         Self {
@@ -383,7 +414,7 @@ impl RegisterScenarioResponse {
 
 fn scenario_tool_error(message: String) -> CallToolResult {
     let response = RegisterScenarioResponse::error(message);
-    CallToolResult::success(vec![Content::text(
+    CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string(&response).unwrap_or_default(),
     )])
 }
@@ -476,23 +507,6 @@ impl Surfpool {
             .ok_or_else(|| format!("Studio's config at {endpoint} has no rpc_url"))
     }
 
-    async fn build_phoenix_collateral_scenario_from_surfnet(
-        &self,
-        studio_url: &str,
-        params: &CreatePhoenixCollateralScenarioParams,
-    ) -> Result<Scenario, String> {
-        let trader = Pubkey::from_str(params.trader.trim())
-            .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
-        // Studio plays the scenario on its own surfnet, so the Trader is checked there.
-        let rpc_url = self.studio_rpc_url(studio_url).await?;
-        let accounts = self.fetch_accounts_at(&rpc_url, &[trader]).await?;
-        let trader_account = accounts[0]
-            .as_ref()
-            .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
-        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots)
-            .map_err(|error| error.to_string())
-    }
-
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
         let endpoint = format!(
             "http://127.0.0.1:{}/v1/scenarios",
@@ -511,7 +525,7 @@ impl Surfpool {
                     "Failed to load scenarios at {endpoint}: {error}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         let status = response.status();
@@ -522,7 +536,7 @@ impl Surfpool {
                     "Failed to read response text: {error}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         let response: serde_json::Value = match serde_json::from_str(&body) {
@@ -532,7 +546,7 @@ impl Surfpool {
                     "Failed to parse JSON response: {error}. Response: {body}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         if status == reqwest::StatusCode::CONFLICT {
@@ -541,12 +555,12 @@ impl Surfpool {
                 scenario.id
             ));
             let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
         }
         if let Some(error) = response.get("error") {
             let response = RegisterScenarioResponse::error(format!("RPC error: {error}"));
             let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
         }
 
         let scenario_id = response
@@ -559,7 +573,7 @@ impl Surfpool {
         );
         let response = RegisterScenarioResponse::success(url);
         let json = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -581,7 +595,7 @@ impl Surfpool {
             Err(e) => {
                 let response = StartSurfnetResponse::error(e);
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -596,7 +610,7 @@ impl Surfpool {
         }
 
         let json_str = serde_json::to_string(&res).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Sets token balances for multiple accounts in your local Solana network (surfnet).
@@ -636,15 +650,13 @@ impl Surfpool {
             }
         }
 
-        let response = SetTokenAccountsResponse::success(
-            results
-                .into_iter()
-                .filter_map(|r| r.success)
-                .flatten()
-                .collect(),
-        );
+        let (accounts, error) = collect_token_results(results);
+        let response = SetTokenAccountsResponse {
+            success: accounts,
+            error,
+        };
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Starts a new local Solana network and sets token balances on it.
@@ -661,7 +673,7 @@ impl Surfpool {
             Err(e) => {
                 let response = StartSurfnetWithTokenAccountsResponse::error(e);
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -682,7 +694,7 @@ impl Surfpool {
                         .unwrap_or_else(|| "Unknown error starting surfnet".to_string())
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -714,18 +726,16 @@ impl Surfpool {
             }
         }
 
-        let response =
+        let (accounts, error) = collect_token_results(results);
+        let mut response =
             StartSurfnetWithTokenAccountsResponse::success(StartSurfnetWithTokenAccountsSuccess {
                 surfnet_url,
                 surfnet_id,
-                accounts: results
-                    .into_iter()
-                    .filter_map(|r| r.success)
-                    .flatten()
-                    .collect(),
+                accounts: accounts.unwrap_or_default(),
             });
+        response.error = error;
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Calls any RPC method on a running surfnet instance.
@@ -770,7 +780,7 @@ impl Surfpool {
                     surfnet_endpoint, e
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -780,7 +790,7 @@ impl Surfpool {
                 let response =
                     SurfnetRpcCallResponse::error(format!("Failed to read response text: {}", e));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -792,14 +802,14 @@ impl Surfpool {
                     e, response_text
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
         if let Some(error) = rpc_response.get("error") {
             let response = SurfnetRpcCallResponse::error(format!("RPC error: {}", error));
             let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
         }
 
         // Extract the result
@@ -810,7 +820,7 @@ impl Surfpool {
 
         let response = SurfnetRpcCallResponse::success(call_params.method, result);
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(description = r#"
@@ -1086,7 +1096,7 @@ impl Surfpool {
         if let Some(message) = validation_error {
             let response = RegisterScenarioResponse::error(message);
             let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
         }
 
         self.stage_scenario(scenario).await
@@ -1153,28 +1163,6 @@ impl Surfpool {
         self.stage_scenario(preparation.scenario).await
     }
 
-    #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's current quoteLotCollateral with a warning, since raising it needs a real deposit. quoteLotCollateral excludes the unrealized PnL and funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective collateral by N. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
-    )]
-    async fn create_phoenix_collateral_scenario(
-        &self,
-        Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let studio_url = format!(
-            "http://127.0.0.1:{}",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let scenario = match self
-            .build_phoenix_collateral_scenario_from_surfnet(&studio_url, &params)
-            .await
-        {
-            Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-
-        self.stage_scenario(scenario).await
-    }
-
     async fn list_phoenix_markets_at(&self, rpc_url: &str) -> Result<serde_json::Value, String> {
         let perp_asset_map = PHOENIX_PERP_ASSET_MAP;
         let maps = self.fetch_accounts_at(rpc_url, &[perp_asset_map]).await?;
@@ -1196,8 +1184,8 @@ impl Surfpool {
                         "markTicks": market.mark_ticks,
                         "tickSize": market.tick_size,
                         "baseLotDecimals": market.base_lot_decimals,
-                        "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
-                        "backstopRiskFactorBps": market.backstop_risk_factor_bps,
+                        "maintenanceRiskFactorBps": market.risk_factors[0],
+                        "backstopRiskFactorBps": market.risk_factors[1],
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1218,7 +1206,61 @@ impl Surfpool {
             ))
             .await
         {
-            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                payload.to_string(),
+            )])),
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
+
+    async fn list_phoenix_trader_positions_at(
+        &self,
+        rpc_url: &str,
+        trader: &str,
+        moves: &[PhoenixMove],
+    ) -> Result<serde_json::Value, String> {
+        let trader = Pubkey::from_str(trader.trim())
+            .map_err(|_| format!("'{trader}' is not a valid Phoenix Trader account address"))?;
+        let moves = moves
+            .iter()
+            .map(|moved| {
+                let ticks = match &moved.target_ticks {
+                    serde_json::Value::String(text) => text.trim().parse().ok(),
+                    serde_json::Value::Number(number) => number.as_u64(),
+                    _ => None,
+                };
+                ticks
+                    .map(|ticks| (moved.symbol.clone(), ticks))
+                    .ok_or_else(|| {
+                        format!("targetTicks of {} must be a whole number", moved.symbol)
+                    })
+            })
+            .collect::<Result<Vec<(String, u64)>, String>>()?;
+        let positions = trader_positions(SurfnetRemoteClient::new(rpc_url), trader, &moves)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(trader_positions_json(&trader, &positions))
+    }
+
+    #[tool(
+        description = "Lists the markets where one Phoenix Eternal trader holds a position, as Phoenix's Hawkeye program reports them on a copy of the surfnet's state, sorted by symbol. Each position comes with its market symbol, its orderbook address, its side (long or short), its size in base lots (baseLots) and its maintenance margin in quote lots (maintenanceMarginQuoteLots), both decimal strings. Hawkeye reads positions where Phoenix keeps them, so this is right even when the Trader account's own copy is not; never decode the Trader account yourself. hot is true when Phoenix's active trader index lists the trader, such as one with resting orders. margin is Hawkeye's view as phoenix-trader-cancel-orders leaves the trader, a hot trader's orders canceled: collateral, effectiveCollateral, maintenanceMargin, backstopMargin and highRiskMargin in quote lots as decimal strings, and liquidatable. refusal is why phoenix-trader-cancel-orders or phoenix-trader-collateral would refuse the trader, or null. phoenix-trader-collateral takes the effective collateral wanted in USDC, a quote lot being a millionth of a USDC. Given moves, marginAfterMoves is the same view once those markets move to targetTicks and uncross the way phoenix-market-move and phoenix-market-uncross play them, for a trader that should cross into liquidation at a later slot."
+    )]
+    async fn list_phoenix_trader_positions(
+        &self,
+        Parameters(params): Parameters<ListPhoenixTraderPositionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .list_phoenix_trader_positions_at(
+                &format!(
+                    "http://127.0.0.1:{}",
+                    params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+                ),
+                &params.trader,
+                &params.moves,
+            )
+            .await
+        {
+            Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 payload.to_string(),
             )])),
             Err(error) => Ok(scenario_tool_error(error)),
@@ -1245,7 +1287,7 @@ impl Surfpool {
             .collect();
 
         let json_str = serde_json::to_string(&templates).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1267,14 +1309,14 @@ impl Surfpool {
         let all_templates = registry.all();
         let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
             let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Unknown templateId {:?}. Valid IDs are: {:?}",
                 params.template_id, valid_ids
             ))]));
         };
 
         let json_str = serde_json::to_string(&compact_template_json(template)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1296,7 +1338,7 @@ impl Surfpool {
         let all_templates = registry.all();
         let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
             let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Unknown templateId {:?}. Valid IDs are: {:?}",
                 params.template_id, valid_ids
             ))]));
@@ -1305,7 +1347,7 @@ impl Surfpool {
         if let Some(ref wanted) = params.constant {
             if !template.constants.contains_key(wanted) {
                 let available: Vec<&String> = template.constants.keys().collect();
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Template {:?} has no constant {:?}. Available constants: {:?}",
                     params.template_id, wanted, available
                 ))]));
@@ -1358,7 +1400,7 @@ impl Surfpool {
             "truncated": total_matches > results.len(),
         });
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1381,72 +1423,56 @@ impl Surfpool {
         };
 
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Surfpool {
     /// Return information about the server, including its capabilities and description.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder()
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "Surfpool MCP server, your personal surfnet manager to start surfing on Solana!"
-                    .to_string(),
-            ),
-        }
+        )
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(
+            "Surfpool MCP server, your personal surfnet manager to start surfing on Solana!",
+        )
+    }
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2024_11_05))
     }
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                RawResource {
-                    uri: "str:///rpc_endpoints".to_string(),
-                    name: "List of available RPC endpoints".to_string(),
-                    title: Some("RPC Endpoints".to_string()),
-                    description: Some("A json file containing all the RPC methods and the parameters available for being able to handle any RPC call with the tool call_surfnet_rpc".to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                }.no_annotation(),
-                RawResource {
-                    uri: "str:///override_templates".to_string(),
-                    name: "List of override templates".to_string(),
-                    title: Some("Override Templates".to_string()),
-                    description: Some("A json file containing all the override templates available for scenario registration with account overrides".to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                }.no_annotation()
-            ],
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("str:///rpc_endpoints", "List of available RPC endpoints")
+                .with_title("RPC Endpoints")
+                .with_description("A json file containing all the RPC methods and the parameters available for being able to handle any RPC call with the tool call_surfnet_rpc")
+                .with_mime_type("application/json"),
+            Resource::new("str:///override_templates", "List of override templates")
+                .with_title("Override Templates")
+                .with_description("A json file containing all the override templates available for scenario registration with account overrides")
+                .with_mime_type("application/json"),
+        ]))
     }
     async fn read_resource(
         &self,
-        ReadResourceRequestParam { uri }: ReadResourceRequestParam,
+        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         match uri.as_str() {
             "str:///rpc_endpoints" => {
                 let rpc_endpoints = include_str!("../../../types/src/rpc_endpoints.json");
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri,
-                        mime_type: Some("application/json".to_string()),
-                        text: rpc_endpoints.to_string(),
-                        meta: None,
-                    }],
-                })
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(rpc_endpoints, uri).with_mime_type("application/json"),
+                ])
+                .into())
             }
             "str:///override_templates" => {
                 let registry = self.template_registry.read().map_err(|_| {
@@ -1473,14 +1499,10 @@ impl ServerHandler for Surfpool {
                     }
                 })?;
 
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri,
-                        mime_type: Some("application/json".to_string()),
-                        text: templates_json,
-                        meta: None,
-                    }],
-                })
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(templates_json, uri).with_mime_type("application/json"),
+                ])
+                .into())
             }
             _ => {
                 use std::borrow::Cow;
@@ -1494,13 +1516,39 @@ impl ServerHandler for Surfpool {
             }
         }
     }
-    async fn initialize(
-        &self,
-        _request: InitializeRequestParam,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<InitializeResult, McpError> {
-        Ok(self.get_info())
-    }
+}
+
+fn trader_positions_json(trader: &Pubkey, held: &TraderPositions) -> serde_json::Value {
+    let margin = |view: &MarginView| {
+        serde_json::json!({
+            "collateral": view.collateral_quote_lots.to_string(),
+            "effectiveCollateral": view.effective_collateral_quote_lots.to_string(),
+            "maintenanceMargin": view.maintenance_margin_quote_lots.to_string(),
+            "backstopMargin": view.backstop_margin_quote_lots.to_string(),
+            "highRiskMargin": view.high_risk_margin_quote_lots.to_string(),
+            "liquidatable": view.is_liquidatable != 0,
+        })
+    };
+    serde_json::json!({
+        "trader": trader.to_string(),
+        "positions": held
+            .positions
+            .iter()
+            .map(|position| {
+                serde_json::json!({
+                    "symbol": position.symbol,
+                    "orderbook": position.orderbook.to_string(),
+                    "side": if position.base_lots > 0 { "long" } else { "short" },
+                    "baseLots": position.base_lots.unsigned_abs().to_string(),
+                    "maintenanceMarginQuoteLots": position.maintenance_margin_quote_lots.to_string(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "hot": held.hot,
+        "margin": margin(&held.margin),
+        "marginAfterMoves": held.margin_after_moves.as_ref().map(margin),
+        "refusal": held.refusal,
+    })
 }
 
 fn unlisted_phoenix_symbols(
@@ -1576,6 +1624,30 @@ mod tests {
                 .expect("error")
                 .contains("Invalid token mint")
         );
+    }
+
+    /// A token account update that fails is reported, never dropped; with no success at all
+    /// there is no success list.
+    #[tokio::test]
+    async fn set_token_accounts_reports_the_updates_that_failed() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .set_token_accounts(Parameters(SetTokenAccountsParams {
+                // No surfnet listens here: every update fails.
+                surfnet_address: "http://127.0.0.1:1".to_string(),
+                token_params_with_owner: vec![CreateTokenAccountForOwnerParams {
+                    owner: None,
+                    params: vec![CreateTokenAccountParams {
+                        token_symbol: Some("USDC".to_string()),
+                        ..CreateTokenAccountParams::default()
+                    }],
+                }],
+            }))
+            .await
+            .expect("tool result");
+        let response = json_of(&result);
+        assert!(response["error"].is_string(), "{response}");
+        assert!(response["success"].is_null(), "{response}");
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {
@@ -1936,11 +2008,122 @@ mod tests {
         assert!(errors[2].contains("'BONK'") && errors[2].contains("list_phoenix_markets"));
     }
 
+    #[test]
+    fn trader_positions_keep_the_contract_studio_reads() {
+        use surfpool_core::scenarios::protocols::phoenix_eternal::v1::trader::TraderPosition;
+
+        let trader = Pubkey::new_unique();
+        let orderbook = Pubkey::new_unique();
+        let position = |symbol: &str, base_lots| TraderPosition {
+            symbol: symbol.to_string(),
+            orderbook,
+            base_lots,
+            maintenance_margin_quote_lots: 12_345_678_901,
+        };
+        let mut view = MarginView::default();
+        view.collateral_quote_lots = -5_030_916_850;
+        view.effective_collateral_quote_lots = 41_872_811;
+        view.maintenance_margin_quote_lots = 11_473_811;
+        view.backstop_margin_quote_lots = 4_589_524;
+        view.high_risk_margin_quote_lots = 2_294_761;
+        view.is_liquidatable = 1;
+        let mut held = TraderPositions {
+            positions: vec![position("ETH", 250), position("SOL", -1_000)],
+            hot: true,
+            margin: view,
+            margin_after_moves: None,
+            refusal: None,
+        };
+        let payload = trader_positions_json(&trader, &held);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "trader": trader.to_string(),
+                "positions": [
+                    {
+                        "symbol": "ETH",
+                        "orderbook": orderbook.to_string(),
+                        "side": "long",
+                        "baseLots": "250",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                    {
+                        "symbol": "SOL",
+                        "orderbook": orderbook.to_string(),
+                        "side": "short",
+                        "baseLots": "1000",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                ],
+                "hot": true,
+                "margin": {
+                    "collateral": "-5030916850",
+                    "effectiveCollateral": "41872811",
+                    "maintenanceMargin": "11473811",
+                    "backstopMargin": "4589524",
+                    "highRiskMargin": "2294761",
+                    "liquidatable": true,
+                },
+                "marginAfterMoves": null,
+                "refusal": null,
+            })
+        );
+        held.margin_after_moves = Some(view);
+        let payload = trader_positions_json(&trader, &held);
+        assert_eq!(payload["marginAfterMoves"], payload["margin"]);
+        let params: ListPhoenixTraderPositionsParams = serde_json::from_value(serde_json::json!({
+            "trader": trader.to_string(),
+            "moves": [{ "symbol": "SOL", "targetTicks": "10446" }, { "symbol": "BTC", "targetTicks": 78545 }],
+        }))
+        .unwrap();
+        assert_eq!(params.moves[0].target_ticks, "10446");
+        assert_eq!(params.moves[1].target_ticks, 78545);
+    }
+
+    #[tokio::test]
+    async fn trader_positions_accept_surrounding_address_whitespace() {
+        let surfpool = Surfpool::new();
+        let trader = Pubkey::new_unique().to_string();
+        let rpc_url = "not-a-url";
+        let expected = surfpool
+            .list_phoenix_trader_positions_at(rpc_url, &trader, &[])
+            .await
+            .unwrap_err();
+        assert!(!expected.contains("is not a valid Phoenix Trader account address"));
+
+        for input in [format!(" {trader} "), format!("\t{trader}\r\n")] {
+            let error = surfpool
+                .list_phoenix_trader_positions_at(rpc_url, &input, &[])
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn trader_positions_refuse_an_invalid_address_before_any_call() {
+        let result = Surfpool::new()
+            .list_phoenix_trader_positions(Parameters(ListPhoenixTraderPositionsParams {
+                trader: "not-an-address".to_string(),
+                surfnet_port: None,
+                moves: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let payload = json_of(&result);
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("'not-an-address' is not a valid")),
+            "{payload}"
+        );
+    }
+
     #[tokio::test]
     async fn create_scenario_rejects_a_missing_dynamic_ref_value() {
         let surfpool = Surfpool::new();
         let template = TemplateRegistry::new()
-            .get("phoenix-direct-mark-risk-shock")
+            .get("phoenix-market-move")
             .expect("template")
             .clone();
         let mut scenario = surfpool_types::Scenario::new(
