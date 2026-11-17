@@ -108,7 +108,7 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
 | `phoenix-market-max-liquidation-size` | The most base lots one liquidation may close.                                                          | risk authority               |
 | `phoenix-market-open-interest-cap`    | The most open interest the market accepts.                                                             | risk authority               |
-| `phoenix-market-funding`              | Funding interval, period and maximum rate.                                                             | market authority             |
+| `phoenix-market-funding`              | Funding interval, period, maximum rate, clamp band and divisor.                                        | market authority             |
 | `phoenix-market-fees`                 | Default taker and maker fees.                                                                          | market authority             |
 | `phoenix-market-status`               | Active, PostOnly, Paused or Closed.                                                                    | market authority             |
 | `phoenix-exchange-status`             | The exchange-wide active, gated and maintenance flags.                                                 | root authority               |
@@ -242,6 +242,16 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `the ... book stayed crossed after ... uncross cranks`        | `phoenix-market-uncross` left the book crossed after its cranks. Try a smaller move.                                              |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
 | `Mark price of market N is unavailable or stale`              | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
+
+## The bundled IDL
+
+`v1/idl.json` is the IDL Phoenix publishes on chain in its Program Metadata account
+`H6r3zQwpMdsuSgoCFm39WjP6F9sMNyxwe3F3F9PhbqkQ`, as written on 2026-11-10, byte for byte. Its
+sha256 is `af1bac114fd2d9926a3e2253192941a3d28466f50b2521b3ff7d5e820b6055b0`.
+
+The IDL's `Trader` has one field `maxPositions: u64`. The program keeps two `u32` values in those
+8 bytes: the position limit, then the trader's preference bits. No template writes
+`maxPositions`. A write through the IDL replaces the preference bits too.
 
 ## Tests against mainnet
 
