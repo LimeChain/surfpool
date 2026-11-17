@@ -1,15 +1,29 @@
 #![allow(dead_code)]
-use std::net::TcpListener;
+use std::{collections::HashMap, net::TcpListener};
 
 use crossbeam_channel::{Receiver, Sender};
+use solana_account::Account;
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_message::{Message, VersionedMessage};
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_system_interface::instruction::transfer;
 use solana_transaction::versioned::VersionedTransaction;
-use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent};
+use surfpool_types::{
+    AccountAddress, CheatcodeConfig, Idl, OverrideInstance, RpcConfig, SimnetCommand, SimnetEvent,
+    SvmFeatureConfig,
+};
 
 use crate::{
     rpc::RunloopContext,
-    surfnet::{PluginCommand, locker::SurfnetSvmLocker, svm::SurfnetSvm},
+    surfnet::{
+        PluginCommand,
+        locker::SurfnetSvmLocker,
+        svm::{SurfnetSvm, SurfnetSvmConfig},
+    },
 };
 
 /// Returns the byte indices whose values differ between two buffers.
@@ -31,6 +45,32 @@ pub fn get_free_port() -> Result<u16, String> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+/// What Agave's `sanitize_transaction` answers for either of [`unsanitary_transactions`].
+pub const UNSANITARY_TRANSACTION_ERROR: &str =
+    "invalid transaction: Transaction failed to sanitize accounts offsets correctly";
+
+/// Transactions that deserialize but that Agave refuses at sanitization: a signed transfer whose
+/// instruction names an account index its message does not carry, and a transfer stripped of
+/// its signatures.
+pub fn unsanitary_transactions(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+) -> [VersionedTransaction; 2] {
+    let mut message = Message::new_with_blockhash(
+        &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+        Some(&payer.pubkey()),
+        &recent_blockhash,
+    );
+    let unsigned = VersionedTransaction {
+        signatures: vec![],
+        message: VersionedMessage::Legacy(message.clone()),
+    };
+    message.instructions[0].accounts[1] = 42;
+    let unknown_account =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[payer]).unwrap();
+    [unknown_account, unsigned]
 }
 
 /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
@@ -64,6 +104,53 @@ pub async fn canned_rpc(result_json: impl Into<String>) -> String {
     format!("http://{addr}")
 }
 
+/// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
+pub const UNHEALTHY_OFFSET: usize = 2256;
+
+/// Writes a zeroed Kamino `Obligation` owned by klend and returns an override that sets its
+/// `unhealthy_borrow_value_sf`. `SurfnetSvm::default()` already registers the bundled template
+/// IDLs, so klend's is resolvable by owner program.
+pub fn scheduled_override_fixture(surfnet_svm: &mut SurfnetSvm) -> (Pubkey, OverrideInstance) {
+    let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+    let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
+        .expect("kamino idl");
+    let obligation_disc = &idl
+        .accounts
+        .iter()
+        .find(|a| a.name == "Obligation")
+        .expect("Obligation account")
+        .discriminator;
+
+    let mut data = vec![0u8; 3344];
+    data[..8].copy_from_slice(obligation_disc);
+
+    let account_pubkey = Pubkey::new_unique();
+    surfnet_svm
+        .inner
+        .set_account(
+            account_pubkey,
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: klend,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("set obligation account");
+
+    let instance = OverrideInstance::new(
+        "kamino-obligation-health".to_string(),
+        0,
+        AccountAddress::Pubkey(account_pubkey.to_string()),
+    )
+    .with_values(HashMap::from([(
+        "unhealthy_borrow_value_sf".to_string(),
+        serde_json::json!(1_234u64),
+    )]));
+    (account_pubkey, instance)
+}
+
 #[derive(Clone)]
 pub struct TestSetup<T>
 where
@@ -84,9 +171,24 @@ where
     /// The same setup, keeping the event receiver, for tests that read what
     /// the surfnet emitted rather than only what it returned.
     pub fn new_with_events(rpc: T) -> (Self, Receiver<SimnetEvent>) {
+        Self::new_with_events_and_features(rpc, SvmFeatureConfig::default())
+    }
+
+    pub fn new_with_features(rpc: T, features: SvmFeatureConfig) -> Self {
+        Self::new_with_events_and_features(rpc, features).0
+    }
+
+    fn new_with_events_and_features(
+        rpc: T,
+        feature_config: SvmFeatureConfig,
+    ) -> (Self, Receiver<SimnetEvent>) {
         let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
 
-        let (mut surfnet_svm, simnet_events_rx, _) = SurfnetSvm::default();
+        let (mut surfnet_svm, simnet_events_rx, _) = SurfnetSvm::new(SurfnetSvmConfig {
+            feature_config,
+            ..SurfnetSvmConfig::default()
+        })
+        .unwrap();
         let clock = Clock {
             slot: 123,
             epoch_start_timestamp: 123,

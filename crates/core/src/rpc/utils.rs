@@ -5,45 +5,23 @@ use jsonrpc_core::{Error, Result};
 use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
-    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
     rpc_request::{
         MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, MAX_GET_PROGRAM_ACCOUNT_FILTERS,
         TokenAccountsFilter,
     },
 };
-use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_message::v1::{MAX_TRANSACTION_SIZE, V1_PREFIX};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::{ParsePubkeyError, Pubkey};
 use solana_signature::Signature;
+use solana_transaction::versioned::{
+    VersionedTransaction, sanitized::SanitizedVersionedTransaction,
+};
 use solana_transaction_status::{TransactionBinaryEncoding, UiTransactionEncoding};
 
-use crate::{
-    error::{SurfpoolError, SurfpoolResult},
-    surfnet::locker::SurfnetSvmLocker,
-};
-
-/// Returns the slot a read at `commitment` answers for, judged before the read.
-///
-/// As with Agave's `get_bank_with_config`, a `min_context_slot` above it is refused before any
-/// work, and this one slot is reported as the response context. The surfnet keeps one account
-/// state, so a value read afterwards reflects every transaction up to this slot, and may already
-/// reflect later ones.
-pub fn context_slot(
-    svm_locker: &SurfnetSvmLocker,
-    commitment: Option<CommitmentConfig>,
-    min_context_slot: Option<Slot>,
-) -> Result<Slot> {
-    let slot = svm_locker.get_slot_for_commitment(&commitment.unwrap_or_default());
-    match min_context_slot {
-        Some(min_context_slot) if slot < min_context_slot => {
-            Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
-        }
-        _ => Ok(slot),
-    }
-}
+use crate::error::{SurfpoolError, SurfpoolResult};
 
 pub fn convert_transaction_metadata_from_canonical(
     transaction_metadata: &TransactionMetadata,
@@ -221,27 +199,48 @@ where
 }
 
 /// Decode the RPC `data` parameter of `sendTransaction` and
-/// `simulateTransaction` into a `solana_transaction::VersionedTransaction`.
+/// `simulateTransaction` with [`decode_transaction`].
 ///
 /// Both methods accept a `UiTransactionEncoding` on their config that defaults
-/// to `Base58`, map it to the internal `TransactionBinaryEncoding`, and feed
-/// the result into `decode_and_deserialize`. The mapping can fail (the RPC
-/// only accepts base58 and base64), which is reported back as an
-/// `Error::invalid_params` listing the supported encodings.
+/// to `Base58` and map it to the internal `TransactionBinaryEncoding`. The
+/// mapping can fail (the RPC only accepts base58 and base64), which is reported
+/// back as an `Error::invalid_params` listing the supported encodings.
 pub fn decode_rpc_versioned_transaction(
     data: String,
     encoding: Option<UiTransactionEncoding>,
-) -> Result<solana_transaction::versioned::VersionedTransaction> {
+) -> Result<SanitizedVersionedTransaction> {
     let tx_encoding = encoding.unwrap_or(UiTransactionEncoding::Base58);
     let binary_encoding = tx_encoding.into_binary_encoding().ok_or_else(|| {
         Error::invalid_params(format!(
             "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
         ))
     })?;
-    let (_, unsanitized_tx) = decode_and_deserialize::<
-        solana_transaction::versioned::VersionedTransaction,
-    >(data, binary_encoding)?;
-    Ok(unsanitized_tx)
+    decode_transaction(data, binary_encoding)
+}
+
+/// Decode a transaction sent to an RPC method and sanitize it, refusing one
+/// whose signatures, header and account indexes don't add up with the error
+/// Agave's `sanitize_transaction` returns.
+pub fn decode_transaction(
+    encoded: String,
+    encoding: TransactionBinaryEncoding,
+) -> Result<SanitizedVersionedTransaction> {
+    let (_, tx) = decode_and_deserialize::<VersionedTransaction>(encoded, encoding)?;
+    SanitizedVersionedTransaction::try_new(tx).map_err(|e| {
+        Error::invalid_params(format!(
+            "invalid transaction: {}",
+            solana_transaction_error::TransactionError::from(e)
+        ))
+    })
+}
+
+/// The transaction behind a sanitized one, without a copy.
+pub fn into_versioned_transaction(tx: SanitizedVersionedTransaction) -> VersionedTransaction {
+    let (signatures, message) = tx.destruct();
+    VersionedTransaction {
+        signatures,
+        message: message.message,
+    }
 }
 
 /// Substrings that, when present in a lowercased error message, indicate the

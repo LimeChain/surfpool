@@ -26,8 +26,8 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
     rpc_response::{
-        RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
-        RpcLogsResponse, RpcTokenAccountBalance,
+        RpcAccountBalance, RpcBlockUpdate, RpcConfirmedTransactionStatusWithSignature,
+        RpcKeyedAccount, RpcLogsResponse, RpcTokenAccountBalance,
     },
 };
 use solana_clock::{Clock, Slot, UnixTimestamp};
@@ -67,7 +67,9 @@ use uuid::Uuid;
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
-    SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    SignatureSubscriptionType, SurfnetSvm,
+    remote::SurfnetRemoteClient,
+    svm::{AccountUpdatePolicy, ReadSlot},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -81,8 +83,6 @@ use crate::{
         },
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
-    storage::StorageResult,
-    surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -93,6 +93,7 @@ struct LocalTransactionLookup {
     result: GetTransactionResult,
     is_pending: bool,
     latest_absolute_slot: Slot,
+    finalized_slot: Slot,
 }
 
 pub struct SvmAccessContext<T> {
@@ -186,10 +187,10 @@ impl SurfnetSvmLocker {
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
     pub fn shutdown(&self) {
-        let read_lock = self.0.clone();
+        let write_lock = self.0.clone();
         tokio::task::block_in_place(move || {
-            let read_guard = read_lock.blocking_read();
-            read_guard.shutdown();
+            let mut write_guard = write_lock.blocking_write();
+            write_guard.shutdown();
         });
     }
 
@@ -213,7 +214,7 @@ impl SurfnetSvmLocker {
     /// slot, epoch info, and blockhash along with the closure's result.
     fn with_contextualized_svm_reader<T, F>(&self, reader: F) -> SvmAccessContext<T>
     where
-        F: Fn(&SurfnetSvm) -> T + Send + Sync,
+        F: FnOnce(&SurfnetSvm) -> T + Send + Sync,
         T: Send + 'static,
     {
         let read_lock = self.0.clone();
@@ -276,34 +277,16 @@ impl SurfnetSvmLocker {
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
-            svm_writer.initialize(epoch_info, epoch_schedule);
             svm_writer
                 .inner
                 .set_sysvar(&last_restart_slot.unwrap_or_default());
-        });
-        Ok(())
+            svm_writer.initialize(epoch_info, epoch_schedule)
+        })
     }
 }
 
 /// Functions for getting accounts from the underlying SurfnetSvm instance or remote client
 impl SurfnetSvmLocker {
-    /// Filters the downloaded account result to remove accounts owned by offline owners.
-    fn filter_downloaded_account_result(
-        requested_pubkey: &Pubkey,
-        result: GetAccountResult,
-        offline_owners: &[Pubkey],
-    ) -> GetAccountResult {
-        match result {
-            GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
-                if offline_owners.contains(&account.owner) =>
-            {
-                GetAccountResult::None(*requested_pubkey)
-            }
-            other => other,
-        }
-    }
-
     /// Re-checks local state after an asynchronous fetch, returning the local
     /// account when another writer won the race.
     fn resolve_account_after_fetch(
@@ -379,9 +362,9 @@ impl SurfnetSvmLocker {
             return Ok(GetAccountResult::None(pubkey));
         };
 
-        let offline_owners = Self::offline_account_owners(svm_writer);
+        let offline_owners = svm_writer.offline_account_owners();
         let fetched_account =
-            Self::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
+            SurfnetSvm::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
 
         if !fetched_account.is_none() {
             svm_writer.apply_account_update(
@@ -431,25 +414,6 @@ impl SurfnetSvmLocker {
             coupled,
             source,
         ))
-    }
-
-    fn offline_account_owners(svm_writer: &SurfnetSvm) -> Vec<Pubkey> {
-        svm_writer
-            .offline_accounts
-            .into_iter()
-            .unwrap_or_else(|e| {
-                warn!("Failed to iterate offline_accounts: {}", e);
-                Box::new(std::iter::empty())
-            })
-            .filter(|(_, config)| config.include_owned_accounts)
-            .filter_map(|(key, _)| match key.parse() {
-                Ok(pubkey) => Some(pubkey),
-                Err(e) => {
-                    warn!("Invalid pubkey in offline_accounts: {}: {}", key, e);
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Retrieves a local account from the SVM cache, returning a contextualized result.
@@ -673,11 +637,25 @@ impl SurfnetSvmLocker {
         remote_client: Option<&SurfnetRemoteClient>,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolResult<usize> {
+        self.load_snapshot_with_options(snapshot, remote_client, commitment_config, false)
+            .await
+    }
+
+    /// Loads a snapshot, optionally failing if any requested account cannot be installed.
+    /// Strict loading can partially install accounts before returning an error.
+    pub async fn load_snapshot_with_options(
+        &self,
+        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
+        remote_client: Option<&SurfnetRemoteClient>,
+        commitment_config: CommitmentConfig,
+        strict: bool,
+    ) -> SurfpoolResult<usize> {
         use std::str::FromStr;
 
         use base64::{Engine, prelude::BASE64_STANDARD};
 
         let mut loaded_count = 0;
+        let mut errors = Vec::new();
 
         // Separate accounts into those with data and those needing remote fetch
         // The boolean records whether an entry was fetched because a snapshot
@@ -690,6 +668,9 @@ impl SurfnetSvmLocker {
             let pubkey = match Pubkey::from_str(pubkey_str) {
                 Ok(pk) => pk,
                 Err(e) => {
+                    if strict {
+                        errors.push(format!("invalid snapshot pubkey '{}': {}", pubkey_str, e));
+                    }
                     self.with_svm_reader(|svm| {
                         svm.simnet_events_tx.warn(format!(
                             "Skipping invalid pubkey '{}' in snapshot: {}",
@@ -706,6 +687,12 @@ impl SurfnetSvmLocker {
                     let data = match BASE64_STANDARD.decode(&account_snapshot.data) {
                         Ok(d) => d,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid base64 data: {}",
+                                    pubkey_str, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': failed to decode base64 data: {}",
@@ -720,6 +707,12 @@ impl SurfnetSvmLocker {
                     let owner = match Pubkey::from_str(&account_snapshot.owner) {
                         Ok(pk) => pk,
                         Err(e) => {
+                            if strict {
+                                errors.push(format!(
+                                    "account '{}': invalid owner pubkey '{}': {}",
+                                    pubkey_str, account_snapshot.owner, e
+                                ));
+                            }
                             self.with_svm_reader(|svm| {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': invalid owner pubkey: {}",
@@ -745,6 +738,11 @@ impl SurfnetSvmLocker {
                     // Queue for remote fetch if client is available
                     if remote_client.is_some() {
                         pubkeys_to_fetch.push(pubkey);
+                    } else if strict {
+                        errors.push(format!(
+                            "account '{}': no upstream RPC configured for null snapshot entry",
+                            pubkey
+                        ));
                     }
                 }
             }
@@ -791,12 +789,23 @@ impl SurfnetSvmLocker {
                                     }
                                 }
                                 GetAccountResult::None(_) => {
-                                    // Account not found on remote, skip
+                                    if strict {
+                                        errors.push(format!(
+                                            "account '{}': absent from upstream RPC",
+                                            pubkey
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => {
+                        if strict {
+                            errors.push(format!(
+                                "upstream fetch failed for accounts {:?}: {}",
+                                pubkeys_to_fetch, e
+                            ));
+                        }
                         self.with_svm_reader(|svm| {
                             svm.simnet_events_tx
                                 .warn(format!("Failed to fetch some accounts from remote: {}", e));
@@ -808,24 +817,70 @@ impl SurfnetSvmLocker {
 
         accounts_to_load.sort_by_key(|(_, account, _)| snapshot_load_priority(account));
 
+        // Validate required upgradeable program dependencies against the live SVM after loading.
+        let accounts_to_validate: Vec<_> = if strict {
+            accounts_to_load
+                .iter()
+                .map(|(pubkey, account, _)| (*pubkey, account.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Load all accounts into the SVM
         self.with_svm_writer(|svm| {
             let slot = svm.get_latest_absolute_slot();
 
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
+                // Surfpool maintains LastRestartSlot and refuses account writes
+                // to it, but a snapshot is a datasource like any other: restore
+                // its value, as `initialize` does from a remote. Programs that
+                // check it (Phoenix halts on a mismatch) otherwise read 0 after
+                // an offline restore.
+                if pubkey == solana_sysvar::last_restart_slot::ID {
+                    match account.data.get(..8).map(|bytes| {
+                        u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
+                    }) {
+                        Some(last_restart_slot) => {
+                            svm.inner.set_sysvar(
+                                &solana_sysvar::last_restart_slot::LastRestartSlot {
+                                    last_restart_slot,
+                                },
+                            );
+                            loaded_count += 1;
+                        }
+                        None => {
+                            let message = format!(
+                                "Skipping LastRestartSlot in snapshot: {} bytes of data, expected 8",
+                                account.data.len()
+                            );
+                            if strict {
+                                errors.push(message.clone());
+                            }
+                            let _ = svm.simnet_events_tx.warn(message);
+                        }
+                    }
+                    continue;
+                }
+                let requested_executable = account.executable;
                 let load_result = if fetched_from_remote {
-                    svm.apply_account_update(
-                        GetAccountResult::FoundAccount(
-                            pubkey,
-                            account.clone(),
-                            AccountSource::Remote,
-                        ),
-                        AccountUpdatePolicy::HydrateIfAbsent,
-                    )
+                    let update = GetAccountResult::FoundAccount(
+                        pubkey,
+                        account.clone(),
+                        AccountSource::Remote,
+                    );
+                    if strict {
+                        svm.hydrate_snapshot_strict(update)
+                    } else {
+                        svm.apply_account_update(update, AccountUpdatePolicy::HydrateIfAbsent)
+                    }
                 } else {
                     svm.set_account(&pubkey, account.clone())
                 };
                 if let Err(e) = load_result {
+                    if strict {
+                        errors.push(format!("account '{}': failed to set account: {}", pubkey, e));
+                    }
                     let _ = svm
                         .simnet_events_tx
                         .warn(format!("Failed to set account '{}': {}", pubkey, e));
@@ -838,12 +893,28 @@ impl SurfnetSvmLocker {
                 // A DB hit alone must not produce a Geyser startup update for an
                 // account that is not actually available in the live SVM.
                 let Some(account) = svm.inner.get_account_no_db(&pubkey) else {
+                    if strict {
+                        errors.push(format!(
+                            "account '{}': absent from live SVM after snapshot load",
+                            pubkey
+                        ));
+                    }
                     let _ = svm.simnet_events_tx.warn(format!(
                         "Account '{}' was not present after snapshot load",
                         pubkey
                     ));
                     continue;
                 };
+
+                // Hydration can retain an existing local account. An executable
+                // requested from upstream still needs a live executable account.
+                // Explicit snapshot entries are checked the same way.
+                if strict && requested_executable && !account.executable {
+                    errors.push(format!(
+                        "account '{}': requested executable is not executable in live SVM",
+                        pubkey
+                    ));
+                }
 
                 // Send startup account update to geyser
                 let write_version = svm.increment_write_version();
@@ -853,8 +924,64 @@ impl SurfnetSvmLocker {
 
                 loaded_count += 1;
             }
+
+            if !strict {
+                return;
+            }
+
+            for (program, requested_account) in accounts_to_validate {
+                // Preserve diagnostics for a program that could not be installed,
+                // while validating the actual account when hydration kept local state.
+                let account = svm.inner.get_account_no_db(&program).unwrap_or(requested_account);
+                if !account.executable
+                    || account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+                {
+                    continue;
+                }
+                let data_address =
+                    match bincode::deserialize::<UpgradeableLoaderState>(&account.data) {
+                        Ok(UpgradeableLoaderState::Program { programdata_address }) => {
+                            programdata_address
+                        }
+                        _ => {
+                            errors.push(format!(
+                                "upgradeable program '{}': invalid Program state",
+                                program
+                            ));
+                            continue;
+                        }
+                    };
+                match svm.inner.get_account_no_db(&data_address) {
+                    Some(data)
+                        if data.owner == solana_sdk_ids::bpf_loader_upgradeable::id()
+                            && !data.executable
+                            && data.data.len()
+                                >= UpgradeableLoaderState::size_of_programdata_metadata()
+                            && matches!(
+                                bincode::deserialize::<UpgradeableLoaderState>(
+                                    &data.data
+                                        [..UpgradeableLoaderState::size_of_programdata_metadata()]
+                                ),
+                                Ok(UpgradeableLoaderState::ProgramData { .. })
+                            ) => {}
+                    Some(_) => errors.push(format!(
+                        "upgradeable program '{}': invalid ProgramData account '{}' in live SVM",
+                        program, data_address
+                    )),
+                    None => errors.push(format!(
+                        "upgradeable program '{}': required ProgramData account '{}' absent from live SVM",
+                        program, data_address
+                    )),
+                }
+            }
         });
 
+        if strict && !errors.is_empty() {
+            return Err(SurfpoolError::invalid_params(format!(
+                "strict snapshot load failed: {}",
+                errors.join("; ")
+            )));
+        }
         Ok(loaded_count)
     }
 
@@ -1240,8 +1367,6 @@ impl SurfnetSvmLocker {
         }
 
         let ctx = self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
-
             let mut records: Vec<Record> = svm_reader
                 .transactions
                 .into_iter()
@@ -1302,13 +1427,7 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = svm_reader.confirmation_status(slot);
 
                         Some(Record {
                             signature: sig,
@@ -1443,13 +1562,51 @@ impl SurfnetSvmLocker {
         &self,
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
-    ) -> SvmAccessContext<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+    ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        self.get_signatures_for_address_local_with_boundaries(pubkey, config)
+            .map(|results| {
+                let (signatures, _, _) = results.inner;
+                SvmAccessContext::new(
+                    results.slot,
+                    results.latest_epoch_info,
+                    results.latest_blockhash,
+                    signatures,
+                )
+            })
+    }
+
+    /// The local signatures, and whether `before` and `until` are local signatures.
+    #[allow(clippy::type_complexity)]
+    fn get_signatures_for_address_local_with_boundaries(
+        &self,
+        pubkey: &Pubkey,
+        config: Option<&RpcSignaturesForAddressConfig>,
+    ) -> SurfpoolContextualizedResult<(Vec<RpcConfirmedTransactionStatusWithSignature>, bool, bool)>
+    {
         let before = config.and_then(|c| c.before.as_ref());
         let until = config.and_then(|c| c.until.as_ref());
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
+        let commitment = config.and_then(|c| c.commitment).unwrap_or_default();
 
-        self.with_contextualized_svm_reader(move |svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
+        let results = self.with_contextualized_svm_reader(move |svm_reader| {
+            // As in Agave, only slots visible at the commitment are listed.
+            let highest_slot = svm_reader.slot_for_commitment(&commitment);
+
+            // Agave's blockstore does not find a boundary above that slot, and the datasource
+            // never has a local signature, so Agave rejects it as FilterTransactionNotFound.
+            let is_local = |sig: Option<&String>| -> SurfpoolResult<bool> {
+                let Some(sig) = sig else {
+                    return Ok(false);
+                };
+                match svm_reader.transactions.get(sig)? {
+                    Some(status) if status.expect_processed().0.slot > highest_slot => {
+                        Err(SurfpoolError::filter_transaction_not_found(sig))
+                    }
+                    status => Ok(status.is_some()),
+                }
+            };
+            let before_is_local = is_local(before)?;
+            let until_is_local = is_local(until)?;
 
             let sigs: Vec<_> = svm_reader
                 .transactions
@@ -1468,22 +1625,18 @@ impl SurfnetSvmLocker {
                             return None;
                         };
 
-                        if !transaction_involves_address(
-                            &transaction,
-                            &meta.loaded_addresses,
-                            pubkey,
-                        ) {
+                        if slot > highest_slot
+                            || !transaction_involves_address(
+                                &transaction,
+                                &meta.loaded_addresses,
+                                pubkey,
+                            )
+                        {
                             return None;
                         }
 
                         // Determine confirmation status
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = svm_reader.confirmation_status(slot);
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the
@@ -1565,8 +1718,19 @@ impl SurfnetSvmLocker {
             };
 
             // Apply the pagination window first, then enforce the RPC limit on that slice.
-            sigs[window].iter().take(limit).cloned().collect()
-        })
+            Ok::<_, SurfpoolError>((
+                sigs[window].iter().take(limit).cloned().collect(),
+                before_is_local,
+                until_is_local,
+            ))
+        });
+        let inner = results.inner?;
+        Ok(SvmAccessContext::new(
+            results.slot,
+            results.latest_epoch_info,
+            results.latest_blockhash,
+            inner,
+        ))
     }
 
     pub async fn get_signatures_for_address_local_then_remote(
@@ -1575,7 +1739,7 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let results = self.get_signatures_for_address_local(pubkey, config);
+        let results = self.get_signatures_for_address_local_with_boundaries(pubkey, config)?;
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
         let first_local_slot = self.with_svm_reader(|svm| svm.genesis_slot);
 
@@ -1583,25 +1747,9 @@ impl SurfnetSvmLocker {
             slot,
             latest_blockhash,
             latest_epoch_info,
-            inner: mut combined_results,
+            inner: (mut combined_results, before_is_local, until_is_local),
         } = results;
         if combined_results.len() < limit {
-            let (before_is_local, until_is_local) =
-                self.with_svm_reader(|svm_reader| -> StorageResult<(bool, bool)> {
-                    let is_local = |sig: &String| -> StorageResult<bool> {
-                        Ok(svm_reader.transactions.get(sig)?.is_some())
-                    };
-                    let before_local = match config.and_then(|c| c.before.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    let until_local = match config.and_then(|c| c.until.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    Ok((before_local, until_local))
-                })?;
-
             let remaining_limit = limit - combined_results.len();
             if let Some(remote_config) = signatures_for_address_remote_config(
                 config,
@@ -1638,7 +1786,7 @@ impl SurfnetSvmLocker {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
         } else {
-            self.get_signatures_for_address_local(pubkey, config)
+            self.get_signatures_for_address_local(pubkey, config)?
         };
 
         Ok(results)
@@ -1719,6 +1867,7 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolResult<LocalTransactionLookup> {
         self.with_svm_reader(|svm_reader| {
             let latest_absolute_slot = svm_reader.get_latest_absolute_slot();
+            let finalized_slot = svm_reader.slot_for_commitment(&CommitmentConfig::finalized());
             let is_pending = svm_reader.is_transaction_pending(signature);
 
             let Some(entry) = svm_reader.transactions.get(&signature.to_string())? else {
@@ -1726,6 +1875,7 @@ impl SurfnetSvmLocker {
                     result: GetTransactionResult::None(*signature),
                     is_pending,
                     latest_absolute_slot,
+                    finalized_slot,
                 });
             };
 
@@ -1753,10 +1903,13 @@ impl SurfnetSvmLocker {
                         block_time,
                         transaction_index: None,
                     },
-                    latest_absolute_slot,
+                    // Skipped slots are no confirmations: count the blocks, as finalization does.
+                    svm_reader.blocks_after(slot),
+                    finalized_slot,
                 ),
                 is_pending,
                 latest_absolute_slot,
+                finalized_slot,
             })
         })
     }
@@ -1772,7 +1925,12 @@ impl SurfnetSvmLocker {
 
         if local_lookup.result.is_none() && !local_lookup.is_pending {
             client
-                .try_get_transaction(*signature, config, local_lookup.latest_absolute_slot)
+                .try_get_transaction(
+                    *signature,
+                    config,
+                    local_lookup.latest_absolute_slot,
+                    local_lookup.finalized_slot,
+                )
                 .await
         } else {
             Ok(local_lookup.result)
@@ -2042,26 +2200,12 @@ impl SurfnetSvmLocker {
         let loaded_addresses = tx_loaded_addresses.as_ref().map(|l| l.loaded_addresses());
 
         let ix_profiles = if self.is_instruction_profiling_enabled() {
-            match self
-                .generate_instruction_profiles(
-                    &transaction,
-                    &transaction_accounts,
-                    &tx_loaded_addresses,
-                    &accounts_before,
-                    &token_accounts_before,
-                    &token_programs,
-                    pre_execution_capture.clone(),
-                    &status_tx,
-                )
-                .await
-            {
-                Ok(profiles) => profiles,
-                Err(e) => {
-                    self.simnet_events_tx()
-                        .error(format!("Failed to generate instruction profiles: {}", e));
-                    None
-                }
-            }
+            self.generate_instruction_profiles(
+                &transaction,
+                &transaction_accounts,
+                &tx_loaded_addresses,
+                pre_execution_capture.clone(),
+            )
         } else {
             None
         };
@@ -2091,22 +2235,17 @@ impl SurfnetSvmLocker {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn generate_instruction_profiles(
+    fn generate_instruction_profiles(
         &self,
         transaction: &VersionedTransaction,
         transaction_accounts: &[Pubkey],
         loaded_addresses: &Option<TransactionLoadedAddresses>,
-        accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
-        status_tx: &Sender<TransactionStatusEvent>,
-    ) -> SurfpoolResult<Option<Vec<ProfileResult>>> {
+    ) -> Option<Vec<ProfileResult>> {
         let instructions = transaction.message.instructions();
         let ix_count = instructions.len();
         if ix_count == 0 {
-            return Ok(None);
+            return None;
         }
         // Extract account categories from original transaction
 
@@ -2130,7 +2269,7 @@ impl SurfnetSvmLocker {
 
             let Some(partial_tx) = partial_transaction_res else {
                 debug!("Unable to create partial transaction");
-                return Ok(None);
+                return None;
             };
 
             let mut previous_execution_captures = ExecutionCapture::new();
@@ -2142,10 +2281,6 @@ impl SurfnetSvmLocker {
                 previous_log_count += result.log_messages.as_ref().map(|m| m.len()).unwrap_or(0);
             }
 
-            let skip_preflight = true;
-            let sigverify = false;
-            let do_propagate = false;
-
             let mut pre_execution_capture_cursor = pre_execution_capture.clone();
             // If a pre-execution capture was provided, any pubkeys that are in the capture
             // that we just took should be replaced with those from the pre-execution capture.
@@ -2156,35 +2291,50 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor.insert(pubkey, pre_account);
                 }
             }
-            let mut svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
-
-            let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
-            let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
-            svm_clone.simnet_events_tx = dummy_simnet_tx;
-            svm_clone.geyser_events_tx = dummy_geyser_tx;
-
-            let svm_locker = SurfnetSvmLocker::new(svm_clone);
-            let mut profile_result = svm_locker
-                .process_transaction_internal(
-                    partial_tx,
-                    skip_preflight,
-                    sigverify,
-                    transaction_accounts,
-                    &loaded_addresses.as_ref().map(|l| l.loaded_addresses()),
-                    accounts_before,
-                    token_accounts_before,
-                    token_programs,
-                    pre_execution_capture_cursor,
-                    status_tx,
-                    do_propagate,
-                )
-                .await?;
+            // Simulating runs the prefix against the live state without committing it, so no
+            // sandbox copy of the SVM is needed.
+            let mut profile_result = self.with_svm_reader(|svm_reader| {
+                match svm_reader.simulate_transaction(partial_tx, false) {
+                    Ok(SimulatedTransactionInfo {
+                        meta,
+                        post_accounts,
+                    }) => {
+                        // A committed run would store the writable accounts (dropping those left
+                        // with no lamports) and leave the others unchanged.
+                        let mut post_accounts =
+                            post_accounts.into_iter().collect::<HashMap<_, _>>();
+                        let post_execution_capture = ix_required_accounts
+                            .iter()
+                            .map(|pubkey| {
+                                let account = match post_accounts.remove(pubkey) {
+                                    Some(account) => {
+                                        (account.lamports() > 0).then(|| account.into())
+                                    }
+                                    None => svm_reader.inner.get_account_no_db(pubkey),
+                                };
+                                (*pubkey, account)
+                            })
+                            .collect();
+                        ProfileResult::new(
+                            pre_execution_capture_cursor,
+                            post_execution_capture,
+                            meta.compute_units_consumed,
+                            Some(meta.logs),
+                            None,
+                        )
+                    }
+                    Err(FailedTransactionMetadata { err, meta }) => ProfileResult::new(
+                        pre_execution_capture_cursor,
+                        BTreeMap::new(),
+                        meta.compute_units_consumed,
+                        Some(meta.logs),
+                        Some(err.to_string()),
+                    ),
+                }
+            });
 
             profile_result
                 .pre_execution_capture
-                .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
-            profile_result
-                .post_execution_capture
                 .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
 
             profile_result.compute_units_consumed = profile_result
@@ -2199,7 +2349,7 @@ impl SurfnetSvmLocker {
             ix_profile_results.push(profile_result);
         }
 
-        Ok(Some(ix_profile_results))
+        Some(ix_profile_results)
     }
 
     fn handle_simulation_failure(
@@ -2297,10 +2447,8 @@ impl SurfnetSvmLocker {
                     .get(&a.mint().to_string())
                     .ok()
                     .flatten()
-                    .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
             })
-            .collect::<Result<Vec<_>, SurfpoolError>>()
-            .unwrap_or_default();
+            .collect();
 
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
@@ -2392,6 +2540,18 @@ impl SurfnetSvmLocker {
         let cus = transaction_metadata.compute_units_consumed;
         let logs = transaction_metadata.logs.clone();
         let signature = transaction.signatures[0];
+        // Read before the registries take the transaction's writes, as Agave reads each pre token
+        // balance's mint from the state before execution.
+        let pre_token_mints = token_accounts_before
+            .iter()
+            .map(|(_, a)| {
+                svm_writer
+                    .token_mints
+                    .get(&a.mint().to_string())
+                    .ok()
+                    .flatten()
+            })
+            .collect();
 
         let post_execution_capture = {
             let accounts_after = pubkeys_from_message
@@ -2488,7 +2648,7 @@ impl SurfnetSvmLocker {
                 }
             }
 
-            let token_mints = token_accounts_after
+            let post_token_mints = token_accounts_after
                 .iter()
                 .map(|(_, a)| {
                     svm_writer
@@ -2513,7 +2673,8 @@ impl SurfnetSvmLocker {
                     &accounts_after,
                     token_accounts_before,
                     &token_accounts_after,
-                    token_mints,
+                    pre_token_mints,
+                    post_token_mints,
                     token_programs,
                     &post_token_program_ids,
                     loaded_addresses.clone().unwrap_or_default(),
@@ -2692,7 +2853,9 @@ impl SurfnetSvmLocker {
             )
         } else {
             let epoch_schedule = SurfnetSvm::default_epoch_schedule();
-            let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+            let mut epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+            // The chain opens the slot after this one: offline, `INITIAL_SLOT`, as at startup.
+            epoch_info.absolute_slot -= 1;
             (epoch_info, epoch_schedule)
         };
         epoch_info.transaction_count = None;
@@ -2808,16 +2971,29 @@ impl SurfnetSvmLocker {
 
     /// Gets all owners whose accounts are marked offline.
     pub fn get_offline_account_owners(&self) -> Vec<Pubkey> {
-        self.with_svm_reader(Self::offline_account_owners)
+        self.with_svm_reader(SurfnetSvm::offline_account_owners)
     }
 
-    /// Registers a scenario for execution
+    /// Schedules a scenario's overrides from `slot`, or from the next slot when omitted.
+    /// A base slot that is already produced is rejected: nothing would ever apply it.
     pub fn register_scenario(
         &self,
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
     ) -> SurfpoolResult<()> {
-        self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
+        self.with_svm_writer(move |svm_writer| {
+            let current_slot = svm_writer.get_latest_absolute_slot();
+            let next_slot = current_slot
+                .checked_add(1)
+                .ok_or_else(|| SurfpoolError::internal("the slot counter overflowed"))?;
+            let base_slot = slot.unwrap_or(next_slot);
+            if base_slot <= current_slot {
+                return Err(SurfpoolError::invalid_params(format!(
+                    "base slot {base_slot} is already produced; the next slot is {next_slot}"
+                )));
+            }
+            svm_writer.register_scenario(scenario, Some(base_slot))
+        })
     }
 
     /// Materializes overrides for a specific slot (not necessarily the current slot)
@@ -3424,13 +3600,13 @@ impl SurfnetSvmLocker {
         match tag_map {
             None => Ok(None),
             Some(uuids_or_sigs) => {
+                // Profiles are kept up to `max_profiles`, oldest dropped
+                // first: a tag lists the ones still kept.
                 let mut profiles = Vec::new();
                 for id in uuids_or_sigs {
-                    let profile = self.get_profile_result(id, config)?;
-                    if profile.is_none() {
-                        return Err(SurfpoolError::tag_not_found(&tag));
+                    if let Some(profile) = self.get_profile_result(id, config)? {
+                        profiles.push(profile);
                     }
-                    profiles.push(profile.unwrap());
                 }
                 Ok(Some(profiles))
             }
@@ -3728,7 +3904,7 @@ impl SurfnetSvmLocker {
             Ok::<_, SurfpoolError>(filtered)
         })?;
 
-        Ok(self.with_contextualized_svm_reader(|_| res.clone()))
+        Ok(self.with_contextualized_svm_reader(move |_| res))
     }
 
     pub fn encode_ui_account(
@@ -3918,8 +4094,7 @@ impl SurfnetSvmLocker {
             slot_time,
             &epoch_info,
             &epoch_schedule,
-        )
-        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+        )?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
@@ -3939,9 +4114,8 @@ impl SurfnetSvmLocker {
         // Wait for confirmation with timeout
         let updated_epoch_info = response_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| {
-                SurfpoolError::internal(format!("Failed to confirm clock update: {}", e))
-            })?;
+            .map_err(|e| SurfpoolError::internal(format!("Failed to confirm clock update: {}", e)))?
+            .map_err(SurfpoolError::internal)?;
 
         self.simnet_events_tx().info(format!(
             "Time travel to {} successful (epoch {} / slot {})",
@@ -3969,6 +4143,17 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(|svm_reader| svm_reader.slot_for_commitment(commitment))
     }
 
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it.
+    /// Internally, this function calls [`SurfnetSvm::read_slot`] under a read guard. This
+    /// should be called before subsequent locker reads, so the context slot is valid for those reads.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        self.with_svm_reader(|svm| svm.read_slot(commitment, min_context_slot))
+    }
+
     /// Executes an airdrop via the underlying SVM.
     pub fn airdrop(
         &self,
@@ -3994,6 +4179,22 @@ impl SurfnetSvmLocker {
         svm_writer.bump_state_revision();
         svm_writer.confirm_current_block()?;
         svm_writer.materialize_overrides(remote_ctx).await
+    }
+
+    /// Applies a time travel's `clock`, then keep-alive at the slot and time it lands on, so the
+    /// accounts keep-alive rewrites match the new Clock before anything reads them.
+    pub async fn apply_time_travel(
+        &self,
+        clock: Clock,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<EpochInfo> {
+        let mut svm_writer = self.0.write().await;
+        svm_writer.bump_state_revision();
+        let epoch_info = svm_writer.apply_time_travel(clock)?;
+        svm_writer
+            .apply_keep_alive(remote_ctx, epoch_info.absolute_slot)
+            .await;
+        Ok(epoch_info)
     }
 
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
@@ -4024,7 +4225,7 @@ impl SurfnetSvmLocker {
         &self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         // Handles the locking/unlocking safely
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_account_updates(account_pubkey, encoding)
@@ -4037,7 +4238,7 @@ impl SurfnetSvmLocker {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_program_updates(program_id, encoding, filters)
         })
@@ -4065,6 +4266,23 @@ impl SurfnetSvmLocker {
         })
     }
 
+    /// Subscribes for `blockSubscribe` notifications and returns a receiver of block updates.
+    pub fn subscribe_for_block_updates(
+        &self,
+        commitment_level: CommitmentLevel,
+        mentions: Option<Pubkey>,
+        config: RpcBlockConfig,
+    ) -> Arc<Receiver<RpcBlockUpdate>> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.subscribe_for_block_updates(commitment_level, mentions, config)
+        })
+    }
+
+    /// The notifier signalled after subscription notifications are sent.
+    pub(crate) fn subscription_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.with_svm_reader(|svm_reader| svm_reader.subscription_wake.clone())
+    }
+
     /// Subscribes for snapshot import updates and returns a receiver of snapshot import notifications.
     /// This method spawns a background task that fetches the snapshot and loads it via `load_snapshot`.
     pub fn subscribe_for_snapshot_import_updates(
@@ -4081,9 +4299,14 @@ impl SurfnetSvmLocker {
         let snapshot_url = snapshot_url.to_string();
         let snapshot_id = snapshot_id.to_string();
 
+        let wake = self.subscription_wake();
+        let send = move |notification| {
+            let _ = tx.send(notification);
+            wake.notify_waiters();
+        };
         tokio::spawn(async move {
             // Send initial notification
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::Started,
                 accounts_loaded: 0,
@@ -4095,7 +4318,7 @@ impl SurfnetSvmLocker {
             let snapshot_data = match SurfnetSvm::fetch_snapshot_from_url(&snapshot_url).await {
                 Ok(data) => data,
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -4109,7 +4332,7 @@ impl SurfnetSvmLocker {
             let total_accounts = snapshot_data.len() as u64;
 
             // Send progress notification with total count
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::InProgress,
                 accounts_loaded: 0,
@@ -4123,7 +4346,7 @@ impl SurfnetSvmLocker {
                 .await
             {
                 Ok(loaded_count) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Completed,
                         accounts_loaded: loaded_count as u64,
@@ -4132,7 +4355,7 @@ impl SurfnetSvmLocker {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -5855,8 +6078,12 @@ mod tests {
         )
         .await;
 
-        let SvmAccessContext { inner: sigs, .. } =
-            locker.get_signatures_for_address_local(&payer_pubkey, None);
+        for _ in 0..locker.with_svm_reader(|svm| svm.finalization_slot_threshold()) {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let SvmAccessContext { inner: sigs, .. } = locker
+            .get_signatures_for_address_local(&payer_pubkey, None)
+            .unwrap();
 
         let row_with_memo = sigs
             .iter()
@@ -5893,8 +6120,10 @@ mod tests {
 
     // Snapshot loading tests
 
+    #[test_case::test_case(false; "best effort")]
+    #[test_case::test_case(true; "strict")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_load_snapshot_basic() {
+    async fn test_load_snapshot_basic(strict: bool) {
         use base64::{Engine, engine::general_purpose};
 
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -5919,14 +6148,12 @@ mod tests {
         );
 
         let loaded = locker
-            .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), strict)
             .await
             .unwrap();
         assert_eq!(loaded, 1);
 
-        let account = locker
-            .with_svm_reader(|svm| svm.get_account(&pubkey))
-            .unwrap();
+        let account = locker.with_svm_reader(|svm| svm.inner.get_account_no_db(&pubkey));
         assert!(account.is_some());
         let account = account.unwrap();
         assert_eq!(account.lamports, 1_000_000);
@@ -6222,11 +6449,35 @@ mod tests {
         // None value (skipped without remote)
         snapshot.insert(Pubkey::new_unique().to_string(), None);
 
+        // Clock sysvar (rejected: surfpool maintains it)
+        let clock_before = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+        snapshot.insert(
+            solana_sdk_ids::sysvar::clock::ID.to_string(),
+            Some(AccountSnapshot {
+                lamports: 1_169_280,
+                owner: solana_sdk_ids::sysvar::ID.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                data: general_purpose::STANDARD.encode(
+                    bincode::serialize(&Clock {
+                        slot: 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                parsed_data: None,
+            }),
+        );
+
         let loaded = locker
             .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
             .await
             .unwrap();
         assert_eq!(loaded, 1);
+        assert_eq!(
+            locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>()),
+            clock_before
+        );
 
         // Only the valid account should exist
         assert!(
@@ -6234,6 +6485,446 @@ mod tests {
                 .with_svm_reader(|svm| svm.get_account(&valid_pubkey))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    struct SnapshotSender {
+        accounts: BTreeMap<String, AccountSnapshot>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl RpcSender for SnapshotSender {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            if self.fail {
+                return Err(solana_rpc_client_api::client_error::ErrorKind::Custom(
+                    "provider unavailable".into(),
+                )
+                .into());
+            }
+            assert_eq!(request, RpcRequest::GetMultipleAccounts);
+            let values: Vec<_> = params[0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| {
+                    self.accounts.get(key.as_str().unwrap()).map(|a| {
+                        serde_json::json!({
+                            "lamports": a.lamports, "owner": a.owner, "executable": a.executable,
+                            "rentEpoch": a.rent_epoch, "data": [a.data, "base64"],
+                        })
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({"context": {"slot": 1}, "value": values}))
+        }
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+        fn url(&self) -> String {
+            "http://snapshot.example".into()
+        }
+    }
+
+    fn snapshot_test_remote(
+        accounts: BTreeMap<String, AccountSnapshot>,
+        fail: bool,
+    ) -> SurfnetRemoteClient {
+        SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                SnapshotSender { accounts, fail },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        }
+    }
+
+    fn snapshot_test_locker() -> SurfnetSvmLocker {
+        let (svm, _, _) = SurfnetSvm::default();
+        SurfnetSvmLocker::new(svm)
+    }
+
+    fn snapshot_test_account() -> AccountSnapshot {
+        AccountSnapshot {
+            lamports: 1_000_000,
+            owner: Pubkey::new_unique().to_string(),
+            executable: false,
+            rent_epoch: 0,
+            data: "AQID".into(),
+            parsed_data: None,
+        }
+    }
+
+    fn snapshot_test_live(locker: &SurfnetSvmLocker, key: &str) -> Option<Account> {
+        let key = key.parse::<Pubkey>().unwrap();
+        locker.with_svm_reader(|svm| svm.inner.get_account_no_db(&key))
+    }
+
+    fn snapshot_test_fixture() -> BTreeMap<String, Option<AccountSnapshot>> {
+        serde_json::from_str(include_str!("../tests/assets/program_snapshot.json")).unwrap()
+    }
+
+    fn snapshot_test_fixture_keys(
+        snapshot: &BTreeMap<String, Option<AccountSnapshot>>,
+    ) -> (String, String) {
+        let program = snapshot
+            .iter()
+            .find(|(_, a)| a.as_ref().unwrap().executable)
+            .unwrap()
+            .0
+            .clone();
+        let data = snapshot
+            .iter()
+            .find(|(_, a)| !a.as_ref().unwrap().executable)
+            .unwrap()
+            .0
+            .clone();
+        (program, data)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_hydrates_complete_remote_map_and_rejects_missing_and_rpc_failure()
+     {
+        let first = Pubkey::new_unique().to_string();
+        let second = Pubkey::new_unique().to_string();
+        let snapshot = BTreeMap::from([(first.clone(), None), (second.clone(), None)]);
+        let values = BTreeMap::from([
+            (first.clone(), snapshot_test_account()),
+            (second.clone(), snapshot_test_account()),
+        ]);
+        let initial_locker = snapshot_test_locker();
+        assert_eq!(
+            initial_locker
+                .load_snapshot_with_options(
+                    &snapshot,
+                    Some(&snapshot_test_remote(values.clone(), false)),
+                    CommitmentConfig::confirmed(),
+                    true
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            snapshot_test_live(&initial_locker, &first).is_some()
+                && snapshot_test_live(&initial_locker, &second).is_some()
+        );
+        let missing = snapshot_test_remote(
+            BTreeMap::from([(first.clone(), values[&first].clone())]),
+            false,
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&missing),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&second) && error.to_lowercase().contains("absent"),
+            "{error}"
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(BTreeMap::new(), true)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&first) && error.contains("upstream fetch failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_null_without_remote_and_invalid_inputs() {
+        let key = Pubkey::new_unique().to_string();
+        let missing = BTreeMap::from([(key.clone(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&missing, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.to_lowercase().contains("upstream"),
+            "{error}"
+        );
+        let mut invalid_data = snapshot_test_account();
+        invalid_data.data = "%%%".into();
+        let mut invalid_owner = snapshot_test_account();
+        invalid_owner.owner = "bad-owner".into();
+        let data_key = Pubkey::new_unique().to_string();
+        let owner_key = Pubkey::new_unique().to_string();
+        let snapshot = BTreeMap::from([
+            ("invalid-key".into(), Some(snapshot_test_account())),
+            (data_key.clone(), Some(invalid_data)),
+            (owner_key.clone(), Some(invalid_owner)),
+        ]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        for part in ["invalid-key", &data_key, &owner_key, "base64", "owner"] {
+            assert!(error.contains(part), "missing {part}: {error}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_invalid_executable_installation() {
+        let key = Pubkey::new_unique().to_string();
+        let mut program = snapshot_test_account();
+        program.owner = solana_sdk_ids::bpf_loader::id().to_string();
+        program.executable = true;
+        let snapshot = BTreeMap::from([(key.clone(), Some(program))]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.contains("failed to set account"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_local_upgradeable_programdata() {
+        let snapshot = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&snapshot);
+        let missing = BTreeMap::from([(program.clone(), snapshot[&program].clone())]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&missing, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&program) && error.contains(&data), "{error}");
+        let locker = snapshot_test_locker();
+        assert_eq!(
+            locker
+                .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            snapshot_test_live(&locker, &program).is_some()
+                && snapshot_test_live(&locker, &data).is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_remote_upgradeable_programdata() {
+        let fixture = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&fixture);
+        let snapshot = BTreeMap::from([(program.clone(), None)]);
+        let values: BTreeMap<_, _> = fixture.into_iter().map(|(k, v)| (k, v.unwrap())).collect();
+        let missing = snapshot_test_remote(
+            BTreeMap::from([(program.clone(), values[&program].clone())]),
+            false,
+        );
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&missing),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&program) && error.contains(&data), "{error}");
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            snapshot_test_live(&locker, &program).is_some()
+                && snapshot_test_live(&locker, &data).is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_does_not_require_guessed_programdata_for_legacy_executable()
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let fixture = snapshot_test_fixture();
+        let (_, data_key) = snapshot_test_fixture_keys(&fixture);
+        let programdata = fixture[&data_key].as_ref().unwrap();
+        let data = STANDARD.decode(&programdata.data).unwrap();
+        let key = Pubkey::new_unique().to_string();
+        let program = AccountSnapshot {
+            lamports: 20_580_720,
+            owner: solana_sdk_ids::bpf_loader::id().to_string(),
+            executable: true,
+            rent_epoch: 0,
+            data: STANDARD.encode(&data[UpgradeableLoaderState::size_of_programdata_metadata()..]),
+            parsed_data: None,
+        };
+        let snapshot = BTreeMap::from([(key.clone(), None)]);
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(
+                    BTreeMap::from([(key.clone(), program)]),
+                    false,
+                )),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(snapshot_test_live(&locker, &key).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_reports_remote_executable_installation_failure() {
+        let key = Pubkey::new_unique().to_string();
+        let mut program = snapshot_test_account();
+        program.owner = solana_sdk_ids::bpf_loader::id().to_string();
+        program.executable = true;
+        let snapshot = BTreeMap::from([(key.clone(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(
+                    BTreeMap::from([(key.clone(), program)]),
+                    false,
+                )),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&key) && error.contains("failed to set account"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_malformed_live_programdata() {
+        let mut snapshot = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&snapshot);
+        snapshot.insert(data.clone(), Some(snapshot_test_account()));
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(&snapshot, None, CommitmentConfig::confirmed(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&program)
+                && error.contains(&data)
+                && error.contains("invalid ProgramData"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_rejects_remote_executable_shadowed_by_live_non_executable() {
+        let fixture = snapshot_test_fixture();
+        let (program, data) = snapshot_test_fixture_keys(&fixture);
+        let local = snapshot_test_account();
+        let locker = snapshot_test_locker();
+        locker
+            .load_snapshot(
+                &BTreeMap::from([(program.clone(), Some(local.clone()))]),
+                None,
+                CommitmentConfig::confirmed(),
+            )
+            .await
+            .unwrap();
+        let values = fixture
+            .into_iter()
+            .map(|(key, value)| (key, value.unwrap()))
+            .collect();
+        let error = locker
+            .load_snapshot_with_options(
+                &BTreeMap::from([(program.clone(), None)]),
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&program) && error.contains("requested executable is not executable"),
+            "{error}"
+        );
+        let live_program = snapshot_test_live(&locker, &program).unwrap();
+        assert!(!live_program.executable);
+        assert_eq!(live_program.data, vec![1, 2, 3]);
+        assert!(snapshot_test_live(&locker, &data).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_snapshot_strict_requires_explicit_mint_but_not_implicitly_fetched_mint() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState};
+
+        let mint = Pubkey::new_unique();
+        let token = Pubkey::new_unique().to_string();
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        let mut token_account = snapshot_test_account();
+        token_account.owner = spl_token_interface::id().to_string();
+        token_account.data = STANDARD.encode(data);
+        let values = BTreeMap::from([(token.clone(), token_account)]);
+        let snapshot = BTreeMap::from([(token.clone(), None)]);
+        let first_locker = snapshot_test_locker();
+        first_locker
+            .load_snapshot_with_options(
+                &snapshot,
+                Some(&snapshot_test_remote(values.clone(), false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(snapshot_test_live(&first_locker, &token).is_some());
+        assert!(snapshot_test_live(&first_locker, &mint.to_string()).is_none());
+        let explicit = BTreeMap::from([(token.clone(), None), (mint.to_string(), None)]);
+        let error = snapshot_test_locker()
+            .load_snapshot_with_options(
+                &explicit,
+                Some(&snapshot_test_remote(values, false)),
+                CommitmentConfig::confirmed(),
+                true,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&mint.to_string()) && error.contains("absent from upstream"),
+            "{error}"
         );
     }
 
@@ -6279,6 +6970,11 @@ mod tests {
                 ),
             )
             .unwrap();
+        // Finalize the slot, so that the default commitment lists it.
+        svm.latest_epoch_info.absolute_slot = svm
+            .latest_epoch_info
+            .absolute_slot
+            .max(slot + svm.finalization_slot_threshold());
     }
 
     fn seed_signature_history(
@@ -6316,6 +7012,7 @@ mod tests {
     ) -> Vec<String> {
         locker
             .get_signatures_for_address_local(pubkey, config)
+            .unwrap()
             .inner
             .iter()
             .map(|s| s.signature.clone())
@@ -6597,7 +7294,9 @@ mod tests {
             // No block header stored — should not panic
         });
 
-        let result = locker.get_signatures_for_address_local(&pubkey, None);
+        let result = locker
+            .get_signatures_for_address_local(&pubkey, None)
+            .unwrap();
 
         // Both transactions should be returned regardless
         assert_eq!(result.inner.len(), 2);
@@ -7189,8 +7888,8 @@ mod tests {
         assert_eq!(result.inner, expected_hash);
     }
 
-    /// A token account the transaction closes is not in its post token balances: a validator
-    /// reads them from the accounts after execution, where a closed account no longer exists.
+    /// A token account the transaction closes is in its pre token balances only: a validator
+    /// reads the post ones from the accounts after execution, where it no longer exists.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_token_account_has_no_post_token_balance() {
         use crossbeam_channel::unbounded;
@@ -7201,6 +7900,13 @@ mod tests {
         let locker = SurfnetSvmLocker::new(svm);
         let owner = Keypair::new();
         let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        // `missing_mint` is never created, so its token account's mint cannot be loaded.
+        let (missing_mint, source, destination, closed_later) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
         let _ = locker
             .airdrop(&owner.pubkey(), 1_000_000_000)
             .expect("airdrop should succeed");
@@ -7222,56 +7928,140 @@ mod tests {
             let mut mint_data = vec![0; Mint::LEN];
             Mint {
                 is_initialized: true,
+                decimals: 6,
                 ..Default::default()
             }
             .pack_into_slice(&mut mint_data);
             account(&mint, mint_data);
-            let mut token_data = vec![0; TokenAccount::LEN];
-            TokenAccount {
-                mint,
-                owner: owner.pubkey(),
-                state: AccountState::Initialized,
-                ..Default::default()
+            for (pubkey, mint) in [
+                (&token_account, mint),
+                (&source, mint),
+                (&destination, missing_mint),
+                (&closed_later, mint),
+            ] {
+                let mut token_data = vec![0; TokenAccount::LEN];
+                TokenAccount {
+                    mint,
+                    owner: owner.pubkey(),
+                    state: AccountState::Initialized,
+                    ..Default::default()
+                }
+                .pack_into_slice(&mut token_data);
+                account(pubkey, token_data);
             }
-            .pack_into_slice(&mut token_data);
-            account(&token_account, token_data);
         });
+        let process = async |instruction| {
+            let message = Message::new_with_blockhash(
+                &[instruction],
+                Some(&owner.pubkey()),
+                &locker.latest_absolute_blockhash(),
+            );
+            let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+                .expect("transaction should sign");
+            let signature = tx.signatures[0];
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, tx, status_tx, true, true)
+                .await
+                .expect("transaction processing should succeed");
+            locker.with_svm_reader(|svm| {
+                let (transaction, _) = svm
+                    .transactions
+                    .get(&signature.to_string())
+                    .unwrap()
+                    .expect("the transaction status should be stored")
+                    .expect_processed()
+                    .clone();
+                transaction.meta
+            })
+        };
+        let decimals = |balances: Option<Vec<TransactionTokenBalance>>| {
+            balances.map(|balances| {
+                balances
+                    .iter()
+                    .map(|balance| balance.ui_token_amount.decimals)
+                    .collect::<Vec<_>>()
+            })
+        };
 
-        let close = spl_token_interface::instruction::close_account(
+        let close = |token_account| {
+            spl_token_interface::instruction::close_account(
+                &spl_token_interface::ID,
+                &token_account,
+                &owner.pubkey(),
+                &owner.pubkey(),
+                &[],
+            )
+            .unwrap()
+        };
+
+        let meta = process(close(token_account)).await;
+        assert_eq!(
+            (
+                meta.status,
+                decimals(meta.pre_token_balances),
+                meta.post_token_balances
+            ),
+            (Ok(()), Some(vec![6]), Some(vec![]))
+        );
+
+        // A failed transaction keeps the balances of the token accounts whose mint loads.
+        let transfer = spl_token_interface::instruction::transfer(
             &spl_token_interface::ID,
-            &token_account,
-            &owner.pubkey(),
+            &source,
+            &destination,
             &owner.pubkey(),
             &[],
+            1,
         )
         .unwrap();
-        let message = Message::new_with_blockhash(
-            &[close],
-            Some(&owner.pubkey()),
-            &locker.latest_absolute_blockhash(),
-        );
-        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
-            .expect("transaction should sign");
-        let signature = tx.signatures[0];
-        let (status_tx, _status_rx) = unbounded();
-        locker
-            .process_transaction(&None, tx, status_tx, true, true)
-            .await
-            .expect("transaction processing should succeed");
-
-        let meta = locker.with_svm_reader(|svm| {
-            let (transaction, _) = svm
-                .transactions
-                .get(&signature.to_string())
-                .unwrap()
-                .unwrap()
-                .expect_processed()
-                .clone();
-            transaction.meta
-        });
+        let meta = process(transfer).await;
         assert_eq!(
-            (meta.status, meta.post_token_balances),
+            (meta.status.is_err(), decimals(meta.pre_token_balances)),
+            (true, Some(vec![6]))
+        );
+
+        // A mint that fails to load leaves its entry out instead of losing the status.
+        locker.with_svm_writer(|svm| svm.token_mints = Box::new(FailingMints));
+        let meta = process(close(closed_later)).await;
+        assert_eq!(
+            (meta.status, meta.pre_token_balances),
             (Ok(()), Some(vec![]))
         );
+    }
+
+    use crate::{
+        storage::{Storage, StorageError, StorageResult},
+        types::MintAccount,
+    };
+
+    #[derive(Clone)]
+    struct FailingMints;
+
+    impl Storage<String, MintAccount> for FailingMints {
+        fn store(&mut self, _: String, _: MintAccount) -> StorageResult<()> {
+            Ok(())
+        }
+        fn clear(&mut self) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get(&self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn take(&mut self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn keys(&self) -> StorageResult<Vec<String>> {
+            Err(StorageError::LockError)
+        }
+        fn into_iter(&self) -> StorageResult<Box<dyn Iterator<Item = (String, MintAccount)> + '_>> {
+            Err(StorageError::LockError)
+        }
+        fn count(&self) -> StorageResult<u64> {
+            Err(StorageError::LockError)
+        }
+        fn clone_box(&self) -> Box<dyn Storage<String, MintAccount>> {
+            Box::new(self.clone())
+        }
     }
 }
