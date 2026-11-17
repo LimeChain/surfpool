@@ -196,9 +196,10 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         "Override a live LbPair through the materializer.".to_string(),
     );
     scenario.add_override(pool_override);
-    locker.register_scenario(scenario, Some(0)).unwrap();
+    let next_slot = locker.get_latest_absolute_slot() + 1;
+    locker.register_scenario(scenario, Some(next_slot)).unwrap();
     locker
-        .materialize_overrides_for_slot(&None, 1)
+        .materialize_overrides_for_slot(&None, next_slot + 1)
         .await
         .unwrap();
 
