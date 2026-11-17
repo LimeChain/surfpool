@@ -86,9 +86,6 @@ variable fee still adds on top, and the program caps the total at 50% (`fee_vers
 (`fee_version` 1). Pools on the deprecated rate limiter (`base_fee_mode` 2) use these bytes for
 other fields; leave them alone.
 
-The official IDL stores the base fee as an opaque 32-byte `data` array. The bundled IDL types it
-with the fields the time and market-cap schedulers share. Bytes 16..24 stay raw (`scheduler_data`)
-because the two schedulers use them differently.
 
 # Troubleshooting
 
@@ -98,3 +95,17 @@ because the two schedulers use them differently.
 | `MathOverflow` (6000) on a bigger swap | `sqrt_price` moved without the tracked reserves |
 | `PriceRangeViolation` (6015) | The new price is outside the pool's range |
 | The swap fails on the token transfer | The paying vault holds less than the output |
+
+# IDL
+
+`idl.json` is the IDL Meteora publishes on chain in its Anchor IDL account
+`F1hSvutXSc9iAvB9bQPmjNDwiN2tCXzazTEEvDgNCBMa` (`cp_amm` 0.2.0), indented with two spaces, with one
+change. The published `BaseFeeInfo` is an opaque 32-byte `data` array. The bundled `BaseFeeInfo`
+types the same 32 bytes with the fields the time and market-cap schedulers share, so
+`meteora-damm-v2-pool-fees` can write the base fee. Bytes 16..24 stay raw (`scheduler_data`)
+because the two schedulers use them differently.
+
+| IDL | sha256 |
+|---|---|
+| Published, as `jq -c .` prints it | `c434c1b74b545dfe606d476fabd9bf5c0d3b1a7a9c91a3989cece773b82473f9` |
+| Bundled `idl.json` | `8d362b3fa1c2c82b686a8262258da2a9c6a02c960bee9283d72c33e97756c9bf` |

@@ -95,3 +95,14 @@ Useful to prove a router drops a dead venue.
 | The shock disappeared after one trade | A trade on the unshocked side moved the active bin back. Re-Play the scenario |
 | The swap fails after a price change | The destination bin array does not exist |
 | A fee override lasted one swap | You set `volatility_accumulator`. Set `parameters.base_factor` |
+
+# IDL
+
+`dlmm/v1/idl.json` is the IDL Meteora publishes on chain in its Anchor IDL account
+`7UZRobkzaKVm1RbCH5WdFaYCGzCRjnu3prziHAsYiSyr` (`lb_clmm` 0.12.0), indented with two spaces. Only
+whitespace changed: `jq -c .` prints the same bytes for both.
+
+| IDL | sha256 |
+|---|---|
+| Published, as `jq -c .` prints it | `01ec576162331b296e7b696d94d257f805381d79aa4dc611678da5f621a200e9` |
+| Bundled `dlmm/v1/idl.json` | `f1a7e513ca463b6977d0b210695cadfd0bd70242a87c07f339d33d93607cf105` |
