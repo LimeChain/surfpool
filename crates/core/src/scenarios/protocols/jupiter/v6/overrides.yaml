@@ -13,6 +13,6 @@ templates:
     name: Override Jupiter Token Ledger
     description: Override intermediate token amounts in multi-hop Jupiter swaps for edge case testing
     idl_account_name: TokenLedger
-    properties: ["tokenAccount", "amount"]
+    properties: ["token_account", "amount"]
     address:
       type: pubkey
