@@ -210,9 +210,10 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
             .to_string(),
     );
     scenario.add_override(pool_override);
-    locker.register_scenario(scenario, Some(0)).unwrap();
+    let next_slot = locker.get_latest_absolute_slot() + 1;
+    locker.register_scenario(scenario, Some(next_slot)).unwrap();
     locker
-        .materialize_overrides_for_slot(&None, 1)
+        .materialize_overrides_for_slot(&None, next_slot + 1)
         .await
         .unwrap();
 
@@ -288,9 +289,10 @@ async fn fee_tier_override_on_the_pools_amm_config_touches_only_the_trade_fee() 
         "Change the trade fee of the AmmConfig a live pool points to.".to_string(),
     );
     scenario.add_override(fee_override);
-    locker.register_scenario(scenario, Some(0)).unwrap();
+    let next_slot = locker.get_latest_absolute_slot() + 1;
+    locker.register_scenario(scenario, Some(next_slot)).unwrap();
     locker
-        .materialize_overrides_for_slot(&None, 1)
+        .materialize_overrides_for_slot(&None, next_slot + 1)
         .await
         .unwrap();
 
