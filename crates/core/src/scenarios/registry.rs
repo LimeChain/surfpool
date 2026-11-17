@@ -1233,7 +1233,7 @@ templates: []
         assert_eq!(jupiter_template.properties.len(), 2);
 
         let property_paths: Vec<&str> = jupiter_template.property_paths();
-        assert!(property_paths.contains(&"tokenAccount"));
+        assert!(property_paths.contains(&"token_account"));
         assert!(property_paths.contains(&"amount"));
         assert!(jupiter_template.tags.contains(&"dex".to_string()));
         assert!(jupiter_template.tags.contains(&"aggregator".to_string()));
@@ -1409,13 +1409,18 @@ templates: []
     fn test_jupiter_idl_has_token_ledger_account() {
         let registry = TemplateRegistry::new();
         let jupiter_template = registry.get("jupiter-token-ledger-override").unwrap();
-        let has_token_ledger = jupiter_template
+        let token_ledger = jupiter_template
             .idl()
             .accounts
             .iter()
-            .any(|acc| acc.name == "TokenLedger");
+            .find(|acc| acc.name == "TokenLedger")
+            .expect("IDL should contain TokenLedger account");
 
-        assert!(has_token_ledger, "IDL should contain TokenLedger account");
+        // The first 8 bytes of every TokenLedger account on mainnet.
+        assert_eq!(
+            token_ledger.discriminator,
+            [156, 247, 9, 188, 54, 108, 85, 77]
+        );
     }
 
     #[test]
