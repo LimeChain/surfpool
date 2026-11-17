@@ -89,12 +89,13 @@ Only pools created after the override copy it. For an existing pool set `protoco
 
 # IDL
 
-`v1/idl.json` is the IDL Orca publishes on chain in its Anchor IDL account
-`2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`, as written in slot 402013534, indented with two
-spaces like the other bundled IDLs. Only whitespace changed: `jq -j -c . v1/idl.json` gives back the
-on-chain bytes.
+`v1/idl.json` is the IDL Orca publishes on chain in its Program Metadata account
+`9fQgUeE2BpGXLHopvZhDKTskXV2druezgX6hpmscbya5` (`whirlpool` 0.9.0), indented with two spaces like
+the other bundled IDLs. Only whitespace changed: `jq -c .` prints the same bytes for both. Orca
+also publishes an IDL in its Anchor IDL account `2KFqE4RWoPVbvodo8vbggCFeHPS8TDvgpwp79ALMrcyn`. It
+differs in one thing: every instruction lists one more account, `whirlpool_program`.
 
 | IDL | sha256 |
 |---|---|
-| On chain (compact) | `7afddfe8766bd24d30ff9ee5b12c7ee89bff5bc3b7b0396620e021a97a7ef63f` |
-| Bundled `v1/idl.json` | `85f673775d33413bf322c31beaa1079d86649fc25f607b6a300a6fe860df2f5c` |
+| Published, as `jq -c .` prints it | `9c4ad85a942e27f571c4f33453b0b0f2fef1dde5e9c201b301668068e67ace0d` |
+| Bundled `v1/idl.json` | `ddd1cd7c0ece91c6dc37dfadf8cc948ffc029ccaec750e06c5eb0a5c101ca85a` |
