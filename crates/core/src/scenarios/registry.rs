@@ -1817,6 +1817,47 @@ templates: []
         );
     }
 
+    /// `WrappedI80F48.value` is the published `[u8; 16]`: an override takes the 16 little-endian
+    /// bytes of value x 2^48 as an array of numbers, and refuses a decimal string.
+    #[test]
+    fn project0_fixed_point_value_takes_its_sixteen_bytes() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("project0-bank-risk-weights").unwrap();
+        let discriminator = &template
+            .idl()
+            .accounts
+            .iter()
+            .find(|account| account.name == "Bank")
+            .unwrap()
+            .discriminator;
+        let mut bank = vec![0u8; 4096];
+        bank[..8].copy_from_slice(discriminator);
+
+        let (svm, _simnet_events_rx, _geyser_events_rx) =
+            crate::surfnet::svm::SurfnetSvm::default();
+        let forge = |value: serde_json::Value| {
+            svm.get_forged_account_data(
+                &Pubkey::new_unique(),
+                &bank,
+                template.idl(),
+                &HashMap::from([("config.asset_weight_init.value".to_string(), value)]),
+            )
+        };
+
+        let weight = -(85i128 << 48) / 100;
+        let forged = forge(serde_json::json!(weight.to_le_bytes())).expect("a 16-byte array");
+        assert_eq!(forged.len(), bank.len());
+        assert_eq!(forged[296..312], weight.to_le_bytes());
+        assert_eq!(forged[..296], bank[..296]);
+        assert_eq!(forged[312..], bank[312..]);
+
+        let refusal = |value| forge(value).unwrap_err().to_string();
+        let decimal = refusal(serde_json::json!(weight.to_string()));
+        assert!(decimal.contains("expected vec, found string"), "{decimal}");
+        let short = refusal(serde_json::json!([1, 2, 3]));
+        assert!(short.contains("expected array length of 16"), "{short}");
+    }
+
     #[test]
     fn pyth_price_feeds_keep_their_price_published() {
         let registry = TemplateRegistry::new();

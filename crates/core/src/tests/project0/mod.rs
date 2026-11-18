@@ -91,6 +91,11 @@ fn read_i128(data: &[u8], offset: usize) -> i128 {
     i128::from_le_bytes(data[offset..offset + 16].try_into().unwrap())
 }
 
+/// A `WrappedI80F48.value` override: the 16 little-endian bytes of the fixed-point integer.
+fn fixed_point(value: i128) -> serde_json::Value {
+    serde_json::json!(value.to_le_bytes())
+}
+
 /// Offset of a balance slot's first byte: `lending_account.balances` starts at 72, 104 bytes each.
 fn balance_slot(slot: usize) -> usize {
     72 + 104 * slot
@@ -264,8 +269,8 @@ async fn llm_context_wallet_lookup_finds_the_wallets_account() {
     );
 }
 
-/// The vendored IDL retypes `WrappedI80F48.value` from `[u8; 16]` to `i128`. Writing back the
-/// little-endian i128 read from the raw bytes must be a no-op, which pins the byte order.
+/// `WrappedI80F48.value` is `[u8; 16]`, the little-endian i128 of value x 2^48. Writing back the
+/// bytes of the i128 read from the raw data must be a no-op, which pins the byte order.
 #[tokio::test]
 async fn fixed_point_fields_read_as_little_endian_i128() {
     let fetched = fetch(&[SOL_BANK, ACCOUNT]).await;
@@ -280,7 +285,7 @@ async fn fixed_point_fields_read_as_little_endian_i128() {
         .iter()
         .map(|(path, offset)| {
             let raw = read_i128(bank_data, *offset);
-            (path.to_string(), serde_json::json!(raw.to_string()))
+            (path.to_string(), fixed_point(raw))
         })
         .collect();
     let forged = surfnet_svm
@@ -304,11 +309,11 @@ async fn fixed_point_fields_read_as_little_endian_i128() {
         let base = balance_slot(slot);
         overrides.insert(
             format!("lending_account.balances.{slot}.asset_shares.value"),
-            serde_json::json!(read_i128(account_data, base + 40).to_string()),
+            fixed_point(read_i128(account_data, base + 40)),
         );
         overrides.insert(
             format!("lending_account.balances.{slot}.liability_shares.value"),
-            serde_json::json!(read_i128(account_data, base + 56).to_string()),
+            fixed_point(read_i128(account_data, base + 56)),
         );
     }
     let forged = surfnet_svm
@@ -331,7 +336,7 @@ async fn each_template_touches_only_its_offsets() {
     let registry = TemplateRegistry::new();
     let pubkey = Pubkey::new_unique();
 
-    let fixed = |v: i128| (serde_json::json!(v.to_string()), v.to_le_bytes().to_vec());
+    let fixed = |v: i128| (fixed_point(v), v.to_le_bytes().to_vec());
     let int = |v: u64, width: usize| (serde_json::json!(v), v.to_le_bytes()[..width].to_vec());
     let key = |k: Pubkey| (serde_json::json!(k.to_string()), k.to_bytes().to_vec());
 
@@ -722,13 +727,10 @@ fn sol_backed_usdc_borrow(fixture: &Fixture) -> Vec<u8> {
                 (format!("{prefix}.active"), serde_json::json!(active)),
                 (format!("{prefix}.bank_pk"), serde_json::json!(bank)),
                 (format!("{prefix}.bank_asset_tag"), serde_json::json!(tag)),
-                (
-                    format!("{prefix}.asset_shares.value"),
-                    serde_json::json!(asset.to_string()),
-                ),
+                (format!("{prefix}.asset_shares.value"), fixed_point(asset)),
                 (
                     format!("{prefix}.liability_shares.value"),
-                    serde_json::json!(liability.to_string()),
+                    fixed_point(liability),
                 ),
             ]);
         };
@@ -784,7 +786,7 @@ async fn risk_engine_honours_weight_and_price_overrides() {
     // SOL is its only asset, so the SOL weight and price scale the asset value one-for-one.
     let (assets, debt) = (baseline.asset_value_maint, baseline.liability_value_maint);
     let live_weight = read_i128(fixture.data(SOL_BANK), 312);
-    let weight = serde_json::json!((live_weight * debt / (2 * assets)).to_string());
+    let weight = fixed_point(live_weight * debt / (2 * assets));
     let weakened_bank = forge(
         "project0-bank-risk-weights",
         fixture.data(SOL_BANK),
@@ -906,11 +908,11 @@ async fn usdc_breaker_accepts_a_move_once_its_reference_prices_follow() {
         &[
             (
                 "cb_reference_price.value".to_string(),
-                serde_json::json!(reference.to_string()),
+                fixed_point(reference),
             ),
             (
                 "cb_window_reference_price.value".to_string(),
-                serde_json::json!(reference.to_string()),
+                fixed_point(reference),
             ),
         ],
     );

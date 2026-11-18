@@ -23998,7 +23998,12 @@
         "fields": [
           {
             "name": "value",
-            "type": "i128"
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
           }
         ]
       }

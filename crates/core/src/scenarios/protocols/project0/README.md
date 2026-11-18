@@ -4,15 +4,14 @@ Surfpool bundles the IDL and override templates for **Project 0**, the lending p
 known as marginfi v2 (`MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`, v0.1.12), so a scenario can
 put a bank or a user account into whatever state you need before your code runs against it.
 
-The bundled IDL is the program's published 0.1.12 IDL with two changes. `WrappedI80F48.value` is
-typed `i128` instead of `[u8; 16]`. The bytes are the same, read as the signed fixed-point integer
-(value x 2^48), so weights and shares take decimal strings instead of 16-byte arrays. And
-`address`, empty in the published IDL, holds the program's address.
+The bundled IDL is the program's published 0.1.12 IDL with one change: `address`, empty in the
+published IDL, holds the program's address. Surfpool registers each bundled IDL under its
+`address` and cannot load one without it.
 
 | IDL | Source | sha256 |
 |---|---|---|
 | Published | Program Metadata account `B66dYmjB9pJ3unjp3QMiEpySb8i44Zhev3qaYj5SfLPG` | `f621c9e4eb789084b088dbd61e5e086224546934b6f0859caea837241501d79f` |
-| Bundled | `v1/idl.json` | `7beb67e50b5ca9888f92b8326cc87ecbae2c06a50e28058f9c4f0e5bbf1716e7` |
+| Bundled | `v1/idl.json` | `6b1adb134a6a8ff0a1450bfdf3b26aedc211a2e69f046e08dd6415091bb802de` |
 
 This is a how-to. For how scenarios work in general see the [scenarios README](../../README.md).
 Every field's own purpose and units are on the template itself, visible in Studio and via
@@ -34,8 +33,8 @@ account's shares, the banks' share values and weights, and the live oracle price
 
 | You'll see | It means | Example |
 |---|---|---|
-| `.value` of a weight, share or share value | value x 2^48, as a decimal string | 1.0 → `"281474976710656"` |
-| Shares | tokens / share value | 10 SOL at share value 1.0 → `"2814749767106560000000000"` |
+| `.value` of a weight, share, share value or reference price | an I80F48 number: the 16 little-endian bytes of value x 2^48. Studio shows and takes a decimal | 1.0 → `[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]` |
+| Shares | tokens / share value | 10 SOL at share value 1.0 → 10000000000, `[0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]` |
 | Interest rates | out of 1000% as u32 | 100% APR → `429496729` |
 | Utilization | out of 100% as u32 | 50% → `2147483647` |
 | Token amounts, limits | the mint's smallest unit | 1 USDC → `1000000` |
@@ -69,8 +68,8 @@ and reads `7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE`; the native USDC bank i
 
 ```
 project0-bank-risk-weights   on the SOL bank
-  config.asset_weight_maint.value: "84442493013197"   # 0.3
-  config.asset_weight_init.value: "84442493013197"    # 0.3
+  config.asset_weight_maint.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # 0.3
+  config.asset_weight_init.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]    # 0.3
 ```
 
 **Why:** health is `sum(deposits x asset_weight_maint) - sum(debts x liability_weight_maint)`,
@@ -85,8 +84,8 @@ bank names at `config.oracle_keys.0`:
 
 ```
 project0-bank-oracle     on the SOL bank, fetchBeforeUse: true
-  cb_reference_price.value: "5629499534213120"         # $20 x 2^48
-  cb_window_reference_price.value: "5629499534213120"
+  cb_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]          # $20
+  cb_window_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 2000000000                       # $20, exponent -8
   price_message.ema_price: 2000000000
@@ -111,12 +110,12 @@ for SOL) away from the bank's `cb_reference_price`, borrow, withdraw and liquida
 confidence the 50 bps take about a 0.7% move. Read the bank to see its flags and tiers, and move
 both references by the same factor as the price. They hold the price the bank computes, which for
 liquid staking tokens includes the exchange rate, so scale the bank's current values; on SOL and
-USDC they are the price x 2^48, as above for SOL and here for USDC:
+USDC they are the price in dollars, as above for SOL and here for USDC:
 
 ```
 project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
-  cb_reference_price.value: "267401227875123"          # $0.95 x 2^48
-  cb_window_reference_price.value: "267401227875123"
+  cb_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]    # $0.95
+  cb_window_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
   price_message.price: 95000000                         # $0.95, exponent -8
   price_message.ema_price: 95000000
@@ -145,19 +144,20 @@ project0-account-balance
   lending_account.balances.0.active: 1
   lending_account.balances.0.bank_pk: <the SOL bank>
   lending_account.balances.0.bank_asset_tag: 1
-  lending_account.balances.0.asset_shares.value: "2814749767106560000000000"
-  lending_account.balances.0.liability_shares.value: "0"
+  lending_account.balances.0.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
+  lending_account.balances.0.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 project0-account-balance
   lending_account.balances.1.active: 1
   lending_account.balances.1.bank_pk: <the USDC bank>
   lending_account.balances.1.bank_asset_tag: 0
-  lending_account.balances.1.asset_shares.value: "0"
-  lending_account.balances.1.liability_shares.value: "140737488355328000000000"
+  lending_account.balances.1.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  lending_account.balances.1.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 101, 205, 29, 0, 0, 0, 0, 0, 0]
 ```
 
 **Why:** slots stay sorted by `bank_pk`, highest first, so SOL's bank goes before USDC's, and
-`bank_asset_tag` must match the bank's `config.asset_tag`. The share values above are 10 SOL and
-500 USDC at a share value of 1.0; divide by each bank's current share value. The template lists
+`bank_asset_tag` must match the bank's `config.asset_tag`. The shares above are 10 SOL
+(10000000000) and 500 USDC (500000000) at a share value of 1.0; divide by each bank's current
+share value. The template lists
 the other rules.
 
 ## Take over a real account
@@ -214,7 +214,7 @@ Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the S
 | Your price override did nothing | Write the bank's `config.oracle_keys.0` with `pyth-core-compatible-price-feed-v2`. The Pyth Core receiver's account for the same feed (`pyth-price-feed-v2`) is a different address, which the bank never reads. See [Move a price](#move-a-price) |
 | Wrong oracle account | Pass exactly the bank's `config.oracle_keys.0` |
 | Withdraw fails on the token transfer | Shares imply more tokens than the bank's `liquidity_vault` holds. Raise the vault with `spl-token-account-balance` |
-| `exceeds what a JSON number can hold exactly` | Pass `.value` fields as decimal strings |
+| `invalid value for idl type: expected vec, found string` or `expected array length of 16` | Pass a `.value` field as an array of 16 bytes, see [Number formats](#number-formats) |
 | A Kamino-, Drift- or JupLend-wrapped bank rejects its price | Those need the venue account refreshed in the same transaction, which these templates do not cover |
 | An earlier change to a bank or account is gone | A later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it. Give later overrides of the same account `fetchBeforeUse: false` |
 

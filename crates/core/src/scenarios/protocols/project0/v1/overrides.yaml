@@ -37,6 +37,17 @@ llm_context: |
   fetchBeforeUse: true to pull the account from upstream first; false only for a later override
   that builds on state an earlier override in the same scenario prepared.
 
+  FIXED-POINT VALUES: every path that ends in .value (weights, shares, share values and circuit
+  breaker prices) is an I80F48 number, stored as [u8; 16]. Pass a JSON array of 16 numbers from 0
+  to 255: the little-endian bytes of the signed integer round(value x 2^48), two's complement when
+  negative. Bytes 0 to 5 hold the fraction and bytes 6 to 15 the whole part, so a whole number N
+  is six zeros followed by N's little-endian bytes. Examples:
+  1.0 is [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  20 is [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  0.3 is [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  getAccountInfo with encoding "jsonParsed" shows these fields as the same 16 numbers: read them
+  back as a little-endian signed integer and divide by 2^48.
+
 templates:
   # ==========================================
   # Bank
@@ -49,23 +60,27 @@ templates:
       - path: config.asset_weight_init.value
         label: Asset weight (borrowing)
         description: >-
-          Share of a deposit's value that counts when borrowing or withdrawing, scaled by 2^48.
-          Example: 0.8 is "225179981368525"
+          Share of a deposit's value that counts when borrowing or withdrawing, as an I80F48
+          number. Example: 0.8, sent as the 16 little-endian bytes of value x 2^48:
+          [205, 204, 204, 204, 204, 204, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       - path: config.asset_weight_maint.value
         label: Asset weight (liquidation)
         description: >-
-          Share of a deposit's value that counts against liquidation, scaled by 2^48. Keep it at or
-          above the borrowing weight. Example: 0.9 is "253327479039590"
+          Share of a deposit's value that counts against liquidation, as an I80F48 number. Keep it
+          at or above the borrowing weight. Example: 0.9, sent as the 16 little-endian bytes of
+          value x 2^48: [102, 102, 102, 102, 102, 230, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       - path: config.liability_weight_init.value
         label: Liability weight (borrowing)
         description: >-
-          Premium on a debt's value when borrowing or withdrawing, scaled by 2^48, at least 1.
-          Example: 1.25 is "351843720888320"
+          Premium on a debt's value when borrowing or withdrawing, as an I80F48 number, at least 1.
+          Example: 1.25, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       - path: config.liability_weight_maint.value
         label: Liability weight (liquidation)
         description: >-
-          Premium on a debt's value against liquidation, scaled by 2^48, at least 1. Example: 1.1 is
-          "309622474381722"
+          Premium on a debt's value against liquidation, as an I80F48 number, at least 1. Example:
+          1.1, sent as the 16 little-endian bytes of value x 2^48:
+          [154, 153, 153, 153, 153, 25, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     address:
       type: pubkey
     llm_context: |
@@ -78,8 +93,8 @@ templates:
          becomes liquidatable once sum(deposit value x asset_weight_maint) falls below
          sum(debt value x liability_weight_maint). Lower config.asset_weight_init.value with it,
          since the liquidation weight must stay at or above the borrowing weight
-      2. Weights are fixed-point numbers scaled by 2^48 (1.0 = "281474976710656"). Pass them as
-         decimal strings
+      2. Weights are I80F48 numbers: pass each as 16 bytes, as FIXED-POINT VALUES above shows
+         (1.0 is [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
       THE PRICE LEVER: to crash a collateral price instead, use pyth-core-compatible-price-feed-v2 on the
       bank's price account (the lookup above returns it). Move price and ema_price together:
@@ -93,9 +108,9 @@ templates:
       project0-bank-oracle on that bank with both breaker references moved with the price, as that
       template explains.
 
-      EXAMPLE - "SOL collateral only counts at 30% against liquidation":
-      config.asset_weight_maint.value: "84442493013197"
-      config.asset_weight_init.value: "84442493013197"
+      EXAMPLE - "SOL collateral only counts at 30% against liquidation" (0.3):
+      config.asset_weight_maint.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      config.asset_weight_init.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
   - id: project0-bank-limits
     name: Override Bank Deposit & Borrow Limits
@@ -169,13 +184,14 @@ templates:
       - path: cb_reference_price.value
         label: Circuit breaker reference price
         description: >-
-          Price the circuit breaker treats as normal, scaled by 2^48. Set it to the new price when
-          moving the price of a bank whose breaker is on. Example: $0.95 is "267401227875123"
+          Price the circuit breaker treats as normal, as an I80F48 number. Set it to the new price
+          when moving the price of a bank whose breaker is on. Example: $0.95, sent as the 16
+          little-endian bytes of value x 2^48: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       - path: cb_window_reference_price.value
         label: Circuit breaker 24h reference price
         description: >-
-          Anchor of the circuit breaker's long-window cap, scaled by 2^48. Set it to the same price
-          as cb_reference_price.value
+          Anchor of the circuit breaker's long-window cap, as an I80F48 number. Set it to the same
+          price as cb_reference_price.value
     address:
       type: pubkey
     llm_context: |
@@ -213,9 +229,10 @@ templates:
       flags, tiers and references. Two ways to work with it:
       - MOVE THE REFERENCES (the default): in the same scenario as the price override, multiply
         the bank's current cb_reference_price.value and cb_window_reference_price.value by the
-        price move (new price / current price). They hold the price the bank computes, which for
-        liquid staking tokens includes the exchange rate, so scaling the current values works for
-        every bank; on SOL and USDC they are the price x 2^48. The breaker then treats the new
+        price move (new price / current price), read and written as FIXED-POINT VALUES above.
+        They hold the price the bank computes, which for liquid staking tokens includes the
+        exchange rate, so scaling the current values works for every bank; on SOL and USDC they
+        are the price in dollars. The breaker then treats the new
         price as normal and still guards further moves, like a slow move it has adapted to. A
         bank whose breaker is off ignores both fields.
       - CHANGE THE THRESHOLDS: set the three config.cb_deviation_bps_tiers entries and the two
@@ -231,15 +248,15 @@ templates:
       EXAMPLE - "accept prices up to an hour old":
       config.oracle_max_age: 3600
 
-      EXAMPLE - "USDC at $0.95", on the USDC bank (price x 2^48 as a decimal string):
-      cb_reference_price.value: "267401227875123"
-      cb_window_reference_price.value: "267401227875123"
+      EXAMPLE - "USDC at $0.95", on the USDC bank (0.95 as FIXED-POINT VALUES):
+      cb_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      cb_window_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
       price_message.ema_price 95000000 (exponent -8), and conf and ema_conf scaled by the same factor.
 
       EXAMPLE - "SOL at $20", on the SOL bank:
-      cb_reference_price.value: "5629499534213120"
-      cb_window_reference_price.value: "5629499534213120"
+      cb_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      cb_window_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
       price_message.ema_price 2000000000, and conf and ema_conf scaled by the same factor.
 
@@ -287,23 +304,27 @@ templates:
       - path: total_asset_shares.value
         label: Total deposit shares
         description: >-
-          Sum of every depositor's shares, scaled by 2^48. Tokens = shares x asset_share_value.
-          Example: "2814749767106560000000000" is 10 SOL of shares at a share value of 1.0
+          Sum of every depositor's shares, as an I80F48 number. Tokens = shares x
+          asset_share_value. Example: 10 SOL of shares at a share value of 1.0 is 10000000000, sent
+          as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
       - path: total_liability_shares.value
         label: Total debt shares
         description: >-
-          Sum of every borrower's shares, scaled by 2^48. Tokens = shares x liability_share_value.
-          Example: "0"
+          Sum of every borrower's shares, as an I80F48 number. Tokens = shares x
+          liability_share_value. Example: 0, sent as 16 zero bytes
       - path: asset_share_value.value
         label: Deposit share value
         description: >-
-          Tokens one deposit share is worth, scaled by 2^48. It only grows as interest accrues.
-          Example: 1.0 is "281474976710656"
+          Tokens one deposit share is worth, as an I80F48 number. It only grows as interest
+          accrues. Example: 1.0, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
       - path: liability_share_value.value
         label: Debt share value
         description: >-
-          Tokens one debt share is worth, scaled by 2^48. It only grows as interest accrues.
-          Example: 1.0 is "281474976710656"
+          Tokens one debt share is worth, as an I80F48 number. It only grows as interest accrues.
+          Example: 1.0, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     address:
       type: pubkey
     llm_context: |
@@ -312,12 +333,13 @@ templates:
       liability_share_value close to the vault balance, and move the vault with
       spl-token-account-balance in the same step, or withdrawals revert on the token transfer.
 
-      All four fields are fixed-point numbers scaled by 2^48, passed as decimal strings. Raising
+      All four fields are I80F48 numbers, passed as FIXED-POINT VALUES above. Raising
       liability_share_value ages every loan in the bank at once.
 
       EXAMPLE - "debt in this bank grew 10%": read the bank's current liability_share_value and
-      write it times 1.1. If it reads "351843720888320" (1.25), write:
-      liability_share_value.value: "387028092977152"
+      write it times 1.1. If it reads [0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0] (1.25),
+      write 1.375:
+      liability_share_value.value: [0, 0, 0, 0, 0, 96, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
   # ==========================================
   # MarginfiAccount
@@ -333,13 +355,15 @@ templates:
       - path: lending_account.balances.0.asset_shares.value
         label: Deposit shares
         description: >-
-          Deposit shares in the bank, scaled by 2^48. Tokens = shares x the bank's asset_share_value.
-          Example: "2814749767106560000000000" is 10 SOL of shares at a share value of 1.0
+          Deposit shares in the bank, as an I80F48 number. Tokens = shares x the bank's
+          asset_share_value. Example: 10 SOL of shares at a share value of 1.0 is 10000000000, sent
+          as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
       - path: lending_account.balances.0.liability_shares.value
         label: Debt shares
         description: >-
-          Debt shares in the bank, scaled by 2^48. Tokens = shares x the bank's
-          liability_share_value. Example: "0"
+          Debt shares in the bank, as an I80F48 number. Tokens = shares x the bank's
+          liability_share_value. Example: 0, sent as 16 zero bytes
       - "lending_account.balances.0.last_update"
     address:
       type: pubkey
@@ -354,20 +378,20 @@ templates:
       - bank_asset_tag must equal the bank's config.asset_tag (SOL bank 1, most others 0)
       - A slot holds either deposit shares or debt shares, never both
       - Shares are not token amounts: tokens = shares x the bank's asset_share_value (deposits) or
-        liability_share_value (debts). Divide the amount you want by the share value, then scale
-        by 2^48
+        liability_share_value (debts). Divide the amount you want by the share value, then pass
+        it as FIXED-POINT VALUES above
 
       Instructions that check health need every active slot's bank and oracle passed in slot order.
       The bank's own totals (total_asset_shares, total_liability_shares) are not updated for you;
       raise them with project0-bank-shares when the scenario depends on bank-wide numbers.
 
       EXAMPLE - "10 SOL deposited in the native SOL bank" in slot 0, with the SOL bank's
-      asset_share_value reading "351843720888320" (1.25): 10 SOL / 1.25 = 8 SOL of shares.
+      asset_share_value reading 1.25: 10 SOL / 1.25 = 8 SOL of shares, 8000000000.
       lending_account.balances.0.active: 1
       lending_account.balances.0.bank_pk: <the SOL bank from the lookup above>
       lending_account.balances.0.bank_asset_tag: 1
-      lending_account.balances.0.asset_shares.value: "2251799813685248000000000"
-      lending_account.balances.0.liability_shares.value: "0"
+      lending_account.balances.0.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 80, 214, 220, 1, 0, 0, 0, 0, 0]
+      lending_account.balances.0.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
   - id: project0-account-authority
     name: Override Account Authority
