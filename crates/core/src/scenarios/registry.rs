@@ -2186,16 +2186,17 @@ templates: []
             .get("meteora-damm-v2-pool-fees")
             .expect("meteora-damm-v2-pool-fees should exist");
         assert_eq!(damm_fees.account_type, "Pool");
-        // Both fields sit inside the base-fee blob, which the bundled IDL types.
-        for path in [
-            "pool_fees.base_fee.base_fee_info.cliff_fee_numerator",
-            "pool_fees.base_fee.base_fee_info.reduction_factor",
-        ] {
-            let resolved =
-                surfpool_types::resolve_idl_type(damm_fees.idl(), &damm_fees.account_type, path)
-                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
-            assert_eq!(*resolved, anchor_lang_idl::types::IdlType::U64);
-        }
+        let path = "pool_fees.base_fee.base_fee_info.data";
+        let resolved =
+            surfpool_types::resolve_idl_type(damm_fees.idl(), &damm_fees.account_type, path)
+                .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+        assert_eq!(
+            *resolved,
+            anchor_lang_idl::types::IdlType::Array(
+                Box::new(anchor_lang_idl::types::IdlType::U8),
+                anchor_lang_idl::types::IdlArrayLen::Value(32),
+            )
+        );
 
         for property in template
             .properties

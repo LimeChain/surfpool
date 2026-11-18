@@ -64,22 +64,27 @@ templates:
     description: Set a flat base fee on a Meteora DAMM v2 pool found by pair or by address
     idl_account_name: Pool
     properties:
-      - path: pool_fees.base_fee.base_fee_info.cliff_fee_numerator
-        label: Base Fee Numerator
-        description: Base fee out of 1,000,000,000 (10000000 = 1%); flat when the reduction is 0
-      - path: pool_fees.base_fee.base_fee_info.reduction_factor
-        label: Fee Reduction Factor
-        description: How fast the scheduled fee falls from the base fee; 0 keeps it flat
+      - path: pool_fees.base_fee.base_fee_info.data
+        label: Base Fee Bytes
+        description: >-
+          All 32 base-fee bytes, little-endian: cliff_fee_numerator u64 at 0..8 (out of
+          1,000,000,000), base_fee_mode u8 at 8, reduction_factor u64 at 24..32 (0 keeps the fee
+          flat); send the pool's current bytes with only those fields changed
     address:
       type: pubkey
     llm_context: |
-      FEE SPIKE: set cliff_fee_numerator to the fee out of 1,000,000,000 (2% is 20000000) and
-      reduction_factor to 0, so the pool's time or market-cap fee schedule stays at that fee. Read
-      the pool first with getAccountInfo, encoding jsonParsed, and refuse a pool whose
-      pool_fees.base_fee.base_fee_info.base_fee_mode is 2: that deprecated rate limiter uses these
-      bytes for other fields. The variable fee still adds on top, and the program caps the total at
-      50% (fee_version 0) or 99% (fee_version 1).
+      BYTES: pool_fees.base_fee.base_fee_info.data is 32 bytes, written as an array of 32 numbers
+      0-255, and a write replaces all of them. Little-endian: cliff_fee_numerator u64 at 0..8 (the
+      base fee out of 1,000,000,000), base_fee_mode u8 at 8, scheduler fields at 9..24 (keep them),
+      reduction_factor u64 at 24..32.
 
-      EXAMPLE - "trading on this pool costs 5%":
-      pool_fees.base_fee.base_fee_info.cliff_fee_numerator: 50000000
-      pool_fees.base_fee.base_fee_info.reduction_factor: 0
+      FEE SPIKE: read the pool first with getAccountInfo, encoding jsonParsed, and copy its current
+      data array. Refuse a pool whose byte 8 (base_fee_mode) is 2: that deprecated rate limiter
+      keeps reference_amount in bytes 24..32. Put the fee out of 1,000,000,000 in bytes 0..8 and
+      zero bytes 24..32, so the time or market-cap fee schedule stays at that fee; leave bytes
+      8..24 as read. The variable fee still adds on top, and the program caps the total at 50%
+      (fee_version 0) or 99% (fee_version 1).
+
+      EXAMPLE - "trading on this pool costs 5%" (50000000 is bytes 128,240,250,2,0,0,0,0), on a pool
+      whose data reads [128,51,2,59,0,0,0,0,1,0,0,0,0,0,180,0,1,0,0,0,0,0,0,0,214,0,0,0,0,0,0,0]:
+      pool_fees.base_fee.base_fee_info.data: [128,240,250,2,0,0,0,0,1,0,0,0,0,0,180,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]

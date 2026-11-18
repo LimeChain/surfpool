@@ -30,7 +30,10 @@ const CONCENTRATED_POOL: Pubkey =
 const COMPOUNDING_POOL: Pubkey =
     Pubkey::from_str_const("7g1ecbk6gtFdpJbq5vRA2Fu2JmNxPLB6Mbzv7PhK5WEp");
 
+const BASE_FEE_INFO_PATH: &str = "pool_fees.base_fee.base_fee_info.data";
+
 const POOL_LEN: usize = 1112;
+const BASE_FEE_INFO_RANGE: std::ops::Range<usize> = 8..40;
 const CLIFF_FEE_NUMERATOR_RANGE: std::ops::Range<usize> = 8..16;
 const REDUCTION_FACTOR_RANGE: std::ops::Range<usize> = 32..40;
 const MINT_A_RANGE: std::ops::Range<usize> = 168..200;
@@ -147,6 +150,9 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
     let new_token_b = u64_at(&before.data, TOKEN_B_AMOUNT_RANGE) + 1;
     let new_cliff_fee_numerator = u64_at(&before.data, CLIFF_FEE_NUMERATOR_RANGE) + 1;
     let new_reduction_factor = u64_at(&before.data, REDUCTION_FACTOR_RANGE) ^ 1;
+    let mut new_data = before.data.clone();
+    new_data[CLIFF_FEE_NUMERATOR_RANGE].copy_from_slice(&new_cliff_fee_numerator.to_le_bytes());
+    new_data[REDUCTION_FACTOR_RANGE].copy_from_slice(&new_reduction_factor.to_le_bytes());
 
     let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     surfnet_svm
@@ -190,16 +196,10 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
             1,
             AccountAddress::Pubkey(CONCENTRATED_POOL.to_string()),
         )
-        .with_values(HashMap::from([
-            (
-                "pool_fees.base_fee.base_fee_info.cliff_fee_numerator".to_string(),
-                serde_json::json!(new_cliff_fee_numerator),
-            ),
-            (
-                "pool_fees.base_fee.base_fee_info.reduction_factor".to_string(),
-                serde_json::json!(new_reduction_factor),
-            ),
-        ]))
+        .with_values(HashMap::from([(
+            BASE_FEE_INFO_PATH.to_string(),
+            serde_json::json!(new_data[BASE_FEE_INFO_RANGE]),
+        )]))
         .with_label("Meteora DAMM v2 fee override".to_string()),
     );
     let next_slot = locker.get_latest_absolute_slot() + 1;
@@ -249,4 +249,195 @@ async fn overrides_through_materializer_touch_only_their_own_bytes() {
         u64_at(&after.data, REDUCTION_FACTOR_RANGE),
         new_reduction_factor
     );
+}
+
+/// A `data` write replaces all 32 base-fee bytes, so the caller sends the pool's own bytes back; the
+/// scheduler bytes between the two numbers must survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn base_fee_array_write_changes_only_the_cliff_fee_numerator() {
+    let before = fetch(&[COMPOUNDING_POOL]).await.remove(0);
+    let scheduler_bytes = CLIFF_FEE_NUMERATOR_RANGE.end..REDUCTION_FACTOR_RANGE.end;
+    assert!(
+        before.data[scheduler_bytes].iter().any(|byte| *byte != 0),
+        "fixture must carry a fee schedule"
+    );
+
+    let new_cliff_fee_numerator = u64_at(&before.data, CLIFF_FEE_NUMERATOR_RANGE) + 1;
+    let mut new_data = before.data.clone();
+    new_data[CLIFF_FEE_NUMERATOR_RANGE].copy_from_slice(&new_cliff_fee_numerator.to_le_bytes());
+
+    let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    surfnet_svm
+        .set_account(&COMPOUNDING_POOL, before.clone())
+        .unwrap();
+    let locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let mut scenario = Scenario::new(
+        "Meteora DAMM v2 Base Fee Bytes".to_string(),
+        "Change a live Pool's base fee through its 32-byte array.".to_string(),
+    );
+    scenario.add_override(
+        OverrideInstance::new(
+            POOL_FEES_TEMPLATE.to_string(),
+            1,
+            AccountAddress::Pubkey(COMPOUNDING_POOL.to_string()),
+        )
+        .with_values(HashMap::from([(
+            BASE_FEE_INFO_PATH.to_string(),
+            serde_json::json!(new_data[BASE_FEE_INFO_RANGE]),
+        )]))
+        .with_label("Meteora DAMM v2 base fee bytes".to_string()),
+    );
+    let next_slot = locker.get_latest_absolute_slot() + 1;
+    locker.register_scenario(scenario, Some(next_slot)).unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, next_slot + 1)
+        .await
+        .unwrap();
+
+    let after = locker
+        .with_svm_reader(|svm| svm.get_account(&COMPOUNDING_POOL))
+        .unwrap()
+        .expect("account should still exist after materialization");
+
+    assert_eq!(after.data, new_data);
+    let changed = diff_indices(&before.data, &after.data);
+    assert!(!changed.is_empty(), "the base fee did not change");
+    assert!(
+        changed
+            .iter()
+            .all(|i| CLIFF_FEE_NUMERATOR_RANGE.contains(i)),
+        "bytes outside cliff_fee_numerator changed: {changed:?}"
+    );
+}
+
+/// Registers one fee override with `values` on the compounding pool, materializes it and returns
+/// the pool's bytes.
+async fn materialize_base_fee_values(
+    before: &Account,
+    values: HashMap<String, serde_json::Value>,
+) -> Vec<u8> {
+    let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    surfnet_svm
+        .set_account(&COMPOUNDING_POOL, before.clone())
+        .unwrap();
+    let locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let mut scenario = Scenario::new(
+        "Meteora DAMM v2 Base Fee Elements".to_string(),
+        "Change a live Pool's base fee one array element at a time.".to_string(),
+    );
+    scenario.add_override(
+        OverrideInstance::new(
+            POOL_FEES_TEMPLATE.to_string(),
+            1,
+            AccountAddress::Pubkey(COMPOUNDING_POOL.to_string()),
+        )
+        .with_values(values)
+        .with_label("Meteora DAMM v2 base fee elements".to_string()),
+    );
+    let next_slot = locker.get_latest_absolute_slot() + 1;
+    locker.register_scenario(scenario, Some(next_slot)).unwrap();
+    locker
+        .materialize_overrides_for_slot(&None, next_slot + 1)
+        .await
+        .unwrap();
+
+    locker
+        .with_svm_reader(|svm| svm.get_account(&COMPOUNDING_POOL))
+        .unwrap()
+        .expect("account should still exist after materialization")
+        .data
+}
+
+fn element_path(index: usize) -> String {
+    format!("{BASE_FEE_INFO_PATH}.{index}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn base_fee_single_element_writes_change_only_the_cliff_fee_numerator() {
+    let before = fetch(&[COMPOUNDING_POOL]).await.remove(0);
+
+    let new_cliff_fee_numerator = u64_at(&before.data, CLIFF_FEE_NUMERATOR_RANGE) + 1;
+    let mut expected = before.data.clone();
+    expected[CLIFF_FEE_NUMERATOR_RANGE].copy_from_slice(&new_cliff_fee_numerator.to_le_bytes());
+
+    let values = new_cliff_fee_numerator
+        .to_le_bytes()
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| (element_path(index), serde_json::json!(byte)))
+        .collect();
+    let after = materialize_base_fee_values(&before, values).await;
+
+    assert_eq!(
+        u64_at(&after, CLIFF_FEE_NUMERATOR_RANGE),
+        new_cliff_fee_numerator
+    );
+    assert_eq!(after, expected, "bytes outside data.0..data.7 changed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn base_fee_non_adjacent_element_writes_land_in_one_override() {
+    let before = fetch(&[COMPOUNDING_POOL]).await.remove(0);
+    let first = BASE_FEE_INFO_RANGE.start;
+    let twenty_fifth = BASE_FEE_INFO_RANGE.start + 24;
+
+    let mut expected = before.data.clone();
+    expected[first] ^= 1;
+    expected[twenty_fifth] ^= 1;
+
+    let after = materialize_base_fee_values(
+        &before,
+        HashMap::from([
+            (element_path(0), serde_json::json!(expected[first])),
+            (element_path(24), serde_json::json!(expected[twenty_fifth])),
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        diff_indices(&before.data, &after),
+        vec![first, twenty_fifth]
+    );
+    assert_eq!(after, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn base_fee_element_write_out_of_range_drops_the_whole_override() {
+    let before = fetch(&[COMPOUNDING_POOL]).await.remove(0);
+    let valid_first_byte = serde_json::json!(before.data[BASE_FEE_INFO_RANGE.start] ^ 1);
+
+    let registry = TemplateRegistry::new();
+    let template = registry
+        .get(POOL_FEES_TEMPLATE)
+        .expect("template should exist");
+    let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+    for (bad, reason) in [
+        (
+            (element_path(32), serde_json::json!(1)),
+            "Index 32 is out of bounds for array of length 32 in path \
+             'pool_fees.base_fee.base_fee_info.data.32'",
+        ),
+        (
+            (element_path(1), serde_json::json!(256)),
+            "failed to encode field 'data': unable to encode value (256) as borsh u8",
+        ),
+    ] {
+        let values = HashMap::from([(element_path(0), valid_first_byte.clone()), bad.clone()]);
+
+        // The materializer logs this error as a warning and skips the override.
+        let error = surfnet_svm
+            .get_forged_account_data(&COMPOUNDING_POOL, &before.data, template.idl(), &values)
+            .expect_err("an out-of-range element must not forge")
+            .to_string();
+        assert!(error.contains(reason), "{bad:?} failed with: {error}");
+
+        let after = materialize_base_fee_values(&before, values).await;
+        assert_eq!(
+            after, before.data,
+            "{bad:?} must drop the whole override, its valid data.0 included"
+        );
+    }
 }

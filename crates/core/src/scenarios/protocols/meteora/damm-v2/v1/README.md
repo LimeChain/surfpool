@@ -21,8 +21,7 @@ other its base fee. For how scenarios work in general see the
 | `sqrt_price` | `sqrt(price_raw) x 2^64`, as a decimal **string** | |
 | `liquidity` | raw `u128`, as a decimal **string** | |
 | `token_a_amount`, `token_b_amount` | the reserves the program prices and pays from, raw units | |
-| `cliff_fee_numerator` | base fee out of `1,000,000,000` | `10000000` = 1% |
-| `reduction_factor` | how fast the scheduled fee falls; `0` keeps it flat | |
+| `base_fee_info.data` | the 32 base-fee bytes, as an array of 32 numbers `0`-`255`; see [Base fee bytes](#base-fee-bytes) | |
 
 `price_raw` is token B per token A in raw units; multiply by `10^(decimals_a - decimals_b)` for the
 human price.
@@ -35,6 +34,33 @@ whose vaults hold the most is usually the one you want; for SOL/USDC that is
 `8Pm2kZpnxD3hoMmt4bjStX2Pw2Z9abpbHzZxMPqxPmie`.
 
 Set `fetchBeforeUse: true` to pull the pool from upstream first.
+
+## Base fee bytes
+
+The IDL types the base fee as one opaque `[u8; 32]`, `pool_fees.base_fee.base_fee_info.data`, at
+pool bytes `8..40`. Byte 8 of the array, `base_fee_mode`, picks how the program reads the rest.
+Every integer is little-endian.
+
+| Bytes | Modes 0, 1 (time) | Mode 2 (rate limiter, deprecated) | Modes 3, 4 (market cap) |
+|---|---|---|---|
+| `0..8` | `cliff_fee_numerator` u64 | `cliff_fee_numerator` u64 | `cliff_fee_numerator` u64 |
+| `8` | `base_fee_mode` u8 | `base_fee_mode` u8 | `base_fee_mode` u8 |
+| `9..14` | padding, zero | padding, zero | padding, zero |
+| `14..16` | `number_of_period` u16 | `fee_increment_bps` u16 | `number_of_period` u16 |
+| `16..20` | `period_frequency` u64, bytes `16..24` | `max_limiter_duration` u32 | `sqrt_price_step_bps` u32 |
+| `20..24` | | `max_fee_bps` u32 | `scheduler_expiration_duration` u32 |
+| `24..32` | `reduction_factor` u64 | `reference_amount` u64 | `reduction_factor` u64 |
+
+- `base_fee_mode`: `0` time linear, `1` time exponential, `2` rate limiter, `3` market-cap linear,
+  `4` market-cap exponential.
+- `cliff_fee_numerator` is the base fee out of `1,000,000,000`; `10000000` is 1%.
+- `reduction_factor` lowers the fee once per period: linear modes subtract it from the numerator,
+  exponential modes multiply the fee by `1 - reduction_factor / 10000`. `0` keeps the fee flat.
+- `period_frequency` and `scheduler_expiration_duration` count in the pool's activation points,
+  slots or seconds.
+
+An override on `data` replaces all 32 bytes. Read the pool's current bytes, change only the
+fields you mean, and send all 32 back.
 
 # Recipes
 
@@ -75,16 +101,20 @@ pool_status: 1
 
 ## Spike the fee
 
+Write `cliff_fee_numerator` (bytes `0..8`) and a `reduction_factor` of 0 (bytes `24..32`) into the
+pool's current 32 bytes. For a time-exponential pool whose bytes read
+`[128,51,2,59,0,0,0,0, 1,0,0,0,0,0,180,0, 1,0,0,0,0,0,0,0, 214,0,0,0,0,0,0,0]` (99%, 180 periods,
+reduction 214), a 5% fee (`50000000`) is:
+
 ```
 template: meteora-damm-v2-pool-fees
-pool_fees.base_fee.base_fee_info.cliff_fee_numerator: 50000000   # 5%
-pool_fees.base_fee.base_fee_info.reduction_factor: 0
+pool_fees.base_fee.base_fee_info.data: [128,240,250,2,0,0,0,0, 1,0,0,0,0,0,180,0, 1,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0]
 ```
 
 A reduction factor of 0 keeps the pool's time or market-cap fee schedule at the base fee. The
 variable fee still adds on top, and the program caps the total at 50% (`fee_version` 0) or 99%
-(`fee_version` 1). Pools on the deprecated rate limiter (`base_fee_mode` 2) use these bytes for
-other fields; leave them alone.
+(`fee_version` 1). Pools on the deprecated rate limiter (`base_fee_mode` 2) keep
+`reference_amount` in bytes `24..32`; leave them alone.
 
 
 # Troubleshooting
@@ -99,13 +129,10 @@ other fields; leave them alone.
 # IDL
 
 `idl.json` is the IDL Meteora publishes on chain in its Anchor IDL account
-`F1hSvutXSc9iAvB9bQPmjNDwiN2tCXzazTEEvDgNCBMa` (`cp_amm` 0.2.0), indented with two spaces, with one
-change. The published `BaseFeeInfo` is an opaque 32-byte `data` array. The bundled `BaseFeeInfo`
-types the same 32 bytes with the fields the time and market-cap schedulers share, so
-`meteora-damm-v2-pool-fees` can write the base fee. Bytes 16..24 stay raw (`scheduler_data`)
-because the two schedulers use them differently.
+`F1hSvutXSc9iAvB9bQPmjNDwiN2tCXzazTEEvDgNCBMa` (`cp_amm` 0.2.0), indented with two spaces and
+otherwise unchanged, so `jq -c .` prints the same bytes for both.
 
 | IDL | sha256 |
 |---|---|
 | Published, as `jq -c .` prints it | `c434c1b74b545dfe606d476fabd9bf5c0d3b1a7a9c91a3989cece773b82473f9` |
-| Bundled `idl.json` | `8d362b3fa1c2c82b686a8262258da2a9c6a02c960bee9283d72c33e97756c9bf` |
+| Bundled `idl.json` | `80b4dd27b3d37621350370d601a66f867e0191d9411e08e53fe5505a8f4b2925` |

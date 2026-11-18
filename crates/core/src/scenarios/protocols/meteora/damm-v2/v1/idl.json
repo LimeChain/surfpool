@@ -4807,38 +4807,13 @@
         "kind": "struct",
         "fields": [
           {
-            "name": "cliff_fee_numerator",
-            "type": "u64"
-          },
-          {
-            "name": "base_fee_mode",
-            "type": "u8"
-          },
-          {
-            "name": "padding_0",
+            "name": "data",
             "type": {
               "array": [
                 "u8",
-                5
+                32
               ]
             }
-          },
-          {
-            "name": "number_of_period",
-            "type": "u16"
-          },
-          {
-            "name": "scheduler_data",
-            "type": {
-              "array": [
-                "u8",
-                8
-              ]
-            }
-          },
-          {
-            "name": "reduction_factor",
-            "type": "u64"
           }
         ]
       }
