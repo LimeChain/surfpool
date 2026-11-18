@@ -19,7 +19,9 @@ constants:
 templates:
   - id: pump-amm-pool-state
     name: Override Pool State
-    description: Override any PumpSwap pool by specifying its address directly
+    description: |
+      Override any PumpSwap pool by specifying its address directly. To set its
+      virtual_quote_reserves, use pump-amm-pool-virtual-quote-reserves.
     idl_account_name: Pool
     properties:
       - path: lp_supply
@@ -28,20 +30,19 @@ templates:
       - path: coin_creator
         label: Coin Creator
         description: Pubkey accruing the coin-creator fee for this pool
-      - path: virtual_quote_reserves
-        label: Virtual Quote Reserves
-        description: Appended quote reserves added to the quote vault balance when quoting (0 on all pools today)
     llm_context: |
       Pass the pool's own address; unlike pump-amm-canonical-pool this template derives
       nothing. Use it for user-created or non-WSOL pools, or any pool whose address you
       already have. Set fetchBeforeUse: true so the fields you don't override keep their
       live values.
 
-      PumpSwap is a constant-product AMM whose reserves live in the pool's token accounts,
-      not in the Pool account: price = effective_quote_reserves / base_vault_balance, where
-      effective_quote_reserves = pool_quote_token_account balance + Pool.virtual_quote_reserves.
-      Move price by setting virtual_quote_reserves here, or by editing the vault balances with
-      the spl-token template.
+      PumpSwap is a constant-product AMM: price = effective_quote_reserves /
+      base_vault_balance, where effective_quote_reserves = pool_quote_token_account balance +
+      the pool's virtual_quote_reserves. This template cannot move the price. To move it,
+      set virtual_quote_reserves on the same pool address with the
+      pump-amm-pool-virtual-quote-reserves template, or edit the vault balances with the
+      spl-token-account-balance template; the vault addresses are in this Pool's
+      pool_base_token_account and pool_quote_token_account fields.
     address:
       type: pubkey
 
@@ -61,9 +62,6 @@ templates:
       - path: coin_creator
         label: Coin Creator
         description: Pubkey accruing the coin-creator fee for this pool
-      - path: virtual_quote_reserves
-        label: Virtual Quote Reserves
-        description: Appended quote reserves added to the quote vault balance when quoting (0 on all pools today)
       - path: base_mint
         type: constant_ref
         label: Base Token Mint
@@ -82,27 +80,18 @@ templates:
       index — override those (and any non-WSOL pool) with the pump-amm-pool-state
       template by passing the pool address directly.
 
-      PRICING: PumpSwap is a constant-product AMM whose reserves live in the pool's token
-      accounts, NOT in the Pool account:
+      PRICING: PumpSwap is a constant-product AMM, and this template cannot move the price:
       - price = effective_quote_reserves / base_vault_balance (coin has 6 decimals, SOL 9)
-      - effective_quote_reserves = pool_quote_token_account balance + Pool.virtual_quote_reserves
+      - effective_quote_reserves = pool_quote_token_account balance + the pool's
+        virtual_quote_reserves
 
       TO SIMULATE PRICE CHANGES either:
-      1. modify the vault token balances with the spl-token template — the vault addresses
-         are stored in the Pool account's pool_base_token_account and
-         pool_quote_token_account fields, or
-      2. set virtual_quote_reserves on this Pool account — it shifts the effective quote
-         reserves without touching any token balance.
-
-      EXAMPLE - "make a migrated coin ~10x more expensive to buy": read the pool's quote
-      vault balance Q (getTokenAccountBalance on pool_quote_token_account), then one
-      override at slot 0, fetchBeforeUse: true, values =
-        base_mint: <the migrated pump.fun mint>
-        virtual_quote_reserves: <9 * Q>
-      Effective quote reserves become Q + 9*Q = 10*Q, so the same buy costs about 10x
-      what it did before, and a buy sized to the old price fails with ExceededSlippage
-      (0x1774). Use spl-token on the vaults instead when you want the balances, not just
-      the quote, to move.
+      1. set virtual_quote_reserves with the pump-amm-virtual-quote-reserves template - it
+         takes the same base_mint and shifts the effective quote reserves without touching
+         any token balance (its llm_context has a worked example), or
+      2. override the vault token balances with the spl-token-account-balance template -
+         the vault addresses are stored in this Pool's pool_base_token_account and
+         pool_quote_token_account fields.
 
       FEES per swap: trades read the fee program's FeeConfig market-cap fee tiers — a
       required account of every buy and sell; GlobalConfig's flat lp_fee_basis_points +

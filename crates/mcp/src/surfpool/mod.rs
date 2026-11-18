@@ -1891,6 +1891,8 @@ mod tests {
             "pump-amm-pool-state",
             "pump-amm-canonical-pool",
             "pump-amm-global-config",
+            "pump-amm-virtual-quote-reserves",
+            "pump-amm-pool-virtual-quote-reserves",
         ] {
             let template = templates
                 .iter()

@@ -18,7 +18,7 @@ Both programs publish Anchor IDLs, so the templates use the standard IDL overrid
 | Program ID         | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`                                                                                                       | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`                                                                                              |
 | ProgramData        | `B5MvUwXdiW1NMM6QFFD3ssPKBujD4zMohncbM73Z2BQu`                                                                                                      | `6naEzKeUuFh1Jeeu51NXQgr5qkXgXtc9WKNct4xynVJc`                                                                                             |
 | Last deployed slot | 433095571                                                                                                                                           | 433112355                                                                                                                                  |
-| Bundled IDL        | byte-identical to [`idl/pump.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json) at pump-public-docs commit `e0687ae9b7e0` | byte-identical to [`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump_amm.json) at commit `2c22246b6708` |
+| Bundled IDL        | byte-identical to [`idl/pump.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json) at pump-public-docs commit `e0687ae9b7e0` | byte-identical to [`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump_amm.json) at commit `3c6721a67c0b` |
 
 A later deployment slot than the one above means the program was upgraded and this
 integration must be revisited (layouts, formulas, fee wiring).
@@ -164,13 +164,12 @@ WSOL pool with the reserve as its base liquidity.
 
 ## Shock a migrated pool's price
 
-Use the existing `pump-amm-canonical-pool` template through the standard scenario API or
-the generic `create_scenario` MCP tool. The Studio preset follows the same path: it loads
-the registered template, supplies the mint and reserve value, and stores a normal scenario.
+Use the `pump-amm-virtual-quote-reserves` template through the standard scenario API or the
+generic `create_scenario` MCP tool.
 
 ```json
 {
-  "templateId": "pump-amm-canonical-pool",
+  "templateId": "pump-amm-virtual-quote-reserves",
   "values": {
     "base_mint": "<WSOL-paired migrated pump.fun mint>",
     "virtual_quote_reserves": 15000000000000
@@ -180,12 +179,17 @@ the registered template, supplies the mint and reserve value, and stores a norma
 }
 ```
 
-`virtual_quote_reserves` is appended to the quote vault balance
-when the AMM quotes, so raising it makes the same sell return more quote without
-touching any token balance. The template derives the canonical WSOL pool from `base_mint`.
-If the derived account is absent or invalid, Play reports the materialization failure.
-After a successful Play, the identical sell transaction simulates with a higher quote-token
-output than before.
+`virtual_quote_reserves` is added to the quote vault balance when the AMM quotes, so raising
+it makes the same sell return more quote without touching any token balance. The template
+derives the canonical WSOL pool from `base_mint` and writes the signed `i128` at `Pool` bytes
+245 to 260, which the published IDL does not describe. If the derived pool is absent or
+shorter than 261 bytes, the surfnet logs a warning and leaves the pool unchanged. After a
+successful Play, the identical sell transaction simulates with a higher quote-token output
+than before.
+
+To move the balances themselves, override a vault with the `spl-token-account-balance`
+template instead. The vault addresses are in the pool's `pool_base_token_account` and
+`pool_quote_token_account` fields.
 
 ## Verification
 
@@ -202,8 +206,8 @@ output than before.
   Token-2022 coin from the pump program's recent transactions (no fixed coin stays
   incomplete; the fork freezes its state on first read), prepares it through the
   production builder and materializer, then executes real `buy_v2` and `migrate_v2`
-  against the live programs. The price-shock test compares a baseline and a shocked
-  PumpSwap `sell` simulation on the established live canonical pool and requires the
-  quote-token output to change, then executes the sell for real. Trading against a
-  freshly migrated (cashback-era) pool uses a different fee wiring and is an open
-  follow-up.
+  against the live programs. The price-shock test raises `virtual_quote_reserves` on the
+  established live canonical pool, compares a baseline and a shocked PumpSwap `sell`
+  simulation and requires the quote-token output to rise, then executes the sell for
+  real. Trading against a freshly migrated (cashback-era) pool uses a different fee wiring
+  and is an open follow-up.

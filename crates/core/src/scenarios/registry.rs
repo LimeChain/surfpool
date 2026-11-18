@@ -65,6 +65,8 @@ pub const PUMP_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/pump/v1/ov
 pub const PUMP_AMM_V1_IDL_CONTENT: &str = include_str!("./protocols/pump-amm/v1/idl.json");
 pub const PUMP_AMM_V1_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/pump-amm/v1/overrides.yaml");
+pub const PUMP_AMM_V1_RAW_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pump-amm/v1/raw_overrides.yaml");
 
 pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/idl.json");
@@ -320,6 +322,7 @@ impl TemplateRegistry {
             PUMP_AMM_V1_OVERRIDES_CONTENT,
             "pump-amm",
         );
+        self.load_raw_layout_overrides(PUMP_AMM_V1_RAW_OVERRIDES_CONTENT, "pump-amm");
     }
 
     pub fn load_phoenix_overrides(&mut self) {
@@ -701,18 +704,106 @@ mod tests {
             pool.address.resolve(Some(&values)).expect("resolves"),
             Pubkey::from_str("GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J").expect("address"),
         );
+
+        let virtual_quote = registry
+            .get("pump-amm-virtual-quote-reserves")
+            .expect("template");
+        assert_eq!(virtual_quote.address, pool.address);
+    }
+
+    #[test]
+    fn pump_pool_virtual_quote_reserves_takes_the_pool_by_address() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("pump-amm-pool-virtual-quote-reserves")
+            .expect("template");
+        assert!(template.raw_layout);
+        assert_eq!(template.address, AccountAddress::Pubkey(String::new()));
+        assert_eq!(
+            template.address,
+            registry
+                .get("pump-amm-pool-state")
+                .expect("template")
+                .address
+        );
+
+        let [property] = template.properties.as_slice() else {
+            panic!("one property, got {:?}", template.properties);
+        };
+        assert_eq!(property.path, "virtual_quote_reserves");
+        assert_eq!(property.offset, Some(245));
+        assert_eq!(property.encoding, Some(RawEncoding::I128));
+        assert_eq!(
+            Some(property),
+            registry
+                .get("pump-amm-virtual-quote-reserves")
+                .expect("template")
+                .properties
+                .iter()
+                .find(|p| p.path == "virtual_quote_reserves")
+        );
     }
 
     #[test]
     fn pump_pool_address_needs_every_seed_to_resolve() {
         let registry = TemplateRegistry::new();
-        let template = registry.get("pump-amm-canonical-pool").expect("template");
+        for id in ["pump-amm-canonical-pool", "pump-amm-virtual-quote-reserves"] {
+            let template = registry.get(id).expect("template");
 
-        assert_eq!(
-            template.address.resolve(Some(&HashMap::new())),
-            None,
-            "a missing base mint must not derive a shorter address"
+            assert_eq!(
+                template.address.resolve(Some(&HashMap::new())),
+                None,
+                "{id}: a missing base mint must not derive a shorter address"
+            );
+        }
+    }
+
+    /// The published `Pool` type ends at byte 245; the deployed program keeps
+    /// `virtual_quote_reserves` as an i128 right after it.
+    #[test]
+    fn pump_virtual_quote_reserves_writes_only_bytes_245_to_261() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("pump-amm-virtual-quote-reserves")
+            .expect("template");
+        let values = HashMap::from([
+            (
+                "virtual_quote_reserves".to_string(),
+                serde_json::json!("-170141183460469231731687303715884105728"),
+            ),
+            (
+                "base_mint".to_string(),
+                serde_json::json!("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump"),
+            ),
+        ]);
+        let (account_values, ..) = account_data_values(
+            &OverrideInstance::new(template.id.clone(), 0, template.address.clone())
+                .with_values(values),
+            Some(template),
         );
+        assert_eq!(
+            account_values.keys().collect::<Vec<_>>(),
+            ["virtual_quote_reserves"]
+        );
+
+        let pool: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        let forged = template
+            .materialize_raw_layout(&pool, &account_values, 0)
+            .unwrap();
+        assert_eq!(forged.len(), pool.len());
+        assert_eq!(forged[..245], pool[..245]);
+        assert_eq!(forged[245..261], i128::MIN.to_le_bytes());
+        assert_eq!(forged[261..], pool[261..]);
+
+        for len in [211, 243, 244, 245, 260] {
+            let error = template
+                .materialize_raw_layout(&pool[..len], &account_values, 0)
+                .unwrap_err();
+            assert!(
+                error.contains(&format!("exceeds the {len} byte account")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -721,11 +812,11 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (5) + Phoenix Eternal (19) = 83
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            83,
+            "Registry should load 83 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -796,6 +887,8 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("pump-amm-virtual-quote-reserves"));
+        assert!(registry.contains("pump-amm-pool-virtual-quote-reserves"));
 
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
@@ -1336,8 +1429,8 @@ templates: []
         let pump_swap_templates = registry.by_protocol("PumpSwap");
         assert_eq!(
             pump_swap_templates.len(),
-            3,
-            "Should have 3 PumpSwap templates"
+            5,
+            "Should have 5 PumpSwap templates"
         );
 
         let phoenix_templates = registry.by_protocol("Phoenix Eternal");

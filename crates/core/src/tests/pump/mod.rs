@@ -35,9 +35,12 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
-use surfpool_types::{OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig};
+use surfpool_types::{
+    AccountAddress, OverrideInstance, RpcConfig, Scenario, SimnetConfig, SurfpoolConfig,
+};
 
 use crate::{
+    error::SurfpoolResult,
     scenarios::{
         TemplateRegistry,
         protocols::pump::v1::graduation_builder::{
@@ -103,10 +106,16 @@ const GLOBAL_WITHDRAW_AUTHORITY_OFFSET: usize = 113;
 const GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET: usize = 483;
 const GLOBAL_BUYBACK_RECIPIENTS_OFFSET: usize = 741;
 const TOKEN_AMOUNT_OFFSET: usize = 64;
+const AMM_LP_FEE_BASIS_POINTS_OFFSET: usize = 40;
+const AMM_DISABLE_FLAGS_OFFSET: usize = 56;
 const AMM_PROTOCOL_FEE_RECIPIENTS_OFFSET: usize = 57;
+const AMM_GLOBAL_CONFIG_IDL_LEN: usize = 907;
+const POOL_QUOTE_TOKEN_ACCOUNT_OFFSET: usize = 171;
 const POOL_LP_SUPPLY_OFFSET: usize = 203;
-const POOL_VIRTUAL_QUOTE_RESERVES_OFFSET: usize = 245;
 const POOL_COIN_CREATOR_OFFSET: usize = 211;
+const POOL_IDL_LEN: usize = 245;
+const POOL_VIRTUAL_QUOTE_RESERVES: std::ops::Range<usize> = 245..261;
+const LLS_MINT: Pubkey = Pubkey::from_str_const("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump");
 
 /// Fetches the accounts in one request, so every account returned is from the same slot.
 async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
@@ -207,8 +216,9 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
 /// fields may change, and the `extend_account` tail past the Borsh layout must survive.
 #[tokio::test]
 async fn override_on_real_account_touches_only_target_bytes() {
-    let accounts = fetch(&[LLS_CURVE, AMM_POOL]).await;
-    let (curve_data, pool_data) = (&accounts[0].data, &accounts[1].data);
+    let accounts = fetch(&[LLS_CURVE, AMM_POOL, AMM_GLOBAL_CONFIG]).await;
+    let (curve_data, pool_data, config_data) =
+        (&accounts[0].data, &accounts[1].data, &accounts[2].data);
 
     let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
@@ -269,12 +279,18 @@ async fn override_on_real_account_touches_only_target_bytes() {
     );
     assert_eq!(forged[CURVE_COMPLETE_OFFSET], 1);
 
+    assert!(
+        pool_data.len() > POOL_IDL_LEN,
+        "the live pool is {} bytes, no longer than its {POOL_IDL_LEN}-byte IDL type",
+        pool_data.len()
+    );
     let pool = registry.get("pump-amm-canonical-pool").expect("template");
+    let coin_creator = Pubkey::new_unique();
     let overrides = HashMap::from([
         ("lp_supply".to_string(), serde_json::json!(9_876_543_210u64)),
         (
-            "virtual_quote_reserves".to_string(),
-            serde_json::json!(5_000_000_000i64),
+            "coin_creator".to_string(),
+            serde_json::json!(coin_creator.to_string()),
         ),
     ]);
     let pool_idl = pool
@@ -287,26 +303,78 @@ async fn override_on_real_account_touches_only_target_bytes() {
     assert_eq!(
         forged.len(),
         pool_data.len(),
-        "the pool's extend_account tail must survive"
+        "the pool's bytes past its IDL type must survive"
     );
     let lp_supply = POOL_LP_SUPPLY_OFFSET..POOL_LP_SUPPLY_OFFSET + 8;
-    let virtual_quote = POOL_VIRTUAL_QUOTE_RESERVES_OFFSET..POOL_VIRTUAL_QUOTE_RESERVES_OFFSET + 16;
+    let creator = POOL_COIN_CREATOR_OFFSET..POOL_COIN_CREATOR_OFFSET + 32;
     let diffs = diff_indices(&forged, pool_data);
     assert!(
         diffs
             .iter()
-            .all(|i| lp_supply.contains(i) || virtual_quote.contains(i)),
-        "only lp_supply and the i128 virtual_quote_reserves may change, got {diffs:?}"
+            .all(|i| lp_supply.contains(i) || creator.contains(i)),
+        "only lp_supply and coin_creator may change, got {diffs:?}"
     );
+    assert_eq!(forged[POOL_IDL_LEN..], pool_data[POOL_IDL_LEN..]);
     assert_eq!(read_u64(&forged, POOL_LP_SUPPLY_OFFSET), 9_876_543_210);
-    assert_eq!(
-        i128::from_le_bytes(
-            forged[POOL_VIRTUAL_QUOTE_RESERVES_OFFSET..POOL_VIRTUAL_QUOTE_RESERVES_OFFSET + 16]
-                .try_into()
-                .unwrap()
-        ),
-        5_000_000_000
+    assert_eq!(forged[creator], coin_creator.to_bytes());
+
+    let virtual_quote = registry
+        .get("pump-amm-virtual-quote-reserves")
+        .expect("template");
+    let overrides = HashMap::from([(
+        "virtual_quote_reserves".to_string(),
+        serde_json::json!(-5_000_000_000i64),
+    )]);
+    let forged = virtual_quote
+        .materialize_raw_layout(pool_data, &overrides, 0)
+        .expect("raw override on the live canonical pool");
+    assert_eq!(forged.len(), pool_data.len());
+    let diffs = diff_indices(&forged, pool_data);
+    assert!(
+        diffs
+            .iter()
+            .all(|i| POOL_VIRTUAL_QUOTE_RESERVES.contains(i)),
+        "only the i128 virtual_quote_reserves may change, got {diffs:?}"
     );
+    assert_eq!(read_virtual_quote_reserves(&forged), -5_000_000_000);
+
+    assert!(
+        config_data.len() > AMM_GLOBAL_CONFIG_IDL_LEN,
+        "the live GlobalConfig is {} bytes, no longer than its {AMM_GLOBAL_CONFIG_IDL_LEN}-byte IDL \
+         type",
+        config_data.len()
+    );
+    let config = registry.get("pump-amm-global-config").expect("template");
+    let overrides = HashMap::from([
+        ("lp_fee_basis_points".to_string(), serde_json::json!(77u64)),
+        ("disable_flags".to_string(), serde_json::json!(0b1_0101u8)),
+    ]);
+    let config_idl = config
+        .idl
+        .as_ref()
+        .expect("Pump AMM template must carry an IDL");
+    let forged = surfnet_svm
+        .get_forged_account_data(&pubkey, config_data, config_idl, &overrides)
+        .expect("GlobalConfig override on the live account");
+    assert_eq!(
+        forged.len(),
+        config_data.len(),
+        "GlobalConfig's bytes past its IDL type must survive"
+    );
+    let lp_fee = AMM_LP_FEE_BASIS_POINTS_OFFSET..AMM_LP_FEE_BASIS_POINTS_OFFSET + 8;
+    let diffs = diff_indices(&forged, config_data);
+    assert!(
+        diffs
+            .iter()
+            .all(|i| lp_fee.contains(i) || *i == AMM_DISABLE_FLAGS_OFFSET),
+        "only lp_fee_basis_points and disable_flags may change, got {diffs:?}"
+    );
+    assert_eq!(
+        forged[AMM_GLOBAL_CONFIG_IDL_LEN..],
+        config_data[AMM_GLOBAL_CONFIG_IDL_LEN..]
+    );
+    assert_eq!(read_u64(&forged, AMM_LP_FEE_BASIS_POINTS_OFFSET), 77);
+    assert_eq!(forged[AMM_DISABLE_FLAGS_OFFSET], 0b1_0101);
 }
 
 /// The production builder's validation against live pump state. Single-byte tweaks pin each
@@ -635,6 +703,10 @@ async fn cheatcode(rpc: &RpcClient, method: &'static str, params: serde_json::Va
         .send(RpcRequest::Custom { method }, params)
         .await
         .unwrap_or_else(|error| panic!("{method} cheatcode failed: {error:?}"));
+}
+
+fn read_virtual_quote_reserves(data: &[u8]) -> i128 {
+    i128::from_le_bytes(data[POOL_VIRTUAL_QUOTE_RESERVES].try_into().unwrap())
 }
 
 fn read_u64(data: &[u8], offset: usize) -> u64 {
@@ -1034,12 +1106,11 @@ async fn build_sell(
     }
 }
 
-/// The price-shock template must change what the deployed AMM actually quotes, proven on the
-/// established live canonical pool (VERIFY-12 / MODEL-06).
+/// The virtual quote reserve shock must change what the deployed AMM actually quotes, proven on
+/// the established live canonical pool (VERIFY-12 / MODEL-06). The published IDL does not
+/// describe the field, so the write goes through the raw-layout template.
 #[tokio::test(flavor = "multi_thread")]
 async fn price_shock_changes_a_live_pool_swap() {
-    const LLS_MINT: Pubkey = Pubkey::from_str_const("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump");
-
     let (rpc, locker, _runloop) = start_live_surfnet();
     let user = Keypair::new();
     let base_token_program = rpc.get_account(&LLS_MINT).await.unwrap().owner;
@@ -1050,10 +1121,11 @@ async fn price_shock_changes_a_live_pool_swap() {
         serde_json::json!([user.pubkey().to_string(), { "lamports": 2_000_000_000u64 }]),
     )
     .await;
+    let user_quote_start = 1_000_000_000u64;
     cheatcode(
         &rpc,
         "surfnet_setTokenAccount",
-        serde_json::json!([user.pubkey().to_string(), WSOL.to_string(), { "amount": 1_000_000_000u64 }, null]),
+        serde_json::json!([user.pubkey().to_string(), WSOL.to_string(), { "amount": user_quote_start }, null]),
     )
     .await;
     cheatcode(
@@ -1069,8 +1141,18 @@ async fn price_shock_changes_a_live_pool_swap() {
     .await;
 
     let user_quote = associated_token_address(&user.pubkey(), &WSOL, &TOKENKEG);
-    let pool_quote_balance =
-        token_amount(&rpc, &associated_token_address(&AMM_POOL, &WSOL, &TOKENKEG)).await;
+    let pool_data = rpc.get_account(&AMM_POOL).await.unwrap().data;
+    let pool_quote_vault = Pubkey::try_from(
+        &pool_data[POOL_QUOTE_TOKEN_ACCOUNT_OFFSET..POOL_QUOTE_TOKEN_ACCOUNT_OFFSET + 32],
+    )
+    .unwrap();
+    let pool_quote_balance = token_amount(&rpc, &pool_quote_vault).await;
+    let live_virtual_quote = read_virtual_quote_reserves(&pool_data);
+    let shocked_virtual_quote = i128::from(pool_quote_balance) * 9;
+    assert!(
+        shocked_virtual_quote > live_virtual_quote,
+        "the shock must raise the effective quote reserves"
+    );
     let sell = build_sell(
         &rpc,
         user.pubkey(),
@@ -1086,8 +1168,8 @@ async fn price_shock_changes_a_live_pool_swap() {
 
     let registry = TemplateRegistry::new();
     let template = registry
-        .get("pump-amm-canonical-pool")
-        .expect("PumpSwap template");
+        .get("pump-amm-virtual-quote-reserves")
+        .expect("PumpSwap virtual quote reserves template");
     let values = HashMap::from([
         (
             "base_mint".to_string(),
@@ -1095,7 +1177,7 @@ async fn price_shock_changes_a_live_pool_swap() {
         ),
         (
             "virtual_quote_reserves".to_string(),
-            serde_json::json!(pool_quote_balance.checked_mul(9).unwrap()),
+            serde_json::json!(shocked_virtual_quote.to_string()),
         ),
     ]);
     let mut pool_override = OverrideInstance::new(template.id.clone(), 0, template.address.clone())
@@ -1116,11 +1198,34 @@ async fn price_shock_changes_a_live_pool_swap() {
         .await
         .unwrap();
 
+    let shocked_pool = rpc.get_account(&AMM_POOL).await.unwrap().data;
+    assert_eq!(
+        read_virtual_quote_reserves(&shocked_pool),
+        shocked_virtual_quote
+    );
+    assert_eq!(
+        token_amount(&rpc, &pool_quote_vault).await,
+        pool_quote_balance,
+        "the shock must not touch the quote vault"
+    );
+
     let shocked =
         simulate_token_amount_after_transaction(&rpc, &user, sell.clone(), user_quote).await;
-    assert_ne!(
-        shocked, baseline,
-        "the price-shock scenario should change the real swap output"
+    let effective_before = i128::from(pool_quote_balance) + live_virtual_quote;
+    let effective_after = i128::from(pool_quote_balance) + shocked_virtual_quote;
+    assert!(
+        shocked > baseline,
+        "raising the effective quote reserves from {effective_before} to {effective_after} should \
+         raise the sell output, got {baseline} before and {shocked} after"
+    );
+    // A sell's output scales with the effective quote reserves; fees, which are a fraction of
+    // the output, keep the two ratios within a couple of percent.
+    let output_ratio = (shocked - user_quote_start) as f64 / (baseline - user_quote_start) as f64;
+    let reserve_ratio = effective_after as f64 / effective_before as f64;
+    assert!(
+        (output_ratio / reserve_ratio - 1.0).abs() < 0.02,
+        "the sell output grew {output_ratio}x while the effective quote reserves grew \
+         {reserve_ratio}x"
     );
 
     send_transaction(&rpc, &user, vec![sell]).await;
@@ -1128,4 +1233,194 @@ async fn price_shock_changes_a_live_pool_swap() {
         token_amount(&rpc, &user_quote).await > 0,
         "sell should credit the user's quote tokens"
     );
+}
+
+fn pool_override(
+    template_id: &str,
+    values: &[(&str, serde_json::Value)],
+    fetch_before_use: bool,
+) -> OverrideInstance {
+    let registry = TemplateRegistry::new();
+    let template = registry.get(template_id).expect("template");
+    let values = values
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.clone()))
+        .chain([(
+            "base_mint".to_string(),
+            serde_json::json!(LLS_MINT.to_string()),
+        )])
+        .collect();
+    let mut instance =
+        OverrideInstance::new(template.id.clone(), 0, template.address.clone()).with_values(values);
+    instance.fetch_before_use = fetch_before_use;
+    instance
+}
+
+/// Registers `overrides` as one scenario at one slot and plays them through the materializer.
+async fn play(
+    svm: &mut SurfnetSvm,
+    overrides: Vec<OverrideInstance>,
+    remote: bool,
+) -> SurfpoolResult<()> {
+    const SLOT: u64 = 100;
+    let mut scenario = Scenario::new("PumpSwap pool".to_string(), String::new());
+    for instance in overrides {
+        scenario.add_override(instance);
+    }
+    svm.register_scenario(scenario, Some(SLOT))?;
+    let remote = remote.then(|| {
+        (
+            SurfnetRemoteClient::new(
+                std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+            ),
+            CommitmentConfig::confirmed(),
+        )
+    });
+    svm.materialize_overrides_for_slot(&remote, SLOT).await
+}
+
+/// An IDL override and a raw-layout override of one pool at one slot keep each other's writes
+/// in either order, with both fetching the pool first: the IDL write re-encodes only the
+/// published 245-byte type and keeps the bytes past it, the raw write patches bytes 245..261,
+/// and the second override does not fetch again over the first one's write.
+#[tokio::test(flavor = "multi_thread")]
+async fn idl_and_raw_overrides_of_one_pool_keep_each_other() {
+    let coin_creator = Pubkey::new_unique();
+    let virtual_quote = -123_456_789_012_345_678_901_234_567_890i128;
+    let idl_values = [
+        ("lp_supply", serde_json::json!(9_876_543_210u64)),
+        ("coin_creator", serde_json::json!(coin_creator.to_string())),
+    ];
+    let raw_values = [(
+        "virtual_quote_reserves",
+        serde_json::json!(virtual_quote.to_string()),
+    )];
+    let lp_supply = POOL_LP_SUPPLY_OFFSET..POOL_LP_SUPPLY_OFFSET + 8;
+    let creator = POOL_COIN_CREATOR_OFFSET..POOL_COIN_CREATOR_OFFSET + 32;
+
+    for raw_first in [false, true] {
+        let mut overrides = vec![
+            pool_override("pump-amm-canonical-pool", &idl_values, true),
+            pool_override("pump-amm-virtual-quote-reserves", &raw_values, true),
+        ];
+        if raw_first {
+            overrides.reverse();
+        }
+        let live = fetch(&[AMM_POOL]).await.remove(0);
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        play(&mut svm, overrides, true).await.unwrap();
+
+        let written = svm.get_account(&AMM_POOL).unwrap().expect("pool").data;
+        assert_eq!(written.len(), live.data.len());
+        let diffs = diff_indices(&written, &live.data);
+        assert!(
+            diffs.iter().all(|i| lp_supply.contains(i)
+                || creator.contains(i)
+                || POOL_VIRTUAL_QUOTE_RESERVES.contains(i)),
+            "raw_first = {raw_first}: only the three overridden fields may change, got {diffs:?}"
+        );
+        assert_eq!(read_u64(&written, POOL_LP_SUPPLY_OFFSET), 9_876_543_210);
+        assert_eq!(written[creator.clone()], coin_creator.to_bytes());
+        assert_eq!(read_virtual_quote_reserves(&written), virtual_quote);
+    }
+
+    // One override cannot write both: the IDL template has no virtual_quote_reserves, so the
+    // payload the canonical-pool template took before is dropped whole, lp_supply included.
+    let live = fetch(&[AMM_POOL]).await.remove(0);
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_account(&AMM_POOL, live.clone()).unwrap();
+    let mut values = idl_values.to_vec();
+    values.extend(raw_values.clone());
+    play(
+        &mut svm,
+        vec![pool_override("pump-amm-canonical-pool", &values, false)],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(svm.get_account(&AMM_POOL).unwrap().expect("pool"), live);
+}
+
+/// The by-address template writes only bytes 245..261 of a live pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_pool_template_writes_virtual_quote_reserves_by_address() {
+    let live = fetch(&[AMM_POOL]).await.remove(0);
+    let virtual_quote = 98_765_432_109_876_543_210_987i128;
+    assert_ne!(read_virtual_quote_reserves(&live.data), virtual_quote);
+
+    let registry = TemplateRegistry::new();
+    let template = registry
+        .get("pump-amm-pool-virtual-quote-reserves")
+        .expect("template");
+    let instance = OverrideInstance::new(
+        template.id.clone(),
+        0,
+        AccountAddress::Pubkey(AMM_POOL.to_string()),
+    )
+    .with_values(HashMap::from([(
+        "virtual_quote_reserves".to_string(),
+        serde_json::json!(virtual_quote.to_string()),
+    )]));
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    svm.set_account(&AMM_POOL, live.clone()).unwrap();
+    play(&mut svm, vec![instance], false).await.unwrap();
+
+    let written = svm.get_account(&AMM_POOL).unwrap().expect("pool");
+    assert_eq!(written.data.len(), live.data.len());
+    let diffs = diff_indices(&written.data, &live.data);
+    assert!(
+        !diffs.is_empty()
+            && diffs
+                .iter()
+                .all(|i| POOL_VIRTUAL_QUOTE_RESERVES.contains(i)),
+        "only the i128 virtual_quote_reserves may change, got {diffs:?}"
+    );
+    assert_eq!(read_virtual_quote_reserves(&written.data), virtual_quote);
+    assert_eq!(
+        Account {
+            data: live.data.clone(),
+            ..written
+        },
+        live
+    );
+}
+
+/// A pool too short for `virtual_quote_reserves` is skipped with a warning: the scenario
+/// registers and plays without an error, and the pool keeps every byte. A 261-byte pool is the
+/// shortest that takes the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_shorter_than_261_bytes_is_left_unchanged() {
+    let live = fetch(&[AMM_POOL]).await.remove(0);
+    let values = [(
+        "virtual_quote_reserves",
+        serde_json::json!(1_000_000_000u64),
+    )];
+
+    for len in [211, 243, 244, 245, 260, 261] {
+        let short = Account {
+            data: live.data[..len].to_vec(),
+            ..live.clone()
+        };
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        svm.set_account(&AMM_POOL, short.clone()).unwrap();
+        play(
+            &mut svm,
+            vec![pool_override(
+                "pump-amm-virtual-quote-reserves",
+                &values,
+                false,
+            )],
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a {len}-byte pool must not fail the scenario: {e}"));
+
+        let after = svm.get_account(&AMM_POOL).unwrap().expect("pool");
+        if len < POOL_VIRTUAL_QUOTE_RESERVES.end {
+            assert_eq!(after, short, "the {len}-byte pool must be left unchanged");
+        } else {
+            assert_eq!(after.data[..245], short.data[..245]);
+            assert_eq!(read_virtual_quote_reserves(&after.data), 1_000_000_000);
+        }
+    }
 }

@@ -1,0 +1,104 @@
+protocol: PumpSwap
+version: v1
+account_type: Pool
+
+raw_layout: true
+
+tags:
+  - amm
+  - constant-product
+  - defi
+
+constants:
+  token_mint:
+    label: Token
+    description: Select the base token mint (the pump.fun coin) from verified tokens
+    source: verified_tokens
+    address_suffix: pump
+
+templates:
+  - id: pump-amm-virtual-quote-reserves
+    name: Override Canonical Pool Virtual Quote Reserves
+    description: |
+      Reprice the canonical PumpSwap pool of a migrated pump.fun coin, found by its mint,
+      through the pool's virtual_quote_reserves. The pool is derived as in
+      pump-amm-canonical-pool.
+    idl_account_name: Pool
+    properties:
+      - path: virtual_quote_reserves
+        offset: 245
+        encoding: i128
+        label: Virtual Quote Reserves
+        description: Signed quote amount the program adds to the quote vault balance when it prices a swap
+      - path: base_mint
+        type: constant_ref
+        label: Base Token Mint
+        description: The migrated pump.fun coin whose canonical WSOL pool is written
+        constant: token_mint
+    llm_context: |
+      Set fetchBeforeUse: true. Works only for the canonical WSOL pool of a migrated
+      pump.fun coin; see pump-amm-canonical-pool for how the pool is derived.
+
+      PRICING: effective_quote_reserves = pool_quote_token_account balance +
+      virtual_quote_reserves, and price = effective_quote_reserves / base_vault_balance
+      (coin has 6 decimals, SOL 9). The value is a signed i128 that replaces the pool's
+      current value V, the little-endian i128 at bytes 245..261 of the pool. V is 0 on
+      most pools but not on all of them.
+
+      EXAMPLE - "make a migrated coin ~10x more expensive to buy": read the pool's quote
+      vault balance Q (getTokenAccountBalance on pool_quote_token_account) and V, then one
+      override at slot 0, fetchBeforeUse: true, values =
+        base_mint: <the migrated pump.fun mint>
+        virtual_quote_reserves: <10 * (Q + V) - Q>
+      Effective quote reserves become 10 * (Q + V), so the same buy costs about 10x what
+      it did before, and a buy sized to the old price fails with ExceededSlippage (0x1774).
+
+      The pool must be at least 261 bytes. On a shorter pool the override changes nothing.
+      Pass a value outside the i64 range as a decimal string.
+    address:
+      type: pda
+      program_id: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+      seeds:
+        - type: string
+          value: pool
+        - type: u16_le
+          value: 0
+        - type: derived_pda
+          program_id: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+          seeds:
+            - type: string
+              value: pool-authority
+            - type: property_ref
+              value: base_mint
+        - type: property_ref
+          value: base_mint
+        - type: pubkey
+          value: So11111111111111111111111111111111111111112
+
+  - id: pump-amm-pool-virtual-quote-reserves
+    name: Override Pool Virtual Quote Reserves
+    description: |
+      Reprice any PumpSwap pool, given by its address, through the pool's
+      virtual_quote_reserves.
+    idl_account_name: Pool
+    properties:
+      - path: virtual_quote_reserves
+        offset: 245
+        encoding: i128
+        label: Virtual Quote Reserves
+        description: Signed quote amount the program adds to the quote vault balance when it prices a swap
+    llm_context: |
+      Pass the pool's own address and set fetchBeforeUse: true. For the canonical WSOL pool
+      of a migrated coin, pump-amm-virtual-quote-reserves takes the mint instead.
+
+      PRICING: effective_quote_reserves = pool_quote_token_account balance Q +
+      virtual_quote_reserves, and price = effective_quote_reserves / base_vault_balance.
+      The value replaces the pool's current value V, the little-endian i128 at bytes
+      245..261 of the pool. Read V first: it is non-zero on about 130 thousand pools. To
+      scale the effective quote reserves by k, write k * (Q + V) - Q.
+
+      A pool shorter than 261 bytes has no such field: the write is skipped and only logs a
+      warning. Nothing checks the account's owner or discriminator, so pass the address of
+      a PumpSwap Pool. Pass a value outside the i64 range as a decimal string.
+    address:
+      type: pubkey

@@ -79,7 +79,10 @@ that remain valid across program upgrades. Large integers that exceed `u64` shou
 decimal strings so JSON parsing cannot lose precision.
 
 Each collection uses exactly one write model: an IDL-backed collection cannot set
-`raw_layout: true`, and an IDL-less collection must set it. Raw-layout collections are currently
+`raw_layout: true`, and an IDL-less collection must set it. A protocol whose published IDL stops
+short of a field its program reads can load a second, raw-layout collection for that field next to
+its IDL collection, as PumpSwap does for `Pool.virtual_quote_reserves`; template IDs must stay
+unique across both. Raw-layout collections are currently
 compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
 endpoint.
 
