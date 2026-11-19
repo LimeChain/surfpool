@@ -6,6 +6,8 @@
 //! the workflow's job.
 
 mod check;
+mod github;
+mod http;
 mod idl;
 mod idl_service;
 mod report;
@@ -24,15 +26,16 @@ use serde::Serialize;
 use surfpool_types::sanitized_datasource_url;
 
 use crate::{
-    check::IdlResult, idl_service::IdlService, report::Report, tests_log::TestRun, verdict::Verdict,
+    check::IdlResult, github::GitHub, idl_service::IdlService, report::Report, tests_log::TestRun,
+    verdict::Verdict,
 };
 
 /// The endpoint the integration tests use. Read only to keep its credentials out of the report.
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
-/// How long the IDL service may take for all protocols together. It answers each in a second or
-/// two; past this the rest are reported as unchecked, so that a slow service cannot cost the run
-/// its report.
-const IDL_SERVICE_BUDGET: Duration = Duration::from_secs(5 * 60);
+/// How long reading the published IDLs may take for all protocols together. Each is served in a
+/// second or two; past this the rest are reported as unchecked, so that a slow service cannot
+/// cost the run its report.
+const PUBLISHED_IDLS_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Parser)]
 #[command(about = "Checks the protocols Surfpool's scenarios integrate against mainnet")]
@@ -66,6 +69,7 @@ struct FindingsFile<'a> {
 fn main() -> Result<()> {
     let args = Cli::parse();
     let service = IdlService::new()?;
+    let github = GitHub::new()?;
     let out = &args.out;
     let protocols = check::discover(&args.root)?;
     // What an earlier run left here would sit beside a report that no longer mentions it. Cleared
@@ -76,12 +80,16 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
-    let deadline = Instant::now() + IDL_SERVICE_BUDGET;
+    let deadline = Instant::now() + PUBLISHED_IDLS_BUDGET;
     let latest = |address: &str| {
         if Instant::now() > deadline {
-            bail!("skipped: the IDL service took too long for the protocols before this one");
+            bail!("skipped: the published IDLs of the protocols before this one took too long");
         }
-        service.latest(address)
+        // A program that publishes its IDL on GitHub is compared with that file alone.
+        match github::idl_url(address) {
+            Some(url) => github.latest(url),
+            None => service.latest(address),
+        }
     };
     let idls = check::check_idls(&latest, &protocols, out)?;
 

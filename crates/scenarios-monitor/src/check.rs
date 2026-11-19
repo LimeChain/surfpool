@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
+    github::GITHUB,
     idl::{self, Format},
     idl_service::{ANCHOR, PROGRAM_METADATA, Published, PublishedIdls},
 };
@@ -126,7 +127,7 @@ pub struct IdlResult {
     pub address: Option<String>,
     pub path: String,
     pub committed_version: Option<String>,
-    /// What the program publishes and could be read, by source (`anchor` or `pmp`).
+    /// What the program publishes and could be read, by source (`anchor`, `pmp` or `github`).
     pub upstream: BTreeMap<String, Upstream>,
     /// The source the committed IDL was compared with.
     pub compared_with: Option<String>,
@@ -204,14 +205,15 @@ pub fn check_idls(
 
 /// The published IDL a committed one is compared with, and its source.
 ///
+/// A program that publishes its IDL on GitHub is compared with that file. Of the on-chain copies,
 /// Program Metadata is where a program publishes its IDL today, and the copy in its Anchor IDL
 /// account is often left behind. So the Program Metadata copy is the one compared with, and the
 /// Anchor one only where the program publishes no other. When that IDL cannot be read or compared
-/// with, the other one does not stand in for it: it can match long after the program moved on.
+/// with, another one does not stand in for it: it can match long after the program moved on.
 fn idl_to_compare_with(
     published: &PublishedIdls,
 ) -> Option<(&'static str, &Result<Published, String>)> {
-    [PROGRAM_METADATA, ANCHOR]
+    [GITHUB, PROGRAM_METADATA, ANCHOR]
         .into_iter()
         .find_map(|source| Some((source, published.get(source)?)))
 }
@@ -358,6 +360,21 @@ mod tests {
         assert_eq!(result.compared_with.as_deref(), Some("pmp"));
         assert!(matches!(result.outcome, Outcome::Differs { .. }));
         assert!(out.path().join("idls/demo-v1.pmp.json").exists());
+    }
+
+    #[test]
+    fn an_idl_published_on_github_is_the_one_compared_with() {
+        let out = tempfile::tempdir().unwrap();
+        let answer = PublishedIdls::from([(GITHUB, published(idl("u128")))]);
+        let result = check(Ok(answer), out.path());
+        assert_eq!(result.compared_with.as_deref(), Some("github"));
+        assert!(matches!(result.outcome, Outcome::Differs { .. }));
+        assert!(out.path().join("idls/demo-v1.github.json").exists());
+
+        let unreadable = Err("the github IDL is not JSON".to_owned());
+        let result = check(Ok(PublishedIdls::from([(GITHUB, unreadable)])), out.path());
+        let error = "the github IDL is not JSON".to_owned();
+        assert_eq!(result.outcome, Outcome::Unchecked { error });
     }
 
     #[test]
