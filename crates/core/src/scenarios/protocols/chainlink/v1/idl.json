@@ -548,50 +548,6 @@
       }
     },
     {
-      "name": "Transmission",
-      "docs": [
-        "One round, laid out as chainlink_solana's repr(C) Transmission (48 bytes)."
-      ],
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "slot",
-            "docs": [
-              "Slot the round was written at."
-            ],
-            "type": "u64"
-          },
-          {
-            "name": "timestamp",
-            "docs": [
-              "Unix seconds the round reports."
-            ],
-            "type": "u32"
-          },
-          {
-            "name": "_padding0",
-            "type": "u32"
-          },
-          {
-            "name": "answer",
-            "docs": [
-              "Feed value scaled by 10^decimals."
-            ],
-            "type": "i128"
-          },
-          {
-            "name": "_padding1",
-            "type": "u64"
-          },
-          {
-            "name": "_padding2",
-            "type": "u64"
-          }
-        ]
-      }
-    },
-    {
       "name": "Transmissions",
       "type": {
         "kind": "struct",
@@ -652,30 +608,6 @@
           {
             "name": "historical_cursor",
             "type": "u32"
-          },
-          {
-            "name": "_header_padding",
-            "docs": [
-              "Unused bytes up to the 192-byte feed header (HEADER_SIZE)."
-            ],
-            "type": {
-              "array": [
-                "u8",
-                40
-              ]
-            }
-          },
-          {
-            "name": "live",
-            "docs": [
-              "The feed's single live round. Chainlink's Solana SDK (chainlink_solana::v2::read_feed_v2)",
-              "reads it here and rejects feeds whose live_length is not 1."
-            ],
-            "type": {
-              "defined": {
-                "name": "Transmission"
-              }
-            }
           }
         ]
       }

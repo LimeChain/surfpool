@@ -11,9 +11,9 @@
 
 use std::collections::HashMap;
 
+use anchor_lang_idl::types::Idl;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use solana_account::Account;
-use solana_account_decoder::{UiAccountData, UiAccountEncoding};
 use solana_commitment_config::CommitmentConfig;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
@@ -22,10 +22,15 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use surfpool_types::{AccountAddress, DEFAULT_MAINNET_RPC_URL, OverrideInstance, Scenario};
+use txtx_addon_network_svm_types::idl::parse_bytes_to_value_with_expected_idl_type_def_ty_with_leftover_bytes;
 
 use crate::{
-    scenarios::TemplateRegistry,
-    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    scenarios::{TemplateRegistry, registry::CHAINLINK_V1_IDL_CONTENT},
+    surfnet::{
+        locker::SurfnetSvmLocker,
+        remote::SurfnetRemoteClient,
+        svm::{SurfnetSvm, get_txtx_value_json_converters},
+    },
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
@@ -108,10 +113,39 @@ async fn data_feed_override_writes_only_the_live_round() {
     let live = fetch(&[SOL_USD_FEED]).await.remove(0);
     assert_eq!(live.owner, STORE_PROGRAM);
     assert_eq!(live.data.len(), 248, "a single-round feed is 248 bytes");
+
+    // The published IDL describes only the header, so the round is what it leaves undecoded.
+    let idl: Idl = serde_json::from_str(CHAINLINK_V1_IDL_CONTENT).unwrap();
+    let account = idl
+        .accounts
+        .iter()
+        .find(|account| account.name == "Transmissions")
+        .unwrap();
+    assert_eq!(account.discriminator, live.data[..8]);
+    let transmissions = idl
+        .types
+        .iter()
+        .find(|ty| ty.name == "Transmissions")
+        .unwrap();
+    let (header, rest) = parse_bytes_to_value_with_expected_idl_type_def_ty_with_leftover_bytes(
+        &live.data[8..],
+        &transmissions.ty,
+        &idl.types,
+        &vec![],
+        &vec![],
+    )
+    .unwrap();
     assert_eq!(
-        u32::from_le_bytes(live.data[148..152].try_into().unwrap()),
-        1,
-        "live_length must be 1, the only shape the Chainlink SDK reads"
+        live.data.len() - rest.len(),
+        160,
+        "the header must end before the round at 200"
+    );
+    let header = header.to_json(Some(&get_txtx_value_json_converters()));
+    assert_eq!(header["decimals"], serde_json::json!(8), "{header}");
+    assert_eq!(
+        header["live_length"],
+        serde_json::json!(1),
+        "live_length must be 1, the only shape the Chainlink SDK reads: {header}"
     );
 
     let registry = TemplateRegistry::new();
@@ -126,39 +160,30 @@ async fn data_feed_override_writes_only_the_live_round() {
             .contains(&BASE64_STANDARD.encode(b"SOL / USD\0"))
     );
 
-    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-    let identity = svm
-        .get_forged_account_data(&SOL_USD_FEED, &live.data, template.idl(), &HashMap::new())
-        .unwrap();
-    assert_eq!(identity, live.data, "no-op round trip changed bytes");
-
     let (live_slot, live_timestamp, live_answer) = live_round(&live);
-    let parsed = match svm
-        .encode_ui_account(
-            &SOL_USD_FEED,
-            &live,
-            UiAccountEncoding::JsonParsed,
-            None,
-            None,
+    let identity = template
+        .materialize_raw_layout(
+            &live.data,
+            &HashMap::from([
+                ("live.slot".to_string(), serde_json::json!(live_slot)),
+                (
+                    "live.timestamp".to_string(),
+                    serde_json::json!(live_timestamp),
+                ),
+                (
+                    "live.answer".to_string(),
+                    serde_json::json!(live_answer.to_string()),
+                ),
+            ]),
+            0,
         )
-        .data
-    {
-        UiAccountData::Json(parsed) => parsed.parsed,
-        other => panic!("the feed should decode through the bundled IDL, got {other:?}"),
-    };
-    let round = &parsed["live"];
-    assert_eq!(round["slot"], serde_json::json!(live_slot), "{parsed}");
+        .unwrap();
     assert_eq!(
-        round["timestamp"],
-        serde_json::json!(live_timestamp),
-        "{parsed}"
-    );
-    assert_eq!(
-        round["answer"].to_string().trim_matches('"'),
-        live_answer.to_string(),
-        "{parsed}"
+        identity, live.data,
+        "rewriting the live round changed bytes"
     );
 
+    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm| svm.set_account(&SOL_USD_FEED, live.clone()).unwrap());
     let (slot, timestamp, answer) = (live_slot + 7, live_timestamp + 3, live_answer / 3);
