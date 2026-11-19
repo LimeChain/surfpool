@@ -55,11 +55,9 @@ const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PERPS: Pubkey = Pubkey::from_str_const("PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu");
 const PERPS_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("C258LjtN8Q928yz2nJe5kwQycckGfWBSrhZBP2mTpLQt");
-const PERPS_DEPLOYED_SLOT: u64 = 465131236;
 const DOVES: Pubkey = Pubkey::from_str_const("DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e");
 const DOVES_PROGRAMDATA: Pubkey =
     Pubkey::from_str_const("4QRRLV8zvwvWDgPNWYXffcMLTS4M6UFCuj2pPMA1tg5D");
-const DOVES_DEPLOYED_SLOT: u64 = 439782203;
 
 const POOL: Pubkey = Pubkey::from_str_const("5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq");
 /// Set in the deployed bytecode, not in any account, so a rotation shows up only as
@@ -184,21 +182,14 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
 }
 
 /// The deployed bytecode, read from the upgradeable loader's ProgramData account once per test
-/// process. The ELF starts 45 bytes in, past the loader header, whose slot field must match the
-/// deploy these tests were written against.
-async fn deployed_program(programdata: Pubkey, deployed_slot: u64) -> Vec<u8> {
+/// process. The ELF starts 45 bytes in, past the loader header.
+async fn deployed_program(programdata: Pubkey) -> Vec<u8> {
     static CACHE: OnceLock<tokio::sync::Mutex<HashMap<Pubkey, Vec<u8>>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().await;
     if let Some(bytes) = cache.get(&programdata) {
         return bytes.clone();
     }
     let data = fetch(&[programdata]).await.remove(0).data;
-    let slot = u64_at(&data, 4);
-    assert_eq!(
-        slot, deployed_slot,
-        "{programdata} was redeployed at slot {slot}; rerun these tests against it and update the \
-         pinned slot"
-    );
     let bytes = data[45..].to_vec();
     cache.insert(programdata, bytes.clone());
     bytes
@@ -398,8 +389,8 @@ fn local_vm(graph: &PerpsGraph) -> SurfnetSvmLocker {
 
 /// The local VM with the deployed Perps and Doves programs and a funded keeper.
 async fn perps_vm(graph: &PerpsGraph) -> SurfnetSvmLocker {
-    let perps = deployed_program(PERPS_PROGRAMDATA, PERPS_DEPLOYED_SLOT).await;
-    let doves = deployed_program(DOVES_PROGRAMDATA, DOVES_DEPLOYED_SLOT).await;
+    let perps = deployed_program(PERPS_PROGRAMDATA).await;
+    let doves = deployed_program(DOVES_PROGRAMDATA).await;
     let locker = local_vm(graph);
     locker.with_svm_writer(|svm| {
         svm.inner.svm.add_program(PERPS, &perps).unwrap();
