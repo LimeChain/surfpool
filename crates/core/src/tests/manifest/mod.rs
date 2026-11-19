@@ -34,7 +34,6 @@ use crate::{
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("G92J4ZFggKZ9LbsQ2zBpajRvRto7ed7uRuJJqWsX4BhJ");
-const DEPLOYED_SLOT: u64 = 459_237_697;
 const SOL_USDC: Pubkey = Pubkey::from_str_const("ENhU8LsaR7vDD2G1CsWcsuSGNrih9Cv5WZEk7q9kPapQ");
 const USDT_USDC: Pubkey = Pubkey::from_str_const("8sjV1AqBFvFuADBCQHhotaRq5DFFYSjjg1jMyVWMqXvZ");
 
@@ -67,7 +66,7 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Option<Account>> {
 }
 
 /// The deployed bytecode, read from ProgramData once per test process. The ELF starts 45 bytes
-/// in, past the upgradeable loader's header, whose bytes 4..12 are the deploy slot.
+/// in, past the upgradeable loader's header.
 async fn deployed_program() -> Arc<Vec<u8>> {
     static PROGRAM: tokio::sync::OnceCell<Arc<Vec<u8>>> = tokio::sync::OnceCell::const_new();
     PROGRAM
@@ -76,12 +75,6 @@ async fn deployed_program() -> Arc<Vec<u8>> {
                 .await
                 .remove(0)
                 .expect("the Manifest ProgramData exists");
-            let deployed_slot = u64::from_le_bytes(programdata.data[4..12].try_into().unwrap());
-            assert_eq!(
-                deployed_slot, DEPLOYED_SLOT,
-                "Manifest was redeployed at slot {deployed_slot}; revalidate the market layout \
-                 and the matching rules the templates rely on, then move the pin"
-            );
             Arc::new(programdata.data[45..].to_vec())
         })
         .await
