@@ -1,19 +1,15 @@
 //! Reads the IDLs a program publishes from the Solana IDL service (https://idl.solana.com/docs).
 
-use std::{collections::BTreeMap, io::Read, thread, time::Duration};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking::Client;
 use serde_json::Value;
 
-const USER_AGENT: &str = "surfpool-scenarios-monitoring";
+use crate::http;
+
 const BASE_URL: &str = "https://idl.solana.com";
 const CLUSTER: &str = "mainnet-beta";
-/// The service answers in a second or two; a request that takes this long is not going to.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const ATTEMPTS: u32 = 3;
-/// Upstream IDLs are a few MB at most; anything far larger is not an IDL.
-const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The two places a program publishes an IDL: its Anchor IDL account, and Program Metadata.
 pub const ANCHOR: &str = "anchor";
@@ -26,8 +22,18 @@ pub struct Published {
     pub document: Value,
 }
 
-/// What one program publishes right now, by source (`ANCHOR` or `PROGRAM_METADATA`): the IDL,
-/// or why it could not be read. A source that publishes nothing is left out.
+impl Published {
+    /// The IDL `source` publishes as `raw`.
+    pub fn read(raw: String, source: &str) -> Result<Self> {
+        let document =
+            serde_json::from_str(&raw).with_context(|| format!("the {source} IDL is not JSON"))?;
+        Ok(Self { raw, document })
+    }
+}
+
+/// What one program publishes right now, by source (`ANCHOR`, `PROGRAM_METADATA` or
+/// [`GITHUB`](crate::github::GITHUB)): the IDL, or why it could not be read. A source that
+/// publishes nothing is left out.
 pub type PublishedIdls = BTreeMap<&'static str, Result<Published, String>>;
 
 pub struct IdlService {
@@ -36,11 +42,9 @@ pub struct IdlService {
 
 impl IdlService {
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client: http::client()?,
+        })
     }
 
     /// The IDLs `program_id` publishes on mainnet right now.
@@ -49,7 +53,7 @@ impl IdlService {
             .client
             .get(format!("{BASE_URL}/api/latest"))
             .query(&[("programId", program_id), ("cluster", CLUSTER)]);
-        let (status, bytes) = send(request)?;
+        let (status, bytes) = http::send(request).context("IDL service")?;
         if status != 200 {
             bail!("IDL service: HTTP {status}");
         }
@@ -93,50 +97,7 @@ fn read_source(entries: &[Value], source: &str) -> Result<Option<Published>> {
         .get("content")
         .and_then(Value::as_str)
         .with_context(|| format!("the {source} IDL has no content"))?;
-    let document =
-        serde_json::from_str(raw).with_context(|| format!("the {source} IDL is not JSON"))?;
-    Ok(Some(Published {
-        raw: raw.to_owned(),
-        document,
-    }))
-}
-
-/// Sends with retries on rate limiting, server errors and transport failures, including one
-/// while reading the body. A 4xx other than 429 is returned as is: it will not change on retry.
-fn send(request: RequestBuilder) -> Result<(u16, Vec<u8>)> {
-    let mut last = String::from("request failed");
-    for attempt in 0..ATTEMPTS {
-        if attempt > 0 {
-            thread::sleep(Duration::from_secs(1 << attempt));
-        }
-        let request = request
-            .try_clone()
-            .expect("requests without a streaming body clone");
-        let response = match request.send() {
-            Ok(response) => response,
-            Err(error) => {
-                last = error.without_url().to_string();
-                continue;
-            }
-        };
-        let status = response.status().as_u16();
-        if status == 429 || status >= 500 {
-            last = format!("HTTP {status}");
-            continue;
-        }
-        let mut bytes = Vec::new();
-        match response
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut bytes)
-        {
-            Ok(_) if bytes.len() as u64 > MAX_RESPONSE_BYTES => {
-                bail!("the response exceeds {MAX_RESPONSE_BYTES} bytes")
-            }
-            Ok(_) => return Ok((status, bytes)),
-            Err(error) => last = format!("reading the response: {error}"),
-        }
-    }
-    bail!("IDL service: {last}")
+    Published::read(raw.to_owned(), source).map(Some)
 }
 
 #[cfg(test)]

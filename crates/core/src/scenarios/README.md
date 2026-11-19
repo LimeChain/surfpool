@@ -66,6 +66,13 @@ Each run compares every committed `idl.json` with the IDL its program publishes,
 the committed file ships. That is the program's Program Metadata copy, or the one in its Anchor IDL
 account when it publishes no Program Metadata copy; both are read through the
 [Solana IDL service](https://idl.solana.com/docs). It also runs the integration tests.
+
+A program that is upgraded without its on-chain IDL being written again, and publishes its IDL on
+GitHub instead, is compared with that file and with nothing else. These programs are the one thing
+listed per protocol, in the monitor's `github.rs`. Such a file can describe a release before it is
+deployed, and an IDL ahead of the deployed program does not decode the live accounts: when one of
+these protocols differs, update its `idl.json` once its integration tests pass with the new IDL.
+
 The report is the run's summary page, and the run's `scenarios-monitoring` artifact also holds, for
 every protocol that differs, the diff and the published IDL. Nothing is committed, and no run
 depends on another.

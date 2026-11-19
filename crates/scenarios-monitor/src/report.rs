@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use crate::{
     check::{IdlResult, Outcome},
-    idl_service,
+    github, idl_service,
     tests_log::{Failure, TestRun},
     verdict::{self, Verdict},
 };
@@ -36,13 +36,17 @@ fn failure_details(failed: &[Failure]) -> String {
         .collect()
 }
 
-/// `text` as a link to the page of the IDL service that shows what the protocol's program
-/// publishes, where the program is known.
+/// `text` as a link to what the protocol's program publishes, where the program is known: its
+/// file on GitHub, or else the page of the IDL service that shows its on-chain copies.
 fn linked(text: &str, result: &IdlResult) -> String {
-    match &result.address {
-        Some(address) => format!("[{text}]({})", idl_service::page_url(address)),
-        None => text.to_owned(),
-    }
+    let Some(address) = &result.address else {
+        return text.to_owned();
+    };
+    let url = match github::idl_url(address) {
+        Some(url) => url.to_owned(),
+        None => idl_service::page_url(address),
+    };
+    format!("[{text}]({url})")
 }
 
 fn code_list(entries: &[String]) -> String {
@@ -87,10 +91,11 @@ impl Report<'_> {
                  Each committed `idl.json` against the IDL its program publishes on chain, over the \
                  entries the committed file ships. Where a program publishes two, the one compared \
                  with is in bold: its Program Metadata (`pmp`) copy, since the one in its Anchor \
-                 IDL account is often left behind. What a program publishes links to its page on \
-                 the Solana IDL service, as does each protocol above whose IDL differs. For every \
-                 protocol that differs, the run's artifact holds the diff and the published IDL \
-                 under `idls/`.\n\n\
+                 IDL account is often left behind. A program that publishes its IDL on GitHub is \
+                 compared with that file (`github`) and not with its on-chain copies. What a \
+                 program publishes links to that file, or to its page on the Solana IDL service, \
+                 as does each protocol above whose IDL differs. For every protocol that differs, \
+                 the run's artifact holds the diff and the published IDL under `idls/`.\n\n\
                  | Protocol | Published | Committed | Result |\n\
                  |---|---|---|---|\n";
         for result in self.idls {
@@ -239,6 +244,17 @@ mod tests {
         assert_eq!(
             row(None, Outcome::NotPublished),
             "| `demo/v1` | nothing | — | nothing to compare with |"
+        );
+    }
+
+    #[test]
+    fn a_program_that_publishes_on_github_links_to_its_file_there() {
+        let pump_amm = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+        let file =
+            "https://raw.githubusercontent.com/pump-fun/pump-public-docs/main/idl/pump_amm.json";
+        assert_eq!(
+            row_of(Some(pump_amm), Some("0.1.0"), Outcome::Matches),
+            format!("| `demo/v1` | [anchor 0.1.0]({file}) | — | matches |")
         );
     }
 
