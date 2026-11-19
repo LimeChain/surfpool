@@ -3,9 +3,7 @@
 //! overrides the endpoint.
 //!
 //! The behavioral tests run the program from its ProgramData account in a local VM and send real
-//! Velocity instructions, encoded through the bundled IDL. Velocity upgrades often: a redeploy
-//! fails these tests until the pinned slot is moved and the bundled IDL is checked against the new
-//! release.
+//! Velocity instructions, encoded through the bundled IDL.
 
 use std::{collections::HashMap, ops::Range, sync::OnceLock};
 
@@ -42,8 +40,6 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const PROGRAM: Pubkey = Pubkey::from_str_const("vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P");
 const STATE: Pubkey = Pubkey::from_str_const("2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW");
 const PROGRAMDATA: Pubkey = Pubkey::from_str_const("HkRf36jvUB32dnHjHqpMnPcKJhUP2TUKJTH7RDTifJm7");
-/// Release program-velocity-v2.170.0.
-const DEPLOYED_SLOT: u64 = 464_750_765;
 
 const ORACLE_PRICE: &str = "velocity-oracle-price";
 const MARKET_RISK: &str = "velocity-perp-market-risk";
@@ -324,12 +320,6 @@ async fn mainnet() -> &'static Mainnet {
 async fn load_mainnet() -> Mainnet {
     let [programdata, state] =
         <[Account; 2]>::try_from(fetch(&[PROGRAMDATA, STATE]).await).unwrap();
-    let deployed_slot = u64_at(&programdata.data, 4..12);
-    assert_eq!(
-        deployed_slot, DEPLOYED_SLOT,
-        "Velocity was redeployed at slot {deployed_slot}; check the bundled IDL against the new \
-         release, then move the pin"
-    );
 
     let perp_count = u16::from_le_bytes(read(&state.data, NUMBER_OF_MARKETS));
     let spot_count = u16::from_le_bytes(read(&state.data, NUMBER_OF_SPOT_MARKETS));

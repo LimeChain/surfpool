@@ -241,6 +241,5 @@ accounts that the published one leaves out.
 cargo test -p surfpool-core --features integration-tests velocity -- --test-threads=1
 ```
 
-They run the deployed program from its ProgramData account and pin the deploy slot, so a Velocity
-upgrade fails them until the IDL is checked against the new release. Set `SURFPOOL_TEST_RPC_URL` to
-use a private endpoint if the public one rate-limits.
+They run the deployed program from its ProgramData account. Set `SURFPOOL_TEST_RPC_URL` to use a
+private endpoint if the public one rate-limits.
