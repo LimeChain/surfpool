@@ -11,13 +11,13 @@ tags:
 
 keep_alive:
   - template: jupiter-perps-doves-publication
-    address: { type: owned, owner: DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e, account: AgPriceFeed }
+    address: { type: override }
     values: { timestamp: $unix_s }
 
 templates:
   - id: jupiter-perps-doves-price
     name: Override Perps Oracle Price
-    description: Override the Doves price Jupiter Perps reads for one asset; keeps every loaded Doves feed published
+    description: Override the Doves price Jupiter Perps reads for one asset; keeps that feed published
     idl_account_name: AgPriceFeed
     properties:
       - path: price
@@ -25,7 +25,7 @@ templates:
         description: "Price mantissa; the USD price is price x 10^expo. Example: 8000000000 is $80 at expo -8"
       - path: timestamp
         label: Publish time
-        description: Unix seconds the price was published. Keep-alive writes the Clock time every slot, so a value set here holds only with keepAlive false
+        description: 'Unix seconds the price was published. Keep-alive writes the Clock time every slot, so a value set here holds only on an override with "keepAlive": []; set it alone to keep the feed published at its price'
     address:
       type: pubkey
     llm_context: |
@@ -46,19 +46,21 @@ templates:
         on a later override of the same feed in another scenario or slot: a reload drops the
         earlier local change.
 
-      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot an override of this template with
-      keepAlive: true plays, Surfpool republishes every Doves feed the surfnet has loaded every slot
-      at the Surfnet clock's time, as the Doves publisher does on mainnet, including feeds a
-      transaction loads later. A JLP deposit, withdrawal, swap, quote or position finds every
-      custody's feed fresh, and a keeper fill finds the price published after its request.
+      THE FEED STAYS PUBLISHED. From the slot an override of this template plays, Surfpool
+      republishes the feed it wrote every slot at the Surfnet clock's time, as the Doves publisher
+      does on mainnet. Feeds no override wrote are not republished and age against the Surfnet
+      clock. A JLP deposit, withdrawal, swap or quote reads every custody's feed and fails with
+      error 6003 once one is older than its custody's oracle.max_price_age_sec.
 
-      STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a feed, and
-      an override with no values writes nothing. To keep one feed stale while the others stay
-      fresh, add two overrides of this template, both with fetchBeforeUse: true and price set to
-      the feed's current price (getAccountInfo, encoding "jsonParsed"), so no price changes:
-      - on the stale feed, keepAlive: false. It then ages against the Surfnet clock;
-      - on any other feed, keepAlive: true. This starts the republishing of every loaded feed
-        except the stale one.
+      EVERY FEED FRESH: add one override of this template per Doves feed the transaction reads,
+      in the same scenario and slot. A JLP deposit, withdrawal, swap or quote reads every
+      custody's doves_ag_oracle. On a feed whose price must not move, set only timestamp;
+      keep-alive rewrites it with the clock time in the same slot, so its value does not matter.
+
+      STALE PRICE: leave the stale feed out of those overrides. It then ages against the Surfnet
+      clock while the others stay published. A feed an earlier override keeps published ages from
+      the slot of a later override of it with "keepAlive": [] and a value, such as timestamp at
+      the Surfnet clock's time.
 
       LIQUIDATIONS: a keeper liquidates a position once collateral + PnL - close and borrow
       fees falls below size x 10000 / the custody's pricing.max_leverage. Move a long's price

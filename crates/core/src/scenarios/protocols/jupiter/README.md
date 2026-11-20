@@ -10,8 +10,8 @@ the JLP pool behind it, which takes its prices from the Doves oracle.
 | Doves oracle | `DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e` | `jupiter-perps-doves` (`doves/v1`) |
 
 Perps reads every price from a Doves `AgPriceFeed`. It never reads the custody's Pyth account, so
-`pyth-price-feed-v2` does not move Perps prices. Once a scenario overrides one Doves price, Surfpool
-keeps every loaded Doves feed published.
+`pyth-price-feed-v2` does not move Perps prices. Surfpool keeps each Doves feed a scenario overrides
+published.
 
 # Template index
 
@@ -85,18 +85,26 @@ old (5 seconds), a quote once it is three times that, at most 15, and a keeper f
 price was published after the position request. JLP deposits, withdrawals, swaps and quotes read
 every custody's feed; positions read their own feeds; liquidations do not check the age.
 
-## Keep-alive (Surfpool handles it)
+## Keep prices published
 
 On mainnet the Doves publisher republishes every feed's price within seconds. Nobody runs it
 against a surfnet, so from the slot a `jupiter-perps-doves-price` override plays, Surfpool
-republishes every Doves feed the surfnet has loaded every slot
-([keep-alive](../../README.md#keep-alive)), including feeds a transaction loads later: each
-`timestamp` follows the Surfnet clock and each price stays the scenario's. A JLP deposit,
-withdrawal, swap or quote, or a position, finds every custody's feed fresh, and a keeper fill finds
-a price published after its request. Keep-alive runs until the network is reset.
+republishes the feed it wrote every slot ([keep-alive](../../README.md#keep-alive)): its
+`timestamp` follows the Surfnet clock and its price stays the scenario's, until the network is
+reset. A feed no override wrote ages against the Surfnet clock.
 
-To keep one feed stale on purpose, override it with `keepAlive: false`; a later override of it with
-`keepAlive: true` republishes it again.
+Give every feed the transaction reads one override, in the same scenario and slot. A JLP deposit,
+withdrawal, swap or quote reads every custody's feed. On a feed whose price does not move, write
+only `timestamp`: keep-alive writes the clock time over it in the same slot.
+
+```
+template: jupiter-perps-doves-price      address: each custody's doves_ag_oracle
+price: 8000000000                        # the feed that moves
+timestamp: 0                             # each other feed
+```
+
+To keep one feed stale, leave it out. A feed an earlier override keeps published ages from the
+slot of a later override of it with `"keepAlive": []` and a value, such as its `timestamp`.
 
 ## Make a position liquidatable
 
@@ -227,7 +235,7 @@ deposits then fail with 6043.
 
 | Error | Meaning | Fix |
 |---|---|---|
-| 6003 `StaleOraclePrice` | a feed the instruction read is too old: 5 seconds for a deposit, 15 for a quote | expected before any `jupiter-perps-doves-price` override plays, or on a feed overridden with `keepAlive: false`: override one feed, at its live price if the scenario does not move it - see "Keep-alive" |
+| 6003 `StaleOraclePrice` | a feed the instruction read is too old: 5 seconds for a deposit, 15 for a quote | expected on a feed no `jupiter-perps-doves-price` override wrote, or one a `"keepAlive": []` override stopped: give every feed the instruction reads an override, with only `timestamp` on a feed whose price does not move - see "Keep prices published" |
 | 6009 `InvalidPositionState` | the position is not liquidatable | move the price further, or lower `pricing.max_leverage` |
 | 6014 `InvalidCustodyBalance` | a custody's vault and staked lamports hold less than its `assets.owned`: the two were copied from mainnet at different moments, as when Studio's market list or a lookup read the custody first, or `fetchBeforeUse` reloaded only the custody | `surfnet_resetAccount` on the custody and on its `token_account`; the next transaction loads them together |
 | 6022 `MaxLeverage` | a keeper's fill would open the position above `pricing.max_leverage`, counting the collateral after the open fee less the close fee | raise `pricing.max_leverage`, lower `decrease_position_bps` or add collateral |
@@ -235,7 +243,7 @@ deposits then fail with 6043.
 | 6027 `InstructionNotAllowed` | a `permissions` switch is off | set it back to `true` |
 | 6034 `InvalidKeeper` | the liquidator is not the keeper the program accepts | sign as the keeper |
 | 6043 `ExceedTokenWeightage` | the deposit leaves the token too far above its target weight | raise `limit.token_weightage_buffer_bps` |
-| 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override a feed before the fill, and fill in a later second than the request - see "Keep-alive" |
+| 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override the position's feeds before the fill, and fill in a later second than the request - see "Keep prices published" |
 | 6066 `LpTokenPriceChangeLimitExceeded` | the JLP price moved past the guard | raise `max_lp_token_price_change_bps` |
 | 6000 `MathOverflow` on a stablecoin custody | its borrow-lend debt overflowed a large rate or time jump | lower the rate or the time step |
 | a changed position does not move the JLP price, or its close leaves the custody totals wrong | `jupiter-perps-position` played without `jupiter-perps-position-totals` | add the totals override in the same slot |

@@ -1270,9 +1270,9 @@ fn usdc_deposit(locker: &SurfnetSvmLocker, graph: &PerpsGraph) -> Sent {
 
 /// Only keep-alive publishes Doves prices on a surfnet. A copied feed refuses a keeper fill on a
 /// request made after it (6045) and, 5 seconds on, a JLP deposit (6003), which reads every feed of
-/// the pool. A price override on one feed republishes every loaded feed every slot at the Surfnet
-/// clock's time and its own price, through produced slots and a time travel, until an override
-/// with keep-alive off lets its feed age.
+/// the pool. One price override per feed republishes each feed every slot at the Surfnet clock's
+/// time and its own price, through produced slots and a time travel, until a later override with
+/// `"keepAlive": []` lets its feed age.
 #[tokio::test(flavor = "multi_thread")]
 async fn price_overrides_keep_their_feeds_published_at_the_clock() {
     let graph = perps_graph(&[]).await;
@@ -1296,19 +1296,26 @@ async fn price_overrides_keep_their_feeds_published_at_the_clock() {
         "a deposit 5 seconds after the copy",
     );
 
-    // SOL 1% lower moves JLP well inside its 5% guard; no override names the other feeds, which
-    // keep their live price.
+    // SOL 1% lower moves JLP well inside its 5% guard; the other feeds' overrides write only
+    // `timestamp`, so they keep their live price.
     let sol_feed = graph.feed_of(custody_address(SOL_MINT));
     let sol_price = u64_at(graph.data(&sol_feed), feed::PRICE) * 99 / 100;
-    let prices: Vec<(Pubkey, u64)> = graph
-        .feeds
+    let mut feeds = graph.feeds.clone();
+    feeds.sort_unstable();
+    feeds.dedup();
+    let prices: Vec<(Pubkey, u64)> = feeds
         .iter()
         .map(|feed| {
             let live = u64_at(graph.data(feed), feed::PRICE);
             (*feed, if *feed == sol_feed { sol_price } else { live })
         })
         .collect();
-    play(&locker, vec![price_override(sol_feed, sol_price)]).await;
+    let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+    let overrides = feeds.iter().map(|feed| match *feed == sol_feed {
+        true => price_override(sol_feed, sol_price),
+        false => template_override(PRICE, *feed, json!({ "timestamp": clock.unix_timestamp })),
+    });
+    play(&locker, overrides.collect()).await;
     let timestamp = |feed: &Pubkey| {
         let data = account(&locker, feed).data;
         i64::from_le_bytes(
@@ -1343,7 +1350,7 @@ async fn price_overrides_keep_their_feeds_published_at_the_clock() {
 
     let btc_feed = graph.feed_of(custody_address(BTC_MINT));
     let mut aging = price_override(btc_feed, u64_at(graph.data(&btc_feed), feed::PRICE));
-    aging.keep_alive = false;
+    aging.keep_alive = Some(vec![]);
     play(&locker, vec![aging]).await;
     let stopped_at = timestamp(&btc_feed);
     travel(&locker, now + DAY + 20).await;
@@ -1356,6 +1363,84 @@ async fn price_overrides_keep_their_feeds_published_at_the_clock() {
         STALE_ORACLE_PRICE,
         "a deposit on a 20-second-old BTC",
     );
+}
+
+/// Keep-alive republishes only the feeds overrides wrote, and a JLP deposit reads every feed of the
+/// pool. Past the custodies' price age limit, a deposit fails (6003) with only SOL's price
+/// overridden, mints JLP with one override per feed (SOL's price and every other feed's
+/// `timestamp`), and fails again with BTC left out: a feed no override wrote stays stale.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jlp_deposit_needs_one_price_override_per_feed() {
+    const DEPOSIT: u64 = 10_000_000;
+    let graph = perps_graph(&[]).await;
+    let now = graph.clock.unix_timestamp;
+    let max_price_age = |custody: &Pubkey| {
+        let oracle = &decode("Custody", &graph.data(custody)[8..])["oracle"];
+        oracle["max_price_age_sec"].as_i64().unwrap()
+    };
+    let limit = graph.custodies.iter().map(max_price_age).max().unwrap();
+    let past_limit = now + limit + 1;
+    let mut feeds = graph.feeds.clone();
+    feeds.sort_unstable();
+    feeds.dedup();
+    let sol_feed = graph.feed_of(custody_address(SOL_MINT));
+    let btc_feed = graph.feed_of(custody_address(BTC_MINT));
+    // SOL 1% lower moves JLP well inside its 5% guard.
+    let sol_price = u64_at(graph.data(&sol_feed), feed::PRICE) * 99 / 100;
+    let sol = price_override(sol_feed, sol_price);
+    let every_feed_but = |left_out: Option<Pubkey>| {
+        let others = feeds
+            .iter()
+            .filter(|feed| **feed != sol_feed && Some(**feed) != left_out);
+        let published =
+            others.map(|feed| template_override(PRICE, *feed, json!({ "timestamp": now })));
+        [vec![sol.clone()], published.collect()].concat()
+    };
+    let cases = [
+        ("SOL only", vec![sol.clone()], Some(STALE_ORACLE_PRICE)),
+        ("one override per feed", every_feed_but(None), None),
+        (
+            "every feed but BTC",
+            every_feed_but(Some(btc_feed)),
+            Some(STALE_ORACLE_PRICE),
+        ),
+    ];
+
+    for (what, overrides, refused) in cases {
+        let locker = perps_vm(&graph).await;
+        copy_feeds_at(&locker, &graph, now);
+        let written: HashSet<Pubkey> = overrides
+            .iter()
+            .filter_map(|instance| match &instance.account {
+                AccountAddress::Pubkey(address) => address.parse().ok(),
+                _ => None,
+            })
+            .collect();
+        play(&locker, overrides).await;
+        let bound: HashSet<Pubkey> = locker.with_svm_reader(|svm| {
+            let bindings = svm.keep_alive_bindings.iter();
+            bindings.map(|binding| binding.address).collect()
+        });
+        assert_eq!(bound, written, "{what}: keep-alive binds the written feeds");
+        travel(&locker, past_limit).await;
+        let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+        for feed in &feeds {
+            let data = account(&locker, feed).data;
+            let at = &data[feed::TIMESTAMP..feed::TIMESTAMP + 8];
+            let age = clock.unix_timestamp - i64::from_le_bytes(at.try_into().unwrap());
+            let expected = if written.contains(feed) { 0 } else { limit + 1 };
+            assert_eq!(age, expected, "{what}: {feed} age");
+        }
+        let wallet = depositor(&locker, USDC_MINT, DEPOSIT);
+        let sent = add_liquidity(&locker, &graph, wallet, USDC_MINT, DEPOSIT);
+        match refused {
+            Some(code) => expect_error(sent, code, what),
+            None => {
+                sent.unwrap_or_else(|e| panic!("{what}: the deposit failed: {e:?}"));
+                assert!(token_amount(&locker, wallet.2) > 0, "{what}: no JLP minted");
+            }
+        }
+    }
 }
 
 /// A USDC deposit that works on the live pool, refused by each lever that guards deposits.
