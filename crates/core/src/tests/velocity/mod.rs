@@ -46,6 +46,10 @@ const MARKET_RISK: &str = "velocity-perp-market-risk";
 const EXCHANGE_RISK: &str = "velocity-exchange-risk";
 const FEES: &str = "velocity-fees";
 const SPOT_RISK: &str = "velocity-spot-market-risk";
+const FUNDING: &str = "velocity-funding";
+const LEVERAGE: &str = "velocity-account-leverage";
+const POSITION: &str = "velocity-perp-position";
+const POSITION_TOTALS: &str = "velocity-position-totals";
 
 const SOL_PERP: u16 = 0;
 const BTC_PERP: u16 = 1;
@@ -57,11 +61,20 @@ const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
 // Byte ranges from the bundled IDL, discriminator included.
 const PERP_MARKET_LEN: usize = 1560;
 const BASE_ASSET_AMOUNT_LONG: Range<usize> = 40..56;
+const BASE_ASSET_AMOUNT_SHORT: Range<usize> = 56..72;
+const MARKET_QUOTE: Range<usize> = 72..88;
 const MAX_OPEN_INTEREST: Range<usize> = 152..168;
+const CUMULATIVE_FUNDING_LONG: Range<usize> = 184..200;
+const CUMULATIVE_FUNDING_SHORT: Range<usize> = 200..216;
 const PENDING_IF_FEE: Range<usize> = 264..280;
 const MARKET_ORACLE: Range<usize> = 312..344;
 const TAKER_FEE_ADDON: Range<usize> = 412..414;
 const MARKET_NAME: Range<usize> = 424..456;
+const LAST_FUNDING_RATE: Range<usize> = 496..504;
+const LAST_FUNDING_RATE_LONG: Range<usize> = 504..512;
+const LAST_FUNDING_RATE_SHORT: Range<usize> = 512..520;
+const LAST_FUNDING_RATE_TS: Range<usize> = 520..528;
+const NET_UNSETTLED_FUNDING: Range<usize> = 528..536;
 const ORDER_STEP_SIZE: Range<usize> = 544..552;
 const ORDER_TICK_SIZE: Range<usize> = 552..560;
 const MARGIN_RATIO_INITIAL: Range<usize> = 616..620;
@@ -69,9 +82,13 @@ const MARGIN_RATIO_MAINTENANCE: Range<usize> = 620..624;
 const PAUSED_OPERATIONS: usize = 645;
 const FEE_ADJUSTMENT: Range<usize> = 648..650;
 const IMMEDIATE_FILL_DELAY_OVERRIDE: usize = 674;
+const FUNDING_PERIOD: Range<usize> = 784..792;
 const MM_ORACLE_PRICE: Range<usize> = 800..808;
 const MM_ORACLE_SEQUENCE_ID: Range<usize> = 816..824;
 const ORACLE_TWAP_5MIN: Range<usize> = 880..888;
+const BASE_WITH_AMM: Range<usize> = 1064..1080;
+const AMM_FUNDING_LONG: Range<usize> = 1224..1232;
+const AMM_FUNDING_SHORT: Range<usize> = 1232..1240;
 
 const PRICE: Range<usize> = 8..16;
 const PUBLISH_TIME: Range<usize> = 16..24;
@@ -101,6 +118,9 @@ const POSITION_BASE: Range<usize> = 8..16;
 const POSITION_QUOTE: Range<usize> = 16..24;
 const POSITION_QUOTE_ENTRY: Range<usize> = 32..40;
 const USER_ORDERS: usize = 1064;
+const USER_LEN: usize = 4496;
+const USER_SETTLED_PERP_PNL: Range<usize> = 4416..4424;
+const USER_CUMULATIVE_FUNDING: Range<usize> = 4432..4440;
 const ORDER_LEN: usize = 104;
 const TOTAL_FEE_PAID: Range<usize> = 72..80;
 const TOTAL_FEE_REBATE: Range<usize> = 80..88;
@@ -123,6 +143,7 @@ const FULL_FILL: u32 = 2;
 /// the live AMM spread; at its end the taker takes any resting order up to its limit price.
 const AT_AUCTION_END: u32 = 100 << 8;
 
+const INSUFFICIENT_COLLATERAL: u32 = 6003;
 const SUFFICIENT_COLLATERAL: u32 = 6004;
 const PRICE_BANDS_BREACHED: u32 = 6023;
 const EXCHANGE_PAUSED: u32 = 6024;
@@ -130,6 +151,7 @@ const INVALID_ORACLE: u32 = 6035;
 const CASTING_FAILURE: u32 = 6041;
 const ORDER_NOT_RISK_REDUCING: u32 = 6046;
 const MAX_OPEN_INTEREST_REACHED: u32 = 6154;
+const INVALID_AMM_DETECTED: u32 = 6168;
 const INVALID_LIQUIDATION: u32 = 6220;
 const ORACLE_STALE_FOR_AMM: u32 = 6266;
 const NOT_FILLED: u32 = 6289;
@@ -177,6 +199,10 @@ fn read<const N: usize>(data: &[u8], range: Range<usize>) -> [u8; N] {
 
 fn i64_at(data: &[u8], range: Range<usize>) -> i64 {
     i64::from_le_bytes(read(data, range))
+}
+
+fn i128_at(data: &[u8], range: Range<usize>) -> i128 {
+    i128::from_le_bytes(read(data, range))
 }
 
 fn u64_at(data: &[u8], range: Range<usize>) -> u64 {
@@ -479,6 +505,17 @@ impl Mainnet {
         let accounts = [STATE, user_keys(trader).0, trader.pubkey(), vault];
         let remaining = self.market_accounts(Some(market), Some(USDT_SPOT_MARKET));
         instruction("settle_pnl", &accounts, vec![int(market)], remaining)
+    }
+
+    fn settle_funding(&self, trader: &Keypair, market: u16) -> Instruction {
+        let accounts = [STATE, user_keys(trader).0];
+        let remaining = self.market_accounts(Some(market), None);
+        instruction("settle_funding_payment", &accounts, vec![], remaining)
+    }
+
+    fn update_funding_rate(&self, market: u16) -> Instruction {
+        let accounts = [STATE, perp_market_address(market), self.oracle_of(market)];
+        instruction("update_funding_rate", &accounts, vec![int(market)], vec![])
     }
 
     /// The keeper crank that refreshes a market's AMM; it loads every perp market it is given as
@@ -825,6 +862,74 @@ impl Vm {
         let bid = self.place_slid_bid(buyer, market, base);
         expect_success(self.send(buyer, &[bid]), "placing the buyer's bid");
         self.sell_into(seller, buyer, market, base)
+    }
+
+    /// Writes `holder`'s position in `market` into its first slot with velocity-perp-position, at
+    /// `entry` (10^6 price precision) and the market's funding, and with `counted` adds the change
+    /// from the slot's current position to the market's totals with velocity-position-totals. Each
+    /// write changes only those fields.
+    async fn write_position(
+        &self,
+        holder: &Keypair,
+        market: u16,
+        base: i64,
+        entry: i128,
+        counted: bool,
+    ) {
+        let (user, address) = (user_keys(holder).0, perp_market_address(market));
+        let (user_before, live) = (self.data(&user), self.data(&address));
+        let quote = i64::try_from(-i128::from(base) * entry / 1_000_000_000).unwrap();
+        let funding = if base > 0 {
+            CUMULATIVE_FUNDING_LONG
+        } else {
+            CUMULATIVE_FUNDING_SHORT
+        };
+        let funding = i64::try_from(i128_at(&live, funding)).unwrap();
+        let position = json!({
+            "perp_positions.0.market_index": market,
+            "perp_positions.0.base_asset_amount": base,
+            "perp_positions.0.quote_asset_amount": quote,
+            "perp_positions.0.quote_entry_amount": quote,
+            "perp_positions.0.quote_break_even_amount": quote,
+            "perp_positions.0.last_cumulative_funding_rate": funding,
+        });
+        self.apply(POSITION, user, position).await;
+        let slot = USER_PERP_POSITIONS..USER_PERP_POSITIONS + PERP_POSITION_LEN;
+        let changed = diff_indices(&user_before, &self.data(&user));
+        assert!(changed.iter().all(|i| slot.contains(i)), "{changed:?}");
+        if !counted {
+            return;
+        }
+        let current = |field: Range<usize>| {
+            let start = USER_PERP_POSITIONS + field.start;
+            i64_at(&user_before, start..start + field.len())
+        };
+        let base_change = base - current(POSITION_BASE);
+        let quote_change = quote - current(POSITION_QUOTE);
+        let (side, side_total) = if base > 0 {
+            ("base_asset_amount_long", BASE_ASSET_AMOUNT_LONG)
+        } else {
+            ("base_asset_amount_short", BASE_ASSET_AMOUNT_SHORT)
+        };
+        let plus = |range: Range<usize>, change: i64| {
+            json!((i128_at(&live, range) + i128::from(change)).to_string())
+        };
+        let totals = serde_json::Map::from_iter([
+            (side.to_string(), plus(side_total.clone(), base_change)),
+            (
+                "amm.base_asset_amount_with_amm".into(),
+                plus(BASE_WITH_AMM, base_change),
+            ),
+            (
+                "quote_asset_amount".into(),
+                plus(MARKET_QUOTE, quote_change),
+            ),
+        ]);
+        self.apply(POSITION_TOTALS, address, totals.into()).await;
+        let changed = diff_indices(&live, &self.data(&address));
+        let written = [side_total, BASE_WITH_AMM, MARKET_QUOTE];
+        let in_totals = |i: &usize| written.iter().any(|range| range.contains(i));
+        assert!(changed.iter().all(in_totals), "{changed:?}");
     }
 }
 
@@ -1506,4 +1611,257 @@ async fn a_zero_mm_oracle_sequence_id_makes_fills_read_a_move_under_one_percent(
     let reset = json!({"market_stats.mm_oracle_sequence_id": 0});
     vm.apply(MARKET_RISK, address, reset).await;
     assert_eq!(fill_price(), bid_at(moved), "the moved price, id at 0");
+}
+
+/// A step written to the cumulative funding totals is what a position pays or earns when it next
+/// settles: a long pays the long step x its base on a settle_funding_payment anyone sends, a short
+/// earns the short step x its base on the fill that closes it, and the unchanged market settles
+/// nothing. A later update_funding_rate adds the market's own rate on top of the step, settles the
+/// AMM's side and books only its own rate as unsettled.
+#[tokio::test(flavor = "multi_thread")]
+async fn written_funding_is_what_each_position_pays_when_it_settles() {
+    const LONG_STEP: i128 = 150_000_000;
+    const SHORT_STEP: i128 = 100_000_000;
+    let mainnet = mainnet().await;
+    let market = SOL_PERP;
+    let address = perp_market_address(market);
+    let vm = Vm::new(mainnet).await;
+    let [long, short, seller] = std::array::from_fn(|_| vm.funded_trader());
+    let base = mainnet.base_for(market, 10_000_000_000);
+    expect_success(vm.match_fill(&long, &short, market, base), "opening");
+    let user = |trader: &Keypair| vm.data(&user_keys(trader).0);
+    let quote = |trader: &Keypair| position_field(&user(trader), market, POSITION_QUOTE);
+    let funding = |trader: &Keypair| i64_at(&user(trader), USER_CUMULATIVE_FUNDING);
+    let settle = || vm.send(&seller, &[mainnet.settle_funding(&long, market)]);
+    let quote_before = quote(&long);
+    expect_success(settle(), "settling on the unchanged market");
+    let unchanged = (quote(&long), funding(&long));
+    assert_eq!(unchanged, (quote_before, 0), "the unchanged market");
+
+    let live = vm.data(&address);
+    let total = |range| i128_at(&live, range);
+    let owed =
+        LONG_STEP * total(BASE_ASSET_AMOUNT_LONG) + SHORT_STEP * total(BASE_ASSET_AMOUNT_SHORT);
+    let owed = i64::try_from(owed / 10i128.pow(12)).unwrap();
+    let unsettled = i64_at(&live, NET_UNSETTLED_FUNDING) - owed;
+    let cumulative_long = total(CUMULATIVE_FUNDING_LONG) + LONG_STEP;
+    let cumulative_short = total(CUMULATIVE_FUNDING_SHORT) + SHORT_STEP;
+    let values = json!({
+        "cumulative_funding_rate_long": cumulative_long.to_string(),
+        "cumulative_funding_rate_short": cumulative_short.to_string(),
+        "net_unsettled_funding_pnl": unsettled,
+    });
+    vm.apply(FUNDING, address, values).await;
+
+    let size = i128::from(base);
+    let paid = -i64::try_from(LONG_STEP * size / 10i128.pow(12)).unwrap();
+    let earned = i64::try_from(SHORT_STEP * size / 10i128.pow(12)).unwrap();
+    expect_success(settle(), "settling the long");
+    assert_eq!(quote(&long) - quote_before, paid, "the long's quote");
+    assert_eq!(funding(&long), paid, "the long's funding");
+    expect_success(
+        vm.match_fill(&short, &seller, market, base),
+        "closing the short",
+    );
+    assert_eq!(vm.position(&short, market), 0, "the short is closed");
+    assert_eq!(funding(&short), earned, "the short's funding");
+    let left = i64_at(&vm.data(&address), NET_UNSETTLED_FUNDING);
+    assert_eq!(left, unsettled - paid - earned, "funding still unsettled");
+
+    // The next funding period, with the price posted in its slot.
+    let funded_at = i64_at(&live, LAST_FUNDING_RATE_TS) + 2 * i64_at(&live, FUNDING_PERIOD);
+    let clock = vm.clock();
+    let slot = clock.slot + 5 * u64::try_from(funded_at - clock.unix_timestamp).unwrap();
+    vm.set_clock(&Clock {
+        slot,
+        unix_timestamp: funded_at,
+        ..clock
+    });
+    vm.stamp(&mainnet.oracle_of(market), slot);
+    let crank = vm.send(&seller, &[mainnet.update_funding_rate(market)]);
+    expect_success(crank, "updating funding");
+    let after = vm.data(&address);
+    let rate = i128::from(i64_at(&after, LAST_FUNDING_RATE));
+    let rates = (
+        i128::from(i64_at(&after, LAST_FUNDING_RATE_LONG)),
+        i128::from(i64_at(&after, LAST_FUNDING_RATE_SHORT)),
+    );
+    assert_eq!(rates, (rate, rate), "a rate the AMM did not cap");
+    let totals = (
+        i128_at(&after, CUMULATIVE_FUNDING_LONG),
+        i128_at(&after, CUMULATIVE_FUNDING_SHORT),
+    );
+    let stepped = (cumulative_long + rate, cumulative_short + rate);
+    assert_eq!(totals, stepped, "the step stays");
+    let amm = (
+        i128::from(i64_at(&after, AMM_FUNDING_LONG)),
+        i128::from(i64_at(&after, AMM_FUNDING_SHORT)),
+    );
+    assert_eq!(amm, totals, "the AMM settled its side");
+    let booked = rate * i128_at(&after, BASE_WITH_AMM) / 10i128.pow(12);
+    let unsettled = i128::from(i64_at(&after, NET_UNSETTLED_FUNDING));
+    assert_eq!(
+        unsettled,
+        i128::from(left) - booked,
+        "the update books its own rate"
+    );
+}
+
+/// An account's margin ratio caps the leverage of orders in every market, and a position's ratio
+/// caps its market only: the same order fails past the cap and rests under it. A cap below the
+/// market's ratio does not raise leverage, and one written on a free slot other than the first is
+/// ignored, since the program opens the position in the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_account_and_position_margin_ratios_cap_leverage() {
+    let mainnet = mainnet().await;
+    let vm = Vm::new(mainnet).await;
+    let bid_of = |trader: &Keypair, market: u16, notional: u64| {
+        let tick = u64_at(mainnet.market(market), ORDER_TICK_SIZE);
+        let price = mainnet.price(market) as u64 * 9 / 10 / tick * tick;
+        let base = mainnet.base_for(market, notional);
+        let params = order("Limit", "Long", base, price, market, "MustPostOnly");
+        vm.send(trader, &[mainnet.place_order(trader, market, params)])
+    };
+    // Bids of about 30,000 USDT at 90% of the price, 1.5x on 20,000 USDT. One needs 22,500 USDT
+    // at a 75% cap and 15,000 at 50%; two need 30,000 at 50%, and 1,500 each at the markets' 5%.
+    let bid = |trader: &Keypair, market: u16| bid_of(trader, market, 30_000_000_000);
+    let account = vm.funded_trader();
+    let user = user_keys(&account).0;
+    // 25x is past BTC-PERP's own 20x, and a 1% cap does not lift it.
+    vm.apply(LEVERAGE, user, json!({"max_margin_ratio": 100}))
+        .await;
+    let past_market = bid_of(&account, BTC_PERP, 500_000_000_000);
+    expect_error(past_market, INSUFFICIENT_COLLATERAL, "25x under a 1% cap");
+    vm.apply(LEVERAGE, user, json!({"max_margin_ratio": 7_500}))
+        .await;
+    let capped = bid(&account, BTC_PERP);
+    expect_error(capped, INSUFFICIENT_COLLATERAL, "the account at 1.33x");
+    vm.apply(LEVERAGE, user, json!({"max_margin_ratio": 5_000}))
+        .await;
+    expect_success(bid(&account, BTC_PERP), "the account at 2x");
+    let second = bid(&account, SOL_PERP);
+    expect_error(second, INSUFFICIENT_COLLATERAL, "a second market at 2x");
+    vm.apply(LEVERAGE, user, json!({"max_margin_ratio": 0}))
+        .await;
+    expect_success(bid(&account, SOL_PERP), "the markets' own ratios");
+
+    let cap = |slot: usize, ratio: u16| {
+        let market_index = format!("perp_positions.{slot}.market_index");
+        let max_margin_ratio = format!("perp_positions.{slot}.max_margin_ratio");
+        json!({market_index: BTC_PERP, max_margin_ratio: ratio})
+    };
+    let account = vm.funded_trader();
+    let user = user_keys(&account).0;
+    vm.apply(LEVERAGE, user, cap(0, 7_500)).await;
+    let capped = bid(&account, BTC_PERP);
+    expect_error(capped, INSUFFICIENT_COLLATERAL, "BTC-PERP at 1.33x");
+    vm.apply(LEVERAGE, user, cap(0, 5_000)).await;
+    expect_success(bid(&account, BTC_PERP), "BTC-PERP at 2x");
+    expect_success(bid(&account, SOL_PERP), "SOL-PERP at its own ratio");
+
+    let account = vm.funded_trader();
+    vm.apply(LEVERAGE, user_keys(&account).0, cap(1, 7_500))
+        .await;
+    expect_success(bid(&account, BTC_PERP), "a cap on the second free slot");
+}
+
+/// A short written with velocity-perp-position and counted with velocity-position-totals carries
+/// the maintenance requirement of a short of the same size opened by a real fill. Written again at
+/// an entry 23% under the price, its loss leaves the account under maintenance and a real
+/// liquidation takes part of it over. A side total moved without the AMM's total fails every fill
+/// in the market.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_written_position_counts_in_margin_and_can_be_liquidated() {
+    let mainnet = mainnet().await;
+    let market = SOL_PERP;
+    let vm = Vm::new(mainnet).await;
+    let [opened, written] = std::array::from_fn(|_| vm.trader(USDT_SPOT_MARKET, 1_000_000_000));
+    vm.open(&opened, market, 4_000_000_000, false);
+    let base = vm.position(&opened, market);
+    vm.write_position(&written, market, base, mainnet.price(market), true)
+        .await;
+    // The lookup recipe: a User of USER_LEN bytes with its wallet at offset 8 and its slots in
+    // jsonParsed.
+    let user = user_keys(&written).0;
+    let account = local_account(&vm.locker, &user);
+    let layout = (account.data.len(), pubkey_at(&account.data, 8..40));
+    assert_eq!(layout, (USER_LEN, written.pubkey()), "User layout");
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::JsonParsed),
+        ..Default::default()
+    };
+    let parsed = vm.locker.with_svm_reader(|svm| {
+        let ui = svm.account_to_rpc_keyed_account(&user, &account, &config, None);
+        serde_json::to_value(&ui.account.data).unwrap()["parsed"].clone()
+    });
+    let slot = &parsed["perp_positions"][0];
+    let fields = (&slot["market_index"], &slot["base_asset_amount"]);
+    assert_eq!(fields, (&json!(market), &json!(base)), "jsonParsed slot");
+
+    let liquidator = vm.funded_trader();
+    let reading = |holder: &Keypair| healthy_reading(vm.liquidate(&liquidator, holder, market));
+    assert_eq!(
+        reading(&written).1,
+        reading(&opened).1,
+        "maintenance requirement"
+    );
+    let underwater = mainnet.price(market) * 77 / 100;
+    vm.write_position(&written, market, base, underwater, true)
+        .await;
+    expect_success(
+        vm.liquidate(&liquidator, &written, market),
+        "liquidating it",
+    );
+    let left = vm.position(&written, market);
+    assert!(left.abs() < base.abs(), "{left} of {base} left");
+    assert_eq!(vm.position(&liquidator, market), base - left, "taken over");
+
+    let address = perp_market_address(market);
+    let step = u64_at(mainnet.market(market), ORDER_STEP_SIZE);
+    let [buyer, seller] = std::array::from_fn(|_| vm.funded_trader());
+    let filled = vm.match_fill(&buyer, &seller, market, step);
+    expect_success(filled, "a fill with the totals together");
+    let long_total = i128_at(&vm.data(&address), BASE_ASSET_AMOUNT_LONG) + i128::from(step);
+    let apart = json!({"base_asset_amount_long": long_total.to_string()});
+    vm.apply(POSITION_TOTALS, address, apart).await;
+    let filled = vm.match_fill(&buyer, &seller, market, step);
+    expect_error(filled, INVALID_AMM_DETECTED, "a fill with the totals apart");
+}
+
+/// A written position closes with a real fill and its loss settles. With velocity-position-totals
+/// the market's long total still counts every long afterwards; without it the total is short by
+/// the written size.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_written_position_closes_and_settles_and_its_totals_keep_the_market_whole() {
+    let mainnet = mainnet().await;
+    let market = SOL_PERP;
+    let address = perp_market_address(market);
+    let base = i64::try_from(mainnet.base_for(market, 4_000_000_000)).unwrap();
+    for counted in [true, false] {
+        let vm = Vm::new(mainnet).await;
+        let live = vm.data(&address);
+        let holder = vm.trader(USDT_SPOT_MARKET, 1_000_000_000);
+        // Entered 2% over the price, so it closes at a loss.
+        let entry = mainnet.price(market) * 102 / 100;
+        vm.write_position(&holder, market, base, entry, counted)
+            .await;
+        let buyer = vm.funded_trader();
+        let closed = vm.match_fill(&buyer, &holder, market, base.unsigned_abs());
+        expect_success(closed, "closing the written long");
+        assert_eq!(vm.position(&holder, market), 0, "closed");
+        let user = || vm.data(&user_keys(&holder).0);
+        let loss = position_field(&user(), market, POSITION_QUOTE);
+        assert!(loss < 0, "a loss of {loss}");
+        let settled = vm.send(&holder, &[mainnet.settle_pnl(&holder, market)]);
+        expect_success(settled, "settling");
+        assert_eq!(i64_at(&user(), USER_SETTLED_PERP_PNL), loss, "settled");
+        let quote_left = position_field(&user(), market, POSITION_QUOTE);
+        assert_eq!(quote_left, 0, "nothing left to settle");
+
+        let buyer_base = i128::from(vm.position(&buyer, market));
+        let longs = i128_at(&live, BASE_ASSET_AMOUNT_LONG) + buyer_base;
+        let long_total = i128_at(&vm.data(&address), BASE_ASSET_AMOUNT_LONG);
+        let missing = if counted { 0 } else { i128::from(base) };
+        assert_eq!(longs - long_total, missing, "counted: {counted}");
+    }
 }

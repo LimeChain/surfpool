@@ -1,12 +1,12 @@
 # Velocity
 
-Velocity is a perpetuals exchange built on the Drift v2 program. Surfpool bundles its IDL and five
+Velocity is a perpetuals exchange built on the Drift v2 program. Surfpool bundles its IDL and nine
 override templates, so a scenario can move a market's oracle price, tighten a market's margin
-requirements, change trading fees, collateral weights, borrow rates and liquidation fees, or pause
-actions across the exchange. Once a scenario moves an oracle, Surfpool keeps every Velocity oracle
-posted on its own. The templates only prepare state: trades, withdrawals and
-liquidations are sent by your own code. For how scenarios work in general see the
-[scenarios README](../../../README.md).
+requirements, change trading fees, collateral weights, borrow rates and liquidation fees, pause
+actions across the exchange, charge funding, cap one account's leverage or give an account a
+position. Once a scenario moves an oracle, Surfpool keeps every Velocity oracle posted on its own.
+The templates only prepare state: trades, withdrawals and liquidations are sent by your own code.
+For how scenarios work in general see the [scenarios README](../../../README.md).
 
 # Template index
 
@@ -19,6 +19,10 @@ liquidations are sent by your own code. For how scenarios work in general see th
 | `velocity-exchange-risk` | `State` | exchange-wide pauses, how long margin checks accept a price, the price guard rails liquidation checks and the liquidation margin buffer |
 | `velocity-fees` | `State` | the taker fee and maker rebate every perp trader pays |
 | `velocity-spot-market-risk` | `SpotMarket` | collateral and borrow weights, the borrow rate curve, status, paused operations and the deposit cap |
+| `velocity-funding` | `PerpMarket` | the funding every open position of the market pays or earns when it next settles |
+| `velocity-account-leverage` | `User` | the most leverage one account may open, in every market or in one |
+| `velocity-perp-position` | `User` | the position an account holds in one market |
+| `velocity-position-totals` | `PerpMarket` | the market's position totals, so the AMM holds the other side of a written position |
 
 ## Number formats
 
@@ -45,6 +49,12 @@ liquidations are sent by your own code. For how scenarios work in general see th
 | `min_borrow_rate` | yearly floor in steps of 0.5%, at most `255` | `200` = 100% |
 | spot `paused_operations` | bits: `1` interest updates, `2` fills, `4` deposits, `8` withdrawals, `16` liquidation | `4` |
 | `max_token_deposits` | the token's base units, as a JSON number; `0` = no cap | |
+| `cumulative_funding_rate_long`, `cumulative_funding_rate_short` | funding per unit of base since the market opened, USD x 10^9, as a decimal **string** | a step of `72450000` = $0.07245 per unit |
+| `net_unsettled_funding_pnl` | funding users owe and have not settled, USDT x 10^6 | |
+| User `max_margin_ratio`, position `max_margin_ratio` | initial margin floor, `10000` = 100%; the most leverage is 10000 / ratio | `5000` = 2x |
+| position `base_asset_amount` | base x 10^9, negative for a short, a multiple of the market's `order_step_size` | `100000000000` = 100 SOL |
+| position `quote_asset_amount`, `quote_entry_amount`, `quote_break_even_amount` | -base x entry price / 10^9, USDT x 10^6 with the price at 10^6 | `-7000000000` = 100 SOL long at $70 |
+| market `base_asset_amount_long`, `base_asset_amount_short`, `amm.base_asset_amount_with_amm`, `quote_asset_amount` | totals over every position, as decimal **strings** | |
 
 Quote amounts (collateral, PnL, fees) are USDT with 6 decimals. Internally the program rescales
 oracle prices to 6 decimals, so market TWAP fields are in that precision.
@@ -63,7 +73,27 @@ oracle, so a SOL price shock moves both.
 
 The `State` is the PDA `["velocity_state"]`, `2etx5NvPNxeMZ7EfHE6GjJfW2imRYEUANehNS1WB4CVW`.
 
-Set `fetchBeforeUse: true` to pull the account from upstream before the write.
+Set `fetchBeforeUse: true` to pull the account from upstream before the write, except for the
+templates under [Picking an account](#picking-an-account) that build on what was read.
+
+## Picking an account
+
+A trader's account is a `User` of 4496 bytes with its wallet at offset 8, so `getProgramAccounts`
+with `dataSize` 4496, a `memcmp` of the wallet at offset 8 and a zero-length `dataSlice` lists a
+wallet's accounts. Read them with `getMultipleAccounts` and `jsonParsed`, which tells them apart by
+`sub_account_id`: upstream RPCs cannot parse Velocity accounts, so `getProgramAccounts` with
+`jsonParsed` returns them as base64. In code, an account is the PDA `["user", wallet,
+sub_account_id as u16 little-endian]`. `perp_positions` holds 8 slots: a market's position is in the slot with its
+`market_index` and a non-zero `base_asset_amount`, `quote_asset_amount` or `open_orders`, and the
+program opens a new one in the first slot whose `base_asset_amount`, `quote_asset_amount`,
+`open_orders`, `open_bids` and `open_asks` are all 0. Replace the `0` in a template's
+`perp_positions.0` paths with the slot's index.
+
+`velocity-funding`, `velocity-account-leverage`, `velocity-perp-position` and
+`velocity-position-totals` take values worked out from the account as the surfnet holds it. Read
+the account first with `getAccountInfo`, which loads it into the surfnet, and leave
+`fetchBeforeUse: false`: a reload from upstream would bring back mainnet's values and drop the
+account's changes on the surfnet, such as its trades.
 
 ## Prices on a fork
 
@@ -195,6 +225,76 @@ towards `max_borrow_rate` at full utilization, and never goes below `min_borrow_
 Interest accrues when anyone sends `update_spot_market_cumulative_interest` or moves the market's
 balances.
 
+## Charge funding
+
+```
+template: velocity-funding                 # account: the market
+cumulative_funding_rate_long: "<live + 72450000>"    # longs pay $0.07245 per SOL
+cumulative_funding_rate_short: "<live + 72450000>"   # shorts earn the same
+net_unsettled_funding_pnl: <live - 72450000 x (base_asset_amount_long + base_asset_amount_short) / 10^12>
+```
+
+Each position keeps the total it last settled at, and when it settles its quote moves by
+-(total - kept) x base / 10^12: a step up charges longs and pays shorts, and the two totals can take
+different steps. A position settles when anyone sends `settle_funding_payment` for its account, and
+before every fill of it. A step for a rate is rate x the oracle price at 10^6 x 1000, so 0.1% of
+$72.45 is `72450000`. `net_unsettled_funding_pnl` takes its live value minus (long step x
+`base_asset_amount_long` + short step x `base_asset_amount_short`) / 10^12, which is what a funding
+update books; each settlement takes its payment back out.
+
+The market's `last_funding_rate`, `last_funding_rate_long` and `last_funding_rate_short` record what
+the last update charged; settlements read only the totals. `update_funding_rate`, which anyone can
+send once each `funding_period` after `last_funding_rate_ts`, adds the market's own rate on top of
+the step, settles the AMM's side of both and books only its own rate as unsettled.
+
+## Cap an account's leverage
+
+```
+template: velocity-account-leverage        # account: the trader's User
+max_margin_ratio: 5000                     # at most 2x in every market
+```
+
+An order that adds risk needs collateral of position value x the higher of the market's
+`margin_ratio_initial` and the caps, or fails with `InsufficientCollateral` (6003). For one market
+only, write `perp_positions.<slot>.max_margin_ratio` and, on a free slot, its `market_index` (see
+[Picking an account](#picking-an-account)). On a free slot the program keeps the cap only in the
+first free slot and only for the market written there. A cap below the market's ratio changes
+nothing; to raise every account's leverage, lower `margin_ratio_initial` with
+`velocity-perp-market-risk`.
+
+## Give an account a position
+
+```
+template: velocity-perp-position           # account: the trader's User, slot 0 free
+perp_positions.0.market_index: 0           # SOL-PERP
+perp_positions.0.base_asset_amount: 100000000000                # 100 SOL long
+perp_positions.0.quote_asset_amount: -7000000000                # entered at $70
+perp_positions.0.quote_entry_amount: -7000000000
+perp_positions.0.quote_break_even_amount: -7000000000
+perp_positions.0.last_cumulative_funding_rate: <market cumulative_funding_rate_long>
+
+template: velocity-position-totals         # account: the market, same slot
+base_asset_amount_long: "<live + 100000000000>"
+amm.base_asset_amount_with_amm: "<live + 100000000000>"
+quote_asset_amount: "<live - 7000000000>"
+```
+
+The position counts in margin as one opened by a fill, and fills, PnL settles and liquidations take
+it like any other. The account keeps its collateral; an entry away from the oracle price is PnL it
+has at once, so a long entered far enough above the price, or a short far enough below, is
+liquidatable at once. Stamp `last_cumulative_funding_rate` with the market's total for the side, or
+the next settlement charges the difference x the base. For a position the account already holds,
+add the new values minus the current ones to the totals.
+
+The market's totals count every position, and the AMM holds the other side of what they say users
+hold. The same change in base to the side's total and to `amm.base_asset_amount_with_amm` keeps
+`base_asset_amount_long + base_asset_amount_short == amm.base_asset_amount_with_amm`, which every
+fill checks first. Without `velocity-position-totals` nothing fails, but the position has no
+counterparty: once it closes, the market's total for its side is short by its size. The market's
+other counters, `quote_entry_amount_*`, `quote_break_even_amount_*`, `number_of_users` and
+`number_of_users_with_base`, are left as they are; the program checks them only when a market is
+deleted or its pools are settled at expiry.
+
 ## Halt liquidations
 
 `exchange_status: 16` pauses them on every market (`ExchangePaused`, 6024);
@@ -221,6 +321,10 @@ fail with `MaxOpenInterest` (6154). `status: {"ReduceOnly": null}` refuses any o
 | `AMMNotUpdatedInSameSlot` (6096) on `settle_pnl` | the price moved from the market's 5-minute TWAP; send `update_amms` for the market in the same transaction |
 | `OracleStaleForAMM` (6266) or `OracleStaleForMargin` (6264) on `settle_pnl` | the price is more than 20 slots old for a settle after a move: nothing reposts the oracle yet, or an override turned keep-alive off for it; play `velocity-oracle-price` |
 | `MaxDeposit` (6038) | the spot market's deposits would pass `max_token_deposits` |
+| `InsufficientCollateral` (6003) on an order | the order would take the account past the higher of the market's `margin_ratio_initial` and the account's or position's `max_margin_ratio` |
+| a per-market cap did nothing | it sits on a free slot other than the first, or the account opened another market in that slot first; write it on the market's slot or the first free one |
+| `InvalidAmmDetected` (6168) on every fill | `base_asset_amount_long + base_asset_amount_short` no longer equals `amm.base_asset_amount_with_amm`; write the same change in base to both with `velocity-position-totals` |
+| a written position's first settlement charges a large funding payment | its `last_cumulative_funding_rate` is not the market's total for its side |
 | `status` override did nothing | it must be an object such as `{"Active": null}`, not a number or a bare string |
 | a `u64` override did nothing | `u64` fields such as `max_token_deposits` take JSON numbers; only 128-bit fields take decimal strings |
 | an earlier change to the State, a market or an oracle is gone, such as an unpause | a later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it; give later overrides of the same account `fetchBeforeUse: false` |

@@ -747,11 +747,11 @@ mod tests {
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19)
-        // + Velocity (5) = 86
+        // + Velocity (9) = 90
         assert_eq!(
             registry.count(),
-            86,
-            "Registry should load 86 templates total"
+            90,
+            "Registry should load 90 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -832,6 +832,10 @@ mod tests {
         assert!(registry.contains("velocity-exchange-risk"));
         assert!(registry.contains("velocity-fees"));
         assert!(registry.contains("velocity-spot-market-risk"));
+        assert!(registry.contains("velocity-funding"));
+        assert!(registry.contains("velocity-account-leverage"));
+        assert!(registry.contains("velocity-perp-position"));
+        assert!(registry.contains("velocity-position-totals"));
     }
 
     #[test]
@@ -1455,8 +1459,8 @@ templates: []
         let velocity_templates = registry.by_protocol("Velocity");
         assert_eq!(
             velocity_templates.len(),
-            5,
-            "Should have 5 Velocity templates"
+            9,
+            "Should have 9 Velocity templates"
         );
     }
 

@@ -359,3 +359,197 @@ templates:
 
       EXAMPLE - "borrowing USDT costs 100% a year": optimal_borrow_rate: 1000000,
       max_borrow_rate: 1000000, min_borrow_rate: 200.
+
+  - id: velocity-funding
+    name: Override Funding
+    description: Make every position in a Velocity perp market owe or earn an amount of funding per unit of base, paid when the position next settles
+    idl_account_name: PerpMarket
+    properties:
+      - path: cumulative_funding_rate_long
+        label: Cumulative Funding (Longs)
+        description: "Funding owed per unit of base since the market opened, USD x 10^9, as a decimal string. Write the live value plus the step: a long pays the step x its base. Example: live + 72450000 charges $0.07245 per unit"
+      - path: cumulative_funding_rate_short
+        label: Cumulative Funding (Shorts)
+        description: "The same total for shorts, as a decimal string: a short earns the step x its base, and a negative step charges it"
+      - path: net_unsettled_funding_pnl
+        label: Net Unsettled Funding
+        description: "Funding users owe and have not settled, USDT x 10^6. Write the live value minus (long step x base_asset_amount_long + short step x base_asset_amount_short) / 10^12"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P.
+
+      FIND A MARKET: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":1560}] and dataSlice {"offset":0,"length":0}: these are the perp markets. Read
+      them with getMultipleAccounts and encoding jsonParsed; `name` holds the market name as ASCII
+      bytes (SOL-PERP starts 83,79,76,45) and `market_index` its index. A market address the user
+      gives is used as is.
+
+      Every value builds on the market as the surfnet holds it: read it with getAccountInfo and
+      encoding jsonParsed, which loads it into the surfnet, and leave fetchBeforeUse false, since a
+      reload would bring back mainnet's totals. Put the market in the override's account as
+      {"pubkey":"<market>"}, never in values.
+
+      Funding runs through two totals on the market, cumulative_funding_rate_long and
+      cumulative_funding_rate_short, in USD per unit of base x 10^9. Each position keeps the total
+      it last settled at. When it settles, its quote moves by -(total - kept) x base / 10^12 USDT
+      x 10^6, so a step up charges longs and pays shorts. A position settles when anyone sends
+      settle_funding_payment for its account, and before each fill of it. Write each total as its
+      live value plus the step, as a decimal string. The same step on both totals is ordinary
+      funding.
+
+      Also write net_unsettled_funding_pnl, the funding users still owe in total: its live value
+      minus (long step x base_asset_amount_long + short step x base_asset_amount_short) / 10^12,
+      read from the same market (base_asset_amount_short is negative). The program books that
+      amount when it updates funding and takes each settlement back out of it.
+
+      A step for a rate: rate x the oracle price at 10^6 x 1000, with the oracle's price / 100 at
+      exponent -8. update_funding_rate, which anyone can send once each funding_period, adds the
+      market's own rate on top and keeps the step.
+
+      EXAMPLE - "longs pay shorts 0.1% of SOL's price" with SOL at $72.45: a step of 72450000 on
+      both totals.
+
+  - id: velocity-account-leverage
+    name: Override Account Leverage Cap
+    description: Cap the leverage one Velocity account may open, in every market or in one market
+    idl_account_name: User
+    properties:
+      - path: max_margin_ratio
+        label: Account Margin Ratio
+        description: "Initial margin each perp position of the account needs, 10000 = 100%; the program uses the higher of this and the market's ratio. 0 leaves the market's. Example: 5000 caps the account at 2x"
+      - path: perp_positions.0.market_index
+        label: Position Market Index
+        description: "The market of position slot 0; replace 0 in the paths with the slot's index"
+      - path: perp_positions.0.max_margin_ratio
+        label: Position Margin Ratio
+        description: "The same cap for that market only, at most 65535. Example: 2500 caps it at 4x"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. A trader's account is a
+      User of 4496 bytes; perp_positions holds 8 slots, one market each by market_index.
+
+      FIND THE ACCOUNT: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":4496},{"memcmp":{"offset":8,"bytes":"<wallet>"}}] and dataSlice
+      {"offset":0,"length":0}: these are the wallet's accounts. Read them with getMultipleAccounts
+      and encoding jsonParsed, which loads them into the surfnet; sub_account_id tells them apart
+      (0 is the first). An account address the user gives is used as is, read the same way. Leave
+      fetchBeforeUse false, so the account's changes on the surfnet, such as its trades, stay. Put
+      the account in the override's account as {"pubkey":"<account>"}.
+
+      An order that adds risk needs collateral of at least position value x the higher of the
+      market's margin_ratio_initial and these caps, 10000 = 100%, or it fails with
+      InsufficientCollateral (6003): the most leverage is 10000 / ratio. max_margin_ratio applies
+      to every perp market of the account, perp_positions.N.max_margin_ratio to slot N's market.
+      They only lower leverage; to raise it for everyone, lower margin_ratio_initial with
+      velocity-perp-market-risk.
+
+      For one market use the slot with that market_index and a non-zero base_asset_amount,
+      quote_asset_amount or open_orders. With none, use the first slot whose base_asset_amount,
+      quote_asset_amount, open_orders, open_bids and open_asks are all 0, and write its
+      market_index too: the program opens the market's position in that first free slot and keeps
+      the cap only when its market_index matches, so a cap on a later free slot does nothing.
+
+      EXAMPLE - "this account may use at most 2x": max_margin_ratio: 5000.
+
+      EXAMPLE - "at most 4x on BTC-PERP (index 1)" on an account with no positions:
+      perp_positions.0.market_index: 1, perp_positions.0.max_margin_ratio: 2500.
+
+  - id: velocity-perp-position
+    name: Override Perp Position
+    description: Set the perp position a Velocity account holds in one market; pair it with velocity-position-totals on the market
+    idl_account_name: User
+    properties:
+      - path: perp_positions.0.market_index
+        label: Market Index
+        description: "The position's market; replace 0 in the paths with the slot's index"
+      - path: perp_positions.0.base_asset_amount
+        label: Base Amount
+        description: "Base x 10^9, positive for a long and negative for a short, a multiple of the market's order_step_size. Example: 100000000000 is a 100 SOL long"
+      - path: perp_positions.0.quote_asset_amount
+        label: Quote Amount
+        description: "-base_asset_amount x entry price / 10^9 in USDT x 10^6, the price at 10^6. Example: -7000000000 for 100 SOL long at $70"
+      - path: perp_positions.0.quote_entry_amount
+        label: Quote Entry Amount
+        description: "The same value as quote_asset_amount"
+      - path: perp_positions.0.quote_break_even_amount
+        label: Quote Break-Even Amount
+        description: "The same value as quote_asset_amount"
+      - path: perp_positions.0.last_cumulative_funding_rate
+        label: Funding Settled At
+        description: "The market's cumulative_funding_rate_long for a long, cumulative_funding_rate_short for a short"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. A trader's account is a
+      User of 4496 bytes; perp_positions holds 8 slots, one market each by market_index.
+
+      FIND THE ACCOUNT: call getProgramAccounts on the program with encoding base64, filters
+      [{"dataSize":4496},{"memcmp":{"offset":8,"bytes":"<wallet>"}}] and dataSlice
+      {"offset":0,"length":0}: these are the wallet's accounts. Read them with getMultipleAccounts
+      and encoding jsonParsed, which loads them into the surfnet; sub_account_id tells them apart
+      (0 is the first). An account address the user gives is used as is, read the same way. Leave
+      fetchBeforeUse false, so the account's changes on the surfnet, such as its trades, stay. Put
+      the account in the override's account as {"pubkey":"<account>"}.
+
+      PICK THE SLOT: the slot with this market_index and a non-zero base_asset_amount,
+      quote_asset_amount or open_orders. With none, the first slot whose base_asset_amount,
+      quote_asset_amount, open_orders, open_bids and open_asks are all 0. Replace the 0 in every
+      path with the slot's index and write market_index too. Never pick a slot that holds another
+      market.
+
+      VALUES: base_asset_amount is base x 10^9, positive for a long, negative for a short, and a
+      multiple of the market's order_step_size. quote_asset_amount, quote_entry_amount and
+      quote_break_even_amount all take -base_asset_amount x entry price / 10^9, in USDT x 10^6
+      with the price at 10^6 (the oracle's price / 100 at exponent -8), so a long's is negative.
+      last_cumulative_funding_rate takes the market's cumulative_funding_rate_long for a long or
+      cumulative_funding_rate_short for a short; any other value charges the position the
+      difference x its base when it next settles funding. Collateral stays as it is, and an entry
+      away from the oracle price is profit or loss the account has at once.
+
+      THE MARKET HOLDS THE OTHER SIDE: in the same slot add velocity-position-totals on the
+      market, read with jsonParsed. With d_base and d_quote the new base_asset_amount and
+      quote_asset_amount minus the slot's current ones, write base_asset_amount_long + d_base for
+      a long or base_asset_amount_short + d_base for a short, amm.base_asset_amount_with_amm +
+      d_base and quote_asset_amount + d_quote. Without it the position has no counterparty: once
+      it closes, the market's total for its side is short by its size.
+
+      EXAMPLE - "this account is long 100 SOL at $70", SOL-PERP (index 0), slot 0 empty:
+      perp_positions.0.market_index: 0, perp_positions.0.base_asset_amount: 100000000000,
+      quote_asset_amount, quote_entry_amount and quote_break_even_amount: -7000000000,
+      last_cumulative_funding_rate: the market's cumulative_funding_rate_long. On the market:
+      base_asset_amount_long and amm.base_asset_amount_with_amm + 100000000000,
+      quote_asset_amount - 7000000000.
+
+  - id: velocity-position-totals
+    name: Override Market Position Totals
+    description: Count a position written with velocity-perp-position in its Velocity perp market, with the AMM holding the other side
+    idl_account_name: PerpMarket
+    properties:
+      - path: base_asset_amount_long
+        label: Long Base Total
+        description: "Sum of every long's base x 10^9, as a decimal string. Add the change in a long's base"
+      - path: base_asset_amount_short
+        label: Short Base Total
+        description: "Sum of every short's base x 10^9, negative, as a decimal string. Add the change in a short's base"
+      - path: amm.base_asset_amount_with_amm
+        label: Users' Net Base Against the AMM
+        description: "Must equal base_asset_amount_long + base_asset_amount_short, as a decimal string. Add the same change in base"
+      - path: quote_asset_amount
+        label: Quote Total
+        description: "Sum of every position's quote_asset_amount, USDT x 10^6, as a decimal string. Add the change in quote"
+    address:
+      type: pubkey
+    llm_context: |
+      Velocity perps, program vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P. Use this only with
+      velocity-perp-position, in the same slot, on the market of the position it writes; that
+      template's llm_context gives the values. Read the market with getAccountInfo and encoding
+      jsonParsed, which loads it into the surfnet, add the changes to the values read, and leave
+      fetchBeforeUse false, since a reload would bring back mainnet's totals. Put the market in the
+      override's account as {"pubkey":"<market>"}.
+
+      Write the same change in base to the side's total and to amm.base_asset_amount_with_amm: the
+      AMM then holds the other side of the position, at its entry price. Every fill in the market
+      first checks base_asset_amount_long + base_asset_amount_short ==
+      amm.base_asset_amount_with_amm and fails with InvalidAmmDetected (6168) while they differ.
