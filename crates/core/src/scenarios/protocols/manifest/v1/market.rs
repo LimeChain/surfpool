@@ -3,15 +3,28 @@ use std::{collections::HashMap, ops::Range, str::FromStr};
 use solana_account::Account;
 use solana_pubkey::Pubkey;
 
+use crate::error::{SurfpoolError, SurfpoolResult};
+
 pub const MANIFEST_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms");
 pub const MARKET_DISCRIMINATOR: [u8; 8] = [240, 175, 97, 143, 147, 159, 113, 67];
+
+const SHIFT_TEMPLATE: &str = "manifest-book-shift";
+const EXPIRE_TEMPLATE: &str = "manifest-orders-expire";
+const CUT_TEMPLATE: &str = "manifest-depth-cut";
 
 const RATIO_FIELD: &str = "ratio_ppm";
 const SIDE_FIELD: &str = "side";
 const LEVELS_FIELD: &str = "levels";
 const EXPIRE_FIELD: &str = "expire_after_slots";
 const SIZE_FIELD: &str = "size_ppm";
+/// The values only one template reads; every template reads `side`.
+const TEMPLATE_FIELDS: [(&str, &str); 4] = [
+    (RATIO_FIELD, SHIFT_TEMPLATE),
+    (LEVELS_FIELD, EXPIRE_TEMPLATE),
+    (EXPIRE_FIELD, EXPIRE_TEMPLATE),
+    (SIZE_FIELD, CUT_TEMPLATE),
+];
 
 const HEADER_LEN: usize = 256;
 const NODE_LEN: usize = 80;
@@ -81,36 +94,63 @@ impl Side {
     }
 }
 
-/// The new bytes for a Manifest market override, or `None` when the account is not a Manifest
-/// market or the values carry none of `ratio_ppm`, `expire_after_slots` and `size_ppm`. Every
-/// other key is ignored. `clock_slot` is the slot Manifest checks order expiry against.
+/// The market write a Manifest override needs, or `None` when the template is not a Manifest one.
+/// A Manifest template refuses an account that is not a Manifest market and a value of another
+/// Manifest template, and ignores every other key. `clock_slot` is the slot Manifest checks order
+/// expiry against.
 pub fn prepare_manifest_override(
+    template_id: &str,
+    account_pubkey: &Pubkey,
     account: &Account,
     values: &HashMap<String, serde_json::Value>,
     clock_slot: u64,
-) -> Result<Option<Vec<u8>>, String> {
-    if account.owner != MANIFEST_PROGRAM_ID || !account.data.starts_with(&MARKET_DISCRIMINATOR) {
+) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
+    if !template_id.starts_with("manifest-") {
         return Ok(None);
     }
-    let mut data = account.data.clone();
-    match [RATIO_FIELD, EXPIRE_FIELD, SIZE_FIELD].map(|field| values.get(field)) {
-        [Some(ratio), None, None] => shift_book(
-            &mut data,
-            parse(ratio, RATIO_FIELD)?,
+    if account.owner != MANIFEST_PROGRAM_ID || !account.data.starts_with(&MARKET_DISCRIMINATOR) {
+        return Err(SurfpoolError::internal(format!(
+            "{template_id} needs a Manifest market, and {account_pubkey} is not one"
+        )));
+    }
+    let mut market = account.clone();
+    rewrite_market(template_id, &mut market.data, values, clock_slot)
+        .map_err(SurfpoolError::internal)?;
+    Ok(Some(vec![(*account_pubkey, market)]))
+}
+
+fn rewrite_market(
+    template_id: &str,
+    data: &mut [u8],
+    values: &HashMap<String, serde_json::Value>,
+    clock_slot: u64,
+) -> Result<(), String> {
+    if let Some((field, owner)) = TEMPLATE_FIELDS
+        .iter()
+        .find(|(field, owner)| *owner != template_id && values.contains_key(*field))
+    {
+        return Err(format!(
+            "{field} is a value of {owner}, not of {template_id}"
+        ));
+    }
+    match template_id {
+        SHIFT_TEMPLATE => shift_book(
+            data,
+            parse(values, RATIO_FIELD)?,
             Side::from_values(values)?,
-        )?,
-        [None, None, Some(size)] => cut_depth(
-            &mut data,
-            parse(size, SIZE_FIELD)?,
+        ),
+        CUT_TEMPLATE => cut_depth(
+            data,
+            parse(values, SIZE_FIELD)?,
             Side::from_values(values)?,
             // Manifest truncates the slot the same way.
             clock_slot as u32,
-        )?,
-        [None, Some(slots), None] => {
+        ),
+        EXPIRE_TEMPLATE => {
             // Manifest matches an order up to and including its last valid slot, so 0 slots ends
             // it before the clock's slot.
             let last_valid_slot = clock_slot
-                .checked_add(parse(slots, EXPIRE_FIELD)?)
+                .checked_add(parse(values, EXPIRE_FIELD)?)
                 .and_then(|slot| slot.checked_sub(1))
                 .and_then(|slot| u32::try_from(slot).ok())
                 .filter(|slot| *slot != 0)
@@ -120,33 +160,28 @@ pub fn prepare_manifest_override(
                         u32::MAX
                     )
                 })?;
-            let levels = values
-                .get(LEVELS_FIELD)
-                .ok_or_else(|| format!("{LEVELS_FIELD} is required with {EXPIRE_FIELD}"))?;
             expire_orders(
-                &mut data,
+                data,
                 Side::from_values(values)?,
-                parse(levels, LEVELS_FIELD)?,
+                parse(values, LEVELS_FIELD)?,
                 last_valid_slot,
                 // Manifest truncates the slot the same way.
                 clock_slot as u32,
-            )?
+            )
         }
-        [None, None, None] => return Ok(None),
-        _ => {
-            return Err(format!(
-                "a Manifest override takes one of {RATIO_FIELD}, {EXPIRE_FIELD} or {SIZE_FIELD}"
-            ));
-        }
+        _ => Err(format!("{template_id} is not a Manifest template")),
     }
-    Ok(Some(data))
 }
 
-fn parse<T: FromStr>(value: &serde_json::Value, field: &str) -> Result<T, String> {
-    let text = match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Number(number) if number.is_u64() => number.to_string(),
-        _ => String::new(),
+fn parse<T: FromStr>(
+    values: &HashMap<String, serde_json::Value>,
+    field: &str,
+) -> Result<T, String> {
+    let text = match values.get(field) {
+        None => return Err(format!("{field} is required")),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) if number.is_u64() => number.to_string(),
+        Some(_) => String::new(),
     };
     text.parse()
         .map_err(|_| format!("{field} must be a whole number, as a decimal string or a number"))
@@ -499,9 +534,24 @@ mod tests {
         serde_json::from_value(values).unwrap()
     }
 
-    fn apply(data: &[u8], values: serde_json::Value, slot: u64) -> Result<Vec<u8>, String> {
-        prepare_manifest_override(&account(data.to_vec()), &to_map(values), slot)
-            .map(|written| written.expect("a Manifest market with codec keys"))
+    fn apply(
+        template_id: &str,
+        data: &[u8],
+        values: serde_json::Value,
+        slot: u64,
+    ) -> Result<Vec<u8>, String> {
+        let address = Pubkey::new_unique();
+        let target = account(data.to_vec());
+        let writes =
+            prepare_manifest_override(template_id, &address, &target, &to_map(values), slot)
+                .map_err(|error| error.to_string())?
+                .expect("a Manifest template writes");
+        let [(written_to, market)] = <[_; 1]>::try_from(writes).expect("one write");
+        assert_eq!(
+            (written_to, market.lamports, market.owner),
+            (address, target.lamports, target.owner)
+        );
+        Ok(market.data)
     }
 
     fn book() -> Vec<u8> {
@@ -532,7 +582,8 @@ mod tests {
             ("1050000", "asks"),
             ("1100000", "asks"),
         ] {
-            let after = apply(&before, json!({"ratio_ppm": ratio, "side": side}), 1).unwrap();
+            let values = json!({"ratio_ppm": ratio, "side": side});
+            let after = apply(SHIFT_TEMPLATE, &before, values, 1).unwrap();
             let ratio: u128 = ratio.parse().unwrap();
             let mut expected = before.clone();
             let shifted_bids = if side == "both" { &bids[..] } else { &[] };
@@ -556,11 +607,14 @@ mod tests {
         let mut before = book();
         let (_, asks) = read_book(&before).unwrap();
         before[asks[0].node + ORDER_TYPE] = GLOBAL_ORDER;
-        for values in [
-            json!({"ratio_ppm": "1000000", "side": "both"}),
-            json!({"size_ppm": "1000000", "side": "both"}),
+        for (template, values) in [
+            (
+                SHIFT_TEMPLATE,
+                json!({"ratio_ppm": "1000000", "side": "both"}),
+            ),
+            (CUT_TEMPLATE, json!({"size_ppm": "1000000", "side": "both"})),
         ] {
-            assert_eq!(apply(&before, values, 1).unwrap(), before);
+            assert_eq!(apply(template, &before, values, 1).unwrap(), before);
         }
     }
 
@@ -576,14 +630,20 @@ mod tests {
         let mut expected = before.clone();
         set_u32(&mut expected, expiry(&asks[1]), 104);
         let values = json!({"side": "asks", "levels": 2, "expire_after_slots": "5"});
-        assert_eq!(apply(&before, values, 100).unwrap(), expected);
+        assert_eq!(
+            apply(EXPIRE_TEMPLATE, &before, values, 100).unwrap(),
+            expected
+        );
 
         let mut expected = before.clone();
         for bid in &bids {
             set_u32(&mut expected, expiry(bid), 99);
         }
         let values = json!({"side": "bids", "levels": "0", "expire_after_slots": 0});
-        assert_eq!(apply(&before, values, 100).unwrap(), expected);
+        assert_eq!(
+            apply(EXPIRE_TEMPLATE, &before, values, 100).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -606,7 +666,7 @@ mod tests {
         set_u64(&mut expected, seat + SEAT_QUOTE.start, 291_600_001_075);
         set_u64(&mut expected, seat + SEAT_BASE.start, 15);
         let values = json!({"size_ppm": "100000", "side": "both"});
-        assert_eq!(apply(&before, values, 100).unwrap(), expected);
+        assert_eq!(apply(CUT_TEMPLATE, &before, values, 100).unwrap(), expected);
     }
 
     #[test]
@@ -629,11 +689,18 @@ mod tests {
         let big_bid = market(&[(P, u64::MAX)], &[]);
         let big_ask = market(&[], &[(P, u64::MAX)]);
         let no_dust = market(&[(108 * P + 7, 3_000_000_001)], &[(109 * P - 3, 5)]);
-        let shift = |ratio: &str, side: &str| json!({"ratio_ppm": ratio, "side": side});
-        let cut = |size: &str, side: &str| json!({"size_ppm": size, "side": side});
-        let no_levels = json!({"side": "both", "expire_after_slots": 1});
-        let two_keys = json!({"ratio_ppm": "1", "size_ppm": "1", "side": "both"});
-        for (data, values, expected) in [
+        let shift =
+            |ratio: &str, side: &str| (SHIFT_TEMPLATE, json!({"ratio_ppm": ratio, "side": side}));
+        let cut = |size: &str, side: &str| (CUT_TEMPLATE, json!({"size_ppm": size, "side": side}));
+        let no_levels = (
+            EXPIRE_TEMPLATE,
+            json!({"side": "both", "expire_after_slots": 1}),
+        );
+        let two_keys = (
+            SHIFT_TEMPLATE,
+            json!({"ratio_ppm": "1", "size_ppm": "1", "side": "both"}),
+        );
+        for (data, (template, values), expected) in [
             (&good, shift("0", "both"), "above 0"),
             (&tiny, shift("999999", "bids"), "to zero"),
             (&huge, shift("2000000", "bids"), "overflows a price"),
@@ -653,15 +720,15 @@ mod tests {
             (&unknown, cut("500000", "bids"), "never rests"),
             (&not_a_seat, cut("500000", "asks"), "not a seat"),
             (&full_seat, cut("500000", "bids"), "overflow"),
-            (&good, two_keys, "one of"),
+            (&good, two_keys, "size_ppm is a value of manifest-depth-cut"),
         ] {
-            let error = apply(data, values, 1).unwrap_err();
+            let error = apply(template, data, values, 1).unwrap_err();
             assert!(error.contains(expected), "{expected}: {error}");
         }
         for (slot, after_slots) in [(0, 0), (1, 0), (u64::from(u32::MAX), 2), (1, u64::MAX)] {
             let after_slots = after_slots.to_string();
             let values = json!({"side": "both", "levels": 1, "expire_after_slots": after_slots});
-            let error = apply(&good, values, slot).unwrap_err();
+            let error = apply(EXPIRE_TEMPLATE, &good, values, slot).unwrap_err();
             assert!(error.contains("expiry slot"), "{error}");
         }
     }
@@ -697,19 +764,24 @@ mod tests {
             (with(&[(BIDS.1, second_bid)]), "best bid"),
             (unsorted, "not sorted"),
         ] {
-            for values in [
-                json!({"ratio_ppm": "900000", "side": "both"}),
-                json!({"side": "both", "levels": 0, "expire_after_slots": 1}),
-                json!({"size_ppm": "500000", "side": "both"}),
+            for (template, values) in [
+                (
+                    SHIFT_TEMPLATE,
+                    json!({"ratio_ppm": "900000", "side": "both"}),
+                ),
+                (
+                    EXPIRE_TEMPLATE,
+                    json!({"side": "both", "levels": 0, "expire_after_slots": 1}),
+                ),
+                (CUT_TEMPLATE, json!({"size_ppm": "500000", "side": "both"})),
             ] {
-                let error = apply(&data, values, 1).unwrap_err();
+                let error = apply(template, &data, values, 1).unwrap_err();
                 assert!(error.contains(expected), "{expected}: {error}");
             }
         }
     }
 
-    /// Each template reads only its own values. Other accounts, and values with no codec key, are
-    /// left to the generic IDL path.
+    /// Each template reads only its own values and ignores keys no Manifest template reads.
     #[test]
     fn writer_reads_only_its_own_keys() {
         let shift = json!({"ratio_ppm": "800000", "side": "both"});
@@ -717,20 +789,72 @@ mod tests {
             "ratio_ppm": "800000", "side": "both", "version": 3, "order_sequence_number": "1",
             "baseMint": Pubkey::new_unique().to_string(), "bidsBestIndex": 80, "quote_volume": 5
         });
-        assert_eq!(apply(&book(), echoed, 1), apply(&book(), shift.clone(), 1));
+        assert_eq!(
+            apply(SHIFT_TEMPLATE, &book(), echoed, 1),
+            apply(SHIFT_TEMPLATE, &book(), shift, 1)
+        );
+    }
+
+    /// A Manifest template never leaves its account to the token or IDL paths.
+    #[test]
+    fn manifest_templates_refuse_what_is_not_a_market_override() {
+        let shift = to_map(json!({"ratio_ppm": "800000", "side": "both"}));
         let mut foreign = account(book());
         foreign.owner = Pubkey::new_unique();
         let mut global = account(book());
         global.data[..8].copy_from_slice(&[1, 170, 151, 47, 187, 160, 180, 149]);
-        let header_only = json!({"quote_volume": 5});
-        for (target, values) in [
-            (foreign, shift.clone()),
-            (global, shift),
-            (account(book()), header_only),
-        ] {
-            let written = prepare_manifest_override(&target, &to_map(values), 1);
-            assert_eq!(written, Ok(None));
+        for target in [foreign, global] {
+            let error = prepare_manifest_override(
+                SHIFT_TEMPLATE,
+                &Pubkey::new_unique(),
+                &target,
+                &shift,
+                1,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("is not one"), "{error}");
         }
+        let header_only = json!({"quote_volume": 5});
+        let error = apply(SHIFT_TEMPLATE, &book(), header_only, 1).unwrap_err();
+        assert!(error.contains("ratio_ppm is required"), "{error}");
+    }
+
+    #[test]
+    fn a_value_of_another_template_is_refused() {
+        for (template, values, refused) in [
+            (
+                SHIFT_TEMPLATE,
+                json!({"ratio_ppm": "900000", "side": "both", "levels": 1}),
+                "levels is a value of manifest-orders-expire",
+            ),
+            (
+                EXPIRE_TEMPLATE,
+                json!({"side": "both", "levels": 1, "expire_after_slots": 1, "size_ppm": "1"}),
+                "size_ppm is a value of manifest-depth-cut",
+            ),
+            (
+                CUT_TEMPLATE,
+                json!({"size_ppm": "500000", "side": "both", "expire_after_slots": 0}),
+                "expire_after_slots is a value of manifest-orders-expire",
+            ),
+        ] {
+            let error = apply(template, &book(), values, 1).unwrap_err();
+            assert!(error.contains(refused), "{template}: {error}");
+        }
+    }
+
+    #[test]
+    fn other_templates_are_left_to_the_other_writers() {
+        let values = to_map(json!({"ratio_ppm": "900000", "side": "both"}));
+        let written = prepare_manifest_override(
+            "phoenix-market-move",
+            &Pubkey::new_unique(),
+            &account(book()),
+            &values,
+            1,
+        );
+        assert!(matches!(written, Ok(None)));
     }
 
     #[test]

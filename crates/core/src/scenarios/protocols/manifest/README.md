@@ -15,8 +15,8 @@ They only prepare state; trades are sent by your own code.
 | `manifest-orders-expire` | makes the best price levels, or a whole side, expire, like makers pulling their quotes |
 | `manifest-depth-cut` | shrinks every order on one or both sides by the same ratio without moving any price, like makers quoting smaller |
 
-Each takes the market's address and reads only its own values; any other value sent with it is
-ignored.
+Each takes the market's address and reads only its own values. A value of another Manifest template
+is refused; any other value sent with it is ignored.
 
 ## Number formats
 

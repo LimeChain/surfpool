@@ -3741,51 +3741,28 @@ impl SurfnetSvm {
                     continue;
                 }
 
-                let manifest = if override_instance.template_id.starts_with("manifest-") {
-                    prepare_manifest_override(
-                        &account,
-                        &account_values,
-                        self.inner.get_sysvar::<Clock>().slot,
-                    )
-                } else {
-                    Ok(None)
-                };
-                match manifest {
-                    Ok(Some(data)) => {
-                        let market = Account { data, ..account };
-                        if let Err(e) =
-                            self.set_scenario_override_account(&account_pubkey, market, target_slot)
-                        {
-                            warn!(
-                                "Failed to set {} for override {}: {}",
-                                account_pubkey, override_instance.id, e
-                            );
-                        } else {
-                            settled_this_slot.insert(account_pubkey);
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(
-                            "Skipping override {} for {}: {}",
-                            override_instance.id, account_pubkey, e
-                        );
-                        continue;
-                    }
-                }
-
-                match prepare_phoenix_override(
-                    self,
+                let prepared = match prepare_manifest_override(
                     &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
-                    remote_ctx,
-                    target_slot,
-                )
-                .await
-                {
+                    self.inner.get_sysvar::<Clock>().slot,
+                ) {
+                    Ok(None) => {
+                        prepare_phoenix_override(
+                            self,
+                            &override_instance.template_id,
+                            &account_pubkey,
+                            &account,
+                            &account_values,
+                            remote_ctx,
+                            target_slot,
+                        )
+                        .await
+                    }
+                    manifest => manifest,
+                };
+                match prepared {
                     Ok(Some(writes)) => {
                         match write_all_or_none(self, writes, target_slot) {
                             Ok(written) => {
