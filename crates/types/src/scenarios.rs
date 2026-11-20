@@ -592,15 +592,14 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
-    /// Keep-alive imports in place of the template's, in the same shape as a template file's
-    /// `keep_alive` list. Absent, the template's imports apply. Present, even empty, they first
-    /// drop the keep-alive that earlier overrides of this account started.
+    /// Keep-alive for the account this override writes. Absent, the template's keep-alive applies;
+    /// `[]` turns it off. Only `[]` is supported.
     #[schemars(
-        description = "Optional keep-alive list in place of the template's, rewritten every slot from this override on: [{\"template\": \"<keep-alive template id>\", \"address\": {\"type\": \"override\"} or {\"type\": \"input\", \"value\": \"<input property>\"} or {\"type\": \"pubkey\", \"value\": \"<base58>\"} or {\"type\": \"pda\", \"program_id\": \"...\", \"seeds\": [...]}, \"values\": {\"<path>\": \"$slot\"}}]. Omit it to use the template's list. Given, even as [], it first stops the keep-alive that earlier overrides of this account started."
+        description = "Optional. Omit it to keep the template's keep-alive. [] turns keep-alive off for the account this override writes, from this slot on, including keep-alive that earlier overrides started. Only [] is supported"
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts-bindings", ts(optional))]
-    pub keep_alive: Option<Vec<YamlKeepAliveImport>>,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "Array<unknown>", optional))]
+    pub keep_alive: Option<Vec<serde_json::Value>>,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
@@ -631,12 +630,6 @@ impl OverrideInstance {
     pub fn with_label(mut self, label: String) -> Self {
         self.label = Some(label);
         self
-    }
-
-    /// The override's own keep-alive imports, when it gives them.
-    pub fn keep_alive_imports(&self) -> Option<Vec<KeepAliveImport>> {
-        let imports = self.keep_alive.clone()?;
-        Some(imports.into_iter().map(Into::into).collect())
     }
 }
 
@@ -1555,19 +1548,16 @@ impl YamlOverrideTemplateCollection {
 // ========================================
 
 /// A keep-alive import as YAML writes it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct YamlKeepAliveImport {
     pub template: String,
     pub address: YamlKeepAliveAddress,
-    #[cfg_attr(feature = "ts-bindings", ts(type = "Record<string, unknown>"))]
     pub values: HashMap<String, serde_json::Value>,
 }
 
 /// Where a keep-alive import writes, as YAML writes it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum YamlKeepAliveAddress {
     /// The account the importing override writes.
     Override,
@@ -1854,9 +1844,8 @@ impl From<YamlAccountAddress> for AccountAddress {
 }
 
 /// YAML representation of PDA seeds
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum YamlPdaSeed {
     String {
         value: String,
@@ -2018,49 +2007,6 @@ mod tests {
         assert_eq!(values["slot"], json!(210));
         assert_eq!(values["ms"], json!(5_000));
         assert_eq!(values["fixed"], json!(3));
-    }
-
-    #[test]
-    fn an_override_takes_the_yaml_keep_alive_shape_or_leaves_it_to_the_template() {
-        let instance = |keep_alive: Option<serde_json::Value>| {
-            let mut value = json!({
-                "id": "o",
-                "templateId": "t",
-                "values": {},
-                "scenarioRelativeSlot": 0,
-                "enabled": true,
-                "account": { "pubkey": "11111111111111111111111111111111" },
-            });
-            if let Some(keep_alive) = keep_alive {
-                value["keepAlive"] = keep_alive;
-            }
-            serde_json::from_value::<super::OverrideInstance>(value).unwrap()
-        };
-        assert_eq!(instance(None).keep_alive_imports(), None);
-        assert_eq!(instance(Some(json!(null))).keep_alive_imports(), None);
-        assert_eq!(
-            instance(Some(json!([]))).keep_alive_imports(),
-            Some(Vec::new())
-        );
-        let program = "11111111111111111111111111111111";
-        let own = instance(Some(json!([
-            { "template": "t", "address": { "type": "pubkey", "value": program }, "values": { "slot": "$slot" } },
-            { "template": "t", "address": { "type": "pda", "program_id": program, "seeds": [{ "type": "property_ref", "value": "feed" }] }, "values": { "ms": "$unix_ms" } },
-        ])));
-        assert_eq!(
-            own.keep_alive_imports(),
-            Some(vec![
-                keep_alive(&format!(
-                    "template: t\naddress: {{ type: pubkey, value: \"{program}\" }}\nvalues: {{ slot: $slot }}\n"
-                )),
-                keep_alive(&format!(
-                    "template: t\naddress: {{ type: pda, program_id: \"{program}\", seeds: [{{ type: property_ref, value: feed }}] }}\nvalues: {{ ms: $unix_ms }}\n"
-                )),
-            ])
-        );
-        let serialized = |instance| serde_json::to_value(instance).unwrap();
-        assert!(serialized(instance(None)).get("keepAlive").is_none());
-        assert_eq!(serialized(own)["keepAlive"][1]["address"]["type"], "pda");
     }
 
     #[test]
@@ -2558,5 +2504,32 @@ templates:
                 Err(format!("property 'value': {error}"))
             );
         }
+    }
+
+    #[test]
+    fn keep_alive_is_absent_unless_given() {
+        let instance = |keep_alive: Option<serde_json::Value>| {
+            let mut value = json!({
+                "id": "o", "templateId": "t", "values": {}, "scenarioRelativeSlot": 0,
+                "enabled": true, "account": { "pubkey": "11111111111111111111111111111111" }
+            });
+            if let Some(keep_alive) = keep_alive {
+                value["keepAlive"] = keep_alive;
+            }
+            serde_json::from_value::<super::OverrideInstance>(value).unwrap()
+        };
+
+        let absent = instance(None);
+        assert_eq!(absent.keep_alive, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("keepAlive")
+                .is_none()
+        );
+
+        let off = instance(Some(json!([])));
+        assert_eq!(off.keep_alive, Some(vec![]));
+        assert_eq!(serde_json::to_value(&off).unwrap()["keepAlive"], json!([]));
     }
 }

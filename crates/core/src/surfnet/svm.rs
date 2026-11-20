@@ -610,8 +610,6 @@ pub struct SurfnetSvm {
     /// The accounts keep-alive rewrites every slot, from the slot a scenario's override first
     /// touched them. Kept in memory only, so a restart on a persistent database stops keep-alive.
     pub keep_alive_bindings: BTreeSet<KeepAliveBinding>,
-    /// The keep-alive lists overrides gave in place of their template's, by the account they wrote.
-    pub keep_alive_imports: HashMap<Pubkey, Vec<surfpool_types::KeepAliveImport>>,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -896,7 +894,6 @@ impl SurfnetSvm {
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
             keep_alive_bindings: self.keep_alive_bindings.clone(),
-            keep_alive_imports: self.keep_alive_imports.clone(),
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -1407,7 +1404,6 @@ impl SurfnetSvm {
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
             keep_alive_bindings: BTreeSet::new(),
-            keep_alive_imports: HashMap::new(),
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -2628,7 +2624,6 @@ impl SurfnetSvm {
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
         self.keep_alive_bindings.clear();
-        self.keep_alive_imports.clear();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -3426,8 +3421,7 @@ impl SurfnetSvm {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         slot: Slot,
     ) {
-        let keep_alive_overrides =
-            self.keep_alive_overrides(template_registry(), slot, remote_ctx.is_some());
+        let keep_alive_overrides = self.keep_alive_overrides(slot, remote_ctx.is_some());
         if let Err(e) = self
             .apply_overrides(remote_ctx, slot, keep_alive_overrides, false)
             .await
@@ -3449,7 +3443,7 @@ impl SurfnetSvm {
                 let touched = self
                     .apply_overrides(remote_ctx, target_slot, overrides, true)
                     .await?;
-                self.enroll_keep_alive(template_registry(), touched);
+                self.enroll_keep_alive(touched);
             }
             Ok::<_, SurfpoolError>(())
         }
@@ -3536,16 +3530,22 @@ impl SurfnetSvm {
 
             // Joins keep-alive only once its write succeeds: a failed override leaves the account as
             // if no scenario had touched it.
+            let keep_alive_off = override_instance
+                .keep_alive
+                .as_ref()
+                .is_some_and(Vec::is_empty);
             let mut keep_alive_source = None;
             if scheduled
-                && let Some(template) = template_registry().get(&override_instance.template_id)
-                && (!template.keep_alive.is_empty() || override_instance.keep_alive.is_some())
+                && (keep_alive_off
+                    || template_registry()
+                        .get(&override_instance.template_id)
+                        .is_some_and(|template| !template.keep_alive.is_empty()))
             {
                 keep_alive_source = Some(KeepAliveSource {
-                    template: template.id.clone(),
+                    template: override_instance.template_id.clone(),
                     address: account_pubkey,
                     values: override_instance.values.clone(),
-                    imports: override_instance.keep_alive_imports(),
+                    off: keep_alive_off,
                 });
             }
 
@@ -3664,10 +3664,7 @@ impl SurfnetSvm {
                 Err(e) => {
                     restore_unprocessed(self, index);
                     // The overrides before this one wrote their accounts, so they still join.
-                    self.enroll_keep_alive(
-                        template_registry(),
-                        std::mem::take(&mut keep_alive_touched),
-                    );
+                    self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                     return Err(e);
                 }
             };
@@ -3817,10 +3814,7 @@ impl SurfnetSvm {
                         ) {
                             restore_unprocessed(self, index);
                             // The overrides before this one wrote their accounts, so they still join.
-                            self.enroll_keep_alive(
-                                template_registry(),
-                                std::mem::take(&mut keep_alive_touched),
-                            );
+                            self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                             return Err(e);
                         }
                         keep_alive_touched.extend(keep_alive_source.take());
@@ -3929,36 +3923,19 @@ impl SurfnetSvm {
         Ok(keep_alive_touched)
     }
 
-    /// Adds the accounts that `touched` makes keep-alive imports rewrite. An override's own list
-    /// replaces its template's, and first drops what earlier overrides of its account bound.
-    fn enroll_keep_alive(&mut self, registry: &TemplateRegistry, touched: Vec<KeepAliveSource>) {
+    /// Adds the accounts that `touched` makes keep-alive imports rewrite.
+    fn enroll_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
-            let Some(template) = registry.get(&source.template) else {
+            if source.off {
+                self.keep_alive_bindings
+                    .retain(|binding| binding.address != source.address);
+                info!("Keep-alive stops rewriting {}", source.address);
+                continue;
+            }
+            let Some(template) = template_registry().get(&source.template) else {
                 continue;
             };
-            let own = source.imports.is_some();
-            let imports = match source.imports {
-                Some(imports) => {
-                    self.keep_alive_bindings
-                        .retain(|binding| binding.source != source.address);
-                    self.keep_alive_imports.insert(source.address, imports);
-                    &self.keep_alive_imports[&source.address]
-                }
-                None => &template.keep_alive,
-            };
-            for (index, import) in imports.iter().enumerate() {
-                if own
-                    && let Err(e) = registry
-                        .keep_alive_template(&import.template)
-                        .ok_or_else(|| "no keep-alive file defines it".to_string())
-                        .and_then(|_| import.validate())
-                {
-                    warn!(
-                        "Keep-alive '{}' of the override of {} is skipped: {}",
-                        import.template, source.address, e
-                    );
-                    continue;
-                }
+            for (index, import) in template.keep_alive.iter().enumerate() {
                 let Some(address) = import.address(source.address, &source.values) else {
                     warn!(
                         "Keep-alive '{}' of override template '{}' has no address for {}",
@@ -3970,8 +3947,6 @@ impl SurfnetSvm {
                     template: template.id.clone(),
                     import: index,
                     address,
-                    own,
-                    source: source.address,
                 };
                 if self.keep_alive_bindings.insert(binding) {
                     info!(
@@ -3985,12 +3960,7 @@ impl SurfnetSvm {
 
     /// The keep-alive overrides for every binding at `slot`. A missing account is fetched first when
     /// `can_fetch` and not offline, otherwise skipped.
-    fn keep_alive_overrides(
-        &self,
-        registry: &TemplateRegistry,
-        slot: Slot,
-        can_fetch: bool,
-    ) -> Vec<OverrideInstance> {
+    fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
         // The time the open slot's Clock sysvar holds. The Clock advances by each slot's own
         // interval, so recomputing it from the slot would apply a changed slot interval to every
         // slot since the last time travel or restart.
@@ -3999,15 +3969,11 @@ impl SurfnetSvm {
             unix_time_ms: self.updated_at,
         };
         let mut instances = Vec::new();
-        let mut previous: Option<&KeepAliveBinding> = None;
         for binding in &self.keep_alive_bindings {
-            if previous
-                .replace(binding)
-                .is_some_and(|previous| binding.repeats(previous))
-            {
-                continue;
-            }
-            let Some(import) = binding.find(registry, &self.keep_alive_imports) else {
+            let Some(import) = template_registry()
+                .get(&binding.template)
+                .and_then(|template| template.keep_alive.get(binding.import))
+            else {
                 continue;
             };
             let missing = match self.get_account(&binding.address) {
@@ -5567,7 +5533,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        scenarios::registry::tests::{KEEP_ALIVE_OVERRIDES, keep_alive_registry},
         storage::tests::TestType,
         surfnet::locker::SurfnetSvmLocker,
         tests::helpers::{UNHEALTHY_OFFSET, canned_rpc, scheduled_override_fixture},
@@ -9797,139 +9762,44 @@ mod tests {
         assert_eq!(update.data.decode(), Some(account.data));
     }
 
-    fn own_keep_alive(imports: serde_json::Value) -> Option<Vec<surfpool_types::KeepAliveImport>> {
-        let imports: Vec<surfpool_types::YamlKeepAliveImport> =
-            serde_json::from_value(imports).unwrap();
-        Some(imports.into_iter().map(Into::into).collect())
-    }
-
-    fn keep_alive_target(svm: &mut SurfnetSvm) -> Pubkey {
-        let address = Pubkey::new_unique();
-        let account = Account {
-            lamports: 1,
-            ..Account::default()
-        };
-        svm.inner.set_account(address, account).unwrap();
-        address
-    }
-
-    /// The accounts keep-alive writes at `slot`, each stamped with that slot.
-    fn written_at(svm: &SurfnetSvm, registry: &TemplateRegistry, slot: Slot) -> Vec<String> {
-        svm.keep_alive_overrides(registry, slot, false)
-            .into_iter()
-            .map(|instance| {
-                assert_eq!(instance.values["slot"], serde_json::json!(slot));
-                match instance.account {
-                    surfpool_types::AccountAddress::Pubkey(address) => address,
-                    pda => panic!("keep-alive writes a pubkey, not {pda:?}"),
-                }
-            })
-            .collect()
-    }
-
-    /// Absent, an override binds its template's imports; its own list replaces what earlier
-    /// overrides of its account bound. A template import two overrides bind is applied once.
-    #[test]
-    fn an_overrides_own_keep_alive_list_replaces_its_templates() {
-        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        let (oracle, feed) = (keep_alive_target(&mut svm), keep_alive_target(&mut svm));
-        let (vault, other_vault) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let source = |address, imports| KeepAliveSource {
-            template: "example-vault".to_string(),
-            address,
-            values: HashMap::from([("oracle".to_string(), serde_json::json!(oracle.to_string()))]),
-            imports,
-        };
-
-        svm.enroll_keep_alive(
-            &registry,
-            vec![source(vault, None), source(other_vault, None)],
-        );
-        assert_eq!(svm.keep_alive_bindings.len(), 2);
-        assert_eq!(written_at(&svm, &registry, 1), [oracle.to_string()]);
-
-        let own = own_keep_alive(serde_json::json!([
-            { "template": "nowhere", "address": { "type": "override" }, "values": { "slot": "$slot" } },
-            { "template": "example-fresh", "address": { "type": "input", "value": "missing" }, "values": { "slot": "$slot" } },
-            { "template": "example-fresh", "address": { "type": "pubkey", "value": feed.to_string() }, "values": { "slot": "$slot" } },
-        ]));
-        svm.enroll_keep_alive(&registry, vec![source(vault, own)]);
-        let bindings = svm
-            .keep_alive_bindings
-            .iter()
-            .map(|binding| (binding.source, binding.address, binding.own))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            bindings,
-            [(other_vault, oracle, false), (vault, feed, true)]
-        );
-        assert_eq!(
-            written_at(&svm, &registry, 1),
-            [oracle, feed].map(|address| address.to_string()),
-            "the other vault still keeps the oracle"
-        );
-    }
-
-    /// The case of the price feeds a transaction reads, which no scenario names.
-    #[test]
-    fn an_overrides_own_pubkey_imports_keep_other_accounts_fresh_every_slot() {
-        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        let feeds = [keep_alive_target(&mut svm), keep_alive_target(&mut svm)];
-        let imports = feeds.map(|feed| {
-            serde_json::json!({
-                "template": "example-fresh",
-                "address": { "type": "pubkey", "value": feed.to_string() },
-                "values": { "slot": "$slot", "ms": "$unix_ms" },
-            })
-        });
-        let source = KeepAliveSource {
-            template: "example-price".to_string(),
-            address: Pubkey::new_unique(),
-            values: HashMap::new(),
-            imports: own_keep_alive(serde_json::json!(imports)),
-        };
-        svm.enroll_keep_alive(&registry, vec![source]);
-        for slot in [7, 8] {
-            let fresh = feeds.map(|feed| feed.to_string());
-            assert_eq!(written_at(&svm, &registry, slot), fresh);
-        }
-    }
-
     #[tokio::test]
-    async fn an_empty_keep_alive_list_stops_what_earlier_overrides_of_its_account_started() {
-        const SLOT: u64 = 500;
-        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
+    async fn an_empty_keep_alive_list_stops_keep_alive_on_the_account_it_writes() {
         let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
         let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let other = Pubkey::new_unique();
-        let earlier = [account_pubkey, other].map(|address| KeepAliveSource {
-            template: "example-price".to_string(),
-            address,
-            values: HashMap::new(),
-            imports: None,
-        });
-        svm.enroll_keep_alive(&registry, earlier.to_vec());
-        let mut play = async |values: HashMap<String, serde_json::Value>| {
+        for address in [account_pubkey, other] {
+            svm.keep_alive_bindings.insert(KeepAliveBinding {
+                template: "an-earlier-override".to_string(),
+                import: 0,
+                address,
+            });
+        }
+        let mut play = async |slot: u64, keep_alive: serde_json::Value, values| {
             let mut instance = instance.clone().with_values(values);
-            instance.keep_alive = Some(Vec::new());
-            svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();
-            svm.materialize_overrides_for_slot(&None, SLOT)
+            instance.keep_alive = serde_json::from_value(keep_alive).unwrap();
+            svm.scheduled_overrides.store(slot, vec![instance]).unwrap();
+            svm.materialize_overrides_for_slot(&None, slot)
                 .await
                 .unwrap();
             svm.keep_alive_bindings
                 .iter()
-                .map(|binding| binding.source)
-                .collect::<Vec<_>>()
+                .map(|binding| binding.address)
+                .collect::<Vec<Pubkey>>()
         };
+        let mut both = vec![account_pubkey, other];
+        both.sort();
 
         let failed = HashMap::from([("nope".to_string(), serde_json::json!(1))]);
+        assert_eq!(play(500, serde_json::json!([]), failed).await, both);
         assert_eq!(
-            play(failed).await.len(),
-            2,
-            "a failed write changes nothing"
+            play(501, serde_json::json!([{}]), instance.values.clone()).await,
+            both,
+            "a failed write and a non-empty list stop nothing"
         );
-        assert_eq!(play(instance.values.clone()).await, [other]);
+        assert_eq!(
+            play(502, serde_json::json!([]), instance.values.clone()).await,
+            vec![other],
+            "only the written account stops"
+        );
     }
 }

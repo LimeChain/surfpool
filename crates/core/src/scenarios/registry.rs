@@ -93,29 +93,12 @@ pub(crate) fn account_data_values(
     instance: &OverrideInstance,
     template: Option<&OverrideTemplate>,
 ) -> (HashMap<String, serde_json::Value>, usize, usize) {
-    // The override's own keep-alive list reads its addresses from the same values. Like a
-    // template's PDA seeds, a value that is a field is still written.
-    let own_imports = instance.keep_alive_imports().unwrap_or_default();
-    let is_field = |path: &str| {
-        template.is_some_and(|template| {
-            template
-                .properties
-                .iter()
-                .any(|property| property.path == path && property.is_field())
-        })
-    };
     let mut pda_refs = instance.account.get_pda_seed_references();
     pda_refs.extend(
         template
             .into_iter()
             .flat_map(OverrideTemplate::keep_alive_pda_seeds),
     );
-    for import in &own_imports {
-        if let KeepAliveAddress::Account(address) = &import.address {
-            let seeds = address.get_pda_seed_references().into_iter();
-            pda_refs.extend(seeds.filter(|seed| !is_field(seed)));
-        }
-    }
     // Keep-alive inputs only name the account a keep-alive writes, so they count as selectors.
     let constant_refs: HashSet<&str> = template
         .into_iter()
@@ -127,14 +110,6 @@ pub(crate) fn account_data_values(
                 .map(|property| property.path.as_str())
                 .chain(template.keep_alive_inputs())
         })
-        .chain(
-            own_imports
-                .iter()
-                .filter_map(|import| match &import.address {
-                    KeepAliveAddress::Input(name) if !is_field(name) => Some(name.as_str()),
-                    _ => None,
-                }),
-        )
         .collect();
     let values = instance
         .values
@@ -488,7 +463,7 @@ impl TemplateRegistry {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         str::FromStr,
@@ -874,7 +849,7 @@ templates:
         assert!(error.contains("exceeds the 15 byte account"), "{error}");
     }
 
-    pub(crate) const KEEP_ALIVE_OVERRIDES: &str = r#"
+    const KEEP_ALIVE_OVERRIDES: &str = r#"
 protocol: Example
 version: v1
 account_type: State
@@ -917,7 +892,7 @@ templates:
       - { path: ms, offset: 16, encoding: u64, description: Published time }
 "#;
 
-    pub(crate) fn keep_alive_registry(overrides: &str) -> TemplateRegistry {
+    fn keep_alive_registry(overrides: &str) -> TemplateRegistry {
         let mut registry = TemplateRegistry::default();
         registry.load_raw_layout_overrides(overrides, "example");
         registry.load_keep_alive(None, KEEP_ALIVE, "example");
@@ -1004,32 +979,6 @@ templates:
         )]));
         let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
         assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
-    }
-
-    #[test]
-    fn what_an_overrides_own_keep_alive_reads_is_never_written_unless_a_field() {
-        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
-        let system = "11111111111111111111111111111111";
-        let mut instance = OverrideInstance::new(
-            "example-price".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(system.to_string()),
-        )
-        .with_values(HashMap::from([
-            ("price".to_string(), serde_json::json!(1)),
-            ("feed".to_string(), serde_json::json!(system)),
-            ("seed".to_string(), serde_json::json!(system)),
-        ]));
-        instance.keep_alive = serde_json::from_value(serde_json::json!([
-            { "template": "example-fresh", "address": { "type": "input", "value": "feed" }, "values": { "slot": "$slot" } },
-            { "template": "example-fresh", "address": { "type": "pda", "program_id": system, "seeds": [
-                { "type": "property_ref", "value": "seed" },
-                { "type": "property_ref", "value": "price" },
-            ] }, "values": { "slot": "$slot" } },
-        ]))
-        .unwrap();
-        let (values, _, _) = account_data_values(&instance, registry.get("example-price"));
-        assert_eq!(values.keys().collect::<Vec<_>>(), ["price"]);
     }
 
     #[test]

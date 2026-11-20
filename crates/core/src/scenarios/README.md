@@ -125,36 +125,12 @@ never takes effect. An account not yet in the surfnet is fetched from the remote
 or its owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
 until an importing override plays again.
 
-An override can give its own `keepAlive` list, in the shape of a `keep_alive` list, in place of its
-template's. Without `keepAlive`, the template's list applies. With a list, `[]` included, keep-alive
-first stops for everything that earlier overrides of the same account started, then the override's
-own imports start. Keep-alive that overrides of other accounts started does not change. So `[]`
-turns keep-alive off for the account's overrides, and a list repeats any template import it still
-needs. A `pubkey` import keeps an account fresh that no override writes, such as another price feed
-a transaction reads:
-
-```json
-{
-  "id": "vault-balance",
-  "templateId": "example-vault-balance",
-  "values": { "balance": 1000, "oracle": "<oracle>" },
-  "scenarioRelativeSlot": 0,
-  "enabled": true,
-  "account": { "pubkey": "<vault>" },
-  "keepAlive": [
-    {
-      "template": "example-oracle-fresh",
-      "address": { "type": "input", "value": "oracle" },
-      "values": { "publication_slot": "$slot", "publication_time": "$unix_ms" }
-    },
-    {
-      "template": "example-oracle-fresh",
-      "address": { "type": "pubkey", "value": "<another oracle>" },
-      "values": { "publication_slot": "$slot", "publication_time": "$unix_ms" }
-    }
-  ]
-}
-```
+An override can turn keep-alive off for the account it writes with `"keepAlive": []`, as `keep_alive: []`
+does for a template. From that override's slot on, nothing rewrites the account, including keep-alive
+that earlier overrides started, so its fields age as the clock moves on, for example to test a stale
+price. The override must write a value for this to take effect. Without the field, the template's
+keep-alive applies as usual. To keep fresh an account a transaction reads but no scenario names, give
+it an override of its own.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
