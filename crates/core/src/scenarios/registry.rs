@@ -93,12 +93,29 @@ pub(crate) fn account_data_values(
     instance: &OverrideInstance,
     template: Option<&OverrideTemplate>,
 ) -> (HashMap<String, serde_json::Value>, usize, usize) {
+    // The override's own keep-alive list reads its addresses from the same values. Like a
+    // template's PDA seeds, a value that is a field is still written.
+    let own_imports = instance.keep_alive_imports().unwrap_or_default();
+    let is_field = |path: &str| {
+        template.is_some_and(|template| {
+            template
+                .properties
+                .iter()
+                .any(|property| property.path == path && property.is_field())
+        })
+    };
     let mut pda_refs = instance.account.get_pda_seed_references();
     pda_refs.extend(
         template
             .into_iter()
             .flat_map(OverrideTemplate::keep_alive_pda_seeds),
     );
+    for import in &own_imports {
+        if let KeepAliveAddress::Account(address) = &import.address {
+            let seeds = address.get_pda_seed_references().into_iter();
+            pda_refs.extend(seeds.filter(|seed| !is_field(seed)));
+        }
+    }
     // Keep-alive inputs only name the account a keep-alive writes, so they count as selectors.
     let constant_refs: HashSet<&str> = template
         .into_iter()
@@ -110,6 +127,14 @@ pub(crate) fn account_data_values(
                 .map(|property| property.path.as_str())
                 .chain(template.keep_alive_inputs())
         })
+        .chain(
+            own_imports
+                .iter()
+                .filter_map(|import| match &import.address {
+                    KeepAliveAddress::Input(name) if !is_field(name) => Some(name.as_str()),
+                    _ => None,
+                }),
+        )
         .collect();
     let values = instance
         .values
@@ -177,9 +202,8 @@ impl TemplateRegistry {
     }
 
     /// Fails on a keep-alive import the registry cannot apply: its template must be a loaded
-    /// keep-alive template that has every property it sets, an input address must name a pubkey
-    /// input of the importing template, and an owned address an account of the keep-alive
-    /// template's IDL.
+    /// keep-alive template that has every property it sets, and an input address must name a
+    /// pubkey input of the importing template.
     pub fn check_keep_alive_imports(&self) -> Result<(), String> {
         for template in self.templates.values() {
             for import in &template.keep_alive {
@@ -208,13 +232,6 @@ impl TemplateRegistry {
                              not {value}"
                         ));
                     }
-                }
-                if let KeepAliveAddress::Owned { account, .. } = &import.address
-                    && keep_alive.account_discriminator(account).is_none()
-                {
-                    return fail(format!(
-                        "its IDL has no account '{account}' with a discriminator"
-                    ));
                 }
                 if let KeepAliveAddress::Input(name) = &import.address {
                     let is_pubkey_input = template.properties.iter().any(|property| {
@@ -471,7 +488,7 @@ impl TemplateRegistry {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         str::FromStr,
@@ -857,7 +874,7 @@ templates:
         assert!(error.contains("exceeds the 15 byte account"), "{error}");
     }
 
-    const KEEP_ALIVE_OVERRIDES: &str = r#"
+    pub(crate) const KEEP_ALIVE_OVERRIDES: &str = r#"
 protocol: Example
 version: v1
 account_type: State
@@ -900,7 +917,7 @@ templates:
       - { path: ms, offset: 16, encoding: u64, description: Published time }
 "#;
 
-    fn keep_alive_registry(overrides: &str) -> TemplateRegistry {
+    pub(crate) fn keep_alive_registry(overrides: &str) -> TemplateRegistry {
         let mut registry = TemplateRegistry::default();
         registry.load_raw_layout_overrides(overrides, "example");
         registry.load_keep_alive(None, KEEP_ALIVE, "example");
@@ -990,6 +1007,32 @@ templates:
     }
 
     #[test]
+    fn what_an_overrides_own_keep_alive_reads_is_never_written_unless_a_field() {
+        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
+        let system = "11111111111111111111111111111111";
+        let mut instance = OverrideInstance::new(
+            "example-price".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(system.to_string()),
+        )
+        .with_values(HashMap::from([
+            ("price".to_string(), serde_json::json!(1)),
+            ("feed".to_string(), serde_json::json!(system)),
+            ("seed".to_string(), serde_json::json!(system)),
+        ]));
+        instance.keep_alive = serde_json::from_value(serde_json::json!([
+            { "template": "example-fresh", "address": { "type": "input", "value": "feed" }, "values": { "slot": "$slot" } },
+            { "template": "example-fresh", "address": { "type": "pda", "program_id": system, "seeds": [
+                { "type": "property_ref", "value": "seed" },
+                { "type": "property_ref", "value": "price" },
+            ] }, "values": { "slot": "$slot" } },
+        ]))
+        .unwrap();
+        let (values, _, _) = account_data_values(&instance, registry.get("example-price"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["price"]);
+    }
+
+    #[test]
     fn imports_the_registry_cannot_apply_are_refused() {
         let refused = |overrides: String, expected: &str| {
             let error = keep_alive_registry(&overrides)
@@ -1063,30 +1106,6 @@ templates:
                 "    keep_alive:\n      - { template: example-fresh, address: { type: override }, values: { slot: $slot } }\n    address: { type: pubkey }",
             ),
             "'example-fresh' is a keep-alive template and cannot import keep-alive",
-        );
-    }
-
-    #[test]
-    fn an_owned_import_needs_its_account_in_the_keep_alive_idl() {
-        use crate::scenarios::keep_alive::tests::{OWNED_OVERRIDES, owned_registry};
-
-        owned_registry(OWNED_OVERRIDES)
-            .check_keep_alive_imports()
-            .unwrap();
-        let error =
-            owned_registry(&OWNED_OVERRIDES.replace("account: PriceUpdateV2", "account: Nope"))
-                .check_keep_alive_imports()
-                .unwrap_err();
-        assert!(error.contains("its IDL has no account 'Nope'"), "{error}");
-        let error = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
-            "address: { type: input, value: oracle }",
-            "address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: State }",
-        ))
-        .check_keep_alive_imports()
-        .unwrap_err();
-        assert!(
-            error.contains("its IDL has no account 'State'"),
-            "a raw layout has no IDL: {error}"
         );
     }
 

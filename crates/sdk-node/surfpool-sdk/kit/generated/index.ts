@@ -34,4 +34,7 @@ export type * from "./UiAccountEncoding.js";
 export type * from "./UiAccountProfileState.js";
 export type * from "./UiKeyedProfileResult.js";
 export type * from "./UiProfileResult.js";
+export type * from "./YamlKeepAliveAddress.js";
+export type * from "./YamlKeepAliveImport.js";
+export type * from "./YamlPdaSeed.js";
 export * from "./methods.js";

@@ -861,7 +861,7 @@
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
-                      "keepAlive": "bool (Optional, defaults to true. If false, keep-alive stops rewriting this account from this slot on, and its fields age as the clock moves on. A later override with true starts it again)",
+                      "keepAlive": "Option<Vec<YamlKeepAliveImport>> (Optional keep-alive list in place of the template's keep_alive list, in the same shape: [{\"template\": \"<keep-alive template id>\", \"address\": {\"type\": \"override\"} or {\"type\": \"input\", \"value\": \"<input property>\"} or {\"type\": \"pubkey\", \"value\": \"<base-58 address>\"} or {\"type\": \"pda\", \"program_id\": \"<base-58 program>\", \"seeds\": [ ... ]}, \"values\": {\"<field path>\": \"$slot\"}}]. Omitted, the template's list applies. Given, even as [], it first stops the keep-alive that earlier overrides of this account started, then starts its own imports)",
                       "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }
