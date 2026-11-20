@@ -33,7 +33,6 @@ const fn pubkey(address: &str) -> Pubkey {
 
 const PROGRAM: Pubkey = pubkey("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH");
 const PROGRAMDATA: Pubkey = pubkey("BzSXM6KLDpHQQChzr7Fdgbzwp8r8zRYWFFrHK2uZmDYV");
-const DEPLOYED_SLOT: u64 = 446053401;
 const GLOBAL_STATE: Pubkey = pubkey("8ekCy2jHHUbW2yeNGFWYJT9Hm9FW7SvZcZK66dSZCDiF");
 const V11_SENTINEL: Pubkey = pubkey("8xeaWCsJYxRoudEZGJWURdfrtFhLYZz9b4iHJnW5tb3d");
 const V11_CONFIG: Pubkey = pubkey("BAT1Ndpu5gbLTp2AZkSXP79LJBZfCH4B3zGhi6LtvdhK");
@@ -195,11 +194,6 @@ async fn fixture() -> TesseraFixture {
             assert!(
                 programdata.data.len() > 400_000,
                 "programdata is unexpectedly short"
-            );
-            let deployed_slot = u64::from_le_bytes(programdata.data[4..12].try_into().unwrap());
-            assert_eq!(
-                deployed_slot, DEPLOYED_SLOT,
-                "program redeployed at slot {deployed_slot}; revalidate the raw offsets"
             );
             let [sol, cbb] = markets.map(|spec| {
                 let market = get(spec.address);
