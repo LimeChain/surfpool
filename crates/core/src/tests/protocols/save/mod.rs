@@ -4,7 +4,7 @@
 //! so they need a network connection and are compiled only behind a feature:
 //!
 //! ```text
-//! cargo test -p surfpool-core --features integration-tests save
+//! cargo test -p surfpool-core --features integration-tests tests::protocols::save
 //! ```
 //!
 //! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
@@ -37,7 +37,6 @@ use surfpool_types::{AccountAddress, OverrideInstance, RawEncoding, Scenario};
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
-    tests::helpers::diff_indices,
     types::RemoteRpcResult,
 };
 
@@ -250,6 +249,16 @@ fn u128_at(data: &[u8], at: usize) -> u128 {
 
 fn pubkey_at(data: &[u8], at: usize) -> Pubkey {
     Pubkey::new_from_array(data[at..at + 32].try_into().unwrap())
+}
+
+/// Byte indices at which two buffers differ.
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// A value that differs from the one stored, so the write is visible in a diff.
