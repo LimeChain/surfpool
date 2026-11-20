@@ -1,0 +1,17 @@
+protocol: Pyth
+version: v2
+account_type: PriceUpdateV2
+idl_file_path: idl.json
+
+templates:
+  - id: pyth-core-compatible-price-publication
+    name: Price publication
+    description: The Pyth publisher republishing a price
+    idl_account_name: PriceUpdateV2
+    address:
+      type: pubkey
+    properties:
+      - path: price_message.publish_time
+        description: Unix seconds the price was published at, checked against the Clock
+      - path: posted_slot
+        description: Slot the price was posted in, for consumers that measure freshness in slots
