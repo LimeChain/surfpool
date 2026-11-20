@@ -1367,6 +1367,9 @@ async fn pool_limits_and_switches_refuse_a_deposit() {
     let aum = decode("Pool", &graph.data(&POOL)[8..])["aum_usd"].clone();
     let aum: u128 = aum.as_str().unwrap().parse().unwrap();
     let limits = |values: Value| template_override(POOL_LIMITS, POOL, values);
+    // Every case lifts the weight limit, so only its own lever can refuse the deposit: a SOL crash
+    // raises USDC's weight, and live weights alone can put USDC past its buffer.
+    let any_weight = limits(json!({ "limit.token_weightage_buffer_bps": "100000" }));
     let cap = limits(json!({ "limit.max_aum_usd": (aum / 2).to_string() }));
     let guard = limits(json!({ "max_lp_token_price_change_bps": 10_000 }));
     let off = json!({ "permissions.allow_add_liquidity": false });
@@ -1397,7 +1400,7 @@ async fn pool_limits_and_switches_refuse_a_deposit() {
 
     for (what, overrides, refused) in cases {
         let locker = perps_vm(&graph).await;
-        play(&locker, overrides).await;
+        play(&locker, [vec![any_weight.clone()], overrides].concat()).await;
         let wallet = depositor(&locker, USDC_MINT, DEPOSIT);
         let sent = add_liquidity(&locker, &graph, wallet, USDC_MINT, DEPOSIT);
         match refused {
