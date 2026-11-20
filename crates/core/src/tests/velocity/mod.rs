@@ -1352,8 +1352,9 @@ async fn spot_market_risk_sets_collateral_value_and_borrow_interest() {
 
 /// Margin checks and matched fills refuse a price older than the State's margin window, three times
 /// that for the USDT price, and liquidations ignore its age. The exchange template raises the
-/// window. Once velocity-oracle-price plays, keep-alive reposts every oracle, so only one written
-/// with keep-alive off ages.
+/// window. velocity-oracle-price reposts only the oracle it writes, so the USDT price ages until an
+/// override of its own that writes only posted_slot reposts it too, and ages again after a later
+/// one with keepAlive [].
 #[tokio::test(flavor = "multi_thread")]
 async fn the_margin_window_ages_prices_until_the_exchange_template_raises_it() {
     const MARGIN_WINDOW: &str = "oracle_guard_rails.validity.slots_before_stale_for_margin";
@@ -1408,25 +1409,41 @@ async fn the_margin_window_ages_prices_until_the_exchange_template_raises_it() {
     at_age(FAR_PAST + 1);
     expect_error(withdraw(), INVALID_ORACLE, "past the raised window");
 
-    // In the live window, velocity-oracle-price on the market's oracle alone keeps the USDT price
-    // posted too, until an override of it turns keep-alive off.
+    // In the live window, velocity-oracle-price on the market's oracle leaves the USDT price aging.
     vm.apply(EXCHANGE_RISK, STATE, json!({MARGIN_WINDOW: units}))
         .await;
     let unchanged = |oracle: &Pubkey| json!({"price": i64_at(&vm.data(oracle), PRICE)});
     vm.apply(ORACLE_PRICE, oracle, unchanged(&oracle)).await;
     let later = book.posted + 2 * FAR_PAST;
     vm.advance_to(later).await;
-    expect_success(withdraw(), "a withdrawal with every oracle reposted");
+    expect_error(
+        withdraw(),
+        INVALID_ORACLE,
+        "the USDT price with no override",
+    );
+
+    // An override that writes only posted_slot reposts the USDT price as it is.
     let usdt_oracle = pubkey_at(mainnet.spot_market(USDT_SPOT_MARKET), SPOT_ORACLE);
+    let before = vm.data(&usdt_oracle);
+    vm.apply(ORACLE_PRICE, usdt_oracle, json!({"posted_slot": later}))
+        .await;
+    let moved = diff_indices(&before, &vm.data(&usdt_oracle));
+    let posting = |i: &usize| PUBLISH_TIME.contains(i) || POSTED_SLOT.contains(i);
+    assert!(moved.iter().all(posting), "{moved:?}");
+    let reposted = later + FAR_PAST;
+    vm.advance_to(reposted).await;
+    expect_success(withdraw(), "a withdrawal with one override per oracle");
+
     let usdt = AccountAddress::Pubkey(usdt_oracle.to_string());
     let values = unchanged(&usdt_oracle).as_object().unwrap().clone();
     let mut stale = OverrideInstance::new(ORACLE_PRICE.into(), 0, usdt)
         .with_values(values.into_iter().collect());
-    stale.keep_alive = false;
+    stale.keep_alive = Some(vec![]);
     vm.play(stale).await;
-    vm.advance_to(later + STABLE_COIN_STALENESS_SLOTS).await;
+    vm.advance_to(reposted + STABLE_COIN_STALENESS_SLOTS).await;
     expect_success(withdraw(), "at the end of the USDT window, keep-alive off");
-    vm.advance_to(later + STABLE_COIN_STALENESS_SLOTS + 1).await;
+    vm.advance_to(reposted + STABLE_COIN_STALENESS_SLOTS + 1)
+        .await;
     expect_error(
         withdraw(),
         INVALID_ORACLE,
@@ -1434,7 +1451,7 @@ async fn the_margin_window_ages_prices_until_the_exchange_template_raises_it() {
     );
     vm.apply(ORACLE_PRICE, usdt_oracle, unchanged(&usdt_oracle))
         .await;
-    expect_success(withdraw(), "the USDT price with keep-alive on again");
+    expect_success(withdraw(), "the USDT price reposted by a later override");
 }
 
 /// AMM fills and a settle right after a price move need a recent price. An order placed after the
@@ -1512,43 +1529,44 @@ async fn amm_fills_and_settling_a_moved_price_need_a_price_within_the_amm_window
     expect_error(filled, CASTING_FAILURE, "an AMM window over 127");
 }
 
-/// velocity-oracle-price keeps every Velocity oracle posted, as Velocity's keeper does on mainnet:
-/// from the slot it plays, later slots and a time travel repost the oracle it writes and every
-/// other oracle in the surfnet, one loaded later too, at the open slot and Clock time. The
-/// scenario's price and confidence stay, and the other oracles keep theirs.
+/// velocity-oracle-price keeps posted the oracle each override writes, as Velocity's keeper does on
+/// mainnet: from the slot it plays, later slots and a time travel repost it at the open slot and
+/// Clock time. The scenario's price and confidence stay, an override that writes only posted_slot
+/// reposts another oracle at its own price, and an oracle no override writes stays as it was loaded.
 #[tokio::test]
 async fn the_oracle_price_stays_posted_through_later_slots_and_a_time_travel() {
     let mainnet = mainnet().await;
     let oracle = mainnet.oracle_of(SOL_PERP);
     let usdt_oracle = pubkey_at(mainnet.spot_market(USDT_SPOT_MARKET), SPOT_ORACLE);
-    let loaded_later = mainnet.oracle_of(BTC_PERP);
+    let unwritten = mainnet.oracle_of(BTC_PERP);
     let original = &mainnet.account(&oracle).data;
     let price = i64_at(original, PRICE) / 10 * 8;
     let conf = u64_at(original, CONF) / 10 * 8;
     let mut kept = HashMap::from([(oracle, (price, conf))]);
-    for other in [usdt_oracle, loaded_later] {
+    for other in [usdt_oracle, unwritten] {
         let account = mainnet.account(&other);
         assert_eq!(account.owner, PROGRAM, "{other}");
         let data = &account.data;
         kept.insert(other, (i64_at(data, PRICE), u64_at(data, CONF)));
     }
     assert_eq!(kept.len(), 3, "three different oracles");
-    let mut scenario = Scenario::new("SOL drops 20%".into(), "keep-alive".into());
-    let target = AccountAddress::Pubkey(oracle.to_string());
-    let values = HashMap::from([
-        ("price".to_string(), json!(price)),
-        ("conf".to_string(), json!(conf)),
-    ]);
-    scenario
-        .add_override(OverrideInstance::new(ORACLE_PRICE.into(), 0, target).with_values(values));
 
     let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     svm.apply_time_travel(mainnet.clock.clone()).unwrap();
-    for address in [oracle, usdt_oracle] {
+    for address in [oracle, usdt_oracle, unwritten] {
         svm.set_account(&address, mainnet.account(&address).clone())
             .unwrap();
     }
     let slot = svm.get_latest_absolute_slot();
+    let price_override = |address: Pubkey, values: serde_json::Value| {
+        let target = AccountAddress::Pubkey(address.to_string());
+        let values = values.as_object().unwrap().clone().into_iter().collect();
+        OverrideInstance::new(ORACLE_PRICE.into(), 0, target).with_values(values)
+    };
+    let mut scenario = Scenario::new("SOL drops 20%".into(), "keep-alive".into());
+    let moved = json!({"price": price, "conf": conf});
+    scenario.add_override(price_override(oracle, moved));
+    scenario.add_override(price_override(usdt_oracle, json!({"posted_slot": slot})));
     svm.register_scenario(scenario, Some(slot)).unwrap();
     svm.materialize_overrides_for_slot(&None, slot)
         .await
@@ -1585,16 +1603,18 @@ async fn the_oracle_price_stays_posted_through_later_slots_and_a_time_travel() {
                 "{what}: escaped the price and keep-alive write set"
             );
         }
+        let data = svm.get_account(&unwritten).unwrap().unwrap().data;
+        let what = format!("{what}, {unwritten}");
+        let loaded = &mainnet.account(&unwritten).data;
+        assert_eq!(&data, loaded, "{what}: no override");
         publish_time
     };
-    assert_posted(&svm, &[oracle, usdt_oracle], "the slot the override plays");
-    svm.set_account(&loaded_later, mainnet.account(&loaded_later).clone())
-        .unwrap();
-    let every_oracle = [oracle, usdt_oracle, loaded_later];
+    let written = [oracle, usdt_oracle];
+    assert_posted(&svm, &written, "the slot the overrides play");
     for _ in 0..3 {
         svm.confirm_current_block().unwrap();
         svm.materialize_overrides(&None).await.unwrap();
-        assert_posted(&svm, &every_oracle, "a later slot");
+        assert_posted(&svm, &written, "a later slot");
     }
 
     let clock = svm.inner.get_sysvar::<Clock>();
@@ -1605,7 +1625,7 @@ async fn the_oracle_price_stays_posted_through_later_slots_and_a_time_travel() {
     });
     let landing = landing.unwrap().absolute_slot;
     svm.apply_keep_alive(&None, landing).await;
-    let published = assert_posted(&svm, &every_oracle, "a time travel");
+    let published = assert_posted(&svm, &written, "a time travel");
     // Fills read the market's MM oracle price within 1% only while its sequence id is newer.
     let mm_price = |market| u64_at(&mainnet.account(market).data, MM_ORACLE_SEQUENCE_ID);
     let newest_mm_price = mainnet.perp_markets.iter().map(mm_price).max().unwrap();

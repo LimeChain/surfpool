@@ -1104,11 +1104,7 @@ templates:
                 panic!("{id} must keep its oracle posted");
             };
             assert_eq!(import.template, "velocity-oracle-publication");
-            let every_oracle = KeepAliveAddress::Owned {
-                owners: vec!["vELoC1audYbSYVRXn1vPaV8Axoa9oU6BYmNGZZBDZ1P".to_string()],
-                account: "PythLazerOracle".to_string(),
-            };
-            assert_eq!(import.address, every_oracle, "{id}");
+            assert_eq!(import.address, KeepAliveAddress::Override, "{id}");
             let clock = surfpool_types::KeepAliveClock {
                 slot: 7,
                 unix_time_ms: 1_800_000_000_123,
@@ -1123,20 +1119,12 @@ templates:
         }
         let publication = registry.keep_alive_template("velocity-oracle-publication");
         let publication = publication.unwrap();
-        let idl = publication.idl.as_ref().expect("written through the IDL");
-        let oracle = publication
-            .account_discriminator("PythLazerOracle")
-            .unwrap();
-        let sharing: Vec<&str> = idl
-            .accounts
-            .iter()
-            .filter(|account| account.discriminator == oracle)
-            .map(|account| account.name.as_str())
-            .collect();
+        assert!(publication.idl.is_some(), "written through the IDL");
+        let price = registry.get("velocity-oracle-price").unwrap();
+        assert_eq!(publication.account_type, "PythLazerOracle");
         assert_eq!(
-            sharing,
-            ["PythLazerOracle"],
-            "keep-alive writes only oracles"
+            price.account_type, publication.account_type,
+            "keep-alive writes the oracle the override writes"
         );
     }
 
