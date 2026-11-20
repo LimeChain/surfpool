@@ -2,7 +2,7 @@
 //! and Doves programs, so they need a network connection and `--features integration-tests`:
 //!
 //! ```text
-//! cargo test -p surfpool-core --features integration-tests tests::jupiter:: -- --test-threads=1
+//! cargo test -p surfpool-core --features integration-tests tests::protocols::jupiter:: -- --test-threads=1
 //! ```
 //!
 //! `SURFPOOL_TEST_RPC_URL` overrides the endpoint. Instructions are built from the bundled IDL. The
