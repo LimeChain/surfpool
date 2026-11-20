@@ -9,12 +9,12 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
 
+use super::diff_indices;
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{
         GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
     },
-    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
