@@ -152,3 +152,7 @@ The following steps can be followed to natively support a protocol:
 If any part of these instructions are beyond your skill level or availability, but you'd like to see a specific protocol supported, feel free to [Open an Issue to Support a new Protocol](https://github.com/solana-foundation/surfpool/issues/new?template=native-scenario-support-for-protocol.md)!
 Opening an issue to signal interest is a big help.
 If you're able to find an IDL for the protocol, even better!
+
+## Templates Written at Runtime
+A program with an Anchor IDL does not need a rebuild to get templates. From any MCP host (Claude Code, Codex, Cursor), the `author_override_template` prompt walks a model through `validate_override_template` and `save_override_template`; the same guide is the `str:///template_authoring_guide` resource and [AUTHORING.md](./AUTHORING.md).
+The user gives the IDL file (Anchor 0.30+; run `anchor idl convert` on a legacy one) and keeps the collection YAML wherever they want; the host reads both and passes their contents. Saved templates live in the memory of the MCP session, so after a restart the host passes them again. The MCP resolves a saved template's account and drops its helper values (inputs, selectors, PDA seed values) before an override reaches the surfnet, and `keep_alive` is not supported in user templates. A collection can be promoted into the repo by adding it under `protocols/` with its `load_*` line.
