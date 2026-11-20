@@ -13,11 +13,20 @@ use crate::{
     surfnet::{
         GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
     },
-    tests::helpers::diff_indices,
 };
 
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+
+/// Byte indices at which two buffers differ.
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
+}
 
 const SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
 const SOL_USDC_TS4: &str = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
