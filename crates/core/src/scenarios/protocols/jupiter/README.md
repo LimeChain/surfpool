@@ -29,7 +29,7 @@ address: each override names the `TokenLedger` account by its pubkey.
 | Template | Overrides |
 |---|---|
 | `jupiter-perps-doves-price` | the Doves price Perps reads for one asset |
-| `jupiter-perps-custody-risk` | a market's liquidation leverage, size caps and action switches |
+| `jupiter-perps-custody-risk` | a market's leverage limit, size caps and action switches |
 | `jupiter-perps-custody-borrow-rate` | the borrow-rate curve a custody charges positions |
 | `jupiter-perps-custody-borrow-fee` | a borrow fee charged to a custody's positions at once |
 | `jupiter-perps-custody-fees` | the fees a market charges to open and close positions |
@@ -109,10 +109,23 @@ jupiter-perps-custody-risk   pricing.max_leverage: 200000     # liquidate everyt
 jupiter-perps-custody-fees   decrease_position_bps: <above the position's spare margin>
 ```
 
-Liquidation is keeper-only: the deployed program accepts one hardcoded keeper key. On a surfnet
-running `--skip-signature-verification`, a transaction can be sent as that keeper.
+Liquidation is keeper-only: the deployed program accepts only keeper keys compiled into it, and
+no account holds them, so no override adds one. On a surfnet running
+`--skip-signature-verification`, a transaction can be sent as a keeper, and so can the keeper
+fills that open and close positions.
 
 A cascade is a price override per asset in the same slot.
+
+## Cap leverage
+
+`pricing.max_leverage` is also the most a position may open at. A keeper's fill of an open or
+increase fails with 6022 once `size x 10^4 / (collateral after the open fee - close fee)` is above
+it; the trader's request does not check it.
+
+```
+template: jupiter-perps-custody-risk      address: the market's custody
+pricing.max_leverage: 100000              # opens above 10x fail, positions above 10x are liquidated
+```
 
 ## Charge positions faster
 
@@ -217,7 +230,7 @@ deposits then fail with 6043.
 | 6003 `StaleOraclePrice` | a feed the instruction read is too old: 5 seconds for a deposit, 15 for a quote | expected before any `jupiter-perps-doves-price` override plays, or on a feed overridden with `keepAlive: false`: override one feed, at its live price if the scenario does not move it - see "Keep-alive" |
 | 6009 `InvalidPositionState` | the position is not liquidatable | move the price further, or lower `pricing.max_leverage` |
 | 6014 `InvalidCustodyBalance` | a custody's vault and staked lamports hold less than its `assets.owned`: the two were copied from mainnet at different moments, as when Studio's market list or a lookup read the custody first, or `fetchBeforeUse` reloaded only the custody | `surfnet_resetAccount` on the custody and on its `token_account`; the next transaction loads them together |
-| 6022 `MaxLeverage` | the position would open past its leverage limit, as when its close fee exceeds its collateral | lower `decrease_position_bps` or add collateral |
+| 6022 `MaxLeverage` | a keeper's fill would open the position above `pricing.max_leverage`, counting the collateral after the open fee less the close fee | raise `pricing.max_leverage`, lower `decrease_position_bps` or add collateral |
 | 6024 `PoolAmountLimit` | the deposit would exceed `limit.max_aum_usd` | raise the cap |
 | 6027 `InstructionNotAllowed` | a `permissions` switch is off | set it back to `true` |
 | 6034 `InvalidKeeper` | the liquidator is not the keeper the program accepts | sign as the keeper |

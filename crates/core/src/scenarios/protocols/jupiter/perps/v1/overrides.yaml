@@ -17,7 +17,7 @@ templates:
     properties:
       - path: pricing.max_leverage
         label: Max leverage
-        description: "Leverage at which positions are liquidated, in BPS (10000 = 1x). Example: 5000000 is 500x"
+        description: "Leverage at which positions are liquidated, and the most a position may open at, in BPS (10000 = 1x). Example: 5000000 is 500x"
       - path: max_position_size_usd
         label: Max position size
         description: "Largest single position, USD with 6 decimals. Example: 10000000000000 is $10M"
@@ -66,7 +66,9 @@ templates:
       liquidates a position once collateral + PnL - close and borrow fees falls below
       size x 10000 / max_leverage. Lowering it liquidates positions without moving the price:
       at 200000 (20x), every position whose size is over 20 times its remaining margin can be
-      liquidated.
+      liquidated. The same line caps opening: a keeper's fill of an open or increase fails with
+      error 6022 once size x 10000 / (collateral after the open fee - close fee) is above
+      max_leverage.
 
       permissions: false refuses that action with error 6027. allow_liquidate_position false
       stops keepers liquidating this market. The size caps are USD with 6 decimals.

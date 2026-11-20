@@ -1482,6 +1482,44 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     assert!(moved, "taxed USDC and JupUSD swaps: {swapped:?}");
 }
 
+/// `pricing.max_leverage` also caps opening, on the line liquidation checks at the entry price:
+/// the keeper's fill is refused (6022) once `size x 10^4 / (collateral - close fee)` is above it,
+/// and passes at it. The trader's request does not check it.
+#[tokio::test(flavor = "multi_thread")]
+async fn max_leverage_caps_the_leverage_a_position_opens_at() {
+    const SIZE: u64 = 1_000_000_000;
+    let graph = perps_graph(&[]).await;
+    let sol = custody_address(SOL_MINT);
+    let locker = perps_vm(&graph).await;
+    let (opened, at) = open_position(&locker, &graph, &SOL_LONG, Pubkey::new_unique(), SIZE).await;
+    opened.expect("the open at the live max leverage");
+    let collateral = u64_at(&account(&locker, &at).data, position::COLLATERAL_USD) as u128;
+    let market = graph.data(&sol);
+    let scalar = u64_at(market, custody::TRADE_IMPACT_FEE_SCALAR) as u128;
+    let impact_bps = (SIZE as u128 * BPS).div_ceil(scalar);
+    let close_bps = u64_at(market, custody::DECREASE_POSITION_BPS) as u128 + impact_bps;
+    let margin = collateral - SIZE as u128 * close_bps / BPS;
+    let leverage = u64::try_from((SIZE as u128 * BPS).div_ceil(margin)).unwrap();
+
+    for (max_leverage, refused) in [(leverage - 1, Some(MAX_LEVERAGE)), (leverage, None)] {
+        let cap = json!({ "pricing.max_leverage": max_leverage });
+        play(&locker, vec![template_override(RISK, sol, cap)]).await;
+        let trader = Pubkey::new_unique();
+        let (requested, fill, _) = request_position(&locker, &graph, &SOL_LONG, trader, SIZE);
+        let what = format!("a {leverage} BPS open under a {max_leverage} BPS cap");
+        requested.unwrap_or_else(|e| panic!("{what}: the request failed: {e:?}"));
+        let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+        travel(&locker, clock.unix_timestamp + 1).await;
+        let filled = send(&locker, KEEPER, &[fill]);
+        match refused {
+            Some(code) => expect_error(filled, code, &what),
+            None => {
+                filled.unwrap_or_else(|e| panic!("{what}: the fill failed: {e:?}"));
+            }
+        }
+    }
+}
+
 /// The borrow fee a `size_usd` position of `market` pays at its close, on a local VM where `step`
 /// is added to the cumulative rate of `custody` after the open, and the pool's value before and
 /// after the step.
