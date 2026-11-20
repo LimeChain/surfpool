@@ -18,6 +18,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
+- **Save v2.0.2** – Lending (formerly Solend) with reserve risk, rate, limit and liquidity templates and a one-deposit, one-borrow obligation template. See [protocols/save/v2/README.md](./protocols/save/v2/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
@@ -43,13 +44,15 @@ fields a protocol's own off-chain actor would every slot.
 `surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots
 it skips are never applied; step one slot at a time to play a scenario under a paused clock.
 
-### Kamino integration tests
+### Integration tests
 
-Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real
-accounts from mainnet, so they need a network connection and are compiled only behind a feature:
+Each protocol's integration tests live in `crates/core/src/tests/protocols/<protocol>/`. They fetch
+the real accounts from mainnet, so they need a network connection and are compiled only behind a
+feature. Some, such as Save's, also run the deployed program in LiteSVM over those accounts. Run one
+protocol's tests by its module path:
 
 ```
-cargo test -p surfpool-core --features integration-tests kamino
+cargo test -p surfpool-core --features integration-tests tests::protocols::save
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
