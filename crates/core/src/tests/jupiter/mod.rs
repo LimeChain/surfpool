@@ -78,6 +78,9 @@ const BORROW_RATE: &str = "jupiter-perps-custody-borrow-rate";
 const TRADING_FEES: &str = "jupiter-perps-custody-fees";
 const POOL_LIMITS: &str = "jupiter-perps-pool-limits";
 const POOL_FEES: &str = "jupiter-perps-pool-fees";
+const BORROW_FEE: &str = "jupiter-perps-custody-borrow-fee";
+const POSITION: &str = "jupiter-perps-position";
+const POSITION_TOTALS: &str = "jupiter-perps-position-totals";
 const DEPOSIT_QUOTE: &str = "get_add_liquidity_amount_and_fee2";
 
 /// Anchor's prefix on the self-invocation that carries an event.
@@ -105,6 +108,10 @@ mod custody {
     pub const ORACLE_ACCOUNT: usize = 106;
     pub const TRADE_IMPACT_FEE_SCALAR: usize = 151;
     pub const MAX_LEVERAGE: usize = 175;
+    pub const LOCKED: usize = 230;
+    pub const GUARANTEED_USD: usize = 238;
+    pub const GLOBAL_SHORT_SIZES: usize = 246;
+    pub const GLOBAL_SHORT_AVERAGE_PRICES: usize = 254;
     pub const CUMULATIVE_INTEREST_RATE: usize = 262;
     pub const INCREASE_POSITION_BPS: usize = 296;
     pub const DECREASE_POSITION_BPS: usize = 304;
@@ -119,6 +126,7 @@ mod feed {
 }
 
 mod position {
+    pub const OWNER: usize = 8;
     pub const POOL: usize = 40;
     pub const CUSTODY: usize = 72;
     pub const COLLATERAL_CUSTODY: usize = 104;
@@ -128,6 +136,7 @@ mod position {
     pub const SIZE_USD: usize = 161;
     pub const COLLATERAL_USD: usize = 169;
     pub const CUMULATIVE_INTEREST_SNAPSHOT: usize = 185;
+    pub const LOCKED_AMOUNT: usize = 201;
     pub const LEN: usize = 216;
     pub const LONG: u8 = 1;
     pub const SHORT: u8 = 2;
@@ -233,6 +242,7 @@ fn decode(name: &str, bytes: &[u8]) -> Value {
 fn txtx(json: &Value) -> TxtxValue {
     match json {
         Value::Null => TxtxValue::null(),
+        Value::Bool(flag) => TxtxValue::bool(*flag),
         Value::Number(number) => TxtxValue::integer(number.as_u64().unwrap().into()),
         Value::Object(fields) => TxtxValue::object(
             fields
@@ -977,6 +987,66 @@ async fn open_position(
     (send(locker, KEEPER, &[fill]), at)
 }
 
+/// Closes the whole position as the app does: the owner's market request, then the keeper's
+/// `decreasePosition4` one second later. The payout goes to the owner's associated token account.
+async fn close_position(
+    locker: &SurfnetSvmLocker,
+    graph: &PerpsGraph,
+    market: &Market,
+    at: Pubkey,
+) -> Sent {
+    let owner = pubkey_at(&account(locker, &at).data, position::OWNER);
+    let mint = market.collateral_mint;
+    let receiving = get_associated_token_address(&owner, &mint);
+    let made = token_account(locker, owner, mint, 0);
+    set_account(locker, receiving, account(locker, &made));
+    let request = pda(&[b"position_request", at.as_ref(), &[0; 8], &[2]]);
+    let custody = custody_address(market.mint);
+    let shared = [
+        ("owner", owner),
+        ("position", at),
+        ("position_request", request),
+        (
+            "position_request_ata",
+            get_associated_token_address(&request, &mint),
+        ),
+        ("custody", custody),
+        ("collateral_custody", custody_address(mint)),
+    ];
+    let price = graph.feed_usd(graph.feed_of(custody)) as u64;
+    let worst_price = match market.side {
+        position::LONG => price / 2,
+        _ => price * 2,
+    };
+    let params = json!({
+        "collateral_usd_delta": 0, "size_usd_delta": 0, "price_slippage": worst_price,
+        "jupiter_minimum_out": null, "entire_position": true, "counter": 0,
+    });
+    let to = [("receiving_account", receiving), ("desired_mint", mint)];
+    let named = [&shared[..], &to].concat();
+    let name = "create_decrease_position_market_request";
+    send(locker, owner, &[perps_ix(graph, name, &named, params)])?;
+    let clock: Clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar());
+    travel(locker, clock.unix_timestamp + 1).await;
+    let named = [&[("keeper", KEEPER)][..], &shared].concat();
+    let fill = perps_ix(graph, "decrease_position4", &named, json!({}));
+    send(locker, KEEPER, &[fill])
+}
+
+/// The pool's value in USD with 6 decimals, as `getAssetsUnderManagement2` computes it from every
+/// custody and feed.
+fn aum(locker: &SurfnetSvmLocker, graph: &PerpsGraph) -> u128 {
+    let name = "get_assets_under_management2";
+    let mut instruction = perps_ix(graph, name, &[], json!({ "mode": null }));
+    instruction.accounts.extend(graph.pool_remaining_accounts());
+    let sent = send(locker, KEEPER, &[instruction]);
+    let returned = sent
+        .unwrap_or_else(|e| panic!("{name} failed: {e:?}"))
+        .return_data
+        .data;
+    u128::from_le_bytes(returned[..16].try_into().unwrap())
+}
+
 /// A failure here means a bundled IDL disagrees with the live layout.
 #[tokio::test(flavor = "multi_thread")]
 async fn bundled_idls_round_trip_live_accounts() {
@@ -1031,7 +1101,11 @@ async fn the_lookup_recipe_reads_every_market_as_json() {
                 AccountAddress::Pubkey(literal) if !literal.is_empty() => {
                     assert_eq!(literal, &POOL.to_string(), "{}", template.id)
                 }
-                _ => assert!(recipe.contains(&POOL.to_string()), "{} lookup", template.id),
+                _ => assert!(
+                    recipe.contains(&POOL.to_string()) || recipe.contains(&PERPS.to_string()),
+                    "{} lookup",
+                    template.id
+                ),
             }
         }
     }
@@ -1406,4 +1480,306 @@ async fn pool_fees_set_deposit_withdrawal_and_swap_fees() {
     let swapped = stable_swaps();
     let moved = swapped.iter().any(|bps| *bps != stable_bps);
     assert!(moved, "taxed USDC and JupUSD swaps: {swapped:?}");
+}
+
+/// The borrow fee a `size_usd` position of `market` pays at its close, on a local VM where `step`
+/// is added to the cumulative rate of `custody` after the open, and the pool's value before and
+/// after the step.
+async fn borrow_fee_at_close(
+    graph: &PerpsGraph,
+    market: &Market,
+    (trader, size_usd): (Pubkey, u64),
+    custody: Pubkey,
+    step: u128,
+) -> (u64, u128, u128) {
+    let locker = perps_vm(graph).await;
+    let (opened, at) = open_position(&locker, graph, market, trader, size_usd).await;
+    opened.unwrap_or_else(|e| panic!("{}: the open failed: {e:?}", market.label));
+    let before = aum(&locker, graph);
+    let rate = u128_at(
+        &account(&locker, &custody).data,
+        custody::CUMULATIVE_INTEREST_RATE,
+    );
+    let charged = (rate + step).to_string();
+    let charged = json!({ "funding_rate_state.cumulative_interest_rate": charged });
+    play(
+        &locker,
+        vec![template_override(BORROW_FEE, custody, charged)],
+    )
+    .await;
+    let after = aum(&locker, graph);
+    let closed = close_position(&locker, graph, market, at).await;
+    let closed = closed.unwrap_or_else(|e| panic!("{}: the close failed: {e:?}", market.label));
+    let fee = amount(&event(&closed, "DecreasePositionEvent"), "funding_fee_usd");
+    (fee, before, after)
+}
+
+/// A step on `funding_rate_state.cumulative_interest_rate` charges a position `step x size / 10^9`
+/// at its close on top of what the unchanged custody charges: a long on its own custody, a short on
+/// its USDC collateral custody and nothing on the traded token's. The pool's value does not count
+/// the fee before a position pays it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cumulative_rate_step_charges_the_borrow_fee_at_close() {
+    const SIZE: u64 = 1_000_000_000;
+    // 1% of the size.
+    const STEP: u128 = 10_000_000;
+    let graph = perps_graph(&[]).await;
+    let trader = (Pubkey::new_unique(), SIZE);
+    let step_fee = (STEP * SIZE as u128 / RATE_POWER) as u64;
+    let cases = [
+        (&SOL_LONG, SOL_MINT, step_fee),
+        (&BTC_SHORT, USDC_MINT, step_fee),
+        (&BTC_SHORT, BTC_MINT, 0),
+    ];
+    for (market, mint, charged) in cases {
+        let custody = custody_address(mint);
+        let (unchanged, ..) = borrow_fee_at_close(&graph, market, trader, custody, 0).await;
+        let (paid, before, after) =
+            borrow_fee_at_close(&graph, market, trader, custody, STEP).await;
+        let what = format!("{}, the step on the {mint} custody", market.label);
+        assert_eq!(paid, unchanged + charged, "{what}");
+        assert_eq!(
+            after, before,
+            "{what}: the pool's value counts an unpaid fee"
+        );
+    }
+}
+
+/// The totals a position counts in: its collateral custody's `assets.locked`, its custody's
+/// `assets.guaranteed_usd` and `assets.global_short_sizes`.
+fn position_totals(locker: &SurfnetSvmLocker, market: &Market) -> [u64; 3] {
+    let traded = account(locker, &custody_address(market.mint)).data;
+    let collateral = account(locker, &custody_address(market.collateral_mint)).data;
+    [
+        u64_at(&collateral, custody::LOCKED),
+        u64_at(&traded, custody::GUARANTEED_USD),
+        u64_at(&traded, custody::GLOBAL_SHORT_SIZES),
+    ]
+}
+
+/// What the position adds to `position_totals`.
+fn share(position_data: &[u8]) -> [u64; 3] {
+    let field = |at| u64_at(position_data, at);
+    let (size, locked) = (field(position::SIZE_USD), field(position::LOCKED_AMOUNT));
+    match position_data[position::SIDE] {
+        position::LONG => [locked, size - field(position::COLLATERAL_USD), 0],
+        _ => [locked, 0, size],
+    }
+}
+
+fn less(totals: [u64; 3], share: [u64; 3]) -> [u64; 3] {
+    [0, 1, 2].map(|i| totals[i] - share[i])
+}
+
+/// `A x old price x (S - old size) / (S x old price - old size x A)`: the average entry of the
+/// custody's shorts once a short of `size` at `price` is taken out.
+fn short_average_without(sizes: u128, average: u128, size: u128, price: u128) -> u128 {
+    (sizes - size) * average * price / (sizes * price - size * average)
+}
+
+/// The live position forged to twice its size, an entry 2% against the live price and collateral
+/// of 1% of its size, so a keeper may liquidate it: the `jupiter-perps-position` override, the
+/// `jupiter-perps-position-totals` overrides computed as their `llm_context` says, how much the
+/// change moves the pool's value, USD with 6 decimals, and the rounding the pool may add to that.
+fn forged(
+    graph: &PerpsGraph,
+    market: &Market,
+    at: Pubkey,
+) -> (OverrideInstance, Vec<OverrideInstance>, i128, i128) {
+    let custody = custody_address(market.mint);
+    let collateral_custody = custody_address(market.collateral_mint);
+    let old = graph.data(&at);
+    let field = |at| u64_at(old, at) as u128;
+    let (size, price) = (field(position::SIZE_USD), field(position::PRICE));
+    let (collateral, locked) = (
+        field(position::COLLATERAL_USD),
+        field(position::LOCKED_AMOUNT),
+    );
+    let total = |custody: &Pubkey, at| u64_at(graph.data(custody), at) as u128;
+    // A feed's mantissa is the USD price x 10^6 x `price_unit`, and tokens x mantissa /
+    // `token_unit` is their value, USD with 6 decimals.
+    let feed = |custody: Pubkey| {
+        let data = graph.data(&graph.feed_of(custody));
+        let decimals = graph.data(&custody)[custody::DECIMALS] as u32;
+        let digits = (-(data[feed::EXPO] as i8)) as u32 - 6;
+        let mantissa = u64_at(data, feed::PRICE) as u128;
+        (mantissa, 10u128.pow(digits), 10u128.pow(decimals + digits))
+    };
+    let (mantissa, price_unit, token_unit) = feed(custody);
+    let live = graph.feed_usd(graph.feed_of(custody));
+    let (new_size, new_collateral) = (size * 2, size * 2 / 100);
+    let (new_price, new_locked) = match market.side {
+        position::LONG => {
+            let new_price = live * 102 / 100;
+            (new_price, new_size * (token_unit / price_unit) / new_price)
+        }
+        _ => {
+            let (stable, _, stable_unit) = feed(collateral_custody);
+            (live * 98 / 100, new_size * stable_unit / stable)
+        }
+    };
+    let snapshot = total(&collateral_custody, custody::CUMULATIVE_INTEREST_RATE);
+    let values = json!({
+        "size_usd": new_size, "price": new_price, "collateral_usd": new_collateral,
+        "locked_amount": new_locked, "cumulative_interest_snapshot": snapshot.to_string(),
+    });
+    let position = template_override(POSITION, at, values);
+    let locked_total = (total(&collateral_custody, custody::LOCKED) + new_locked - locked) as u64;
+    if market.side == position::LONG {
+        let guaranteed = total(&custody, custody::GUARANTEED_USD) + new_size
+            - new_collateral
+            - (size - collateral);
+        let values = json!({
+            "assets.locked": locked_total, "assets.guaranteed_usd": guaranteed as u64,
+        });
+        let totals = vec![template_override(POSITION_TOTALS, custody, values)];
+        let held = (new_locked as i128 - locked as i128) * mantissa as i128 / token_unit as i128;
+        let moved = (new_size - new_collateral) as i128 - (size - collateral) as i128 - held;
+        return (position, totals, moved, 2);
+    }
+    let sizes = total(&custody, custody::GLOBAL_SHORT_SIZES);
+    let average = total(&custody, custody::GLOBAL_SHORT_AVERAGE_PRICES);
+    let without = short_average_without(sizes, average, size, price);
+    let (rest, new_sizes) = (sizes - size, sizes - size + new_size);
+    let new_average = new_sizes * without * new_price / (rest * new_price + new_size * without);
+    let shorts = json!({
+        "assets.global_short_sizes": new_sizes as u64,
+        "assets.global_short_average_prices": new_average as u64,
+    });
+    let totals = vec![
+        template_override(
+            POSITION_TOTALS,
+            collateral_custody,
+            json!({ "assets.locked": locked_total }),
+        ),
+        template_override(POSITION_TOTALS, custody, shorts),
+    ];
+    let pnl = |size: u128, entry: u128| {
+        let entry = (entry * price_unit) as i128;
+        size as i128 * (entry - mantissa as i128) / entry
+    };
+    // Each of the two rounded-down steps leaves the average up to 1 low, and the pool values the
+    // shorts at sizes x (average - price) / average, which 1 of average moves by about
+    // sizes x price / average^2.
+    let slack = 2 * (new_sizes * live / new_average / new_average + 1) as i128 + 2;
+    (
+        position,
+        totals,
+        pnl(size, price) - pnl(new_size, new_price),
+        slack,
+    )
+}
+
+/// A position changed with `jupiter-perps-position` counts once `jupiter-perps-position-totals`
+/// adds the change to the custody totals: the pool's value moves by the change in what it owes the
+/// trader, and the keeper's liquidation takes the totals back to the live ones less the live
+/// position's share. Without the totals the pool ignores the change, and the liquidation leaves
+/// every total off by it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_position_counts_in_the_pool_and_liquidates() {
+    for market in [&SOL_LONG, &BTC_SHORT] {
+        let (graph, at, _) = liquidation_candidate(market).await;
+        let (position, totals, moves, slack) = forged(&graph, market, at);
+        let custody = custody_address(market.mint);
+        for with_totals in [false, true] {
+            let what = match with_totals {
+                true => format!("{} with the totals", market.label),
+                false => format!("{} alone", market.label),
+            };
+            let locker = perps_vm(&graph).await;
+            play(&locker, vec![live_price(&graph)]).await;
+            let (value, before) = (aum(&locker, &graph), position_totals(&locker, market));
+            let mut overrides = vec![position.clone()];
+            if with_totals {
+                overrides.extend(totals.clone());
+            }
+            play(&locker, overrides).await;
+            let moved = aum(&locker, &graph) as i128 - value as i128;
+            let forged_share = share(&account(&locker, &at).data);
+            liquidated(&locker, &graph, at, &what);
+            let after = position_totals(&locker, market);
+            if !with_totals {
+                assert_eq!(moved, 0, "{what}: the pool's value moved");
+                assert_eq!(after, less(before, forged_share), "{what}: totals");
+                continue;
+            }
+            let off = (moved - moves).abs();
+            assert!(off <= slack, "{what}: the pool moved {moved}, not {moves}");
+            assert_eq!(
+                after,
+                less(before, share(graph.data(&at))),
+                "{what}: totals"
+            );
+            if market.side == position::SHORT {
+                let data = graph.data(&at);
+                let field = |data: &[u8], at| u64_at(data, at) as u128;
+                let expected = short_average_without(
+                    field(graph.data(&custody), custody::GLOBAL_SHORT_SIZES),
+                    field(graph.data(&custody), custody::GLOBAL_SHORT_AVERAGE_PRICES),
+                    field(data, position::SIZE_USD),
+                    field(data, position::PRICE),
+                );
+                let average = field(
+                    &account(&locker, &custody).data,
+                    custody::GLOBAL_SHORT_AVERAGE_PRICES,
+                );
+                assert!(
+                    average.abs_diff(expected) <= 1,
+                    "{what}: average {average}, not {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// The position lookup `jupiter-perps-position` teaches, sent to mainnet: Perps accounts of 216
+/// bytes with the wallet at offset 8 are the wallet's positions, and they decode as `Position`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_position_lookup_finds_a_wallets_positions() {
+    let registry = TemplateRegistry::new();
+    let recipe = registry.get(POSITION).unwrap().llm_context.clone();
+    let taught = r#"[{"dataSize":216},{"memcmp":{"offset":8,"bytes":"<wallet>"}}]"#;
+    assert!(
+        recipe.unwrap_or_default().contains(taught),
+        "the lookup changed"
+    );
+    let none = || panic!("no eligible live candidate: no open {}", SOL_LONG.label);
+    let at = *open_positions(&SOL_LONG, 1)
+        .await
+        .first()
+        .unwrap_or_else(none);
+    let wallet = pubkey_at(&fetch(&[at]).await[0].data, position::OWNER);
+    let by_wallet = Memcmp::new_raw_bytes(position::OWNER, wallet.to_bytes().to_vec());
+    let config = RpcProgramAccountsConfig {
+        filters: Some(vec![
+            RpcFilterType::DataSize(position::LEN as u64),
+            RpcFilterType::Memcmp(by_wallet),
+        ]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let found = client()
+        .client
+        .get_program_ui_accounts_with_config(&PERPS, config)
+        .await
+        .unwrap_or_else(|e| panic!("the lookup for {wallet}: {e}"));
+    assert!(
+        found.iter().any(|(address, _)| *address == at),
+        "{at} is missing from {wallet}'s positions"
+    );
+    let discriminator = &perps_idl().get_account("Position").unwrap().discriminator;
+    for (address, account) in found {
+        let data = account.data.decode().unwrap();
+        assert_eq!(
+            &data[..8],
+            &discriminator[..],
+            "{address} is not a Position"
+        );
+        let owner = &decode("Position", &data[8..])["owner"];
+        assert_eq!(pubkey(owner), wallet, "{address}");
+    }
 }

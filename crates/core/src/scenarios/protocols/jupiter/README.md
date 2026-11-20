@@ -31,9 +31,12 @@ address: each override names the `TokenLedger` account by its pubkey.
 | `jupiter-perps-doves-price` | the Doves price Perps reads for one asset |
 | `jupiter-perps-custody-risk` | a market's liquidation leverage, size caps and action switches |
 | `jupiter-perps-custody-borrow-rate` | the borrow-rate curve a custody charges positions |
+| `jupiter-perps-custody-borrow-fee` | a borrow fee charged to a custody's positions at once |
 | `jupiter-perps-custody-fees` | the fees a market charges to open and close positions |
 | `jupiter-perps-pool-limits` | the JLP pool's AUM cap, weight buffer and price guard |
 | `jupiter-perps-pool-fees` | the JLP pool's deposit, withdrawal and swap fees |
+| `jupiter-perps-position` | one position's size, entry price and collateral |
+| `jupiter-perps-position-totals` | the custody totals that count a changed position |
 
 ### Number formats
 
@@ -45,6 +48,7 @@ address: each override names the `TokenLedger` account by its pubkey.
 | `pricing.max_leverage` | leverage x 10^4 | `5000000` = 500x |
 | `pricing.trade_impact_fee_scalar` | USD with 6 decimals; the price impact fee rate is size / scalar, rounded up to a whole BPS | `1000000000000` charges a $1,000 trade 10 BPS |
 | `target_utilization_rate`, `cumulative_interest_rate` | scaled by 10^9 | `800000000` = 80% |
+| `locked_amount`, `assets.locked` | tokens of the collateral custody, in its smallest unit | 1 SOL -> `1000000000` |
 
 `limit.max_aum_usd` and `limit.token_weightage_buffer_bps` are `u128`: pass them as decimal strings.
 
@@ -58,6 +62,14 @@ Nothing but the pool is hardcoded; custodies and feeds are read live.
 A `getAccountInfo` or `getMultipleAccounts` with `jsonParsed` encoding returns these accounts
 decoded. Positions live on the custody of the traded token, longs and shorts alike; a short's
 collateral sits in the USDC or USDT custody.
+
+### Finding a position
+
+`getProgramAccounts` on the Perps program with `base64` encoding, the filters
+`[{"dataSize":216},{"memcmp":{"offset":8,"bytes":"<wallet>"}}]` and a zero-length `dataSlice`
+lists a wallet's positions, one per market, collateral token and side. Read them with
+`getMultipleAccounts` and `jsonParsed` through the surfnet, which decodes them with the bundled IDL;
+mainnet cannot decode them. A closed position keeps its account with `size_usd` 0.
 
 # Perps recipes
 
@@ -114,6 +126,43 @@ jump_rate_state.max_rate_bps: 100000
 The fee accrues over the time since the custody's last update, whenever a transaction touches the
 custody. A long pays its own custody's rate; a short's fee follows its
 stablecoin collateral custody.
+
+## Charge a borrow fee now
+
+```
+template: jupiter-perps-custody-borrow-fee     address: the custody that charges the positions
+funding_rate_state.cumulative_interest_rate: "<live value + 10000000>"    # 1% of each position's size
+```
+
+Each position pays `(cumulative_interest_rate - its cumulative_interest_snapshot) x size_usd / 10^9`
+when it closes, decreases or is liquidated, and counts it against its margin until then. Read the
+custody as the surfnet holds it and leave `fetchBeforeUse` false. A long pays its own custody; a
+short pays its USDC or USDT collateral custody, never the traded token's. Transactions keep adding
+the ordinary rate on top. The pool's value, and so the JLP price, counts the fee only once a
+position pays it.
+
+## Change a position
+
+```
+jupiter-perps-position          address: the position
+size_usd, price, collateral_usd, locked_amount, cumulative_interest_snapshot
+jupiter-perps-position-totals   address: each custody the position names, same slot
+```
+
+The pool's value and every close or liquidation read the custodies' totals, never the positions,
+so every change to a position needs the totals override in the same slot. Without it the JLP price
+ignores the change, and closing or liquidating the position leaves the totals off by it.
+
+| Side | Custody | Totals to add the change to |
+|---|---|---|
+| long | its custody | `assets.locked` (+ change in `locked_amount`), `assets.guaranteed_usd` (+ change in `size_usd - collateral_usd`) |
+| short | its collateral custody | `assets.locked` (+ change in `locked_amount`) |
+| short | its custody | `assets.global_short_sizes` (+ change in `size_usd`), `assets.global_short_average_prices` (the size-weighted harmonic mean, in the template's `llm_context`) |
+
+A long's `locked_amount` is `size_usd x 10^decimals / price`; a short's is `size_usd` in its
+stablecoin at that coin's Doves price. A long's collateral is part of the pool's tokens: the pool
+pays for an increase and keeps a decrease. A short's collateral sits outside them, so keep it at or
+below its current value.
 
 ## Make trading expensive
 
@@ -176,6 +225,7 @@ deposits then fail with 6043.
 | 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override a feed before the fill, and fill in a later second than the request - see "Keep-alive" |
 | 6066 `LpTokenPriceChangeLimitExceeded` | the JLP price moved past the guard | raise `max_lp_token_price_change_bps` |
 | 6000 `MathOverflow` on a stablecoin custody | its borrow-lend debt overflowed a large rate or time jump | lower the rate or the time step |
+| a changed position does not move the JLP price, or its close leaves the custody totals wrong | `jupiter-perps-position` played without `jupiter-perps-position-totals` | add the totals override in the same slot |
 | an earlier change to a custody, the pool or a feed is gone | a later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it | give later overrides of the same account `fetchBeforeUse: false` |
 
 # IDL provenance

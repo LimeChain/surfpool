@@ -761,11 +761,11 @@ mod tests {
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19)
-        // + Jupiter Perps (5) + Doves (1) = 87
+        // + Jupiter Perps (8) + Doves (1) = 90
         assert_eq!(
             registry.count(),
-            87,
-            "Registry should load 87 templates total"
+            90,
+            "Registry should load 90 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -846,6 +846,9 @@ mod tests {
         assert!(registry.contains("jupiter-perps-custody-fees"));
         assert!(registry.contains("jupiter-perps-pool-limits"));
         assert!(registry.contains("jupiter-perps-pool-fees"));
+        assert!(registry.contains("jupiter-perps-custody-borrow-fee"));
+        assert!(registry.contains("jupiter-perps-position"));
+        assert!(registry.contains("jupiter-perps-position-totals"));
         assert!(registry.contains("jupiter-perps-doves-price"));
     }
 
@@ -1441,8 +1444,8 @@ templates: []
 
         assert_eq!(
             registry.by_protocol("jupiter-perps").len(),
-            5,
-            "Should have 5 Jupiter Perps templates"
+            8,
+            "Should have 8 Jupiter Perps templates"
         );
         assert_eq!(
             registry.by_protocol("jupiter-perps-doves").len(),
