@@ -44,20 +44,15 @@ fields a protocol's own off-chain actor would every slot.
 `surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots
 it skips are never applied; step one slot at a time to play a scenario under a paused clock.
 
-### Kamino integration tests
+### Integration tests
 
-Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real
-accounts from mainnet, so they need a network connection and are compiled only behind a feature:
-
-```
-cargo test -p surfpool-core --features integration-tests kamino
-```
-
-Save coverage in `crates/core/src/tests/save/` works the same way, and also runs the deployed Save
-program in LiteSVM over those accounts:
+Each protocol's integration tests live in `crates/core/src/tests/protocols/<protocol>/`. They fetch
+the real accounts from mainnet, so they need a network connection and are compiled only behind a
+feature. Some, such as Save's, also run the deployed program in LiteSVM over those accounts. Run one
+protocol's tests by its module path:
 
 ```
-cargo test -p surfpool-core --features integration-tests save
+cargo test -p surfpool-core --features integration-tests tests::protocols::save
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
