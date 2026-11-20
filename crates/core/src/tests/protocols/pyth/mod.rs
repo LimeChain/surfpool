@@ -4,7 +4,7 @@
 //! only behind a feature:
 //!
 //! ```text
-//! cargo test -p surfpool-core --features integration-tests pyth
+//! cargo test -p surfpool-core --features integration-tests tests::protocols::pyth
 //! ```
 //!
 //! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.

@@ -189,11 +189,11 @@ expects the `constants` block to end right before `templates:`.
 
 ## Tests
 
-The Pyth integration tests in `crates/core/src/tests/pyth/` fetch real price accounts from mainnet,
-so they need a network connection and are compiled only behind a feature:
+The Pyth integration tests in `crates/core/src/tests/protocols/pyth/` fetch real price accounts from
+mainnet, so they need a network connection and are compiled only behind a feature:
 
 ```
-cargo test -p surfpool-core --features integration-tests pyth
+cargo test -p surfpool-core --features integration-tests tests::protocols::pyth
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits. The unit tests
