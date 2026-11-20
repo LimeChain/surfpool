@@ -110,7 +110,7 @@ keep-alive rewrites that field in the same slot:
 
 ```
 template: velocity-oracle-price            # account: the USDT oracle
-posted_slot: <current slot>                # reposted from now on, price unchanged
+posted_slot: 0                             # any value; reposted from now on, price unchanged
 ```
 
 An oracle with no override is never reposted. A later override with `"keepAlive": []` that writes a

@@ -59,8 +59,9 @@ templates:
       its collateral, such as the USDT price, spot market 0's oracle. Surfpool reposts only the
       oracles overrides of this template write; any other oracle ages from the slot it was posted
       at. For each oracle a transaction reads and the scenario does not move, add one more override
-      of this template, with fetchBeforeUse: true, that writes only posted_slot, set to the current
-      slot: its price stays as it is and it is reposted from then on. To stop reposting an oracle
+      of this template, with fetchBeforeUse: true, that writes only posted_slot (any value, such as
+      0: keep-alive rewrites it in the same slot): its price stays as it is and it is reposted from
+      then on. To stop reposting an oracle
       from a later slot, add an override of this template on it in that slot with keepAlive: [] and
       price set to its current price. An oracle nothing reposts ages, and margin checks, such as
       withdrawals, orders that add risk and matched fills, refuse it once it is older than the
