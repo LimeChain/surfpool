@@ -6,11 +6,7 @@ pub mod kamino;
 pub mod phoenix;
 pub mod plugin;
 #[cfg(feature = "integration-tests")]
+pub mod protocols;
+#[cfg(feature = "integration-tests")]
 pub mod pump;
-#[cfg(feature = "integration-tests")]
-pub mod raydium_amm;
-#[cfg(feature = "integration-tests")]
-pub mod raydium_clmm;
-#[cfg(feature = "integration-tests")]
-pub mod raydium_cpmm;
 pub mod simnet_events;
