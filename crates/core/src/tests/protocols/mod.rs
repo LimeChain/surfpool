@@ -8,4 +8,5 @@
 //!
 //! A protocol's module is declared here and nowhere else; the filter above then covers it.
 
+pub mod project0;
 pub mod pyth;

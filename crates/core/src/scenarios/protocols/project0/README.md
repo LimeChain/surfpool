@@ -1,0 +1,236 @@
+# Project 0
+
+Surfpool bundles the IDL and override templates for **Project 0**, the lending program formerly
+known as marginfi v2 (`MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`, v0.1.12), so a scenario can
+put a bank or a user account into whatever state you need before your code runs against it.
+
+The bundled IDL is the program's published 0.1.12 IDL with one change: `address`, empty in the
+published IDL, holds the program's address. Surfpool registers each bundled IDL under its
+`address` and cannot load one without it.
+
+| IDL | Source | sha256 |
+|---|---|---|
+| Published | Program Metadata account `B66dYmjB9pJ3unjp3QMiEpySb8i44Zhev3qaYj5SfLPG` | `f621c9e4eb789084b088dbd61e5e086224546934b6f0859caea837241501d79f` |
+| Bundled | `v1/idl.json` | `6b1adb134a6a8ff0a1450bfdf3b26aedc211a2e69f046e08dd6415091bb802de` |
+
+This is a how-to. For how scenarios work in general see the [scenarios README](../../README.md).
+Every field's own purpose and units are on the template itself, visible in Studio and via
+`get_override_templates`.
+
+## Override inputs, not results
+
+Project 0 recomputes an account's health on every borrow, withdraw and liquidation, from the
+account's shares, the banks' share values and weights, and the live oracle price. The account's
+`health_cache` and a bank's `cache` are outputs written along the way; nothing reads them back.
+
+| Want to change | Override this | Not this |
+|---|---|---|
+| A price | the bank's Pyth feed with `pyth-core-compatible-price-feed-v2` (see [Move a price](#move-a-price)) | `cache.last_oracle_price` |
+| Position health | `project0-bank-risk-weights` → `config.asset_weight_maint.value` | `health_cache` |
+| A position | `project0-account-balance` | |
+
+## Number formats
+
+| You'll see | It means | Example |
+|---|---|---|
+| `.value` of a weight, share, share value or reference price | an I80F48 number: the 16 little-endian bytes of value x 2^48. Studio shows and takes a decimal | 1.0 → `[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]` |
+| Shares | tokens / share value | 10 SOL at share value 1.0 → 10000000000, `[0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]` |
+| Interest rates | out of 1000% as u32 | 100% APR → `429496729` |
+| Utilization | out of 100% as u32 | 50% → `2147483647` |
+| Token amounts, limits | the mint's smallest unit | 1 USDC → `1000000` |
+| `operational_state` | a variant name | `"ReduceOnly"` |
+
+## Picking a bank
+
+Every template takes the account it writes; callers are responsible for passing a Bank or a
+MarginfiAccount. Symbols repeat: the main group (`4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8`)
+holds native banks and Kamino-, Drift- or JupLend-wrapped banks of the same mint, so key
+everything by address.
+
+A token's native bank and the price account it reads come from one `getProgramAccounts` call on
+the program: filter on the Bank discriminator at offset 0 (`QnTef4UXSzF` in base58), the group at
+offset 41, the mint at offset 8 and an oracle setup byte of 3 at offset 609 (a Pyth push oracle),
+with a `dataSlice` of 32 bytes at offset 610 (`config.oracle_keys.0`). The templates'
+`llm_context` spells the call out. A wallet's accounts are the program's MarginfiAccounts
+(discriminator `CKkRR4La3xu` at offset 0) with the group at offset 8 and the authority at offset 40.
+Filter on the discriminator rather than the account size, which program upgrades change.
+
+For example, the native SOL bank is `CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh` (asset tag 1)
+and reads `7AviUf9nL62mcxNbQGKm4nKDQnPjswo6c5MX4D57HmyE`; the native USDC bank is
+`2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB` (asset tag 0) and reads
+`6HAuqASbHEh4w4REJEUUUCginTLfj1kwCh215ZLtMkrT`.
+
+---
+
+# Recipes
+
+## Make a position liquidatable
+
+```
+project0-bank-risk-weights   on the SOL bank
+  config.asset_weight_maint.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]   # 0.3
+  config.asset_weight_init.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]    # 0.3
+```
+
+**Why:** health is `sum(deposits x asset_weight_maint) - sum(debts x liability_weight_maint)`,
+recomputed from the bank on every check. Tested against the deployed program: a SOL-backed USDC
+borrow goes from healthy to liquidatable.
+
+## Move a price
+
+Project 0 banks read Pyth `PriceUpdateV2` accounts of the Pyth Core Compatible receiver,
+`rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp`. Use `pyth-core-compatible-price-feed-v2` on the account the
+bank names at `config.oracle_keys.0`:
+
+```
+project0-bank-oracle     on the SOL bank, fetchBeforeUse: true
+  cb_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]          # $20
+  cb_window_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
+  price_message.price: 2000000000                       # $20, exponent -8
+  price_message.ema_price: 2000000000
+  price_message.conf: <live conf x 2000000000 / live price>
+  price_message.ema_conf: <live ema_conf x 2000000000 / live ema_price>
+```
+
+**Why:** the price must be fresh: `clock - publish_time <= config.oracle_max_age`. Keep-alive
+keeps the overridden price published, and the other banks' prices need an override each, see
+[Prices on a fork](#prices-on-a-fork).
+Borrow and withdraw checks use the EMA price, liquidation the spot price, so move both.
+Scale `conf` and `ema_conf` by the same factor: Project 0 multiplies the confidence by 2.12 and
+refuses a price whose result is over the bank's `config.oracle_max_confidence` share of it (10%
+when the field is 0), so a crash that keeps the live confidence can be refused.
+Tested against the deployed program: SOL at $20 turns a healthy SOL-backed USDC borrow
+liquidatable.
+
+**Most banks have a price circuit breaker**, among them the stablecoins, SOL and its liquid staking
+tokens, BTC and ETH. It is on when the bank's `flags` include `2048` (bit 11). Once the price, net
+of the oracle's confidence, is `config.cb_deviation_bps_tiers[0]` basis points (50 for USDC, 600
+for SOL) away from the bank's `cb_reference_price`, borrow, withdraw and liquidation fail with
+`CircuitBreakerPriceJump` (6604). The confidence counts 2.12 times, so at a typical USDC
+confidence the 50 bps take about a 0.7% move. Read the bank to see its flags and tiers, and move
+both references by the same factor as the price. They hold the price the bank computes, which for
+liquid staking tokens includes the exchange rate, so scale the bank's current values; on SOL and
+USDC they are the price in dollars, as above for SOL and here for USDC:
+
+```
+project0-bank-oracle     on the USDC bank, fetchBeforeUse: true
+  cb_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]    # $0.95
+  cb_window_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+pyth-core-compatible-price-feed-v2   on the bank's config.oracle_keys.0, fetchBeforeUse: true
+  price_message.price: 95000000                         # $0.95, exponent -8
+  price_message.ema_price: 95000000
+  price_message.conf: <live conf x 95000000 / live price>
+  price_message.ema_conf: <live ema_conf x 95000000 / live ema_price>
+```
+
+The breaker then treats $0.95 as normal and still guards further moves, as after a slow move it
+has adapted to. That is the default: it keeps the breaker on and tests the protocol as deployed.
+
+The other way is to change the breaker's own thresholds on the bank with the same template: the
+three `config.cb_deviation_bps_tiers` entries and the `config.cb_window_max_up_bps` /
+`config.cb_window_max_down_bps` caps. Use it to test the breaker itself, with a price just under
+or just over the first tier, or to model the admin loosening it. Raising the first tier alone is
+not enough: a borrow or withdrawal still checks the higher tiers and the 24h caps and can halt the
+bank (`BankCircuitBreakerHalted`, 6600). All five at `10000` let any move through. The breaker's
+own off switch is bit 11 of `flags`, which these templates do not write.
+
+## Build a position from scratch
+
+On an account whose other slots are empty (`active` 0, `bank_pk` `11111111111111111111111111111111`,
+zero shares; clear them first on an account in use):
+
+```
+project0-account-balance
+  lending_account.balances.0.active: 1
+  lending_account.balances.0.bank_pk: <the SOL bank>
+  lending_account.balances.0.bank_asset_tag: 1
+  lending_account.balances.0.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
+  lending_account.balances.0.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+project0-account-balance
+  lending_account.balances.1.active: 1
+  lending_account.balances.1.bank_pk: <the USDC bank>
+  lending_account.balances.1.bank_asset_tag: 0
+  lending_account.balances.1.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  lending_account.balances.1.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 101, 205, 29, 0, 0, 0, 0, 0, 0]
+```
+
+**Why:** slots stay sorted by `bank_pk`, highest first, so SOL's bank goes before USDC's, and
+`bank_asset_tag` must match the bank's `config.asset_tag`. The shares above are 10 SOL
+(10000000000) and 500 USDC (500000000) at a share value of 1.0; divide by each bank's current
+share value. The template lists
+the other rules.
+
+## Take over a real account
+
+```
+project0-account-authority   authority: <your wallet>
+```
+
+## Age every loan in a bank
+
+```
+project0-bank-shares   liability_share_value.value: <raise it>
+```
+
+**Why:** a debt is `liability_shares x liability_share_value`. Raise `asset_share_value` too if
+depositors should earn, and keep the vault balance in line (see Troubleshooting).
+
+## Block an action to test the rejection
+
+```
+project0-bank-status   config.operational_state: "ReduceOnly"            # no new deposits or borrows
+project0-bank-limits   config.borrow_limit: 1                            # bank lent out
+project0-bank-limits   config.deposit_limit: 1                           # bank full
+```
+
+---
+
+## Prices on a fork
+
+Nothing publishes Pyth prices on a surfnet, so a bank refuses a price once the Surfnet clock is its
+`config.oracle_max_age` seconds past the price's `publish_time`:
+
+- From the slot a `pyth-core-compatible-price-feed-v2` override plays until the network is reset,
+  keep-alive writes the Clock's time to the price account it writes, every slot, time travels
+  included.
+- A health check or liquidation reads the price of every bank the account uses. Give each of those
+  banks' `config.oracle_keys.0` its own `pyth-core-compatible-price-feed-v2` override that sets only
+  `price_message.publish_time`. Any value works, because keep-alive rewrites it in the same slot.
+- A price account with no override ages. To keep one price stale while the others stay fresh, leave
+  that bank's `config.oracle_keys.0` out of the overrides above. To let it age only later, give it
+  a later override with `"keepAlive": []` and a value, such as its current price.
+- A bank priced by anything other than a Pyth Core Compatible feed is not kept alive. Raise its
+  `oracle_max_age` with `project0-bank-oracle`.
+
+# Troubleshooting
+
+| Rejection | Fix |
+|---|---|
+| Stale oracle | No `pyth-core-compatible-price-feed-v2` override writes that bank's price account, an override of it set `"keepAlive": []`, or the bank is not priced by a Pyth Core Compatible feed. Give the price account its own override, or raise that bank's `oracle_max_age` - see [Prices on a fork](#prices-on-a-fork) |
+| `CircuitBreakerPriceJump` (6604) | The price moved past the bank's circuit breaker. Move the reference prices with it, see [Move a price](#move-a-price) |
+| `BankCircuitBreakerHalted` (6600) | `lending_pool_pulse_bank_price_cache` ran during a breach and halted the bank. Refetch the bank with `fetchBeforeUse: true` and move its reference prices |
+| The program panics in `accrue_interest` | The bank was loaded from upstream after the Surfnet clock stopped, so its `last_update` is ahead of the clock. Move the clock to the current time with `surfnet_timeTravel`: `[{"absoluteTimestamp": <now in milliseconds>}]` |
+| Your price override did nothing | Write the bank's `config.oracle_keys.0` with `pyth-core-compatible-price-feed-v2`. The Pyth Core receiver's account for the same feed (`pyth-price-feed-v2`) is a different address, which the bank never reads. See [Move a price](#move-a-price) |
+| Wrong oracle account | Pass exactly the bank's `config.oracle_keys.0` |
+| Withdraw fails on the token transfer | Shares imply more tokens than the bank's `liquidity_vault` holds. Raise the vault with `spl-token-account-balance` |
+| `invalid value for idl type: expected vec, found string` or `expected array length of 16` | Pass a `.value` field as an array of 16 bytes, see [Number formats](#number-formats) |
+| A Kamino-, Drift- or JupLend-wrapped bank rejects its price | Those need the venue account refreshed in the same transaction, which these templates do not cover |
+| An earlier change to a bank or account is gone | A later override with `fetchBeforeUse: true` loaded the account from mainnet again, which drops every local change to it. Give later overrides of the same account `fetchBeforeUse: false` |
+
+---
+
+# Template index
+
+**Project 0** &middot; `MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA`
+
+| Template | Overrides |
+|---|---|
+| `project0-bank-risk-weights` | the collateral and debt weights of a bank |
+| `project0-bank-limits` | the deposit, borrow and collateral value caps of a bank |
+| `project0-bank-status` | a bank's operational state (pause, reduce-only) |
+| `project0-bank-oracle` | the oracle staleness, confidence and circuit breaker guards of a bank |
+| `project0-bank-interest-rate` | the bank borrow-rate curve |
+| `project0-bank-shares` | the total shares and share values of a bank |
+| `project0-account-balance` | one balance slot of a MarginfiAccount |
+| `project0-account-authority` | the authority of a MarginfiAccount |

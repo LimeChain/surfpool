@@ -1,0 +1,410 @@
+protocol: Project 0
+version: v0.1.12
+account_type: Bank
+idl_file_path: idl.json
+
+tags:
+  - lending
+  - risk-engine
+  - defi
+
+llm_context: |
+  FINDING A BANK WHEN THE USER NAMES A TOKEN OR STUDIO DOES NOT LIST IT:
+  1. Resolve the token's mint with get_token_address.
+  2. Call getProgramAccounts with two positional params: the program id
+     "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA", then the config object
+     {"encoding":"base58","dataSlice":{"offset":610,"length":32},"filters":[
+     {"memcmp":{"offset":0,"bytes":"QnTef4UXSzF"}},
+     {"memcmp":{"offset":41,"bytes":"4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8"}},
+     {"memcmp":{"offset":8,"bytes":"<mint>"}},{"memcmp":{"offset":609,"bytes":"4"}}]}.
+     Offset 0 is the Bank account type, 41 the main group and 8 the mint. Byte 609 equal to 3
+     ("4" in base58) keeps the bank priced straight from a Pyth push oracle and leaves out the
+     Kamino-, Drift- and JupLend-wrapped banks of the same mint. The result's pubkey is the bank,
+     and its data is the bank's price account (config.oracle_keys.0).
+  3. No result: many tokens (staked SOL, LSTs such as jitoSOL or mSOL, PT tokens) have no bank
+     priced straight from Pyth. Repeat the call without the 609 filter; one result is the bank,
+     several are wrapped banks of the same mint, so pick the one the user means or ask.
+  4. Still no result means a mistyped mint or no such bank. Copy the mint again and repeat once,
+     then ask the user for the bank address instead of saying none exists.
+  5. A bank address the user gives is used as is.
+
+  FINDING A WALLET'S ACCOUNT: getProgramAccounts on the same program with the config object
+  {"encoding":"base64","dataSlice":{"offset":0,"length":0},"filters":[
+  {"memcmp":{"offset":0,"bytes":"CKkRR4La3xu"}},{"memcmp":{"offset":8,"bytes":"<group>"}},
+  {"memcmp":{"offset":40,"bytes":"<wallet>"}}]}. Each result's pubkey is one MarginfiAccount.
+
+  Put the bank or account in the override's account as {"pubkey":"<address>"}. Set
+  fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+  that builds on state an earlier override in the same scenario prepared.
+
+  FIXED-POINT VALUES: every path that ends in .value (weights, shares, share values and circuit
+  breaker prices) is an I80F48 number, stored as [u8; 16]. Pass a JSON array of 16 numbers from 0
+  to 255: the little-endian bytes of the signed integer round(value x 2^48), two's complement when
+  negative. Bytes 0 to 5 hold the fraction and bytes 6 to 15 the whole part, so a whole number N
+  is six zeros followed by N's little-endian bytes. Examples:
+  1.0 is [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  20 is [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  0.3 is [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  getAccountInfo with encoding "jsonParsed" shows these fields as the same 16 numbers: read them
+  back as a little-endian signed integer and divide by 2^48.
+
+templates:
+  # ==========================================
+  # Bank
+  # ==========================================
+  - id: project0-bank-risk-weights
+    name: Override Bank Risk Weights
+    description: Override the collateral and debt weights of a Project 0 bank
+    idl_account_name: Bank
+    properties:
+      - path: config.asset_weight_init.value
+        label: Asset weight (borrowing)
+        description: >-
+          Share of a deposit's value that counts when borrowing or withdrawing, as an I80F48
+          number. Example: 0.8, sent as the 16 little-endian bytes of value x 2^48:
+          [205, 204, 204, 204, 204, 204, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - path: config.asset_weight_maint.value
+        label: Asset weight (liquidation)
+        description: >-
+          Share of a deposit's value that counts against liquidation, as an I80F48 number. Keep it
+          at or above the borrowing weight. Example: 0.9, sent as the 16 little-endian bytes of
+          value x 2^48: [102, 102, 102, 102, 102, 230, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - path: config.liability_weight_init.value
+        label: Liability weight (borrowing)
+        description: >-
+          Premium on a debt's value when borrowing or withdrawing, as an I80F48 number, at least 1.
+          Example: 1.25, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - path: config.liability_weight_maint.value
+        label: Liability weight (liquidation)
+        description: >-
+          Premium on a debt's value against liquidation, as an I80F48 number, at least 1. Example:
+          1.1, sent as the 16 little-endian bytes of value x 2^48:
+          [154, 153, 153, 153, 153, 25, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to make positions liquidatable in a way that survives every instruction.
+      Project 0 recomputes health from these weights on each borrow, withdraw and liquidation, so
+      the MarginfiAccount health_cache is never the lever.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Lower config.asset_weight_maint.value on the bank the borrower deposited into. The account
+         becomes liquidatable once sum(deposit value x asset_weight_maint) falls below
+         sum(debt value x liability_weight_maint). Lower config.asset_weight_init.value with it,
+         since the liquidation weight must stay at or above the borrowing weight
+      2. Weights are I80F48 numbers: pass each as 16 bytes, as FIXED-POINT VALUES above shows
+         (1.0 is [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+      THE PRICE LEVER: to crash a collateral price instead, use pyth-core-compatible-price-feed-v2 on the
+      bank's price account (the lookup above returns it). Move price and ema_price together:
+      liquidation reads the spot price, borrows and withdrawals check the EMA. That price account
+      stays published by itself, so leave its time fields unset. The bank refuses a price older
+      than config.oracle_max_age seconds, and a health check also reads the prices of the other
+      banks the account uses. Keep each of those fresh with its own
+      pyth-core-compatible-price-feed-v2 override on that bank's config.oracle_keys.0 that sets
+      only price_message.publish_time (any value; keep-alive rewrites it), or its price ages. For
+      a bank priced by another oracle, raise its oracle_max_age with project0-bank-oracle. Read
+      the bank first: when its
+      flags include 2048 (bit 11), the circuit breaker is on and the same scenario needs
+      project0-bank-oracle on that bank with both breaker references moved with the price, as that
+      template explains.
+
+      EXAMPLE - "SOL collateral only counts at 30% against liquidation" (0.3):
+      config.asset_weight_maint.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      config.asset_weight_init.value: [205, 204, 204, 204, 204, 76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  - id: project0-bank-limits
+    name: Override Bank Deposit & Borrow Limits
+    description: Override the deposit, borrow and collateral value caps of a Project 0 bank
+    idl_account_name: Bank
+    properties:
+      - "config.deposit_limit"
+      - "config.borrow_limit"
+      - "config.total_asset_value_init_limit"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to hit a cap and test the rejection.
+
+      deposit_limit and borrow_limit are in the mint's smallest unit. total_asset_value_init_limit
+      is in whole US dollars and discounts the bank's collateral for borrowing once total deposits
+      are worth more than it.
+
+      EXAMPLE - "the SOL bank is full" (10 SOL cap, far below current deposits):
+      config.deposit_limit: 10000000000
+
+  - id: project0-bank-status
+    name: Override Bank Operational State
+    description: Pause a Project 0 bank or put it into reduce-only mode
+    idl_account_name: Bank
+    properties:
+      - "config.operational_state"
+    address:
+      type: pubkey
+    llm_context: |
+      config.operational_state is an enum. Pass the variant name, e.g. "ReduceOnly".
+
+      Variants: Paused, Operational, ReduceOnly, KilledByBankruptcy, Uninitialized,
+      ReduceOnlyWithBorrowingPower, CircuitBroken. Scenarios use the first three and
+      ReduceOnlyWithBorrowingPower; KilledByBankruptcy, Uninitialized and CircuitBroken are states
+      the program moves a bank into itself.
+
+      EXAMPLE - "no new deposits or borrows, repayments still allowed":
+      config.operational_state: "ReduceOnly"
+
+  - id: project0-bank-oracle
+    name: Override Bank Oracle Configuration
+    description: Override the oracle staleness, confidence and circuit breaker guards of a Project 0 bank
+    idl_account_name: Bank
+    properties:
+      - "config.oracle_max_age"
+      - "config.oracle_max_confidence"
+      - path: config.cb_deviation_bps_tiers.0
+        label: Circuit breaker tier 1 (bps)
+        description: >-
+          Price deviation from cb_reference_price, in basis points, at which the breaker refuses
+          borrow, withdraw and liquidation. 10000 is 100%
+      - path: config.cb_deviation_bps_tiers.1
+        label: Circuit breaker tier 2 (bps)
+        description: >-
+          Deviation at which the breaker's second, longer halt applies. Keep it above tier 1
+      - path: config.cb_deviation_bps_tiers.2
+        label: Circuit breaker tier 3 (bps)
+        description: >-
+          Deviation at which the breaker's longest halt applies. Keep it above tier 2
+      - path: config.cb_window_max_up_bps
+        label: Circuit breaker 24h cap up (bps)
+        description: >-
+          Largest rise from cb_window_reference_price the breaker allows inside its window; 0 means
+          the program's default cap, not no cap
+      - path: config.cb_window_max_down_bps
+        label: Circuit breaker 24h cap down (bps)
+        description: >-
+          Largest drop from cb_window_reference_price the breaker allows inside its window; 0 means
+          the program's default cap, not no cap
+      - path: cb_reference_price.value
+        label: Circuit breaker reference price
+        description: >-
+          Price the circuit breaker treats as normal, as an I80F48 number. Set it to the new price
+          when moving the price of a bank whose breaker is on. Example: $0.95, sent as the 16
+          little-endian bytes of value x 2^48: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - path: cb_window_reference_price.value
+        label: Circuit breaker 24h reference price
+        description: >-
+          Anchor of the circuit breaker's long-window cap, as an I80F48 number. Set it to the same
+          price as cb_reference_price.value
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to change how old a price the bank accepts, or to let a price move past
+      the bank's circuit breaker.
+
+      A price is stale once the Surfnet clock is more than config.oracle_max_age seconds past its
+      publish_time. Lower oracle_max_age to make the bank refuse a price sooner, or raise it (max
+      65535) to accept older prices. A pyth-core-compatible-price-feed-v2 override keeps the price
+      account it writes republished every slot; a price account no override writes, or a bank
+      priced by another oracle, still ages. To move the price itself, use
+      pyth-core-compatible-price-feed-v2 on the bank's price account, config.oracle_keys.0.
+
+      ONE STALE PRICE, THE OTHERS FRESH: do not lower oracle_max_age for this, because a
+      republished price is never more than a second old. Find every bank the scenario reads with
+      the getProgramAccounts call above; each result's data is that bank's config.oracle_keys.0.
+      Add one pyth-core-compatible-price-feed-v2 override, with fetchBeforeUse: true, on the
+      config.oracle_keys.0 of each bank that must stay fresh, and set only
+      price_message.publish_time (any value; keep-alive rewrites it). Give the stale bank's price
+      account no override: its price ages and the bank refuses it once config.oracle_max_age
+      seconds have passed. To let it age only later, give it a later override with
+      "keepAlive": [] and a value, such as its current price.
+
+      CIRCUIT BREAKER: most banks have one, among them the stablecoins, SOL and its liquid staking
+      tokens, BTC and ETH. It is on when the bank's flags include 2048 (bit 11). Such a bank
+      rejects borrow, withdraw and liquidation with error 6604 (CircuitBreakerPriceJump) once its
+      price, net of the oracle's confidence, is config.cb_deviation_bps_tiers.0 basis points (50
+      for USDC, 600 for SOL) away from cb_reference_price, or past the 24h cap from
+      cb_window_reference_price. The confidence counts 2.12 times, so at a typical USDC confidence
+      the 50 bps take about a 0.7% move. Read the bank with getAccountInfo jsonParsed to see its
+      flags, tiers and references. Two ways to work with it:
+      - MOVE THE REFERENCES (the default): in the same scenario as the price override, multiply
+        the bank's current cb_reference_price.value and cb_window_reference_price.value by the
+        price move (new price / current price), read and written as FIXED-POINT VALUES above.
+        They hold the price the bank computes, which for liquid staking tokens includes the
+        exchange rate, so scaling the current values works for every bank; on SOL and USDC they
+        are the price in dollars. The breaker then treats the new
+        price as normal and still guards further moves, like a slow move it has adapted to. A
+        bank whose breaker is off ignores both fields.
+      - CHANGE THE THRESHOLDS: set the three config.cb_deviation_bps_tiers entries and the two
+        config.cb_window_max_*_bps caps. Use this to test the breaker itself, with a price just
+        under or just over tier 1, or to model the admin loosening it. Raising tier 1 alone is not
+        enough: a borrow or withdrawal still checks tiers 2 and 3 and the 24h caps and can halt
+        the bank (6600). All five at 10000 let any move through. The breaker's own off switch is
+        bit 11 of flags, which these templates do not write.
+
+      EXAMPLE - "accept prices up to an hour old":
+      config.oracle_max_age: 3600
+
+      EXAMPLE - "USDC at $0.95", on the USDC bank (0.95 as FIXED-POINT VALUES):
+      cb_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      cb_window_reference_price.value: [51, 51, 51, 51, 51, 243, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
+      price_message.ema_price 95000000 (exponent -8), and conf and ema_conf scaled by the same factor.
+
+      EXAMPLE - "SOL at $20", on the SOL bank:
+      cb_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      cb_window_reference_price.value: [0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      plus pyth-core-compatible-price-feed-v2 on the bank's config.oracle_keys.0 with price_message.price and
+      price_message.ema_price 2000000000, and conf and ema_conf scaled by the same factor.
+
+      EXAMPLE - "the SOL breaker trips at 1% instead of 6%":
+      config.cb_deviation_bps_tiers.0: 100
+      config.cb_deviation_bps_tiers.1: 1050
+      config.cb_deviation_bps_tiers.2: 1800
+
+  - id: project0-bank-interest-rate
+    name: Override Bank Interest Rate Curve
+    description: Override the Project 0 bank borrow-rate curve
+    idl_account_name: Bank
+    properties:
+      - "config.interest_rate_config.zero_util_rate"
+      - "config.interest_rate_config.hundred_util_rate"
+      - path: config.interest_rate_config.points.0.util
+        label: Kink utilization
+        description: >-
+          Utilization at which this curve point applies, out of 100% as u32 (50% = 2147483647). Change
+          the index for other points. Example: 3435973836
+      - path: config.interest_rate_config.points.0.rate
+        label: Kink rate
+        description: >-
+          Borrow rate at this curve point, out of 1000% as u32 (100% = 429496729). Example: 42949672
+      - "config.interest_rate_config.curve_type"
+    address:
+      type: pubkey
+    llm_context: |
+      The borrow rate is a piecewise-linear curve from zero_util_rate at 0% utilization, through up
+      to 5 points, to hundred_util_rate at 100%. Points stay in ascending util order and a point with
+      util 0 is unused. Rates are out of 1000% (100% APR = 429496729), utilization out of 100%
+      (u32::MAX = 100%). Keep curve_type at 1; 0 is the retired legacy curve.
+
+      Interest accrues on the next instruction that touches the bank, from its last_update to the
+      Surfnet clock.
+
+      EXAMPLE - "borrowing costs 100% APR at full utilization":
+      config.interest_rate_config.hundred_util_rate: 429496729
+
+  - id: project0-bank-shares
+    name: Override Bank Share Accounting
+    description: Override the total shares and share values of a Project 0 bank
+    idl_account_name: Bank
+    properties:
+      - path: total_asset_shares.value
+        label: Total deposit shares
+        description: >-
+          Sum of every depositor's shares, as an I80F48 number. Tokens = shares x
+          asset_share_value. Example: 10 SOL of shares at a share value of 1.0 is 10000000000, sent
+          as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
+      - path: total_liability_shares.value
+        label: Total debt shares
+        description: >-
+          Sum of every borrower's shares, as an I80F48 number. Tokens = shares x
+          liability_share_value. Example: 0, sent as 16 zero bytes
+      - path: asset_share_value.value
+        label: Deposit share value
+        description: >-
+          Tokens one deposit share is worth, as an I80F48 number. It only grows as interest
+          accrues. Example: 1.0, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - path: liability_share_value.value
+        label: Debt share value
+        description: >-
+          Tokens one debt share is worth, as an I80F48 number. It only grows as interest accrues.
+          Example: 1.0, sent as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    address:
+      type: pubkey
+    llm_context: |
+      CRITICAL: the bank's liquidity_vault token account must still hold the tokens these shares
+      imply. Keep total_asset_shares x asset_share_value - total_liability_shares x
+      liability_share_value close to the vault balance, and move the vault with
+      spl-token-account-balance in the same step, or withdrawals revert on the token transfer.
+
+      All four fields are I80F48 numbers, passed as FIXED-POINT VALUES above. Raising
+      liability_share_value ages every loan in the bank at once.
+
+      EXAMPLE - "debt in this bank grew 10%": read the bank's current liability_share_value and
+      write it times 1.1. If it reads [0, 0, 0, 0, 0, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0] (1.25),
+      write 1.375:
+      liability_share_value.value: [0, 0, 0, 0, 0, 96, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  # ==========================================
+  # MarginfiAccount
+  # ==========================================
+  - id: project0-account-balance
+    name: Override Account Position
+    description: Override one balance slot of a Project 0 MarginfiAccount
+    idl_account_name: MarginfiAccount
+    properties:
+      - "lending_account.balances.0.active"
+      - "lending_account.balances.0.bank_pk"
+      - "lending_account.balances.0.bank_asset_tag"
+      - path: lending_account.balances.0.asset_shares.value
+        label: Deposit shares
+        description: >-
+          Deposit shares in the bank, as an I80F48 number. Tokens = shares x the bank's
+          asset_share_value. Example: 10 SOL of shares at a share value of 1.0 is 10000000000, sent
+          as the 16 little-endian bytes of value x 2^48:
+          [0, 0, 0, 0, 0, 0, 0, 228, 11, 84, 2, 0, 0, 0, 0, 0]
+      - path: lending_account.balances.0.liability_shares.value
+        label: Debt shares
+        description: >-
+          Debt shares in the bank, as an I80F48 number. Tokens = shares x the bank's
+          liability_share_value. Example: 0, sent as 16 zero bytes
+      - "lending_account.balances.0.last_update"
+    address:
+      type: pubkey
+    llm_context: |
+      An account holds 16 fixed balance slots. Replace the 0 in the paths with the slot you edit.
+
+      RULES TO KEEP:
+      - Active slots are kept sorted by bank_pk, highest first, compared as raw bytes. Pick the slot
+        so that order still holds
+      - An empty slot is active 0, bank_pk 11111111111111111111111111111111 and zero shares. Take a
+        free slot for a new position rather than overwriting one in use
+      - bank_asset_tag must equal the bank's config.asset_tag (SOL bank 1, most others 0)
+      - A slot holds either deposit shares or debt shares, never both
+      - Shares are not token amounts: tokens = shares x the bank's asset_share_value (deposits) or
+        liability_share_value (debts). Divide the amount you want by the share value, then pass
+        it as FIXED-POINT VALUES above
+
+      Instructions that check health need every active slot's bank and oracle passed in slot order.
+      The bank's own totals (total_asset_shares, total_liability_shares) are not updated for you;
+      raise them with project0-bank-shares when the scenario depends on bank-wide numbers.
+
+      EXAMPLE - "10 SOL deposited in the native SOL bank" in slot 0, with the SOL bank's
+      asset_share_value reading 1.25: 10 SOL / 1.25 = 8 SOL of shares, 8000000000.
+      lending_account.balances.0.active: 1
+      lending_account.balances.0.bank_pk: <the SOL bank from the lookup above>
+      lending_account.balances.0.bank_asset_tag: 1
+      lending_account.balances.0.asset_shares.value: [0, 0, 0, 0, 0, 0, 0, 80, 214, 220, 1, 0, 0, 0, 0, 0]
+      lending_account.balances.0.liability_shares.value: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  - id: project0-account-authority
+    name: Override Account Authority
+    description: Take over a Project 0 MarginfiAccount by changing its authority
+    idl_account_name: MarginfiAccount
+    properties:
+      - path: authority
+        label: Authority
+        description: >-
+          The wallet allowed to deposit, borrow, withdraw and repay on this account. Example: your
+          test wallet's address
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to act as the owner of a real account in the local VM, so a test can borrow
+      or withdraw against its live positions.
+
+      Set authority to a wallet whose keypair you hold, and sign with it.
+
+      EXAMPLE:
+      authority: <your wallet address>
