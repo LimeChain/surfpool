@@ -13,7 +13,6 @@ use solana_epoch_info::EpochInfo;
 use solana_program_option::COption;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_system_interface::program as system_program;
-use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
@@ -32,7 +31,7 @@ use crate::{
     error::SurfpoolError,
     rpc::{
         State,
-        utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
+        utils::{decode_transaction, into_versioned_transaction, verify_pubkey, verify_pubkeys},
     },
     surfnet::{
         AccountSource, GetAccountResult, locker::SvmAccessContext,
@@ -1437,10 +1436,13 @@ pub trait SurfnetCheatcodes {
     ///     - `fetchBeforeUse`: If true, fetch fresh account data just before transaction execution (useful for price feeds, oracle updates, and dynamic balances)
     ///     - `account`: Account address (either `{ "pubkey": "..." }` or `{ "pda": { "programId": "...", "seeds": [...] } }`)
     ///   - `tags`: Array of tags for categorization
-    /// - `slot` (optional): The base slot from which relative slot offsets are calculated. If omitted, uses the current slot.
+    /// - `slot` (optional): The base slot from which relative slot offsets are calculated. If omitted, the next slot the surfnet produces. A base slot that is already produced is rejected with InvalidParams.
     ///
     /// ## Returns
     /// A `RpcResponse<()>` indicating whether the Scenario registration was successful.
+    ///
+    /// Overrides are applied when the surfnet produces their slot; nothing is applied during this call.
+    /// `surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots it skips are never applied; step one slot at a time.
     ///
     /// ## Example Request (with slot)
     /// ```json
@@ -1473,7 +1475,7 @@ pub trait SurfnetCheatcodes {
     ///       ],
     ///       "tags": ["defi", "price-feed"]
     ///     },
-    ///     355684457
+    ///     355684458
     ///   ]
     /// }
     /// ```
@@ -1968,10 +1970,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         config: Option<RpcProfileResultConfig>,
     ) -> BoxFuture<Result<RpcResponse<UiKeyedProfileResult>>> {
         Box::pin(async move {
-            let (_, transaction) = decode_and_deserialize::<VersionedTransaction>(
+            let transaction = into_versioned_transaction(decode_transaction(
                 transaction_data_b64,
                 solana_transaction_status::TransactionBinaryEncoding::Base64,
-            )?;
+            )?);
 
             let SurfnetRpcContext {
                 svm_locker,
@@ -2534,37 +2536,14 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         scenario: Scenario,
         slot: Option<Slot>,
     ) -> BoxFuture<Result<RpcResponse<()>>> {
-        let SurfnetRpcContext {
-            svm_locker,
-            remote_ctx,
-        } = match meta.get_rpc_context(CommitmentConfig::confirmed()) {
-            Ok(res) => res,
-            Err(e) => return e.into(),
-        };
+        let SurfnetRpcContext { svm_locker, .. } =
+            match meta.get_rpc_context(CommitmentConfig::confirmed()) {
+                Ok(res) => res,
+                Err(e) => return e.into(),
+            };
 
         Box::pin(async move {
-            // Get the base slot for registration (either provided or current)
-            let base_slot = slot.unwrap_or_else(|| svm_locker.get_latest_absolute_slot());
-
-            // Register the scenario with explicit base slot
-            svm_locker
-                .register_scenario(scenario, Some(base_slot))
-                .map_err(|e| jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to register scenario: {}", e),
-                    data: None,
-                })?;
-
-            // Immediately materialize overrides for the BASE slot (not current slot)
-            // This ensures slot 0's override is applied right away
-            svm_locker
-                .materialize_overrides_for_slot(&remote_ctx, base_slot)
-                .await
-                .map_err(|e| jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to materialize initial overrides: {}", e),
-                    data: None,
-                })?;
+            svm_locker.register_scenario(scenario, slot)?;
 
             Ok(cheatcode_response(
                 svm_locker.get_latest_absolute_slot(),
@@ -2600,7 +2579,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc, tests::helpers::TestSetup,
+        rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc,
+        tests::helpers::{
+            TestSetup, UNHEALTHY_OFFSET, UNSANITARY_TRANSACTION_ERROR, scheduled_override_fixture,
+            unsanitary_transactions,
+        },
         types::confidential_key_signature,
     };
 
@@ -6211,6 +6194,143 @@ mod tests {
                 .await
                 .is_err(),
             "the wrong aesKey should fail rather than decrypt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profile_transaction_refuses_an_unsanitary_transaction() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let recent_blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        for transaction in unsanitary_transactions(&Keypair::new(), recent_blockhash) {
+            let error = client
+                .rpc
+                .profile_transaction(
+                    Some(client.context.clone()),
+                    base64::engine::general_purpose::STANDARD
+                        .encode(bincode::serialize(&transaction).unwrap()),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("an unsanitary transaction must be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(error.message, UNSANITARY_TRANSACTION_ERROR);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_scenario_applies_overrides_when_the_next_slot_is_produced() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let (account_pubkey, instance) = client
+            .context
+            .svm_locker
+            .with_svm_writer(scheduled_override_fixture);
+        let account = || {
+            client.context.svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
+                    .inner
+                    .get_account(&account_pubkey)
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let scheduled_slots = || {
+            client
+                .context
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.scheduled_overrides.keys().unwrap())
+        };
+        let before = account();
+        let mut scenario = Scenario::new("next slot".to_string(), String::new());
+        scenario.add_override(instance);
+
+        let response = client
+            .rpc
+            .register_scenario(Some(client.context.clone()), scenario, None)
+            .await
+            .expect("registering without a slot should succeed");
+
+        assert_eq!(response.context.slot, 123);
+        assert_eq!(account(), before, "registering must not apply anything");
+        assert_eq!(scheduled_slots(), vec![124]);
+
+        client
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &account().data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16],
+            &1_234u128.to_le_bytes(),
+            "producing slot 124 applies its override"
+        );
+        assert!(scheduled_slots().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_scenario_rejects_a_produced_base_slot() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let (_, instance) = client
+            .context
+            .svm_locker
+            .with_svm_writer(scheduled_override_fixture);
+
+        for produced_slot in [123, 100] {
+            let mut scenario = Scenario::new("produced slot".to_string(), String::new());
+            scenario.add_override(instance.clone());
+
+            let error = client
+                .rpc
+                .register_scenario(Some(client.context.clone()), scenario, Some(produced_slot))
+                .await
+                .expect_err("a base slot that is already produced must be rejected");
+
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                format!("base slot {produced_slot} is already produced; the next slot is 124")
+            );
+        }
+        let scheduled_slots = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.scheduled_overrides.keys().unwrap());
+        assert!(scheduled_slots.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_register_scenario_rejects_a_relative_slot_that_overflows() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let (_, instance) = client
+            .context
+            .svm_locker
+            .with_svm_writer(scheduled_override_fixture);
+        let mut scenario = Scenario::new("overflow".to_string(), String::new());
+        scenario.add_override(instance.clone());
+        let mut far = instance;
+        far.scenario_relative_slot = u64::MAX;
+        scenario.add_override(far);
+
+        let error = client
+            .rpc
+            .register_scenario(Some(client.context.clone()), scenario, None)
+            .await
+            .expect_err("a relative slot that overflows must be rejected");
+
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        let scheduled_slots = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.scheduled_overrides.keys().unwrap());
+        assert!(
+            scheduled_slots.is_empty(),
+            "nothing may be scheduled when one override is rejected"
         );
     }
 }

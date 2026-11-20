@@ -23,7 +23,9 @@ use solana_epoch_info::EpochInfo;
 use solana_message::inner_instruction::InnerInstructionsList;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::versioned::{
+    VersionedTransaction, sanitized::SanitizedVersionedTransaction,
+};
 use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_error::TransactionError;
 use txtx_addon_kit::indexmap::IndexMap;
@@ -803,7 +805,7 @@ pub enum SimnetCommand {
     /// than race that window.
     ProcessTransaction(
         Option<(Hash, String)>,
-        VersionedTransaction,
+        SanitizedVersionedTransaction,
         Sender<TransactionStatusEvent>,
         bool,
         Option<bool>,
@@ -815,7 +817,7 @@ pub enum SimnetCommand {
     /// between the bundle snapshot and its commit.
     ProcessBundle(
         Option<(Hash, String)>,
-        Vec<VersionedTransaction>,
+        Vec<SanitizedVersionedTransaction>,
         Sender<Result<String, String>>,
     ),
     /// Runs a state-mutating RPC operation exclusively with transactions and
@@ -925,6 +927,9 @@ pub struct SimnetConfig {
     /// Snapshot accounts to preload at startup.
     /// Keys are pubkey strings, values can be None to fetch from remote RPC.
     pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    /// Fail startup if any snapshot account cannot be loaded.
+    #[serde(default)]
+    pub strict_snapshot: bool,
     /// Hash reported by `getGenesisHash`, overriding the datasource's (or, offline,
     /// the local genesis config's), so clients can identify the surfnet as a cluster.
     #[serde(default)]
@@ -948,6 +953,7 @@ impl Default for SimnetConfig {
             skip_blockhash_check: false,
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
+            strict_snapshot: false,
             genesis_hash: None,
         }
     }
@@ -2693,6 +2699,17 @@ mod tests {
 
         let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
         assert!(!config.skip_blockhash_check);
+    }
+
+    #[test]
+    fn test_simnet_config_strict_snapshot_defaults_on_deserialize() {
+        let mut config_json = serde_json::to_value(SimnetConfig::default()).unwrap();
+        config_json
+            .as_object_mut()
+            .unwrap()
+            .remove("strict_snapshot");
+        let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
+        assert!(!config.strict_snapshot);
     }
 
     // Configs written before the startup planner existed must keep working;
