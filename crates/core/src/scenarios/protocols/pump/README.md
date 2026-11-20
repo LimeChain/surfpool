@@ -11,17 +11,41 @@ life spans two on-chain programs, so the integration covers both:
 Both programs publish Anchor IDLs, so the templates use the standard IDL override path
 (no raw-offset layout needed).
 
-## Program identity (verified 2026-08-07)
+## Program identity (verified 2026-11-19)
 
-|                    | Pump                                                                                                                                                | PumpSwap                                                                                                                                   |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Program ID         | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`                                                                                                       | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`                                                                                              |
-| ProgramData        | `B5MvUwXdiW1NMM6QFFD3ssPKBujD4zMohncbM73Z2BQu`                                                                                                      | `6naEzKeUuFh1Jeeu51NXQgr5qkXgXtc9WKNct4xynVJc`                                                                                             |
-| Last deployed slot | 433095571                                                                                                                                           | 433112355                                                                                                                                  |
-| Bundled IDL        | byte-identical to [`idl/pump.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json) at pump-public-docs commit `3c6721a67c0b` | byte-identical to [`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump_amm.json) at commit `2c22246b6708` |
+|                    | Pump                                           | PumpSwap                                       |
+| ------------------ | ---------------------------------------------- | ---------------------------------------------- |
+| Program ID         | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`  | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`  |
+| ProgramData        | `B5MvUwXdiW1NMM6QFFD3ssPKBujD4zMohncbM73Z2BQu` | `6naEzKeUuFh1Jeeu51NXQgr5qkXgXtc9WKNct4xynVJc` |
+| Last deployed slot | 469811025                                      | 469811067                                      |
 
 A later deployment slot than the one above means the program was upgraded and this
 integration must be revisited (layouts, formulas, fee wiring).
+
+## The bundled IDLs
+
+Both IDLs come from [pump-public-docs](https://github.com/pump-fun/pump-public-docs), not from
+the programs' Anchor IDL accounts: the on-chain copies lag the deployed programs. On
+2026-11-18 the Pump IDL account held pump-public-docs commit `e0687ae9b7e0` (2026-09-12) and
+the PumpSwap IDL account held `3c6721a67c0b` (2026-05-18). Pump redeployed both programs on
+2026-11-15 without an IDL update anywhere, so even the latest published IDLs can lag them.
+
+| Program  | File                                                                                                                                | pump-public-docs commit     | sha256                                                             |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------ |
+| Pump     | [`idl/pump.json`](https://github.com/pump-fun/pump-public-docs/blob/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/idl/pump.json)         | `639b87fb45c3` (2026-10-13) | `7616681ea557975f9f623ac211080f22a93060781eaf4765b0a488d980997207` |
+| PumpSwap | [`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/8cda1fa30ea658b20909d8aedf002047119388d2/idl/pump_amm.json) | `8cda1fa30ea6` (2026-10-07) | `b7d8c57a4d9c4dd0109a9ab893052352333252d4eedced10ac091d4d66cab89b` |
+
+Each bundled file is byte-identical to the file at that commit, the latest commit to change
+it on 2026-11-19.
+
+An IDL write decodes the whole account type, so on an account shorter than its type it
+fails, and the surfnet skips the whole override with a warning. The bundled `BondingCurve`
+type is 166 bytes. A census of `BondingCurve` accounts on 2026-11-19 found 2,586,858 curves of
+166 or 256 bytes, which take writes, and at least 13 million curves of 49 to 151 bytes, which
+do not, such as the 150-byte Fartcoin curve `TBHe5tJnuT4CQbHorJ1uVdfUoaYGPKgfCpiv2jgesVN`. At
+least 9,457,515 of them are 125 to 151 bytes long and took writes with the 125-byte type of the
+on-chain IDL. The bundled `Global` type is 1,088 bytes, and the live account is 1,096 bytes. For `Pool` and
+`GlobalConfig`, see [`../pump-amm/README.md`](../pump-amm/README.md).
 
 Fees: every buy/sell passes the fee program's `FeeConfig` (market-cap fee tiers) as a
 required account under `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ`; the flat
@@ -124,7 +148,9 @@ Expected result: the coin's `BondingCurve` PDA holds exactly these values while 
 other byte (token_total_supply, creator, the extend_account tail) stays live. Verify by
 re-opening the override in the Studio field editor, or via `getAccountInfo`: u64 LE at
 offsets 8 (virtual tokens), 16 (virtual quote), 24 (real tokens), 32 (real quote), bool
-at 48 (complete). The surfpool log must contain no `skipping override` line.
+at 48 (complete). The surfpool log must contain no `skipping override` line. The curve must
+be at least 166 bytes, the size of the bundled `BondingCurve` type (see
+[The bundled IDLs](#the-bundled-idls)).
 
 Variant — a semantically valid _completed_ curve (rejects buys/sells with
 `BondingCurveComplete`): `complete: true` requires `real_token_reserves: 0`; keep the
@@ -180,12 +206,18 @@ the registered template, supplies the mint and reserve value, and stores a norma
 }
 ```
 
-`virtual_quote_reserves` is appended to the quote vault balance
-when the AMM quotes, so raising it makes the same sell return more quote without
-touching any token balance. The template derives the canonical WSOL pool from `base_mint`.
-If the derived account is absent or invalid, Play reports the materialization failure.
-After a successful Play, the identical sell transaction simulates with a higher quote-token
-output than before.
+`virtual_quote_reserves` is added to the quote vault balance when the AMM quotes, so raising
+it makes the same sell return more quote without touching any token balance. The template
+derives the canonical WSOL pool from `base_mint`. The value replaces the pool's current
+value V, which is not 0 on every pool; to scale the effective quote reserves by k, write
+k * (Q + V) - Q, where Q is the quote vault balance. If the derived pool is absent or shorter
+than the bundled 287-byte `Pool` type, the surfnet logs a warning and leaves the pool
+unchanged. After a successful Play, the identical sell transaction simulates with a higher
+quote-token output than before.
+
+To move the balances themselves, override a vault with the `spl-token-account-balance`
+template instead. The vault addresses are in the pool's `pool_base_token_account` and
+`pool_quote_token_account` fields.
 
 ## Verification
 
@@ -197,13 +229,14 @@ output than before.
   network connection (`SURFPOOL_TEST_RPC_URL` overrides the public mainnet endpoint).
   It round-trips live mainnet curve, pool, and config accounts through the bundled
   IDLs to catch layout drift after a program upgrade, proves overrides touch only
-  their target bytes on real account data, and exercises the graduation builder's
+  their target bytes on real account data, pins which live curves and pools are too short
+  for the bundled types and are left unchanged, and exercises the graduation builder's
   validation against live state. The lifecycle test discovers a fresh, still-trading
   Token-2022 coin from the pump program's recent transactions (no fixed coin stays
   incomplete; the fork freezes its state on first read), prepares it through the
   production builder and materializer, then executes real `buy_v2` and `migrate_v2`
-  against the live programs. The price-shock test compares a baseline and a shocked
-  PumpSwap `sell` simulation on the established live canonical pool and requires the
-  quote-token output to change, then executes the sell for real. Trading against a
-  freshly migrated (cashback-era) pool uses a different fee wiring and is an open
-  follow-up.
+  against the live programs. The price-shock test raises `virtual_quote_reserves` on the
+  established live canonical pool, compares a baseline and a shocked PumpSwap `sell`
+  simulation and requires the quote-token output to rise, then executes the sell for
+  real. Trading against a freshly migrated (cashback-era) pool uses a different fee wiring
+  and is an open follow-up.
