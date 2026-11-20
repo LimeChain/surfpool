@@ -53,11 +53,11 @@ accounts from mainnet, so they need a network connection and are compiled only b
 cargo test -p surfpool-core --features integration-tests kamino
 ```
 
-Project 0 has the same kind of suite in `crates/core/src/tests/project0/`, plus a test that runs
-the deployed program over overridden state:
+Project 0 has the same kind of suite in `crates/core/src/tests/protocols/project0/`, plus a test
+that runs the deployed program over overridden state:
 
 ```
-cargo test -p surfpool-core --features integration-tests project0
+cargo test -p surfpool-core --features integration-tests tests::protocols::project0
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
