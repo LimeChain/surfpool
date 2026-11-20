@@ -34,7 +34,6 @@ use txtx_addon_network_svm::codec::idl::IdlRef;
 use crate::{
     scenarios::TemplateRegistry,
     surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm},
-    tests::helpers::diff_indices,
     types::RemoteRpcResult,
 };
 
@@ -268,6 +267,16 @@ fn u32_at(data: &[u8], range: Range<usize>) -> u32 {
 
 fn pubkey_at(data: &[u8], range: Range<usize>) -> Pubkey {
     Pubkey::new_from_array(read(data, range))
+}
+
+/// Byte indices at which two buffers differ.
+fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The bundled IDL, which also encodes every instruction the tests send.
