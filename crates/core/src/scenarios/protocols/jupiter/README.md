@@ -1,10 +1,12 @@
-# Jupiter Perps
+# Jupiter
 
-Templates for the Jupiter Perps exchange and the JLP pool behind it, across two programs:
+Templates for three Jupiter programs: the v6 swap aggregator, and the Jupiter Perps exchange with
+the JLP pool behind it, which takes its prices from the Doves oracle.
 
 | Program | Address | Collection |
 |---|---|---|
-| Jupiter Perps | `PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu` | `jupiter-perps` (this folder) |
+| Jupiter v6 | `JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4` | `Jupiter` (`v6`) |
+| Jupiter Perps | `PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu` | `jupiter-perps` (`perps/v1`) |
 | Doves oracle | `DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e` | `jupiter-perps-doves` (`doves/v1`) |
 
 Perps reads every price from a Doves `AgPriceFeed`. It never reads the custody's Pyth account, so
@@ -12,6 +14,17 @@ Perps reads every price from a Doves `AgPriceFeed`. It never reads the custody's
 keeps every loaded Doves feed published.
 
 # Template index
+
+## Jupiter v6
+
+| Template | Overrides |
+|---|---|
+| `jupiter-token-ledger-override` | the intermediate token amounts of a multi-hop swap |
+
+It writes both `TokenLedger` fields: the token account and the amount. The template has no fixed
+address: each override names the `TokenLedger` account by its pubkey.
+
+## Jupiter Perps and Doves
 
 | Template | Overrides |
 |---|---|
@@ -22,7 +35,7 @@ keeps every loaded Doves feed published.
 | `jupiter-perps-pool-limits` | the JLP pool's AUM cap, weight buffer and price guard |
 | `jupiter-perps-pool-fees` | the JLP pool's deposit, withdrawal and swap fees |
 
-## Number formats
+### Number formats
 
 | You'll see | It means | Example |
 |---|---|---|
@@ -35,7 +48,7 @@ keeps every loaded Doves feed published.
 
 `limit.max_aum_usd` and `limit.token_weightage_buffer_bps` are `u128`: pass them as decimal strings.
 
-## Finding a market
+### Finding a market
 
 Nothing but the pool is hardcoded; custodies and feeds are read live.
 
@@ -46,7 +59,7 @@ A `getAccountInfo` or `getMultipleAccounts` with `jsonParsed` encoding returns t
 decoded. Positions live on the custody of the traded token, longs and shorts alike; a short's
 collateral sits in the USDC or USDT custody.
 
-# Recipes
+# Perps recipes
 
 ## Crash a price
 
@@ -65,7 +78,7 @@ every custody's feed; positions read their own feeds; liquidations do not check 
 On mainnet the Doves publisher republishes every feed's price within seconds. Nobody runs it
 against a surfnet, so from the slot a `jupiter-perps-doves-price` override plays, Surfpool
 republishes every Doves feed the surfnet has loaded every slot
-([keep-alive](../../../README.md#keep-alive)), including feeds a transaction loads later: each
+([keep-alive](../../README.md#keep-alive)), including feeds a transaction loads later: each
 `timestamp` follows the Surfnet clock and each price stays the scenario's. A JLP deposit,
 withdrawal, swap or quote, or a position, finds every custody's feed fresh, and a keeper fill finds
 a price published after its request. Keep-alive runs until the network is reset.
@@ -148,7 +161,7 @@ jupiter-perps-pool-limits    max_lp_token_price_change_bps: 10000
 A large crash also shifts every token's weight; raise `limit.token_weightage_buffer_bps` if
 deposits then fail with 6043.
 
-# Troubleshooting
+# Perps troubleshooting
 
 | Error | Meaning | Fix |
 |---|---|---|
@@ -168,13 +181,13 @@ deposits then fail with 6043.
 # IDL provenance
 
 Perps publishes a legacy Anchor IDL on chain, in account `38GK1i4cQPAxqrbfKX4RRMNfXpKRn5PgLFHVJeXm1C8Y`,
-which the engine cannot read. `idl.json` is that IDL after `anchor idl convert` (anchor-cli
+which the engine cannot read. `perps/v1/idl.json` is that IDL after `anchor idl convert` (anchor-cli
 0.31.1), unchanged.
 
 | File | sha256 |
 |---|---|
 | on-chain legacy IDL | `1292d2ecec3f6c17501704a423f1e0f4c2cde25b7821cabeeb2b98eb52168861` |
-| `idl.json` | `8d9860d8baf41478d8a44f9507611043ffa685c8d1e801ee032c16817a46b3f3` |
+| `perps/v1/idl.json` | `8d9860d8baf41478d8a44f9507611043ffa685c8d1e801ee032c16817a46b3f3` |
 
 Doves publishes a current Anchor IDL in account `4D2RLxRVWjGUp7E45noWC6x7BfmSQbQ4mQevHvTV5ai6`.
 `doves/v1/idl.json` is that IDL as fetched, unchanged (sha256

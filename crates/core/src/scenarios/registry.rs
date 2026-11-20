@@ -71,16 +71,16 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
-pub const JUPITER_PERPS_IDL_CONTENT: &str = include_str!("./protocols/jupiter-perps/v1/idl.json");
+pub const JUPITER_PERPS_IDL_CONTENT: &str = include_str!("./protocols/jupiter/perps/v1/idl.json");
 pub const JUPITER_PERPS_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/jupiter-perps/v1/overrides.yaml");
+    include_str!("./protocols/jupiter/perps/v1/overrides.yaml");
 
 pub const JUPITER_PERPS_DOVES_IDL_CONTENT: &str =
-    include_str!("./protocols/jupiter-perps/doves/v1/idl.json");
+    include_str!("./protocols/jupiter/doves/v1/idl.json");
 pub const JUPITER_PERPS_DOVES_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/jupiter-perps/doves/v1/overrides.yaml");
+    include_str!("./protocols/jupiter/doves/v1/overrides.yaml");
 pub const JUPITER_PERPS_DOVES_KEEP_ALIVE_CONTENT: &str =
-    include_str!("./protocols/jupiter-perps/doves/v1/keep-alive.yaml");
+    include_str!("./protocols/jupiter/doves/v1/keep-alive.yaml");
 
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
