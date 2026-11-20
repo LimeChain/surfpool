@@ -37,6 +37,11 @@ enabled: boolean,
  */
 fetchBeforeUse?: boolean, 
 /**
+ * Keep-alive for the account this override writes. Absent, the template's keep-alive applies;
+ * `[]` turns it off. Only `[]` is supported.
+ */
+keepAlive?: Array<unknown>, 
+/**
  * Account address to override - use pubkey for known addresses or pda for derived addresses
  */
 account: AccountAddress, };

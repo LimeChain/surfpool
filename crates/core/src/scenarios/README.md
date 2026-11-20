@@ -125,6 +125,13 @@ never takes effect. An account not yet in the surfnet is fetched from the remote
 or its owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
 until an importing override plays again.
 
+An override can turn keep-alive off for the account it writes with `"keepAlive": []`, as `keep_alive: []`
+does for a template. From that override's slot on, nothing rewrites the account, including keep-alive
+that earlier overrides started, so its fields age as the clock moves on, for example to test a stale
+price. The override must write a value for this to take effect. Without the field, the template's
+keep-alive applies as usual. To keep fresh an account a transaction reads but no scenario names, give
+it an override of its own.
+
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
 This is a cumbersome process in most cases.

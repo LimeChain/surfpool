@@ -592,6 +592,14 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
+    /// Keep-alive for the account this override writes. Absent, the template's keep-alive applies;
+    /// `[]` turns it off. Only `[]` is supported.
+    #[schemars(
+        description = "Optional. Omit it to keep the template's keep-alive. [] turns keep-alive off for the account this override writes, from this slot on, including keep-alive that earlier overrides started. Only [] is supported"
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "Array<unknown>", optional))]
+    pub keep_alive: Option<Vec<serde_json::Value>>,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
@@ -609,6 +617,7 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
+            keep_alive: None,
             account,
         }
     }
@@ -2495,5 +2504,32 @@ templates:
                 Err(format!("property 'value': {error}"))
             );
         }
+    }
+
+    #[test]
+    fn keep_alive_is_absent_unless_given() {
+        let instance = |keep_alive: Option<serde_json::Value>| {
+            let mut value = json!({
+                "id": "o", "templateId": "t", "values": {}, "scenarioRelativeSlot": 0,
+                "enabled": true, "account": { "pubkey": "11111111111111111111111111111111" }
+            });
+            if let Some(keep_alive) = keep_alive {
+                value["keepAlive"] = keep_alive;
+            }
+            serde_json::from_value::<super::OverrideInstance>(value).unwrap()
+        };
+
+        let absent = instance(None);
+        assert_eq!(absent.keep_alive, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("keepAlive")
+                .is_none()
+        );
+
+        let off = instance(Some(json!([])));
+        assert_eq!(off.keep_alive, Some(vec![]));
+        assert_eq!(serde_json::to_value(&off).unwrap()["keepAlive"], json!([]));
     }
 }

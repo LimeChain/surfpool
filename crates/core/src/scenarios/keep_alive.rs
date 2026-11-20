@@ -15,6 +15,8 @@ pub struct KeepAliveSource {
     pub address: Pubkey,
     /// The override's values, which input and PDA addresses resolve against.
     pub values: HashMap<String, serde_json::Value>,
+    /// The override set `keepAlive: []`: keep-alive stops rewriting `address`.
+    pub off: bool,
 }
 
 /// Binds a template's keep-alive import to the account it rewrites every slot, resolved when an

@@ -3530,15 +3530,22 @@ impl SurfnetSvm {
 
             // Joins keep-alive only once its write succeeds: a failed override leaves the account as
             // if no scenario had touched it.
+            let keep_alive_off = override_instance
+                .keep_alive
+                .as_ref()
+                .is_some_and(Vec::is_empty);
             let mut keep_alive_source = None;
             if scheduled
-                && let Some(template) = template_registry().get(&override_instance.template_id)
-                && !template.keep_alive.is_empty()
+                && (keep_alive_off
+                    || template_registry()
+                        .get(&override_instance.template_id)
+                        .is_some_and(|template| !template.keep_alive.is_empty()))
             {
                 keep_alive_source = Some(KeepAliveSource {
-                    template: template.id.clone(),
+                    template: override_instance.template_id.clone(),
                     address: account_pubkey,
                     values: override_instance.values.clone(),
+                    off: keep_alive_off,
                 });
             }
 
@@ -3919,6 +3926,12 @@ impl SurfnetSvm {
     /// Adds the accounts that `touched` makes keep-alive imports rewrite.
     fn enroll_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
+            if source.off {
+                self.keep_alive_bindings
+                    .retain(|binding| binding.address != source.address);
+                info!("Keep-alive stops rewriting {}", source.address);
+                continue;
+            }
             let Some(template) = template_registry().get(&source.template) else {
                 continue;
             };
@@ -9747,5 +9760,46 @@ mod tests {
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));
+    }
+
+    #[tokio::test]
+    async fn an_empty_keep_alive_list_stops_keep_alive_on_the_account_it_writes() {
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
+        let other = Pubkey::new_unique();
+        for address in [account_pubkey, other] {
+            svm.keep_alive_bindings.insert(KeepAliveBinding {
+                template: "an-earlier-override".to_string(),
+                import: 0,
+                address,
+            });
+        }
+        let mut play = async |slot: u64, keep_alive: serde_json::Value, values| {
+            let mut instance = instance.clone().with_values(values);
+            instance.keep_alive = serde_json::from_value(keep_alive).unwrap();
+            svm.scheduled_overrides.store(slot, vec![instance]).unwrap();
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .unwrap();
+            svm.keep_alive_bindings
+                .iter()
+                .map(|binding| binding.address)
+                .collect::<Vec<Pubkey>>()
+        };
+        let mut both = vec![account_pubkey, other];
+        both.sort();
+
+        let failed = HashMap::from([("nope".to_string(), serde_json::json!(1))]);
+        assert_eq!(play(500, serde_json::json!([]), failed).await, both);
+        assert_eq!(
+            play(501, serde_json::json!([{}]), instance.values.clone()).await,
+            both,
+            "a failed write and a non-empty list stop nothing"
+        );
+        assert_eq!(
+            play(502, serde_json::json!([]), instance.values.clone()).await,
+            vec![other],
+            "only the written account stops"
+        );
     }
 }
