@@ -89,7 +89,29 @@ pub fn parse(document: &Value, address: &str) -> Result<Idl> {
             metadata.insert("address".into(), json!(address));
         }
     }
+    // The older format carries no discriminators. Its client derived an account's from the name
+    // in Pascal case, and the converter derives it from the name as written, so an account that
+    // IDL spells in camel case (`priceUpdateV2`) would get one no account carries. The names are
+    // read as that client read them.
+    if Format::of(&document) == Format::AnchorLegacy
+        && let Some(accounts) = document.get_mut("accounts").and_then(Value::as_array_mut)
+    {
+        for account in accounts {
+            if let Some(Value::String(name)) = account.get_mut("name") {
+                *name = capitalized(name);
+            }
+        }
+    }
     convert_idl(&serde_json::to_vec(&document)?)
+}
+
+/// The name with its first letter in upper case.
+fn capitalized(name: &str) -> String {
+    let mut letters = name.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => String::new(),
+    }
 }
 
 /// A shipped entry the published IDL has differently, or not at all.
@@ -304,6 +326,25 @@ mod tests {
             "{:?}",
             comparison.differing()
         );
+    }
+
+    #[test]
+    fn an_older_format_account_spelled_in_camel_case_is_read_as_its_client_read_it() {
+        let mut published = legacy();
+        published["accounts"][0]["name"] = json!("reserve");
+        let published = parse(&published, ADDRESS).unwrap();
+        // sha256("account:Reserve")[..8], which the program's accounts carry.
+        assert_eq!(published.accounts[0].name, "Reserve");
+        assert_eq!(
+            published.accounts[0].discriminator,
+            [43, 242, 204, 202, 26, 247, 59, 127]
+        );
+        assert!(compare(&committed(), &published).differing().is_empty());
+
+        // The current format states its discriminators, and its names are left as written.
+        let stated = json!([{"name": "reserve", "discriminator": [1, 2, 3, 4, 5, 6, 7, 8]}]);
+        let current = parse(&current(json!([reserve()]), stated), ADDRESS).unwrap();
+        assert_eq!(current.accounts[0].name, "reserve");
     }
 
     fn route(name: &str, amount_type: &str) -> Value {
