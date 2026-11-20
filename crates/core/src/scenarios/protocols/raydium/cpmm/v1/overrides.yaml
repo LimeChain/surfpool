@@ -1,0 +1,70 @@
+protocol: Raydium
+version: v0.2.0
+account_type: PoolState
+idl_file_path: idl.json
+
+tags:
+  - amm
+  - constant-product
+  - defi
+
+llm_context: |
+  Raydium CPMM (CP-Swap), program CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C.
+
+  FIND A POOL BY PAIR: resolve both mints with get_token_address, then call getProgramAccounts on the
+  program with filters dataSize 637 and memcmp of the two mints at offsets 168 and 200, once in each
+  order (only one returns pools). Read each pool's token_0_vault with dataSlice {offset 72, length 32}
+  and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool whose
+  vault holds the most; name it. If neither order returns a pool, recheck the mints once, then ask for
+  the pool address. A pool address the user gives is used as is.
+
+  Set fetchBeforeUse: true. Neither template holds the price: a swap prices off the two vault token
+  accounts minus the fees the pool owes out of them, and the Studio price shock writes both vaults.
+
+templates:
+  - id: raydium-cpmm-pool-state
+    name: Override CPMM Pool State
+    description: Override which operations a Raydium CPMM pool allows and when it opens for swaps
+    idl_account_name: PoolState
+    properties:
+      - path: status
+        label: Pool Status
+        description: "Disable bitmask (u8): bit0 deposit, bit1 withdraw, bit2 swap; 0 = all enabled, 4 = swaps off"
+      - path: open_time
+        label: Open Time
+        description: Unix seconds; swaps fail until the cluster clock reaches it
+    address:
+      type: pubkey
+    llm_context: |
+      Put the pool in the override's account as {"pubkey":"<pool>"}, never in values.
+
+      status is a bitmask of disabled operations: 1 deposits, 2 withdrawals, 4 swaps; 4 halts swaps and 0
+      enables everything. A swap on a halted pool, or before open_time (unix seconds), fails with
+      NotApproved (6000).
+
+  - id: raydium-cpmm-amm-config
+    name: Override CPMM Fee Tier (AmmConfig)
+    description: Override a Raydium CPMM fee tier, shared by every pool created on it
+    idl_account_name: AmmConfig
+    properties:
+      - path: trade_fee_rate
+        label: Trade Fee Rate
+        description: Fee on the input amount, parts per million (2500 = 0.25%)
+      - path: protocol_fee_rate
+        label: Protocol Fee Rate
+        description: Protocol treasury's share of the collected trade fee, parts per million
+      - path: fund_fee_rate
+        label: Fund Fee Rate
+        description: Fund owner's share of the collected trade fee, parts per million
+      - path: creator_fee_rate
+        label: Creator Fee Rate
+        description: Extra fee on the input of pools that enable a creator fee, parts per million
+    address:
+      type: pubkey
+    llm_context: |
+      Read the pool's fee tier with getAccountInfo on the pool, dataSlice {offset 8, length 32} and
+      encoding base58, and put that address in the override's account. Every pool on the tier shares it.
+
+      Rates are parts per million. trade_fee_rate and creator_fee_rate are charged on the input (2500 =
+      0.25%; keep their sum below 1,000,000; the creator fee only on pools that enable it).
+      protocol_fee_rate and fund_fee_rate are shares of the collected fee, together at most 1,000,000.
