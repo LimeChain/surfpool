@@ -1,0 +1,17 @@
+protocol: jupiter-perps-doves
+version: v1
+account_type: AgPriceFeed
+idl_file_path: idl.json
+
+templates:
+  - id: jupiter-perps-doves-publication
+    name: Price publication
+    description: The Doves publisher republishing a price
+    idl_account_name: AgPriceFeed
+    address:
+      type: pubkey
+    properties:
+      - path: timestamp
+        description: >-
+          Unix seconds the price was published. Perps refuses a feed older than its staleness
+          window and a keeper fill on a price published no later than its request.

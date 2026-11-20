@@ -1,0 +1,393 @@
+protocol: jupiter-perps
+version: v1
+account_type: Multiple
+idl_file_path: idl.json
+
+tags:
+  - perpetuals
+  - risk-engine
+  - liquidity-pool
+  - defi
+
+templates:
+  - id: jupiter-perps-custody-risk
+    name: Override Custody Risk Limits
+    description: Override a Jupiter Perps market's liquidation leverage, size caps and switches
+    idl_account_name: Custody
+    properties:
+      - path: pricing.max_leverage
+        label: Max leverage
+        description: "Leverage at which positions are liquidated, and the most a position may open at, in BPS (10000 = 1x). Example: 5000000 is 500x"
+      - path: max_position_size_usd
+        label: Max position size
+        description: "Largest single position, USD with 6 decimals. Example: 10000000000000 is $10M"
+      - path: pricing.max_global_long_sizes
+        label: Max total longs
+        description: "Cap on all open longs, USD with 6 decimals. Example: 240000000000000 is $240M"
+      - path: pricing.max_global_short_sizes
+        label: Max total shorts
+        description: "Cap on all open shorts, USD with 6 decimals. Example: 112290000000000 is $112.29M"
+      - path: permissions.allow_swap
+        label: Allow swaps
+        description: "false refuses swaps through this custody. Example: false"
+      - path: permissions.allow_add_liquidity
+        label: Allow deposits
+        description: "false refuses JLP deposits in this token. Example: false"
+      - path: permissions.allow_remove_liquidity
+        label: Allow withdrawals
+        description: "false refuses JLP withdrawals in this token. Example: false"
+      - path: permissions.allow_increase_position
+        label: Allow opening
+        description: "false refuses opening or increasing positions. Example: false"
+      - path: permissions.allow_decrease_position
+        label: Allow closing
+        description: "false refuses closing or decreasing positions. Example: false"
+      - path: permissions.allow_collateral_withdrawal
+        label: Allow collateral withdrawal
+        description: "false refuses withdrawing position collateral. Example: false"
+      - path: permissions.allow_liquidate_position
+        label: Allow liquidations
+        description: "false stops keepers liquidating positions in this market. Example: false"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to change a Jupiter Perps market's liquidation threshold, size caps or
+      action switches. The address is the custody of the traded token: SOL longs and SOL shorts
+      both live on the SOL custody.
+
+      FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
+      5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
+      custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on
+      later ones in another scenario or slot, since a reload drops earlier local changes; a custody
+      reloaded on its own can also fall out of step with its vault (6014), which the README covers.
+
+      pricing.max_leverage is the liquidation threshold, in BPS (10000 = 1x). A keeper
+      liquidates a position once collateral + PnL - close and borrow fees falls below
+      size x 10000 / max_leverage. Lowering it liquidates positions without moving the price:
+      at 200000 (20x), every position whose size is over 20 times its remaining margin can be
+      liquidated. The same line caps opening: a keeper's fill of an open or increase fails with
+      error 6022 once size x 10000 / (collateral after the open fee - close fee) is above
+      max_leverage.
+
+      permissions: false refuses that action with error 6027. allow_liquidate_position false
+      stops keepers liquidating this market. The size caps are USD with 6 decimals.
+
+      EXAMPLE - liquidate every SOL position above 20x:
+      pricing.max_leverage: 200000
+
+  - id: jupiter-perps-custody-borrow-rate
+    name: Override Custody Borrow Rate
+    description: Override the borrow-rate curve a Jupiter Perps custody charges positions
+    idl_account_name: Custody
+    properties:
+      - path: jump_rate_state.min_rate_bps
+        label: Min rate
+        description: "Yearly borrow rate at 0% utilization, in BPS. Example: 1000 is 10%"
+      - path: jump_rate_state.max_rate_bps
+        label: Max rate
+        description: "Yearly borrow rate at 100% utilization, in BPS. Example: 15000 is 150%"
+      - path: jump_rate_state.target_rate_bps
+        label: Target rate
+        description: "Yearly borrow rate at the target utilization, in BPS. Example: 3500 is 35%"
+      - path: jump_rate_state.target_utilization_rate
+        label: Target utilization
+        description: "Utilization where the curve bends, scaled by 10^9. Example: 800000000 is 80%"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to make borrowing expensive, so positions lose margin over time.
+      Jupiter Perps charges a yearly rate from a curve on the custody's utilization
+      (assets.locked / assets.owned): min_rate_bps at 0%, target_rate_bps at
+      target_utilization_rate, max_rate_bps at 100%. Set all three rates to one value for a
+      flat rate.
+
+      The fee accrues into funding_rate_state.cumulative_interest_rate whenever a transaction
+      touches the custody, liquidations included, over the time since its last update; move
+      time on with surfnet_timeTravel after the override. A position owes
+      (cumulative_interest_rate - its cumulative_interest_snapshot) x size / 10^9 against its
+      margin. To charge a fee at once, without moving time, use jupiter-perps-custody-borrow-fee.
+
+      FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
+      5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
+      custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on
+      later ones in another scenario or slot, since a reload drops earlier local changes; a custody
+      reloaded on its own can also fall out of step with its vault (6014), which the README covers.
+
+      A long pays its own token's custody. A short does not pay the traded token's rate; its fee
+      follows the USDC or USDT custody holding its collateral. Those custodies also carry
+      borrow-lend debt, and a high rate or a long time jump on them overflows (error 6000).
+
+      EXAMPLE - 1000% a year on SOL:
+      jump_rate_state.min_rate_bps: 100000
+      jump_rate_state.target_rate_bps: 100000
+      jump_rate_state.max_rate_bps: 100000
+
+  - id: jupiter-perps-custody-fees
+    name: Override Custody Trading Fees
+    description: Override the fees a Jupiter Perps market charges to open and close positions
+    idl_account_name: Custody
+    properties:
+      - path: increase_position_bps
+        label: Open fee
+        description: "Fee on the size of a position opened or increased, in BPS. Example: 6 is 0.06%"
+      - path: decrease_position_bps
+        label: Close fee
+        description: "Fee on the size of a position closed or liquidated, in BPS. Example: 6 is 0.06%"
+      - path: pricing.trade_impact_fee_scalar
+        label: Price impact scalar
+        description: "The price impact fee rate is size / this, rounded up to a whole BPS; both USD with 6 decimals. Example: 1000000000000 charges a $1,000 trade 10 BPS"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to change what a Jupiter Perps market charges to open and close
+      positions. The address is the custody of the traded token: SOL longs and SOL shorts both
+      pay the SOL custody's fees.
+
+      FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
+      5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
+      custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
+      is the token's mint. Set fetchBeforeUse: true on the first override of an account and false on
+      later ones in another scenario or slot, since a reload drops earlier local changes; a custody
+      reloaded on its own can also fall out of step with its vault (6014), which the README covers.
+
+      Fees come out of the position's collateral, in USD with 6 decimals:
+      - opening or increasing: size x increase_position_bps / 10000
+      - closing or liquidating: size x decrease_position_bps / 10000, rounded up
+      - both also pay a price impact fee of size x ceil(size x 10000 /
+        pricing.trade_impact_fee_scalar) / 10000. A lower scalar charges more.
+
+      A keeper liquidates a position once collateral + PnL - close and borrow fees falls below
+      size x 10000 / pricing.max_leverage, so raising decrease_position_bps makes positions
+      liquidatable at an unchanged price. Opening a position whose close fee would exceed its
+      collateral fails with error 6022.
+
+      EXAMPLE - charge 1% to open and to close SOL positions:
+      increase_position_bps: 100
+      decrease_position_bps: 100
+
+  - id: jupiter-perps-pool-limits
+    name: Override JLP Pool Limits
+    description: Override the JLP pool's AUM cap, weight buffer and price guard
+    idl_account_name: Pool
+    properties:
+      - path: limit.max_aum_usd
+        label: Max AUM
+        description: "Deposits that would take the pool's value above this are refused, USD with 6 decimals. Example: \"3000000000000000\" is $3B"
+      - path: limit.token_weightage_buffer_bps
+        label: Weight buffer
+        description: "How far a token's value may exceed its target after a deposit, in BPS of that target. Example: \"1000\" is 10%"
+      - path: max_lp_token_price_change_bps
+        label: Max JLP price move
+        description: "Largest JLP price move from the pool's recorded value that deposits accept, in BPS. Example: 500 is 5%"
+    address:
+      type: pubkey
+      value: 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq
+    llm_context: |
+      Use this template to refuse or reopen JLP deposits. The address is the JLP Pool, the only
+      pool Jupiter Perps runs. Set fetchBeforeUse: true on the first override of the pool and
+      false on later ones in another scenario or slot, since a reload drops earlier local changes.
+      limit.max_aum_usd and limit.token_weightage_buffer_bps are u128: pass them as decimal strings.
+
+      - limit.max_aum_usd: a deposit that would take the pool's value above it is refused
+        (error 6024). Below the pool's aum_usd, every deposit is refused.
+      - limit.token_weightage_buffer_bps: a deposit is refused (error 6043) when it leaves the
+        token's value above its target (the custody's target_ratio_bps of the pool) by more
+        than target x buffer / 10000. 0 refuses deposits of every token already above target.
+      - max_lp_token_price_change_bps: deposits are refused (error 6066) once a price shock
+        moves the JLP price more than this from the value the pool recorded. A shock of more
+        than about 5% of the JLP price trips the live 500; raise it to 10000 to keep deposits
+        open after a crash.
+
+      EXAMPLE - refuse every JLP deposit:
+      limit.max_aum_usd: "1"
+
+  - id: jupiter-perps-pool-fees
+    name: Override JLP Pool Fees
+    description: Override the JLP pool's deposit, withdrawal and swap fees
+    idl_account_name: Pool
+    properties:
+      - path: fees.add_remove_liquidity_bps
+        label: Deposit and withdrawal fee
+        description: "Base fee on JLP deposits and withdrawals, in BPS. Example: 20 is 0.2%"
+      - path: fees.swap_bps
+        label: Swap fee
+        description: "Base fee on swaps that involve a non-stable token, in BPS. Example: 10 is 0.1%"
+      - path: fees.tax_bps
+        label: Weight tax
+        description: "Raises the fee of deposits and swaps that move a token away from its target weight and lowers it for those that move it back, in BPS. Example: 100 is 1%"
+      - path: fees.stable_swap_bps
+        label: Stable swap fee
+        description: "Base fee on swaps between two stablecoins, in BPS. Example: 2 is 0.02%"
+      - path: fees.stable_swap_tax_bps
+        label: Stable swap weight tax
+        description: "The weight tax for swaps between two stablecoins, in BPS. Example: 5 is 0.05%"
+    address:
+      type: pubkey
+      value: 5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq
+    llm_context: |
+      Use this template to change what JLP deposits, withdrawals and pool swaps cost. The
+      address is the JLP Pool, the only pool Jupiter Perps runs. Set fetchBeforeUse: true on the
+      first override of the pool and false on later ones in another scenario or slot, since a reload
+      drops earlier local changes. Every field is in BPS (10000 = 100%).
+
+      - fees.add_remove_liquidity_bps: base fee on JLP deposits and withdrawals.
+      - fees.swap_bps: base fee on swaps that involve a non-stable token. That token's custody
+        multiplies the swap fee by 1 + its external_swap_fee_multiplier_bps / 10000, so at
+        20000 a swap pays three times the fee.
+      - fees.stable_swap_bps: base fee on swaps between two stablecoins.
+      - fees.tax_bps and fees.stable_swap_tax_bps: the weight tax. A deposit or swap that moves
+        a token further from its target weight (the custody's target_ratio_bps of the pool)
+        pays more than the base fee, one that moves it back pays less, never below 0. At 0
+        every deposit and swap pays exactly the base fee.
+
+      getAddLiquidityAmountAndFee2 and getRemoveLiquidityAmountAndFee2 return the fee in BPS a
+      deposit or withdrawal would pay.
+
+      EXAMPLE - a flat 1% on every JLP deposit and withdrawal:
+      fees.add_remove_liquidity_bps: 100
+      fees.tax_bps: 0
+
+  - id: jupiter-perps-custody-borrow-fee
+    name: Override Accrued Borrow Fee
+    description: Charge every Jupiter Perps position on a custody a borrow fee at once, paid when the position next settles
+    idl_account_name: Custody
+    properties:
+      - path: funding_rate_state.cumulative_interest_rate
+        label: Cumulative borrow rate
+        description: "Borrow fee per dollar of size since the custody opened, scaled by 10^9, as a decimal string. Write the live value plus the step: each position pays step x size / 10^9. Example: live + 10000000 charges 1% of size"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to charge positions a borrow fee now, without moving time. The address is
+      the custody that charges the positions: a long pays its own token's custody; a short pays the
+      USDC or USDT custody holding its collateral, never the traded token's.
+
+      FIND THE CUSTODY (read it live, nothing is hardcoded): getAccountInfo on the JLP Pool
+      5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq with encoding jsonParsed lists its
+      custodies; read them with getMultipleAccounts and jsonParsed, and take the one whose mint
+      is the token's mint. The value builds on the custody as the surfnet holds it: read it with
+      getAccountInfo and encoding jsonParsed, which loads it into the surfnet, and leave
+      fetchBeforeUse false, since a reload drops earlier local changes and can put the custody out
+      of step with its vault (6014).
+
+      funding_rate_state.cumulative_interest_rate is the fee per dollar of size the custody has
+      charged since it opened, scaled by 10^9. Each position keeps the value it last paid at in
+      cumulative_interest_snapshot and pays (cumulative_interest_rate - snapshot) x size_usd /
+      10^9 when it closes, decreases or is liquidated; until then the fee counts against its
+      margin. Write the live value plus the step, as a decimal string. Transactions keep adding
+      the custody's ordinary rate on top. The pool's value, and so the JLP price, counts the fee
+      only once a position pays it.
+
+      EXAMPLE - charge every SOL long 1% of its size: on the SOL custody,
+      funding_rate_state.cumulative_interest_rate: the live value + 10000000.
+
+  - id: jupiter-perps-position
+    name: Override Position
+    description: Set the size, entry price and collateral of a Jupiter Perps position; pair it with jupiter-perps-position-totals on its custodies
+    idl_account_name: Position
+    properties:
+      - path: size_usd
+        label: Size
+        description: "Position size, USD with 6 decimals. Example: 10000000000 is $10,000"
+      - path: price
+        label: Entry price
+        description: "Entry price, USD with 6 decimals. Example: 80000000 is $80"
+      - path: collateral_usd
+        label: Collateral
+        description: "Collateral, USD with 6 decimals. Keep a short's at or below its current value. Example: 1000000000 is $1,000"
+      - path: locked_amount
+        label: Locked tokens
+        description: "Tokens the pool reserves for the position, in the collateral custody's smallest unit: a long's size_usd x 10^decimals / price; llm_context gives a short's"
+      - path: cumulative_interest_snapshot
+        label: Borrow fee paid up to
+        description: "The collateral custody's funding_rate_state.cumulative_interest_rate, as a decimal string; a lower value owes the difference x size_usd / 10^9"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to change an open Jupiter Perps position: its size, entry price or
+      collateral. Always add jupiter-perps-position-totals in the same slot: the pool's value and
+      the custodies count positions only through those totals, so without them the pool ignores
+      the change, and a later close or liquidation leaves the totals off by it.
+
+      FIND THE POSITION (read it live): getProgramAccounts on the Perps program
+      PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu with encoding base64, filters
+      [{"dataSize":216},{"memcmp":{"offset":8,"bytes":"<wallet>"}}] and dataSlice
+      {"offset":0,"length":0} lists the wallet's position addresses. Read them with
+      getMultipleAccounts and encoding jsonParsed, which loads them into the surfnet: custody is
+      the traded token's custody, collateral_custody the one holding its collateral, side Long or
+      Short, size_usd 0 a closed one. A position address the user gives is used as is, read the
+      same way. Only an existing account can change: a wallet with no position account for that
+      market and side cannot get one. Leave fetchBeforeUse false. Keep owner, custody,
+      collateral_custody and side.
+
+      VALUES, USD with 6 decimals:
+      - size_usd, and price, the entry price. A long gains when the custody's Doves price is
+        above price, a short when it is below; the PnL is size_usd x the move / price.
+      - collateral_usd. A long's collateral is part of the pool's tokens, so the pool pays for
+        an increase and keeps a decrease. A short's sits in the vault outside the pool's tokens,
+        and a close pays it out of the vault alone, so keep it at or below its current value:
+        added short collateral has no tokens behind it.
+      - locked_amount, the tokens reserved to pay the position, in the collateral custody's
+        smallest unit. A long: size_usd x 10^decimals / price, with the custody's decimals. A
+        short: size_usd x 10^8 / the price mantissa of the collateral custody's Doves feed
+        (doves_ag_oracle; USDC and USDT have 6 decimals and expo -8).
+      - cumulative_interest_snapshot: the collateral custody's
+        funding_rate_state.cumulative_interest_rate, as a decimal string, for no borrow fee owed.
+
+      A keeper liquidates a position once collateral + PnL - close and borrow fees falls below
+      size x 10000 / the custody's pricing.max_leverage.
+
+      EXAMPLE - a SOL long becomes $10,000 at $80 on $500, SOL custody with 9 decimals:
+      size_usd: 10000000000, price: 80000000, collateral_usd: 500000000,
+      locked_amount: 125000000000; then jupiter-perps-position-totals as its llm_context says.
+
+  - id: jupiter-perps-position-totals
+    name: Override Custody Position Totals
+    description: Count a position changed with jupiter-perps-position in its custodies' totals, as a real open writes them
+    idl_account_name: Custody
+    properties:
+      - path: assets.locked
+        label: Locked tokens
+        description: "Sum of the locked_amount of every position whose collateral sits in this custody. Add the change in locked_amount"
+      - path: assets.guaranteed_usd
+        label: Longs' size less collateral
+        description: "Sum of size_usd - collateral_usd over the custody's longs, USD with 6 decimals. Add the change in that difference"
+      - path: assets.global_short_sizes
+        label: Short size total
+        description: "Sum of the custody's shorts' size_usd, USD with 6 decimals. Add the change in size_usd"
+      - path: assets.global_short_average_prices
+        label: Short average price
+        description: "Size-weighted harmonic mean of the shorts' entry prices, USD with 6 decimals; llm_context gives the update"
+    address:
+      type: pubkey
+    llm_context: |
+      Jupiter Perps, program PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu. Use this only with
+      jupiter-perps-position, in the same slot, on the custodies the position names (custody and
+      collateral_custody), with the values that template writes. The pool's value (AUM) and every
+      close or liquidation read these totals, never the positions. Read each custody with
+      getAccountInfo and encoding jsonParsed, which loads it into the surfnet, add the changes to
+      the values read, and leave fetchBeforeUse false, since a reload would bring back mainnet's
+      totals and can put the custody out of step with its vault (6014). Below, old is the position
+      as read and new the values written to it.
+
+      A LONG: one override on its custody (custody and collateral_custody are the same):
+      - assets.locked: + new locked_amount - old locked_amount
+      - assets.guaranteed_usd: + (new size_usd - new collateral_usd) - (old size_usd - old
+        collateral_usd)
+
+      A SHORT: two overrides.
+      - On its collateral_custody: assets.locked: + new locked_amount - old locked_amount.
+      - On its custody, with S = assets.global_short_sizes and A =
+        assets.global_short_average_prices as read: assets.global_short_sizes: S - old size_usd
+        + new size_usd, and assets.global_short_average_prices in two steps, each rounded down:
+        A1 = (S - old size) x A x old price / (S x old price - old size x A), then
+        A2 = (S - old size + new size) x A1 x new price
+             / ((S - old size) x new price + new size x A1).
+        Write A2. For a closed position (old size 0), A1 = A.
+
+      EXAMPLE - a SOL long with locked_amount 60000000000, size_usd 5000000000 and collateral_usd
+      1000000000 becomes locked_amount 125000000000, size_usd 10000000000, collateral_usd
+      500000000: on the SOL custody, assets.locked + 65000000000 and assets.guaranteed_usd +
+      5500000000.

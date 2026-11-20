@@ -1,0 +1,849 @@
+{
+  "accounts": [
+    {
+      "discriminator": [
+        112,
+        249,
+        139,
+        217,
+        215,
+        208,
+        249,
+        54
+      ],
+      "name": "AgPriceFeed"
+    },
+    {
+      "discriminator": [
+        189,
+        103,
+        252,
+        23,
+        152,
+        35,
+        243,
+        156
+      ],
+      "name": "PriceFeed"
+    },
+    {
+      "discriminator": [
+        209,
+        117,
+        255,
+        185,
+        196,
+        175,
+        68,
+        9
+      ],
+      "name": "Storage"
+    }
+  ],
+  "address": "DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e",
+  "errors": [
+    {
+      "code": 6000,
+      "msg": "Threshold must be >0",
+      "name": "ThresholdUnderflow"
+    },
+    {
+      "code": 6001,
+      "msg": "Threshold must be <= whitelist length",
+      "name": "ThresholdOverflow"
+    },
+    {
+      "code": 6002,
+      "msg": "Number of signers must be >= threshold",
+      "name": "ThresholdNotMet"
+    },
+    {
+      "code": 6003,
+      "msg": "Pair string must not be blank",
+      "name": "PairStringUnderflow"
+    },
+    {
+      "code": 6004,
+      "msg": "Pair string must be <= 32 bytes",
+      "name": "PairStringOverflow"
+    },
+    {
+      "code": 6005,
+      "msg": "Signer out of range",
+      "name": "SignerIndexOverflow"
+    },
+    {
+      "code": 6006,
+      "msg": "Signature verification failed",
+      "name": "InvalidSigner"
+    },
+    {
+      "code": 6007,
+      "msg": "All signers must be unique",
+      "name": "DuplicateSigner"
+    },
+    {
+      "code": 6008,
+      "msg": "New timestamp must be greater than previous one",
+      "name": "InvalidTimestamp"
+    },
+    {
+      "code": 6009,
+      "msg": "Integer overflow",
+      "name": "Overflow"
+    },
+    {
+      "code": 6010,
+      "msg": "Integer underflow",
+      "name": "Underflow"
+    },
+    {
+      "code": 6011,
+      "msg": "Invalid price feed",
+      "name": "InvalidPriceFeed"
+    },
+    {
+      "code": 6012,
+      "msg": "Invalid expo",
+      "name": "InvalidExpo"
+    },
+    {
+      "code": 6013,
+      "msg": "Invalid Pyth Lazer payload",
+      "name": "InvalidPythLazerPayload"
+    },
+    {
+      "code": 6014,
+      "msg": "Invalid Pyth Lazer channel",
+      "name": "InvalidPythLazerChannel"
+    },
+    {
+      "code": 6015,
+      "msg": "Invalid Pyth Lazer price feed accounts",
+      "name": "InvalidPythLazerFeedAccounts"
+    },
+    {
+      "code": 6016,
+      "msg": "Invalid Pyth Lazer config",
+      "name": "InvalidPythLazerConfig"
+    },
+    {
+      "code": 6017,
+      "msg": "Too many Pyth Lazer price feed updates",
+      "name": "TooManyPythLazerPriceFeedUpdates"
+    },
+    {
+      "code": 6018,
+      "msg": "Invalid RedStone price feed accounts",
+      "name": "InvalidRedstoneFeedAccounts"
+    },
+    {
+      "code": 6019,
+      "msg": "Aggregate price feed v2 is already configured",
+      "name": "AgPriceV2AlreadyConfigured"
+    }
+  ],
+  "instructions": [
+    {
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "pair"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "pair",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "feed_signer",
+          "type": {
+            "array": [
+              "u8",
+              33
+            ]
+          }
+        }
+      ],
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "name": "initialize"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "pair"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "pair",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "feed_id",
+          "type": "u32"
+        },
+        {
+          "name": "channel_id",
+          "type": "u8"
+        }
+      ],
+      "discriminator": [
+        244,
+        187,
+        210,
+        9,
+        84,
+        50,
+        255,
+        137
+      ],
+      "name": "initialize_pyth_lazer_price_feed"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "ag_price_feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  95,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "account": "AgPriceFeed",
+                "kind": "account",
+                "path": "ag_price_feed.mint"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "pyth_lazer_feed"
+        },
+        {
+          "name": "cl_feed"
+        },
+        {
+          "name": "redstone_feed"
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        61,
+        65,
+        60,
+        229,
+        235,
+        142,
+        250,
+        117
+      ],
+      "name": "update_ag_price2"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "ag_price_feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  95,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "account": "AgPriceFeed",
+                "kind": "account",
+                "path": "ag_price_feed.mint"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "edge_feed"
+        },
+        {
+          "name": "cl_feed"
+        },
+        {
+          "name": "pyth_feed"
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        181,
+        230,
+        146,
+        98,
+        116,
+        172,
+        249,
+        27
+      ],
+      "name": "update_ag_price_feed"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "ag_price_feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  103,
+                  95,
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "account": "AgPriceFeed",
+                "kind": "account",
+                "path": "ag_price_feed.mint"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "name": "pyth_lazer_feed"
+        },
+        {
+          "name": "redstone_feed"
+        }
+      ],
+      "args": [],
+      "discriminator": [
+        166,
+        45,
+        37,
+        18,
+        198,
+        105,
+        232,
+        53
+      ],
+      "name": "update_ag_price_feed_to_v2"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true,
+          "writable": true
+        },
+        {
+          "address": "3rdJbqfnagQ4yx9HXJViD4zc4xpiSqmFsKpPuSCQVyQL",
+          "name": "pyth_lazer_storage"
+        },
+        {
+          "name": "pyth_lazer_treasury",
+          "writable": true
+        },
+        {
+          "address": "pytd2yyk641x7ak7mkaasSJVXh6YYZnC7wTmtgAyxPt",
+          "name": "pyth_lazer_program"
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        },
+        {
+          "address": "Sysvar1nstructions1111111111111111111111111",
+          "name": "instructions_sysvar"
+        }
+      ],
+      "args": [
+        {
+          "name": "message_data",
+          "type": "bytes"
+        },
+        {
+          "name": "ed25519_instruction_index",
+          "type": "u16"
+        },
+        {
+          "name": "signature_index",
+          "type": "u8"
+        },
+        {
+          "name": "raise",
+          "type": "bool"
+        }
+      ],
+      "discriminator": [
+        203,
+        59,
+        95,
+        176,
+        236,
+        21,
+        73,
+        153
+      ],
+      "name": "update_many_with_pyth_lazer"
+    },
+    {
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "feed",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  102,
+                  101,
+                  101,
+                  100
+                ]
+              },
+              {
+                "account": "PriceFeed",
+                "kind": "account",
+                "path": "feed.pair"
+              }
+            ]
+          },
+          "writable": true
+        },
+        {
+          "address": "11111111111111111111111111111111",
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "update",
+          "type": {
+            "defined": {
+              "name": "UpdateMessage"
+            }
+          }
+        },
+        {
+          "name": "raise",
+          "type": "bool"
+        }
+      ],
+      "discriminator": [
+        117,
+        159,
+        82,
+        197,
+        207,
+        85,
+        237,
+        45
+      ],
+      "name": "update_with_signer"
+    }
+  ],
+  "metadata": {
+    "description": "Created with Anchor",
+    "name": "doves",
+    "spec": "0.1.0",
+    "version": "0.1.0"
+  },
+  "types": [
+    {
+      "name": "AgPriceFeed",
+      "type": {
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "edge_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "cl_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "pyth_feed_id",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "expo",
+            "type": "i8"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          },
+          {
+            "name": "config",
+            "type": {
+              "defined": {
+                "name": "Config"
+              }
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pyth_lazer_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "redstone_feed",
+            "type": "pubkey"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "Config",
+      "type": {
+        "fields": [
+          {
+            "name": "max_ag_price_age_sec",
+            "type": "u32"
+          },
+          {
+            "name": "max_price_feed_age_sec",
+            "type": "u32"
+          },
+          {
+            "name": "max_price_diff_bps",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PriceFeed",
+      "type": {
+        "fields": [
+          {
+            "name": "pair",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "signer",
+            "type": {
+              "array": [
+                "u8",
+                33
+              ]
+            }
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "expo",
+            "type": "i8"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pyth_lazer_config",
+            "type": {
+              "defined": {
+                "name": "PythLazerConfig"
+              }
+            }
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PythLazerConfig",
+      "type": {
+        "fields": [
+          {
+            "name": "feed_id",
+            "type": "u32"
+          },
+          {
+            "name": "channel_id",
+            "type": "u8"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "Storage",
+      "type": {
+        "fields": [
+          {
+            "name": "top_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury",
+            "type": "pubkey"
+          },
+          {
+            "name": "single_update_fee_in_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "num_trusted_signers",
+            "type": "u8"
+          },
+          {
+            "name": "trusted_signers",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "generics": [
+                      {
+                        "kind": "type",
+                        "type": "pubkey"
+                      }
+                    ],
+                    "name": "TrustedSignerInfo"
+                  }
+                },
+                5
+              ]
+            }
+          },
+          {
+            "name": "num_trusted_ecdsa_signers",
+            "type": "u8"
+          },
+          {
+            "name": "trusted_ecdsa_signers",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "generics": [
+                      {
+                        "kind": "type",
+                        "type": {
+                          "array": [
+                            "u8",
+                            20
+                          ]
+                        }
+                      }
+                    ],
+                    "name": "TrustedSignerInfo"
+                  }
+                },
+                2
+              ]
+            }
+          },
+          {
+            "name": "_extra_space",
+            "type": {
+              "array": [
+                "u8",
+                43
+              ]
+            }
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "generics": [
+        {
+          "kind": "type",
+          "name": "T"
+        }
+      ],
+      "name": "TrustedSignerInfo",
+      "type": {
+        "fields": [
+          {
+            "name": "pubkey",
+            "type": {
+              "generic": "T"
+            }
+          },
+          {
+            "name": "expires_at",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "UpdateMessage",
+      "type": {
+        "fields": [
+          {
+            "name": "recovery_id",
+            "type": "u8"
+          },
+          {
+            "name": "signature",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "expo",
+            "type": "i8"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ]
+}
