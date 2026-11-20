@@ -13,7 +13,7 @@ For Surfpool to understand how to serialize and deserialize account data, it nee
 Protocols that are natively supported by Surfpool will have their IDLs included by default.
 
 **Currently supported protocols:**
-- **Pyth v2** - Price oracle with a price feed template for the Pyth Core receiver (`pyth-price-feed-v2`) and one for the Pyth Core Compatible receiver (`pyth-core-compatible-price-feed-v2`); both keep the price they write published
+- **Pyth v2** - Price oracle with a price feed template for the Pyth Core receiver (`pyth-price-feed-v2`) and one for the Pyth Core Compatible receiver (`pyth-core-compatible-price-feed-v2`); both keep the price they write published. See [protocols/pyth/README.md](./protocols/pyth/README.md)
 - **Jupiter v6** - DEX aggregator with TokenLedger manipulation template
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
@@ -123,20 +123,22 @@ templates:
 | `{ type: input, value: oracle }` | the pubkey given in that `input` property (`value_type: pubkey`, never written) |
 | `{ type: pubkey, value: <address> }` | a fixed account |
 | `{ type: pda, program_id, seeds }` | a derived account; seeds resolve against the override's values |
-| `{ type: owned, owner: <program id or list>, account: <IDL account> }` | every local account an owner owns whose data starts with that account's discriminator in the keep-alive template's IDL, including accounts loaded later; never fetched |
 
 `$slot`, `$slot±N` and `$unix_s`/`ms`/`us`/`ns` in `values` are filled from the slot and its Clock
 time; other values are written as given.
 
 Keep-alive starts in the slot the importing override plays and rewrites its fields every slot, after
 that slot's overrides, until the network is reset. An override of one of those fields therefore
-never takes effect. An override with `keepAlive: false` stops keep-alive for the account it writes
-from that slot on, so the account ages as the clock moves on, for example to test a stale price. A
-later override with `keepAlive: true`, the default, on that account starts it again, with every import
-that rewrites it, including imports bound by other templates' overrides. An account not
-yet in the surfnet is fetched from the remote first, unless it, or its owner with its owned accounts,
-is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
+never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it,
+or its owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
 until an importing override plays again.
+
+An override can turn keep-alive off for the account it writes with `"keepAlive": []`, as `keep_alive: []`
+does for a template. From that override's slot on, nothing rewrites the account, including keep-alive
+that earlier overrides started, so its fields age as the clock moves on, for example to test a stale
+price. The override must write a value for this to take effect. Without the field, the template's
+keep-alive applies as usual. To keep fresh an account a transaction reads but no scenario names, give
+it an override of its own.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.

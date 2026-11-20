@@ -8,7 +8,7 @@ pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod project0;
 #[cfg(feature = "integration-tests")]
-pub mod pump;
+pub mod protocols;
 #[cfg(feature = "integration-tests")]
-pub mod pyth;
+pub mod pump;
 pub mod simnet_events;

@@ -4,7 +4,7 @@
 //! only behind a feature:
 //!
 //! ```text
-//! cargo test -p surfpool-core --features integration-tests pyth
+//! cargo test -p surfpool-core --features integration-tests tests::protocols::pyth
 //! ```
 //!
 //! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
@@ -155,14 +155,16 @@ async fn core_compatible_price_feed_touches_only_price_fields() {
     }
 }
 
-/// Once a scenario overrides one price account, keep-alive republishes every price account of its
-/// receiver every slot, as the Pyth publisher does on mainnet, time travels included: the
-/// overridden one, and one loaded after the override played. Only the publication fields move with
-/// the Clock: each price stays as it was. An account overridden with keep-alive off is not
-/// republished.
+/// Keep-alive republishes each price account an override writes every slot, as the Pyth publisher
+/// does on mainnet, time travels included: one whose price moved, and one whose override set only
+/// `publish_time`. Only the publication fields move with the Clock: each price stays as the
+/// scenario left it. A price account no override writes is never republished, and one whose later
+/// override sets `keepAlive: []` is not republished from that slot on.
 #[tokio::test(flavor = "multi_thread")]
-async fn price_feeds_stay_published_through_surfnet_svm() {
+async fn each_override_keeps_the_price_account_it_writes_published() {
     const PRICE: i64 = 2_000_000_000;
+    const STOP_PRICE: i64 = 1_000_000_000;
+    const STOP_SLOT: u64 = 2;
     for (template_id, address, receiver) in [
         ("pyth-price-feed-v2", CORE_SOL_USD_FEED, PYTH_CORE_RECEIVER),
         (
@@ -178,32 +180,43 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
             live.data[40], 1,
             "{address} verification level should be Full"
         );
+        let word =
+            |data: &[u8], offset: usize| <[u8; 8]>::try_from(&data[offset..offset + 8]).unwrap();
+        let live_price = i64::from_le_bytes(word(&live.data, 73));
 
-        let target = Pubkey::from_str_const(address);
-        let stale = Pubkey::new_unique();
-        let loaded_later = Pubkey::new_unique();
+        let moved = Pubkey::from_str_const(address);
+        let published = Pubkey::new_unique();
+        let unnamed = Pubkey::new_unique();
+        let stopped = Pubkey::new_unique();
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = SurfnetSvmLocker::new(svm);
         locker.with_svm_writer(|svm| {
-            svm.set_account(&target, live.clone()).unwrap();
-            svm.set_account(&stale, live.clone()).unwrap();
+            for address in [moved, published, unnamed, stopped] {
+                svm.set_account(&address, live.clone()).unwrap();
+            }
         });
-        let price_override = |address: &Pubkey| {
+        let override_of = |address: &Pubkey, slot: u64, path: &str, value: i64| {
             OverrideInstance::new(
                 template_id.to_string(),
-                0,
+                slot,
                 AccountAddress::Pubkey(address.to_string()),
             )
             .with_values(HashMap::from([(
-                "price_message.price".to_string(),
-                serde_json::json!(PRICE),
+                path.to_string(),
+                serde_json::json!(value),
             )]))
         };
-        let mut scenario = Scenario::new("Pyth SOL at $20".to_string(), "Price only".to_string());
-        scenario.add_override(price_override(&target));
-        let mut stale_override = price_override(&stale);
-        stale_override.keep_alive = false;
-        scenario.add_override(stale_override);
+        let mut scenario = Scenario::new(
+            "Pyth SOL at $20".to_string(),
+            "One override per price account".to_string(),
+        );
+        scenario.add_override(override_of(&moved, 0, "price_message.price", PRICE));
+        // Any value: keep-alive rewrites it in the same slot.
+        scenario.add_override(override_of(&published, 0, "price_message.publish_time", 1));
+        scenario.add_override(override_of(&stopped, 0, "price_message.price", PRICE));
+        let mut stop = override_of(&stopped, STOP_SLOT, "price_message.price", STOP_PRICE);
+        stop.keep_alive = Some(vec![]);
+        scenario.add_override(stop);
         locker.register_scenario(scenario, None).unwrap();
 
         let read = |address: &Pubkey| {
@@ -214,18 +227,15 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
                 )
             })
         };
-        let word =
-            |data: &[u8], offset: usize| <[u8; 8]>::try_from(&data[offset..offset + 8]).unwrap();
-        let assert_published = |when: &str, with_loaded_later: bool| {
-            let mut published = vec![(target, "overridden", PRICE)];
-            if with_loaded_later {
-                published.push((
-                    loaded_later,
-                    "loaded later",
-                    i64::from_le_bytes(word(&live.data, 73)),
-                ));
+        let assert_published = |when: &str, with_stopped: bool| {
+            let mut kept = vec![
+                (moved, "moved", PRICE),
+                (published, "publish_time only", live_price),
+            ];
+            if with_stopped {
+                kept.push((stopped, "stopped later", PRICE));
             }
-            for (address, name, price) in published {
+            for (address, name, price) in kept {
                 let (data, clock) = read(&address);
                 let what = format!("{name} {when}");
                 assert_eq!(
@@ -253,17 +263,20 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
                     "{template_id} {what}: changed {diffs:?}"
                 );
             }
-            let mut unpublished = live.data.clone();
-            unpublished[73..81].copy_from_slice(&PRICE.to_le_bytes());
-            assert_eq!(read(&stale).0, unpublished, "{template_id} stale {when}");
+            assert_eq!(read(&unnamed).0, live.data, "{template_id} unnamed {when}");
         };
 
-        locker.confirm_current_block(&None).await.unwrap();
-        assert_published("slot 1", false);
-        locker.with_svm_writer(|svm| svm.set_account(&loaded_later, live.clone()).unwrap());
-        for slot in 2..=3 {
+        for slot in 0..STOP_SLOT {
             locker.confirm_current_block(&None).await.unwrap();
-            assert_published(&format!("slot {slot}"), true);
+            assert_published(&format!("relative slot {slot}"), true);
+        }
+        let mut aged = read(&stopped).0;
+        aged[73..81].copy_from_slice(&STOP_PRICE.to_le_bytes());
+        for slot in STOP_SLOT..=STOP_SLOT + 1 {
+            locker.confirm_current_block(&None).await.unwrap();
+            let when = format!("relative slot {slot}");
+            assert_published(&when, false);
+            assert_eq!(read(&stopped).0, aged, "{template_id} stopped {when}");
         }
         let clock = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
         locker
@@ -277,6 +290,11 @@ async fn price_feeds_stay_published_through_surfnet_svm() {
             )
             .await
             .unwrap();
-        assert_published("after a time travel", true);
+        assert_published("after a time travel", false);
+        assert_eq!(
+            read(&stopped).0,
+            aged,
+            "{template_id} stopped after a time travel"
+        );
     }
 }
