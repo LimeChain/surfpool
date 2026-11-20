@@ -31,7 +31,8 @@ most is usually the one you want. For SOL/USDC that is
 at `https://solana.pancakeswap.finance/liquidity-pools/`.
 
 **Check the owner.** The layouts match Raydium's, so a PancakeSwap template pointed at a Raydium
-pool writes it without complaint.
+pool writes it without complaint. The templates' `llm_context` tells the model to check the owner of
+a pool address the user gives.
 
 Set `fetchBeforeUse: true` to pull the pool from upstream first.
 

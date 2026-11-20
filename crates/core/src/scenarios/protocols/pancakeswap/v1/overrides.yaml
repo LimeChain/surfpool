@@ -16,7 +16,8 @@ llm_context: |
   order (only one returns pools). Read each pool's token_vault_0 with dataSlice {offset 137, length
   32} and encoding base58, compare the vaults with getMultipleAccounts jsonParsed and keep the pool
   whose vault holds the most; name it. If neither order returns a pool, recheck the mints once, then
-  ask for the pool address. A pool address the user gives is used as is.
+  ask for the pool address. Before you use a pool address the user gives, check with getAccountInfo
+  that the program above owns it; if it does not, stop and tell the user.
 
   Set fetchBeforeUse: true.
 
