@@ -236,11 +236,7 @@ impl TemplateRegistry {
     }
 
     pub fn load_chainlink_overrides(&mut self) {
-        self.load_protocol_overrides(
-            CHAINLINK_V1_IDL_CONTENT,
-            CHAINLINK_V1_OVERRIDES_CONTENT,
-            "chainlink",
-        );
+        self.load_raw_layout_overrides(CHAINLINK_V1_OVERRIDES_CONTENT, "chainlink");
     }
 
     pub fn load_jupiter_overrides(&mut self) {
@@ -1677,20 +1673,44 @@ templates: []
     fn test_chainlink_data_feed_writes_the_round_the_sdk_reads() {
         let registry = TemplateRegistry::new();
         let template = registry.get("chainlink-data-feed").unwrap();
-        assert_eq!(
-            template.idl().address,
-            "HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny"
-        );
+        assert!(template.raw_layout);
         assert_eq!(
             template.address,
             AccountAddress::Pubkey(String::new()),
             "the feed must be chosen by the caller"
         );
 
+        let idl: anchor_lang_idl::types::Idl =
+            serde_json::from_str(CHAINLINK_V1_IDL_CONTENT).unwrap();
+        assert_eq!(idl.address, "HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny");
+        let header_size: usize = idl
+            .constants
+            .iter()
+            .find(|constant| constant.name == "HEADER_SIZE")
+            .unwrap()
+            .value
+            .parse()
+            .unwrap();
+        assert_eq!(header_size, 192);
+
         // chainlink_solana::v2::read_feed_v2 reads one 48-byte round after the 8-byte
-        // discriminator and the 192-byte header: slot at 200, timestamp at 208, answer at 216.
-        // The forged data below starts after the discriminator, so its offsets are 8 lower.
-        let header = vec![0xAB; 192];
+        // discriminator and the header: slot at 200, timestamp at 208, answer at 216.
+        let round = 8 + header_size;
+        let offsets: Vec<_> = template
+            .properties
+            .iter()
+            .map(|property| (property.path.as_str(), property.offset.unwrap()))
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                ("live.answer", round + 16),
+                ("live.slot", round),
+                ("live.timestamp", round + 8),
+            ]
+        );
+
+        let feed = [vec![0xAB; round], vec![0xCD; 48]].concat();
         let values = HashMap::from([
             ("live.slot".to_string(), serde_json::json!(312_000_000u64)),
             (
@@ -1702,24 +1722,18 @@ templates: []
                 serde_json::json!("12500000000000000000"),
             ),
         ]);
-        let forged = crate::surfnet::svm::SurfnetSvm::get_forged_idl_type_data(
-            &[header.clone(), vec![0; 48]].concat(),
-            template.idl(),
-            "Transmissions",
-            &values,
-        )
-        .unwrap();
+        let forged = template.materialize_raw_layout(&feed, &values, 0).unwrap();
 
-        assert_eq!(forged.len(), 240);
-        assert_eq!(&forged[..192], header.as_slice(), "header bytes changed");
-        assert_eq!(&forged[192..200], &312_000_000u64.to_le_bytes());
-        assert_eq!(&forged[200..204], &1_761_630_000u32.to_le_bytes());
-        assert_eq!(&forged[204..208], &[0; 4]);
+        assert_eq!(forged.len(), 248);
+        assert_eq!(&forged[..200], &feed[..200], "header bytes changed");
+        assert_eq!(&forged[200..208], &312_000_000u64.to_le_bytes());
+        assert_eq!(&forged[208..212], &1_761_630_000u32.to_le_bytes());
+        assert_eq!(&forged[212..216], &feed[212..216]);
         assert_eq!(
-            &forged[208..224],
+            &forged[216..232],
             &12_500_000_000_000_000_000i128.to_le_bytes()
         );
-        assert_eq!(&forged[224..240], &[0; 16]);
+        assert_eq!(&forged[232..], &feed[232..]);
     }
 
     #[test]
