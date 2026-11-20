@@ -15,9 +15,9 @@ pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/id
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/jupiter/v6/overrides.yaml");
 
-pub const RAYDIUM_CLMM_IDL_CONTENT: &str = include_str!("./protocols/raydium/v3/idl.json");
+pub const RAYDIUM_CLMM_IDL_CONTENT: &str = include_str!("./protocols/raydium/clmm/v1/idl.json");
 pub const RAYDIUM_CLMM_OVERRIDES_CONTENT: &str =
-    include_str!("./protocols/raydium/v3/overrides.yaml");
+    include_str!("./protocols/raydium/clmm/v1/overrides.yaml");
 
 pub const RAYDIUM_AMM_V4_IDL_CONTENT: &str = include_str!("./protocols/raydium/v4/idl.json");
 pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
