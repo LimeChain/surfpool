@@ -10,7 +10,7 @@ use std::{collections::HashMap, ops::Range, sync::OnceLock};
 use anchor_lang_idl::types::{IdlDefinedFields, IdlInstructionAccountItem, IdlTypeDefTy};
 use serde_json::json;
 use solana_account::Account;
-use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_account_decoder::{UiAccount, UiAccountEncoding, UiDataSliceConfig};
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
@@ -18,7 +18,10 @@ use solana_instruction::{AccountMeta, Instruction, error::InstructionError};
 use solana_keypair::Keypair;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::{config::RpcAccountInfoConfig, filter::RpcFilterType};
+use solana_rpc_client_api::{
+    config::RpcAccountInfoConfig,
+    filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
+};
 use solana_sdk_ids::{system_program, sysvar};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
@@ -60,6 +63,7 @@ const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
 
 // Byte ranges from the bundled IDL, discriminator included.
 const PERP_MARKET_LEN: usize = 1560;
+const SPOT_MARKET_LEN: usize = 1064;
 const BASE_ASSET_AMOUNT_LONG: Range<usize> = 40..56;
 const BASE_ASSET_AMOUNT_SHORT: Range<usize> = 56..72;
 const MARKET_QUOTE: Range<usize> = 72..88;
@@ -176,6 +180,55 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
             })
         })
         .collect()
+}
+
+/// getProgramAccounts on the Velocity program on mainnet, base64 as the llm_context recipes ask.
+async fn program_accounts(
+    filters: Vec<RpcFilterType>,
+    data_slice: UiDataSliceConfig,
+) -> Vec<(Pubkey, UiAccount)> {
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        data_slice: Some(data_slice),
+        commitment: Some(CommitmentConfig::confirmed()),
+        ..Default::default()
+    };
+    let found = client()
+        .get_program_accounts(&PROGRAM, config, Some(filters.clone()))
+        .await
+        .unwrap_or_else(|e| panic!("getProgramAccounts {filters:?} failed: {e}"));
+    let RemoteRpcResult::Ok(found) = found else {
+        panic!("the RPC endpoint does not serve getProgramAccounts; set {RPC_URL_ENV}")
+    };
+    found
+}
+
+/// The recipes' first call: addresses only.
+const ADDRESSES_ONLY: UiDataSliceConfig = UiDataSliceConfig {
+    offset: 0,
+    length: 0,
+};
+
+/// Reads the accounts as the surfnet serves getMultipleAccounts with jsonParsed: fetched upstream,
+/// then decoded through the bundled IDL.
+async fn json_parsed(svm: &SurfnetSvm, addresses: &[Pubkey]) -> Vec<serde_json::Value> {
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::JsonParsed),
+        ..Default::default()
+    };
+    let accounts = fetch(addresses).await;
+    let parse = |(address, account)| {
+        let ui = svm.account_to_rpc_keyed_account(address, account, &config, None);
+        let json = serde_json::to_value(&ui.account.data).unwrap();
+        assert!(json["parsed"].is_object(), "{address}: {json}");
+        json["parsed"].clone()
+    };
+    addresses.iter().zip(&accounts).map(parse).collect()
+}
+
+fn name_starts_with(parsed: &serde_json::Value, prefix: &[u8]) -> bool {
+    let name: Vec<u8> = serde_json::from_value(parsed["name"].clone()).unwrap();
+    name.starts_with(prefix)
 }
 
 fn pda(seeds: &[&[u8]]) -> Pubkey {
@@ -1864,4 +1917,185 @@ async fn a_written_position_closes_and_settles_and_its_totals_keep_the_market_wh
         let missing = if counted { 0 } else { i128::from(base) };
         assert_eq!(longs - long_total, missing, "counted: {counted}");
     }
+}
+
+/// The market lookup of velocity-oracle-price, velocity-perp-market-risk and velocity-funding, run
+/// on mainnet as written: the perp markets by size, then read with jsonParsed. Each market's
+/// market_index is its PDA's, the name bytes 83,79,76,45 find SOL-PERP alone, and its oracle's
+/// price is USD x 10^exponent.
+#[tokio::test]
+async fn llm_context_perp_market_lookup_finds_sol_perp_and_its_oracle() {
+    let by_size = vec![RpcFilterType::DataSize(PERP_MARKET_LEN as u64)];
+    let found = program_accounts(by_size, ADDRESSES_ONLY).await;
+    let addresses: Vec<Pubkey> = found.iter().map(|(address, _)| *address).collect();
+    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+    let markets = json_parsed(&svm, &addresses).await;
+    for (address, market) in addresses.iter().zip(&markets) {
+        let index = u16::try_from(market["market_index"].as_u64().unwrap()).unwrap();
+        assert_eq!(*address, perp_market_address(index), "market {index}");
+    }
+    let sol: Vec<usize> = (0..markets.len())
+        .filter(|i| name_starts_with(&markets[*i], &[83, 79, 76, 45]))
+        .collect();
+    let [sol] = sol.as_slice() else {
+        panic!("markets named SOL-: {sol:?}");
+    };
+    let market = &markets[*sol];
+    assert_eq!(addresses[*sol], perp_market_address(SOL_PERP), "SOL-PERP");
+
+    let oracle = Pubkey::from_str_const(market["oracle"].as_str().unwrap());
+    assert_eq!(
+        fetch(&[oracle]).await[0].owner,
+        PROGRAM,
+        "the oracle's owner"
+    );
+    let parsed = json_parsed(&svm, &[oracle]).await.remove(0);
+    assert_eq!(parsed["exponent"], -8, "prices are x 10^8");
+    // The market's last oracle price is at 10^6.
+    let usd = parsed["price"].as_i64().unwrap() / 100;
+    let historical = &market["market_stats"]["historical_oracle_data"];
+    let last = historical["last_oracle_price"].as_i64().unwrap();
+    assert!(
+        (usd - last).abs() * 20 < last,
+        "oracle {usd} vs market {last}"
+    );
+}
+
+/// The spot market lookup of velocity-spot-market-risk, run on mainnet as written. Each market's
+/// market_index is its PDA's, index 0 is USDT, and the name bytes 83,79,76 find the wrapped SOL
+/// market alone, which reads the SOL-PERP oracle.
+#[tokio::test]
+async fn llm_context_spot_market_lookup_finds_usdt_and_sol() {
+    const USDT_MINT: Pubkey =
+        Pubkey::from_str_const("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+    let by_size = vec![RpcFilterType::DataSize(SPOT_MARKET_LEN as u64)];
+    let found = program_accounts(by_size, ADDRESSES_ONLY).await;
+    let addresses: Vec<Pubkey> = found.iter().map(|(address, _)| *address).collect();
+    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+    let markets = json_parsed(&svm, &addresses).await;
+    let mut usdt = None;
+    for (address, market) in addresses.iter().zip(&markets) {
+        let index = u16::try_from(market["market_index"].as_u64().unwrap()).unwrap();
+        assert_eq!(
+            *address,
+            pda(&[b"spot_market", &index.to_le_bytes()]),
+            "{index}"
+        );
+        if index == USDT_SPOT_MARKET {
+            usdt = Some(market);
+        }
+    }
+    let usdt = usdt.expect("no spot market 0");
+    assert!(name_starts_with(usdt, b"USDT"), "{}", usdt["name"]);
+    assert_eq!(usdt["mint"], USDT_MINT.to_string(), "USDT mint");
+
+    let sol: Vec<&serde_json::Value> = markets
+        .iter()
+        .filter(|market| name_starts_with(market, &[83, 79, 76]))
+        .collect();
+    let [sol] = sol.as_slice() else {
+        panic!("{} markets named SOL", sol.len());
+    };
+    let native = spl_token_interface::native_mint::ID.to_string();
+    assert_eq!(sol["mint"], native, "SOL mint");
+    let mainnet = mainnet().await;
+    assert_eq!(sol["oracle"], mainnet.oracle_of(SOL_PERP).to_string());
+}
+
+/// The account lookup of velocity-account-leverage and velocity-perp-position, run on mainnet as
+/// written for the wallet of a live account that holds a perp position. Upstream returns Velocity
+/// accounts as base64 even when asked for jsonParsed, so the recipe lists addresses only and reads
+/// them with getMultipleAccounts. The wallet's accounts are the PDAs of their sub_account_id, which
+/// jsonParsed decodes with the authority and the slots.
+/// PICK THE SLOT finds the slot holding a market the account trades, and for a market it does not
+/// trade the first slot the program would open a position in.
+#[tokio::test]
+async fn llm_context_account_lookup_finds_a_wallets_accounts_and_the_slot_to_write() {
+    let by_size = || RpcFilterType::DataSize(USER_LEN as u64);
+    let slots = UiDataSliceConfig {
+        offset: USER_PERP_POSITIONS,
+        length: 8 * PERP_POSITION_LEN,
+    };
+    // An account with a position and a free slot, so both picks below have an answer.
+    let holds_a_position = |(address, account): (Pubkey, UiAccount)| {
+        let data = account.data.decode()?;
+        let words = |slot: &[u8]| [8..16, 16..24, 40..48, 48..56].map(|r| i64_at(slot, r));
+        let free = |slot: &[u8]| words(slot) == [0; 4] && slot[78] == 0;
+        let mut slots = data.chunks(PERP_POSITION_LEN);
+        let held = slots.clone().any(|slot| i64_at(slot, POSITION_BASE) != 0);
+        (held && slots.any(free)).then_some(address)
+    };
+    let holder = program_accounts(vec![by_size()], slots)
+        .await
+        .into_iter()
+        .find_map(holds_a_position)
+        .expect("no Velocity account holds a perp position and has a free slot");
+    let wallet = pubkey_at(&fetch(&[holder]).await[0].data, 8..40);
+
+    let at_wallet = MemcmpEncodedBytes::Base58(wallet.to_string());
+    let filters = vec![by_size(), RpcFilterType::Memcmp(Memcmp::new(8, at_wallet))];
+    let found = program_accounts(filters, ADDRESSES_ONLY).await;
+    let addresses: Vec<Pubkey> = found.iter().map(|(address, _)| *address).collect();
+    assert!(addresses.contains(&holder), "{holder} not in {addresses:?}");
+    let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+    let users = json_parsed(&svm, &addresses).await;
+    let mut sub_accounts = Vec::new();
+    for (address, user) in addresses.iter().zip(&users) {
+        assert_eq!(user["authority"], wallet.to_string(), "{address}");
+        let sub_account = u16::try_from(user["sub_account_id"].as_u64().unwrap()).unwrap();
+        let derived = pda(&[b"user", wallet.as_ref(), &sub_account.to_le_bytes()]);
+        assert_eq!(*address, derived, "sub-account {sub_account}");
+        sub_accounts.push(sub_account);
+    }
+    sub_accounts.sort();
+    sub_accounts.dedup();
+    assert_eq!(
+        sub_accounts.len(),
+        users.len(),
+        "sub_account_id tells them apart"
+    );
+
+    let user = &users[addresses.iter().position(|a| *a == holder).unwrap()];
+    let slots = user["perp_positions"].as_array().unwrap();
+    assert_eq!(slots.len(), 8, "perp_positions");
+    let field = |slot: &serde_json::Value, name: &str| slot[name].as_i64().unwrap();
+    let busy = |slot: &serde_json::Value| {
+        ["base_asset_amount", "quote_asset_amount", "open_orders"]
+            .iter()
+            .any(|name| field(slot, name) != 0)
+    };
+    let free = |slot: &serde_json::Value| {
+        let fields = ["base_asset_amount", "quote_asset_amount", "open_orders"];
+        let orders = ["open_bids", "open_asks"];
+        fields
+            .iter()
+            .chain(&orders)
+            .all(|name| field(slot, name) == 0)
+    };
+    let in_market = |market: u64| move |slot: &serde_json::Value| slot["market_index"] == market;
+    let pick = |market: u64| {
+        let held = slots
+            .iter()
+            .position(|slot| in_market(market)(slot) && busy(slot));
+        held.or_else(|| slots.iter().position(free))
+    };
+
+    let position = slots
+        .iter()
+        .find(|slot| field(slot, "base_asset_amount") != 0);
+    let held = position.unwrap()["market_index"].as_u64().unwrap();
+    let slot = &slots[pick(held).expect("a slot for a held market")];
+    assert!(in_market(held)(slot), "{slot}");
+    assert_ne!(field(slot, "base_asset_amount"), 0, "{slot}");
+
+    let untraded = (0..).find(|market| {
+        !slots
+            .iter()
+            .any(|slot| in_market(*market)(slot) && busy(slot))
+    });
+    let slot = &slots[pick(untraded.unwrap()).expect("a free slot")];
+    // The program opens a position in the first slot that is free and also holds no isolated
+    // collateral and no liquidation flag.
+    assert_eq!(field(slot, "isolated_position_scaled_balance"), 0, "{slot}");
+    assert_eq!(field(slot, "position_flag"), 0, "{slot}");
 }
