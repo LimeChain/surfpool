@@ -106,8 +106,9 @@ use crate::{
     scenarios::{
         TemplateRegistry, account_data_values,
         keep_alive::{KeepAliveBinding, KeepAliveSource},
-        protocols::phoenix_eternal::v1::state_builder::{
-            prepare_phoenix_override, write_all_or_none,
+        protocols::{
+            manifest::v1::market::prepare_manifest_override,
+            phoenix_eternal::v1::state_builder::{prepare_phoenix_override, write_all_or_none},
         },
         template_registry,
     },
@@ -3740,17 +3741,28 @@ impl SurfnetSvm {
                     continue;
                 }
 
-                match prepare_phoenix_override(
-                    self,
+                let prepared = match prepare_manifest_override(
                     &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
-                    remote_ctx,
-                    target_slot,
-                )
-                .await
-                {
+                    self.inner.get_sysvar::<Clock>().slot,
+                ) {
+                    Ok(None) => {
+                        prepare_phoenix_override(
+                            self,
+                            &override_instance.template_id,
+                            &account_pubkey,
+                            &account,
+                            &account_values,
+                            remote_ctx,
+                            target_slot,
+                        )
+                        .await
+                    }
+                    manifest => manifest,
+                };
+                match prepared {
                     Ok(Some(writes)) => {
                         match write_all_or_none(self, writes, target_slot) {
                             Ok(written) => {

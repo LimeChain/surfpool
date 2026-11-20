@@ -1,0 +1,143 @@
+protocol: Manifest
+version: v1
+account_type: MarketFixed
+idl_file_path: idl.json
+
+tags:
+  - orderbook
+  - liquidity
+  - defi
+
+templates:
+  - id: manifest-book-shift
+    name: Manifest Book Shift
+    description: >-
+      Move every resting order on one or both sides of a Manifest market by the same ratio, as if
+      the market makers repriced after a price move.
+    idl_account_name: MarketFixed
+    properties:
+      - path: ratio_ppm
+        type: input
+        value_type: string
+        label: Price ratio (ppm)
+        description: >-
+          New price over old price in parts per million, as a decimal string: 1000000 keeps
+          prices, 900000 is 10% lower, 1050000 is 5% higher
+      - path: side
+        type: input
+        value_type: string
+        label: Side
+        description: Which orders move, both, bids or asks
+    llm_context: |
+      This moves the price of a Manifest order book. Manifest has no oracle: its price is its
+      resting orders, so a price shock moves them. Every order on the chosen side moves by the
+      same ratio. Asks keep their size; a bid keeps its quote value, so its size grows when its
+      price falls. It does not send a trade.
+      ratio_ppm is the new price over the old one in parts per million, as a decimal string:
+      "800000" is a 20% drop and "1100000" a 10% rise. side is "both", "bids" or "asks". Use both
+      for a price move; a one-sided shift that would cross the book is refused.
+      A later shift with fetchBeforeUse false compounds on an earlier one: 0.9 then 0.9 is 0.81.
+      The account is the market. To find it by pair, resolve both mints, then call
+      getProgramAccounts on MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms with encoding base64,
+      dataSlice {"offset": 0, "length": 0} and three memcmp filters: offset 0 bytes
+      "hFwv1prLTHL", offset 16 the base mint and offset 48 the quote mint. If nothing comes back,
+      swap the two mints. Several markets can share a pair: call getSignaturesForAddress with
+      {"limit": 1} on each and pick the one whose latest transaction has the highest slot. Never
+      pick by vault balance, since an inactive market can hold large idle balances.
+      Set fetchBeforeUse: true so the market is fetched from the upstream datasource first; an
+      override on a market that is not in the local VM yet is skipped. Use false to build on an
+      earlier override of the same scenario or on orders placed in the local VM.
+    address:
+      type: pubkey
+
+  - id: manifest-orders-expire
+    name: Manifest Orders Expire
+    description: >-
+      Expire the best price levels or a whole side of a Manifest market, so the book thins out or
+      empties as when market makers pull their quotes.
+    idl_account_name: MarketFixed
+    properties:
+      - path: side
+        type: input
+        value_type: string
+        label: Side
+        description: Which orders expire, both, bids or asks
+      - path: levels
+        type: input
+        value_type: u32
+        label: Price levels
+        description: >-
+          How many of the best prices expire on each chosen side; 0 expires the whole side.
+          Example: 3
+      - path: expire_after_slots
+        type: input
+        value_type: u32
+        label: Slots until expiry
+        description: >-
+          Slots the orders keep matching, counting the one the override runs in; 0 expires them at
+          once. Example: 0
+    llm_context: |
+      This pulls liquidity from a Manifest order book: the best price levels, or a whole side,
+      expire, as when market makers withdraw or stop updating their quotes. Manifest removes an
+      expired order the first time a trade reaches it and returns what the order locked to its
+      maker's balance on the market. It does not send a trade.
+      levels counts distinct prices from the best one, and 0 expires the whole side. Orders that
+      already expired do not count. side is "both", "bids" or "asks".
+      The orders keep matching for expire_after_slots slots, counting the one the override runs
+      in, so 0 removes them at once. An order that already expires sooner keeps its own expiry.
+      Pass levels and expire_after_slots as JSON numbers.
+      The account is the market. To find it by pair, resolve both mints, then call
+      getProgramAccounts on MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms with encoding base64,
+      dataSlice {"offset": 0, "length": 0} and three memcmp filters: offset 0 bytes
+      "hFwv1prLTHL", offset 16 the base mint and offset 48 the quote mint. If nothing comes back,
+      swap the two mints. Several markets can share a pair: call getSignaturesForAddress with
+      {"limit": 1} on each and pick the one whose latest transaction has the highest slot. Never
+      pick by vault balance, since an inactive market can hold large idle balances.
+      Set fetchBeforeUse: true so the market is fetched from the upstream datasource first; an
+      override on a market that is not in the local VM yet is skipped. Use false to build on an
+      earlier override of the same scenario or on orders placed in the local VM.
+    address:
+      type: pubkey
+
+  - id: manifest-depth-cut
+    name: Manifest Depth Cut
+    description: >-
+      Shrink every resting order on one or both sides of a Manifest market without moving any
+      price, as if the market makers quoted smaller sizes.
+    idl_account_name: MarketFixed
+    properties:
+      - path: size_ppm
+        type: input
+        value_type: string
+        label: Size ratio (ppm)
+        description: >-
+          New size over old size in parts per million, as a decimal string from 1 to 1000000:
+          1000000 keeps sizes, 250000 leaves a quarter
+      - path: side
+        type: input
+        value_type: string
+        label: Side
+        description: Which orders shrink, both, bids or asks
+    llm_context: |
+      This thins a Manifest order book without moving its price: every live order on the chosen
+      side keeps its price and shrinks to the same share of its size, as when market makers quote
+      smaller. What an order no longer locks goes back to its maker's balance on the market. It
+      does not send a trade.
+      size_ppm is the new size over the old one in parts per million, as a decimal string from "1"
+      to "1000000": "250000" leaves a quarter of the depth and "1000000" changes nothing. Sizes
+      round down but never below one atom, so this cannot empty a book; to remove orders, use
+      manifest-orders-expire. side is "both", "bids" or "asks". Orders that already expired are
+      left as they are.
+      A later cut with fetchBeforeUse false compounds on an earlier one: 0.5 then 0.5 is 0.25.
+      The account is the market. To find it by pair, resolve both mints, then call
+      getProgramAccounts on MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms with encoding base64,
+      dataSlice {"offset": 0, "length": 0} and three memcmp filters: offset 0 bytes
+      "hFwv1prLTHL", offset 16 the base mint and offset 48 the quote mint. If nothing comes back,
+      swap the two mints. Several markets can share a pair: call getSignaturesForAddress with
+      {"limit": 1} on each and pick the one whose latest transaction has the highest slot. Never
+      pick by vault balance, since an inactive market can hold large idle balances.
+      Set fetchBeforeUse: true so the market is fetched from the upstream datasource first; an
+      override on a market that is not in the local VM yet is skipped. Use false to build on an
+      earlier override of the same scenario or on orders placed in the local VM.
+    address:
+      type: pubkey
