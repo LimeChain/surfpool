@@ -117,10 +117,7 @@ jupiter-perps-custody-risk   pricing.max_leverage: 200000     # liquidate everyt
 jupiter-perps-custody-fees   decrease_position_bps: <above the position's spare margin>
 ```
 
-Liquidation is keeper-only: the deployed program accepts only keeper keys compiled into it, and
-no account holds them, so no override adds one. On a surfnet running
-`--skip-signature-verification`, a transaction can be sent as a keeper, and so can the keeper
-fills that open and close positions.
+Only a keeper can send the liquidation; see "Keepers" under "Perps limits".
 
 A cascade is a price override per asset in the same slot.
 
@@ -231,6 +228,22 @@ jupiter-perps-pool-limits    max_lp_token_price_change_bps: 10000
 A large crash also shifts every token's weight; raise `limit.token_weightage_buffer_bps` if
 deposits then fail with 6043.
 
+# Perps limits
+
+## Keepers
+
+The deployed Perps program accepts position fills and liquidations only from four keeper keys
+compiled into it:
+
+- `DFZcDnmEYNUK1khquZzx5dQYiEyjJ3N5STqaDVLZ88ZU`
+- `A2rCQdCqQB4wu72x9Q7iq1QugtdZmcyWsiSPfgfZzu2u`
+- `Ag28fGtwtpnqassHURUBsQ1WfiyaWWzDDNs4Q28qHRjv`
+- `H3dDE6K6uqBp5kBKctH6w8hzpV5eAmxUiqvcdHxuE9i4`
+
+No account holds them, so no override adds a keeper. On a surfnet, a fill or a liquidation runs
+only when the surfnet starts with `--skip-signature-verification` and the transaction is sent as
+one of these keys. User instructions, such as JLP deposits and position requests, are not affected.
+
 # Perps troubleshooting
 
 | Error | Meaning | Fix |
@@ -241,7 +254,7 @@ deposits then fail with 6043.
 | 6022 `MaxLeverage` | a keeper's fill would open the position above `pricing.max_leverage`, counting the collateral after the open fee less the close fee | raise `pricing.max_leverage`, lower `decrease_position_bps` or add collateral |
 | 6024 `PoolAmountLimit` | the deposit would exceed `limit.max_aum_usd` | raise the cap |
 | 6027 `InstructionNotAllowed` | a `permissions` switch is off | set it back to `true` |
-| 6034 `InvalidKeeper` | the liquidator is not the keeper the program accepts | sign as the keeper |
+| 6034 `InvalidKeeper` | the fill or liquidation was not sent by one of the keeper keys | send it as a keeper key on a surfnet started with `--skip-signature-verification` - see "Keepers" |
 | 6043 `ExceedTokenWeightage` | the deposit leaves the token too far above its target weight | raise `limit.token_weightage_buffer_bps` |
 | 6045 `PullOraclePublishTimeTooEarly` | a keeper filled a position request with a price published no later than the request | override the position's feeds before the fill, and fill in a later second than the request - see "Keep prices published" |
 | 6066 `LpTokenPriceChangeLimitExceeded` | the JLP price moved past the guard | raise `max_lp_token_price_change_bps` |
