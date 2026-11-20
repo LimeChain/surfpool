@@ -1283,7 +1283,7 @@ async fn price_overrides_keep_their_feeds_published_at_the_clock() {
     let (requested, fill, _) = request_position(&locker, &graph, &SOL_LONG, trader, 1_000_000_000);
     requested.expect("the request");
     travel(&locker, now + 5).await;
-    let refused = send(&locker, KEEPER, &[fill.clone()]);
+    let refused = send(&locker, KEEPER, std::slice::from_ref(&fill));
     expect_error(
         refused,
         PULL_ORACLE_PUBLISH_TIME_TOO_EARLY,
