@@ -242,9 +242,6 @@ templates:
         the bank (6600). All five at 10000 let any move through. The breaker's own off switch is
         bit 11 of flags, which these templates do not write.
 
-      Kamino, Drift and JupLend wrapped banks also need their venue account refreshed in the same
-      transaction, which these templates do not do.
-
       EXAMPLE - "accept prices up to an hour old":
       config.oracle_max_age: 3600
 
@@ -410,9 +407,6 @@ templates:
       or withdraw against its live positions.
 
       Set authority to a wallet whose keypair you hold, and sign with it.
-
-      Positions in Kamino, Drift or JupLend wrapped banks still need those venues refreshed in the
-      same transaction.
 
       EXAMPLE:
       authority: <your wallet address>
