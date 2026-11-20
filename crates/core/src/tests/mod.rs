@@ -3,10 +3,10 @@ pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
 #[cfg(feature = "integration-tests")]
-pub mod pancakeswap;
-#[cfg(feature = "integration-tests")]
 pub mod phoenix;
 pub mod plugin;
+#[cfg(feature = "integration-tests")]
+pub mod protocols;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
 pub mod simnet_events;
