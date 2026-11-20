@@ -37,10 +37,10 @@ enabled: boolean,
  */
 fetchBeforeUse?: boolean, 
 /**
- * Whether keep-alive rewrites this account from this slot on. Off, keep-alive stops for the
- * account, so its fields age as the clock moves on, until a later override turns it on again.
+ * Keep-alive for the account this override writes. Absent, the template's keep-alive applies;
+ * `[]` turns it off. Only `[]` is supported.
  */
-keepAlive?: boolean, 
+keepAlive?: Array<unknown>, 
 /**
  * Account address to override - use pubkey for known addresses or pda for derived addresses
  */
