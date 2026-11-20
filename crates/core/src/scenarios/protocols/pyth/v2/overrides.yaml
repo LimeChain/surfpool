@@ -11,7 +11,7 @@ tags:
 
 keep_alive:
   - template: pyth-price-publication
-    address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: PriceUpdateV2 }
+    address: { type: override }
     values: { price_message.publish_time: $unix_s, posted_slot: $slot }
 
 constants:
@@ -199,7 +199,7 @@ constants:
 templates:
   - id: pyth-price-feed-v2
     name: Override Price Feed
-    description: Override any Pyth price feed with custom price data; keeps every loaded Pyth Core price account published
+    description: Override any Pyth price feed with custom price data; keeps that feed published
     idl_account_name: PriceUpdateV2
     properties:
       - path: feed_id
@@ -217,7 +217,7 @@ templates:
         description: Decimal exponent, normally -8 and -10 on some feeds. Rescales every price field
       - path: price_message.publish_time
         label: Publish Time
-        description: Unix seconds of this update, interpreted against the Surfnet clock. Keep-alive writes the Clock time every slot, so a value set here holds only with keepAlive false
+        description: 'Unix seconds of this update, interpreted against the Surfnet clock. Keep-alive writes the Clock time every slot, so a value set here holds only in an override with "keepAlive": []'
       - path: price_message.prev_publish_time
         label: Previous Publish Time
         description: Unix seconds of the preceding update
@@ -229,7 +229,7 @@ templates:
         description: Exponential moving average confidence, in the same scale as conf
       - path: posted_slot
         label: Posted Slot
-        description: Slot the update was posted at, for consumers that measure freshness in slots. Keep-alive writes the current slot every slot, so a value set here holds only with keepAlive false
+        description: 'Slot the update was posted at, for consumers that measure freshness in slots. Keep-alive writes the current slot every slot, so a value set here holds only in an override with "keepAlive": []'
     llm_context: |
       CRITICAL: Always set fetchBeforeUse: true for Pyth price feeds!
       This fetches the current account data from mainnet before applying your price override.
@@ -267,25 +267,22 @@ templates:
         every scaled field to match.
       - price_message.ema_price and price_message.ema_conf use the same scales as price and conf.
 
-      THE PRICE STAYS PUBLISHED BY ITSELF. From the slot this override plays until the network is
-      reset, Surfpool republishes every price account of the Pyth Core receiver the Surfnet has
-      loaded every slot, as the Pyth publisher does on mainnet: publish_time becomes the Surfnet
-      clock's unix seconds and posted_slot the slot, also after a time travel. This includes feeds
-      no override names and, from the next slot, feeds a transaction loads later, so a liquidation
-      that reads the borrower's other feeds finds them fresh. Price, conf and the EMA fields keep
-      their values. With keepAlive: true, a value set for publish_time or posted_slot never takes
-      effect, so leave both unset.
+      THE PRICE STAYS PUBLISHED. From the slot this override plays until the network is reset,
+      Surfpool republishes the price account it writes every slot, as the Pyth publisher does on
+      mainnet: publish_time becomes the Surfnet clock's unix seconds and posted_slot the slot, also
+      after a time travel. Price, conf and the EMA fields keep their values, and a value set for
+      publish_time or posted_slot does not hold.
 
-      STALE PRICE: keep-alive starts only when an override with keepAlive: true writes a price
-      account, and an override with no values beyond feed_id writes nothing. To keep one feed
-      stale while the others stay fresh, add two overrides of this template, both with
-      fetchBeforeUse: true and price_message.price set to the feed's current price
-      (getAccountInfo, encoding "jsonParsed"), so no price changes:
-      - on the stale feed, keepAlive: false. It then ages against the Surfnet clock and turns
-        stale once the consumer's age limit has passed;
-      - on any other feed the same consumer reads, keepAlive: true. This starts the
-        republishing of every loaded price account except the stale one.
-      To make it stale at once, surfnet_timeTravel past the consumer's limit. Its
+      EVERY FEED A TRANSACTION READS: a price account no override writes is not republished and
+      ages against the Surfnet clock. A liquidation reads every feed of the borrower, so add one
+      override of this template per feed the transaction reads, in the same scenario and slot. On
+      a feed whose price must not move, set only price_message.publish_time: any value works,
+      because keep-alive rewrites it in the same slot. feed_id alone writes nothing.
+
+      STALE PRICE: a feed left without an override ages from the start. To let a feed age later,
+      give a later override of it "keepAlive": [] and a value, such as its current price. From
+      that slot on nothing republishes it, and a publish_time or posted_slot set in that override
+      holds. To make it stale at once, surfnet_timeTravel past the consumer's limit. Its
       absoluteTimestamp is in MILLISECONDS, while publish_time and the Clock sysvar are in
       SECONDS.
     address:

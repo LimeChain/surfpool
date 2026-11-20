@@ -85,32 +85,30 @@ restate every scaled field to match.
 # Keep-alive
 
 Nobody publishes Pyth prices on a surfnet, so both templates import a
-[keep-alive](../../README.md#keep-alive): from the slot an override of a template plays until
-the network is reset, Surfpool writes the Clock's unix seconds to `price_message.publish_time` and
-the slot to `posted_slot` every slot, time travels included. It does so for every price account of
-that template's receiver the surfnet has loaded, including feeds no override names and, from the
-next slot, feeds a transaction loads later, so a liquidation that reads the borrower's other feeds
-finds them fresh. The price, confidence and EMA fields keep their values. To keep one feed stale on
-purpose, override it with `keepAlive: false`; it then ages against the Surfnet clock.
+[keep-alive](../../README.md#keep-alive) for the price account an override writes: from the slot
+the override plays until the network is reset, Surfpool writes the Clock's unix seconds to
+`price_message.publish_time` and the slot to `posted_slot` every slot, time travels included. The
+price, confidence and EMA fields keep their values. A price account no override writes is not
+republished and ages against the Surfnet clock.
 
 Each `overrides.yaml` imports, at its top level, the publication template of its folder's
 `keep-alive.yaml`:
 
-| Template | Keep-alive template | Rewrites |
-|---|---|---|
-| `pyth-price-feed-v2` | `pyth-price-publication` | every loaded `PriceUpdateV2` account owned by `rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ` |
-| `pyth-core-compatible-price-feed-v2` | `pyth-core-compatible-price-publication` | every loaded `PriceUpdateV2` account owned by `rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp` |
+| Template | Keep-alive template |
+|---|---|
+| `pyth-price-feed-v2` | `pyth-price-publication` |
+| `pyth-core-compatible-price-feed-v2` | `pyth-core-compatible-price-publication` |
 
 ```yaml
 keep_alive:
   - template: pyth-price-publication
-    address: { type: owned, owner: rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ, account: PriceUpdateV2 }
+    address: { type: override }
     values: { price_message.publish_time: $unix_s, posted_slot: $slot }
 ```
 
 The keep-alive templates are never offered in Studio or MCP. Because keep-alive rewrites
 `price_message.publish_time` and `posted_slot` every slot, a value an override sets for them holds
-only with `keepAlive: false`.
+only in an override with `"keepAlive": []`.
 
 # Recipes
 
@@ -129,18 +127,19 @@ Move `ema_price` with `price`: consumers use the EMA for some checks and the spo
 Scale `conf` and `ema_conf` by the same factor as the price: consumers refuse a price whose
 confidence is too wide a share of it, so a large drop that keeps the live `conf` can be refused.
 
-## Keep one feed stale
+## Keep every feed a transaction reads fresh
 
-Keep-alive starts only when an override with `keepAlive: true` writes a price account, and an
-override with no values writes nothing. For `pyth-price-feed-v2`, `feed_id` does not count as a
-value. To keep one feed stale while the others stay fresh, add two overrides of the receiver's
-template, both with `fetchBeforeUse: true` and `price_message.price` set to the account's current
-price, so no price changes:
+A transaction can read more feeds than the scenario moves: a liquidation reads every feed of the
+borrower. Add one override of the receiver's template per such feed, in the same scenario and slot.
+On a feed whose price must not move, set only `price_message.publish_time`. Any value works,
+because keep-alive rewrites it in the same slot. For `pyth-price-feed-v2`, `feed_id` alone writes
+nothing.
 
-- on the stale feed's price account, `keepAlive: false`. It then ages against the Surfnet clock and
-  turns stale once the consumer's age limit has passed;
-- on any other price account the same consumer reads, `keepAlive: true`. This starts the
-  republishing of every loaded price account except the stale one.
+## Let a feed go stale
+
+- A feed left without an override ages against the Surfnet clock from the start.
+- To let a feed age later, give a later override of it `"keepAlive": []` and a value, such as its
+  current price. From that slot on nothing republishes it.
 
 To make it stale at once, `surfnet_timeTravel` past the consumer's limit. Its `absoluteTimestamp`
 is in milliseconds, while `publish_time` and the Clock sysvar are in seconds.
@@ -151,8 +150,8 @@ is in milliseconds, while `publish_time` and the Clock sysvar are in seconds.
 |---|---|
 | The consumer still reads the old price | The override wrote the other receiver's account. Check the price account's owner and use that receiver's template |
 | A large price drop is refused | Scale `conf` and `ema_conf` with the price. See [Drop a price](#drop-a-price) |
-| A `publish_time` or `posted_slot` value did not hold | Keep-alive rewrites both every slot. Set `keepAlive: false` on that override |
-| Other feeds of the consumer turn stale | Keep-alive starts only when an override with `keepAlive: true` writes a price account. Give that override a value, such as the current price |
+| A `publish_time` or `posted_slot` value did not hold | Keep-alive rewrites both every slot. A value holds only in an override with `"keepAlive": []` |
+| Other feeds the transaction reads turn stale | Keep-alive republishes only the price accounts overrides write. See [Keep every feed a transaction reads fresh](#keep-every-feed-a-transaction-reads-fresh) |
 | A feed meant to be stale is still fresh after `surfnet_timeTravel` | `absoluteTimestamp` is in milliseconds, and `publish_time` is in seconds |
 | Prices are off by a power of ten after an exponent change | `exponent` rescales every price field. Restate `price`, `conf`, `ema_price` and `ema_conf` to match |
 
