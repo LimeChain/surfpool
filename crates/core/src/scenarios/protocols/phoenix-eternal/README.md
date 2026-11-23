@@ -245,15 +245,10 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 
 ## The bundled IDL
 
-`v1/idl.json` is the IDL Phoenix publishes on chain in its Program Metadata account
-`H6r3zQwpMdsuSgoCFm39WjP6F9sMNyxwe3F3F9PhbqkQ`, as written on 2026-11-10 (sha256
-`af1bac114fd2d9926a3e2253192941a3d28466f50b2521b3ff7d5e820b6055b0`), with one change.
-
-The published `Trader` has one field `maxPositions: u64`. The program keeps two `u32` values in
-those 8 bytes: the position limit, then the trader's preference bits. The bundled `Trader` has
-them as `maxPositions: u32` and `traderPreferenceBits: u32`, so a write of one leaves the other.
-Until Phoenix publishes the two fields, redo this split after each refresh of the file. The
-bundled file's sha256 is `35f1cedcdcb6598df87e11e483992608b5e02e978facfe627f0c04643181a5a3`.
+The `Trader` type in the IDL Phoenix publishes has one field `maxPositions: u64`. The program keeps
+two `u32` values in those 8 bytes: the position limit, then the trader's preference bits. The
+bundled `Trader` has them as `maxPositions: u32` and `traderPreferenceBits: u32`, so a write of one
+leaves the other.
 
 ## Tests against mainnet
 
