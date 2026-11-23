@@ -1,3 +1,5 @@
+#[cfg(feature = "integration-tests")]
+pub mod bisonfi;
 pub mod helpers;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
@@ -8,5 +10,7 @@ pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
 pub mod simnet_events;
+#[cfg(feature = "integration-tests")]
+pub mod solfi;
 #[cfg(feature = "integration-tests")]
 pub mod tessera;
