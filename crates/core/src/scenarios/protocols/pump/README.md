@@ -24,20 +24,6 @@ integration must be revisited (layouts, formulas, fee wiring).
 
 ## The bundled IDLs
 
-Both IDLs come from [pump-public-docs](https://github.com/pump-fun/pump-public-docs), not from
-the programs' Anchor IDL accounts: the on-chain copies lag the deployed programs. On
-2026-11-18 the Pump IDL account held pump-public-docs commit `e0687ae9b7e0` (2026-09-12) and
-the PumpSwap IDL account held `3c6721a67c0b` (2026-05-18). Pump redeployed both programs on
-2026-11-15 without an IDL update anywhere, so even the latest published IDLs can lag them.
-
-| Program  | File                                                                                                                                | pump-public-docs commit     | sha256                                                             |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------ |
-| Pump     | [`idl/pump.json`](https://github.com/pump-fun/pump-public-docs/blob/639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22/idl/pump.json)         | `639b87fb45c3` (2026-10-13) | `7616681ea557975f9f623ac211080f22a93060781eaf4765b0a488d980997207` |
-| PumpSwap | [`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/8cda1fa30ea658b20909d8aedf002047119388d2/idl/pump_amm.json) | `8cda1fa30ea6` (2026-10-07) | `b7d8c57a4d9c4dd0109a9ab893052352333252d4eedced10ac091d4d66cab89b` |
-
-Each bundled file is byte-identical to the file at that commit, the latest commit to change
-it on 2026-11-19.
-
 An IDL write decodes the whole account type, so on an account shorter than its type it
 fails, and the surfnet skips the whole override with a warning. The bundled `BondingCurve`
 type is 166 bytes. A census of `BondingCurve` accounts on 2026-11-19 found 2,586,858 curves of

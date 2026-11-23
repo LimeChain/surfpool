@@ -7,18 +7,6 @@ Program: `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`.
 
 ## The bundled IDL
 
-`v1/idl.json` is byte-identical to
-[`idl/pump_amm.json`](https://github.com/pump-fun/pump-public-docs/blob/8cda1fa30ea658b20909d8aedf002047119388d2/idl/pump_amm.json)
-at pump-public-docs commit `8cda1fa30ea6` (2026-10-07), the latest commit to change that file
-on 2026-11-19. Its sha256 is
-`b7d8c57a4d9c4dd0109a9ab893052352333252d4eedced10ac091d4d66cab89b`.
-
-The IDL comes from pump-public-docs, not from the program's Anchor IDL account
-`5fLnXNNoZcZt9Qku6HARM3un3Ttm2cGsR7gN9Zp1R7h3`. The on-chain copy was last written on
-2026-05-14 and lags the deployed program: it has no `Pool.virtual_quote_reserves`, which the
-deployed program adds to the quote vault balance when it prices a swap. Pump redeployed the
-program on 2026-11-15 without an IDL update anywhere, so even this IDL can lag the program.
-
 The bundled `Pool` type is 287 bytes. An IDL write decodes the whole type, so on a shorter
 pool it fails, and the surfnet skips the whole override with a warning. A census of all
 1,610,872 `Pool` accounts on 2026-11-18 found 1,334,394 pools of 287, 300 or 301 bytes, which
