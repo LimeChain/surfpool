@@ -1,7 +1,8 @@
 protocol: Chainlink
 version: v1
 account_type: Transmissions
-idl_file_path: idl.json
+
+raw_layout: true
 
 tags:
   - oracle
@@ -15,12 +16,18 @@ templates:
     idl_account_name: Transmissions
     properties:
       - path: live.answer
+        offset: 216
+        encoding: i128
         label: Answer
         description: Feed value as a scaled integer - multiply the value by 10^decimals
       - path: live.slot
+        offset: 200
+        encoding: u64
         label: Round Slot
         description: Slot of the round. Consumers age it against the Surfnet clock and reject a slot ahead of it
       - path: live.timestamp
+        offset: 208
+        encoding: u32
         label: Round Timestamp
         description: Unix seconds of the round, interpreted against the Surfnet clock
     address:
@@ -34,14 +41,16 @@ templates:
          as is.
       2. Otherwise search by the feed's description, the pair text stored at byte 106 such as
          "SOL / USD", "BTC / USD" or "JLP / USD". Call getProgramAccounts on
-         HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny with the filters
+         HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny with encoding "base64", dataSlice
+         {"offset":200,"length":8} and the filters
          [{"dataSize":248},{"memcmp":{"offset":106,"bytes":"<base64>","encoding":"base64"}}],
          where <base64> encodes the description followed by one zero byte: "SOL / USD" is
-         U09MIC8gVVNEAA==.
-      3. Read each match with getAccountInfo, encoding "jsonParsed". Retired feeds keep their
-         description, so when several match, take the one with the highest live.slot. Read its
-         decimals, then put it in the override's account as {"pubkey":"<feed>"} and set
-         fetchBeforeUse: true.
+         U09MIC8gVVNEAA==. Each match's data is the slot of its round, and "AAAAAAAAAAA=" is a
+         feed that was never written: skip it. Retired feeds keep their description and their
+         last round, so when more than one match remains, ask the user which feed to use.
+      3. Read the feed's decimals with getAccountInfo, encoding "base64" and dataSlice
+         {"offset":138,"length":1}: "CA==" is 8, "Bg==" is 6 and "Eg==" is 18. Then put the feed
+         in the override's account as {"pubkey":"<feed>"} and set fetchBeforeUse: true.
 
       VALUE: live.answer = value x 10^decimals. USD price feeds use 8 decimals, so $145.00 is
       14500000000. Exchange-rate feeds use 6, 8 or 18; read decimals, never assume.
