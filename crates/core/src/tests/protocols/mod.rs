@@ -8,6 +8,10 @@
 //!
 //! A protocol's module is declared here and nowhere else; the filter above then covers it.
 
+pub mod bisonfi;
+pub mod goonfi;
+pub mod humidifi;
 pub mod kamino;
 pub mod phoenix;
 pub mod pump;
+pub mod solfi;
