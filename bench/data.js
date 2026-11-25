@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795509992176,
+  "lastUpdate": 1795599099542,
   "repoUrl": "https://github.com/LimeChain/surfpool",
   "entries": {
     "surfpool throughput": [
@@ -59,6 +59,66 @@ window.BENCHMARK_DATA = {
             "name": "send_tx_no_profiling/tps_confirmed",
             "value": 1650.993053492507,
             "range": "1626.5..1653.3",
+            "unit": "tx/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "bakasura@abv.bg",
+            "name": "bakasura980",
+            "username": "bakasura980"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "309014210db043b30b31f859b468ae4ef3fd60d8",
+          "message": "feat(scenarios): add GoonFi support - state templates & presets (#965)\n\nCo-authored-by: Georgi Petroff <102983346+92Infinitus92@users.noreply.github.com>",
+          "timestamp": "2026-11-24T13:46:28-05:00",
+          "tree_id": "bcc8f259ff6d156b5c42f9bad82e2bad7fdf3122",
+          "url": "https://github.com/LimeChain/surfpool/commit/309014210db043b30b31f859b468ae4ef3fd60d8"
+        },
+        "date": 1795599098953,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "gpa/rps",
+            "value": 110.1,
+            "range": "107.2..110.3",
+            "unit": "req/s"
+          },
+          {
+            "name": "reads/rps",
+            "value": 9416.5,
+            "range": "9358.8..9476.6",
+            "unit": "req/s"
+          },
+          {
+            "name": "send_tx_default/send_rate",
+            "value": 1726,
+            "range": "1724.5..1739.5",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_default/tps_confirmed",
+            "value": 1687.7043322201232,
+            "range": "1687.5..1702.0",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/send_rate",
+            "value": 1776.6,
+            "range": "1766.6..1778.2",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/tps_confirmed",
+            "value": 1727.4416597721129,
+            "range": "1719.7..1731.2",
             "unit": "tx/s"
           }
         ]
