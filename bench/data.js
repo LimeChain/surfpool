@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795618684290,
+  "lastUpdate": 1795686414819,
   "repoUrl": "https://github.com/LimeChain/surfpool",
   "entries": {
     "surfpool throughput": [
@@ -179,6 +179,66 @@ window.BENCHMARK_DATA = {
             "name": "send_tx_no_profiling/tps_confirmed",
             "value": 1642.0170622577527,
             "range": "1633.0..1666.6",
+            "unit": "tx/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "41898282+github-actions[bot]@users.noreply.github.com",
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "927ddbebe5892fd3053692fd179b6eb36fa218fb",
+          "message": "chore(release): publish v1.8.0 (#976)\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+          "timestamp": "2026-11-25T16:33:11-05:00",
+          "tree_id": "f00ac4e7bdd23bb11d60157d8a63b9834930b297",
+          "url": "https://github.com/LimeChain/surfpool/commit/927ddbebe5892fd3053692fd179b6eb36fa218fb"
+        },
+        "date": 1795686414169,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "gpa/rps",
+            "value": 129,
+            "range": "119.4..131.4",
+            "unit": "req/s"
+          },
+          {
+            "name": "reads/rps",
+            "value": 11500,
+            "range": "11095.2..11595.2",
+            "unit": "req/s"
+          },
+          {
+            "name": "send_tx_default/send_rate",
+            "value": 1990.8,
+            "range": "1952.5..1997.9",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_default/tps_confirmed",
+            "value": 1942.2126726066697,
+            "range": "1906.2..1949.9",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/send_rate",
+            "value": 2015.6,
+            "range": "2013.5..2035.0",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/tps_confirmed",
+            "value": 1965.774004389058,
+            "range": "1964.6..1991.3",
             "unit": "tx/s"
           }
         ]
