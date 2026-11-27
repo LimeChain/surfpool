@@ -1147,7 +1147,7 @@ async fn goonfi_size_impact_prices_larger_trades_worse_on_the_fixture_markets() 
 }
 
 const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-/// The Orca SOL/USDC pool the `whirlpool-sol-usdc` template targets.
+/// The Orca SOL/USDC pool the arbitrage scenario overrides.
 const WHIRLPOOL_SOL_USDC: &str = "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ";
 /// Ticks one Whirlpool tick array holds, in units of the pool's tick spacing.
 const TICK_ARRAY_SIZE: i32 = 88;
@@ -1378,7 +1378,7 @@ async fn goonfi_pmm_arbitrage_against_a_whirlpool_drop_pays_end_to_end() {
     );
     for (template_id, target_account, values) in [
         (
-            "whirlpool-sol-usdc",
+            "whirlpool-pool-state",
             WHIRLPOOL_SOL_USDC,
             vec![
                 ("sqrt_price", serde_json::json!(dropped.to_string())),

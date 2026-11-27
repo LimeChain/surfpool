@@ -26,6 +26,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
  - **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, size-impact,
    swap-pressure and vault-inventory templates; its oracle is kept alive. See
    [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)
+- **Whirlpool v1** - Orca's concentrated-liquidity AMM, addressed by pool, with the shared fee config override template. See [protocols/whirlpool/README.md](./protocols/whirlpool/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 

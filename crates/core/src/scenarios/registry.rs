@@ -76,8 +76,9 @@ pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
 pub const HUMIDIFI_KEEP_ALIVE_CONTENT: &str =
     include_str!("./protocols/humidifi/v8/keep-alive.yaml");
 
-pub const WHIRLPOOL_IDL_CONTENT: &str = include_str!("./protocols/whirlpool/idl.json");
-pub const WHIRLPOOL_OVERRIDES_CONTENT: &str = include_str!("./protocols/whirlpool/overrides.yaml");
+pub const WHIRLPOOL_IDL_CONTENT: &str = include_str!("./protocols/whirlpool/v1/idl.json");
+pub const WHIRLPOOL_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/whirlpool/v1/overrides.yaml");
 
 pub const SPL_TOKEN_IDL_CONTENT: &str = include_str!("./protocols/spl-token/idl.json");
 pub const SPL_TOKEN_OVERRIDES_CONTENT: &str = include_str!("./protocols/spl-token/overrides.yaml");
@@ -890,12 +891,12 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + Whirlpool (2) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 87
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            87,
+            "Registry should load 87 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -945,12 +946,8 @@ templates:
         assert!(registry.contains("kamino-liquidity-strategy-rewards"));
         assert!(registry.contains("kamino-liquidity-strategy-guards"));
 
-        assert!(registry.contains("whirlpool-sol-usdc"));
-        assert!(registry.contains("whirlpool-sol-usdt"));
-        assert!(registry.contains("whirlpool-msol-sol"));
-        assert!(registry.contains("whirlpool-orca-usdc"));
-        assert!(registry.contains("whirlpool-popcat-sol"));
-        assert!(registry.contains("whirlpool-custom"));
+        assert!(registry.contains("whirlpool-pool-state"));
+        assert!(registry.contains("whirlpools-config"));
 
         assert!(registry.contains("spl-token-account-balance"));
         assert!(registry.contains("spl-token-mint-supply"));
@@ -1553,8 +1550,8 @@ templates: []
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
             whirlpool_templates.len(),
-            6,
-            "Should have 6 Whirlpool templates"
+            2,
+            "Should have 2 Whirlpool templates (whirlpool-pool-state, whirlpools-config)"
         );
 
         let pump_templates = registry.by_protocol("Pump");
@@ -1670,12 +1667,8 @@ templates: []
         assert!(ids.contains(&"kamino-lending-market-risk".to_string()));
         assert!(ids.contains(&"kamino-scope-price".to_string()));
         assert!(ids.contains(&"kamino-farms-user-rewards".to_string()));
-        assert!(ids.contains(&"whirlpool-sol-usdc".to_string()));
-        assert!(ids.contains(&"whirlpool-sol-usdt".to_string()));
-        assert!(ids.contains(&"whirlpool-msol-sol".to_string()));
-        assert!(ids.contains(&"whirlpool-orca-usdc".to_string()));
-        assert!(ids.contains(&"whirlpool-popcat-sol".to_string()));
-        assert!(ids.contains(&"whirlpool-custom".to_string()));
+        assert!(ids.contains(&"whirlpool-pool-state".to_string()));
+        assert!(ids.contains(&"whirlpools-config".to_string()));
     }
 
     #[test]
@@ -2559,5 +2552,40 @@ templates: []
                 "{template_id} keeps alive the oracle it writes or the one it is given"
             );
         }
+    }
+
+    fn every_whirlpool_property_has_a_label_and_description() {
+        let registry = TemplateRegistry::new();
+        let mut missing = Vec::new();
+
+        for template in registry.by_protocol("Whirlpool") {
+            for property in &template.properties {
+                if property.label.is_none() {
+                    missing.push(format!("{}:{} missing label", template.id, property.path));
+                }
+                match property.description.as_deref() {
+                    Some(text) if !text.trim().is_empty() => {}
+                    _ => missing.push(format!(
+                        "{}:{} missing description",
+                        template.id, property.path
+                    )),
+                }
+            }
+        }
+
+        assert!(missing.is_empty(), "{}", missing.join("\n  "));
+    }
+
+    #[test]
+    fn whirlpools_config_address_is_the_singleton() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("whirlpools-config")
+            .expect("whirlpools-config template should exist");
+        assert_eq!(template.account_type, "WhirlpoolsConfig");
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey("2LecshUwdy9xi7meFgHtFJQNSKk4KdTrcpvaB56dP2NQ".to_string())
+        );
     }
 }
