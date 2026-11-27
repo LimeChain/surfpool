@@ -10,15 +10,11 @@
   "accounts": [
     {
       "name": "AmmInfo",
-      "discriminator": [0, 0, 0, 0, 0, 0, 0, 0]
+      "discriminator": []
     },
     {
       "name": "TargetOrders",
-      "discriminator": [0, 0, 0, 0, 0, 0, 0, 1]
-    },
-    {
-      "name": "Fees",
-      "discriminator": [0, 0, 0, 0, 0, 0, 0, 2]
+      "discriminator": []
     }
   ],
   "types": [
