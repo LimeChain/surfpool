@@ -1,4 +1,10 @@
+#[cfg(feature = "integration-tests")]
+pub mod bisonfi;
+#[cfg(feature = "integration-tests")]
+pub mod goonfi;
 pub mod helpers;
+#[cfg(feature = "integration-tests")]
+pub mod humidifi;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
@@ -10,3 +16,5 @@ pub mod protocols;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
 pub mod simnet_events;
+#[cfg(feature = "integration-tests")]
+pub mod solfi;
