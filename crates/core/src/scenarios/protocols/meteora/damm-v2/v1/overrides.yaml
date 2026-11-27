@@ -1,5 +1,5 @@
 protocol: Meteora
-version: v0.2.0
+version: v0.2.5
 account_type: Pool
 idl_file_path: idl.json
 

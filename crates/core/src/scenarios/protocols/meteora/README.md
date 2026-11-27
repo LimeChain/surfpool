@@ -237,11 +237,12 @@ whitespace changed: `jq -c .` prints the same bytes for both.
 
 ## DAMM v2
 
-`damm-v2/v1/idl.json` is the IDL Meteora publishes on chain in its Anchor IDL account
-`F1hSvutXSc9iAvB9bQPmjNDwiN2tCXzazTEEvDgNCBMa` (`cp_amm` 0.2.0), indented with two spaces and
-otherwise unchanged, so `jq -c .` prints the same bytes for both.
+`damm-v2/v1/idl.json` is the IDL of the deployed `cp_amm` 0.2.5, byte for byte as Meteora
+publishes it in its SDK:
+[`src/idl/cp_amm.json`](https://github.com/MeteoraAg/damm-v2-sdk/blob/a8fadfac18f63d1e3a5af7170d4b9bdc781bdc15/src/idl/cp_amm.json)
+at `a8fadfa`. The program's Anchor IDL account still holds 0.2.0, which lacks instructions and
+fields of the deployed program, so it is not the source.
 
 | IDL | sha256 |
 |---|---|
-| Published, as `jq -c .` prints it | `c434c1b74b545dfe606d476fabd9bf5c0d3b1a7a9c91a3989cece773b82473f9` |
-| Bundled `damm-v2/v1/idl.json` | `80b4dd27b3d37621350370d601a66f867e0191d9411e08e53fe5505a8f4b2925` |
+| Bundled `damm-v2/v1/idl.json` | `7f5e5f5e9cab57cd208575dc53359676550e41ee0c19fc822560fe1062fd3ac5` |
