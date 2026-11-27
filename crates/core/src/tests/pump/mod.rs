@@ -80,21 +80,10 @@ const PUMP_GLOBAL: Pubkey = Pubkey::from_str_const("4wTV1YmiEkRvAtNtsSGPtUrqRYQM
 const AMM_GLOBAL_CONFIG: Pubkey =
     Pubkey::from_str_const("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw");
 
-/// The bonding curve of the migrated coin 7LSsEoJG…pump, documented in pump-public-docs and
-/// checked against mainnet on 2026-08-06 (complete = true, so it never changes again). It is
-/// 150 bytes, shorter than the bundled 166-byte `BondingCurve` type.
-const LLS_CURVE: Pubkey = Pubkey::from_str_const("3MUkKMbuornHohtAtzrToSzqkj1gEEhQqYVz8sZnmQg1");
-/// The canonical PumpSwap pool of the same migrated coin.
+/// The canonical PumpSwap pool of the migrated coin 7LSsEoJG…pump.
 const AMM_POOL: Pubkey = Pubkey::from_str_const("GseMAnNDvntR5uFePZ51yZBXzNSn7GdFPkfHwfr6d77J");
-/// The 150-byte bonding curve of the migrated Fartcoin, 9BB6NFEc…pump.
-const FARTCOIN_CURVE: Pubkey =
-    Pubkey::from_str_const("TBHe5tJnuT4CQbHorJ1uVdfUoaYGPKgfCpiv2jgesVN");
 /// A 256-byte bonding curve, 90 bytes longer than the bundled `BondingCurve` type.
 const LONG_CURVE: Pubkey = Pubkey::from_str_const("JEKFMnxdTCH88x9HR6xPJb2jQxSaz5J5izwdWqrdW7m1");
-/// A 245-byte pool, idle since 2026-03-06.
-const POOL_245: Pubkey = Pubkey::from_str_const("12Tmc1bcYnY3dJc8Gh8awuH77FLQvMema2Qmy8aF1nK");
-/// A 271-byte pool, idle since 2026-09-16.
-const POOL_271: Pubkey = Pubkey::from_str_const("1CnDGYt2LYJUjQQM1yHAz1wF7YKMKQVqyXMfpgeJHQQ");
 
 const BUY_V2_DISCRIMINATOR: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
 const MIGRATE_V2_DISCRIMINATOR: [u8; 8] = [187, 203, 18, 31, 206, 237, 254, 41];
@@ -217,22 +206,34 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
 /// (287 bytes) types are longer than many live accounts. An IDL write decodes the whole type, so
 /// on a shorter account the override is skipped with a warning and the account keeps every
 /// byte; the same override on a long enough account is written.
+///
+/// Pump grows a short account when someone trades on it or extends it, so no live account stays
+/// short. Each case is a live account cut to `len` bytes; 150 is the end of an older
+/// `BondingCurve` layout. `a_pool_shorter_than_its_idl_type_is_left_unchanged` has the short pools.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_accounts_shorter_than_their_idl_type_are_left_unchanged() {
     let cases: &[(Pubkey, &str, usize, bool)] = &[
-        (LLS_CURVE, "pump-bonding-curve-custom", 150, false),
-        (FARTCOIN_CURVE, "pump-bonding-curve-custom", 150, false),
+        (CURVE, "pump-bonding-curve-custom", 150, false),
         (CURVE, "pump-bonding-curve-custom", CURVE_IDL_LEN, true),
         (LONG_CURVE, "pump-bonding-curve-custom", 256, true),
-        (POOL_245, "pump-amm-pool-state", 245, false),
-        (POOL_271, "pump-amm-pool-state", 271, false),
         (AMM_POOL, "pump-amm-pool-state", 300, true),
     ];
-    let accounts = fetch(&cases.iter().map(|case| case.0).collect::<Vec<_>>()).await;
+    let mut addresses: Vec<Pubkey> = cases.iter().map(|case| case.0).collect();
+    addresses.dedup();
+    let accounts: HashMap<Pubkey, Account> = addresses
+        .iter()
+        .copied()
+        .zip(fetch(&addresses).await)
+        .collect();
     let registry = TemplateRegistry::new();
 
-    for (&(address, template_id, len, writable), live) in cases.iter().zip(accounts) {
-        assert_eq!(live.data.len(), len, "{address} changed size");
+    for &(address, template_id, len, writable) in cases {
+        let mut live = accounts[&address].clone();
+        assert!(
+            live.data.len() >= len,
+            "{address} is shorter than {len} bytes"
+        );
+        live.data.truncate(len);
         let template = registry.get(template_id).expect("template");
         let idl = template.idl.as_ref().expect("IDL");
         let (svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
