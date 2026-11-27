@@ -774,19 +774,49 @@ async fn humidifi_price_moves_the_executed_fill_on_the_fixture_markets() {
                         fixture.def.pair
                     )
                 });
-            let expected = expected_output(fair_value);
-            assert!(
-                output.abs_diff(expected) <= expected / 100,
-                "{} fair value {fair_value}: output {output} is more than 1% from {expected}",
-                fixture.def.pair
-            );
             outputs.push(output);
         }
+        // The inventory skew moves each fill off fair value with the live vaults, but it does not
+        // depend on the fair value, so the ratio holds whatever the vaults hold.
         let ratio = outputs[0] as f64 / outputs[1] as f64;
         assert!(
             (ratio - 2.0).abs() < 0.02,
             "{}: a doubled fair value must halve the base bought, got {ratio}",
             fixture.def.pair
+        );
+    }
+}
+
+/// SOL / USDC's inventory skew stays within a bp or so once its base vault holds a few times the
+/// live inventory, so there a buy must fill at fair value itself.
+#[tokio::test]
+async fn humidifi_price_sets_the_sol_usdc_fill() {
+    let fixture = &fixtures().await[0];
+    assert_eq!(fixture.def.pair, "SOL / USDC");
+    let mut base_vault = fixture.base_vault.data.clone();
+    let deep = amount(&base_vault) * 5;
+    base_vault[AMOUNT].copy_from_slice(&deep.to_le_bytes());
+    let upstream = word(&fixture.market.data, 576) ^ FAIR_VALUE_MASK;
+    for fair_value in [upstream, upstream * 2] {
+        let market = apply_raw(
+            "humidifi-spread",
+            &priced_market(fixture, fair_value),
+            &fixed_spread(0),
+            0,
+        );
+        let output = replay(
+            fixture,
+            Side::Buy,
+            fixture.slot,
+            market,
+            base_vault.clone(),
+            fixture.quote_vault.data.clone(),
+        )
+        .unwrap_or_else(|e| panic!("fair value {fair_value} must fill: {e:?}"));
+        let expected = expected_output(fair_value);
+        assert!(
+            output.abs_diff(expected) <= expected / 5_000,
+            "fair value {fair_value}: output {output} is more than 2 bps from {expected}"
         );
     }
 }
@@ -805,11 +835,16 @@ async fn humidifi_spread_widens_the_executed_fill_on_the_fixture_markets() {
                 })
             })
             .collect();
-        let ratio = outputs[1] as f64 / outputs[0] as f64;
+        // HumidiFi adds its inventory skew to the spread, and the skew moves with the live vaults,
+        // so it is measured from the zero-spread fill.
+        let skew = expected_output(upstream) as f64 / outputs[0] as f64 - 1.0;
+        let expected = expected_output(upstream) as f64 / (1.0 + skew + 0.01);
         assert!(
-            (ratio - 1.0 / 1.01).abs() < 1e-4,
-            "{}: a 100 bps spread must cut the base bought by 1/1.01, got {ratio}",
-            fixture.def.pair
+            (outputs[1] as f64 / expected - 1.0).abs() < 1e-4,
+            "{}: a 100 bps spread must price a buy at fair * (1 + skew + S): got {}, expected \
+             {expected:.0}",
+            fixture.def.pair,
+            outputs[1]
         );
     }
 }
@@ -1031,7 +1066,8 @@ async fn humidifi_vault_scenario_drains_only_the_selected_side() {
             "{context}: thin inventory {thin_output} must quote below {baseline}"
         );
 
-        // The quote vault only receives this direction's input.
+        // The quote vault only receives this direction's input, so emptying it does not stop a
+        // buy. Its balance feeds the inventory skew, so the fill itself may move.
         let drained_quote = materialized_vault(
             fixture.slot,
             fixture.def.quote_vault,
@@ -1040,18 +1076,15 @@ async fn humidifi_vault_scenario_drains_only_the_selected_side() {
         )
         .await;
         assert_eq!(amount(&drained_quote), 0);
-        assert_eq!(
-            replay(
-                fixture,
-                Side::Buy,
-                fixture.slot,
-                fixture.market.data.clone(),
-                fixture.base_vault.data.clone(),
-                drained_quote
-            ),
-            Ok(baseline),
-            "{context}"
-        );
+        replay(
+            fixture,
+            Side::Buy,
+            fixture.slot,
+            fixture.market.data.clone(),
+            fixture.base_vault.data.clone(),
+            drained_quote,
+        )
+        .unwrap_or_else(|e| panic!("{context}: a buy must fill with an empty quote vault: {e:?}"));
     }
 }
 

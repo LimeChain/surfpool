@@ -219,12 +219,6 @@ templates:
       - "config.token_info.scope_configuration.price_chain"
       - "config.token_info.scope_configuration.twap_chain"
       - "config.token_info.pyth_configuration.price"
-      - "config.token_info.switchboard_configuration.price_aggregator"
-      - path: config.token_info.switchboard_configuration.twap_aggregator
-        label: Switchboard TWAP feed
-        description: >-
-          Switchboard aggregator supplying a TWAP for this token. Example: the aggregator address, or
-          the default pubkey to disable
       - path: config.token_info.max_age_price_seconds
         label: Max price age
         description: "How old the oracle price may be before Kamino refuses it, in seconds. Example: 600"
