@@ -26,6 +26,11 @@ pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
+
+pub const METEORA_DAMM_V2_IDL_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/idl.json");
+pub const METEORA_DAMM_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/overrides.yaml");
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
@@ -272,6 +277,11 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             METEORA_DLMM_IDL_CONTENT,
             METEORA_DLMM_OVERRIDES_CONTENT,
+            "meteora",
+        );
+        self.load_protocol_overrides(
+            METEORA_DAMM_V2_IDL_CONTENT,
+            METEORA_DAMM_V2_OVERRIDES_CONTENT,
             "meteora",
         );
     }
@@ -888,14 +898,15 @@ templates:
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4)
+        // + Meteora (DLMM 1, DAMM v2 2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 92
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            92,
+            "Registry should load 92 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -909,8 +920,9 @@ templates:
         assert!(registry.contains("raydium-amm-swap-stats"));
         assert!(registry.contains("raydium-amm-custom"));
 
-        assert!(registry.contains("meteora-dlmm-sol-usdc"));
-        assert!(registry.contains("meteora-dlmm-usdt-sol"));
+        assert!(registry.contains("meteora-dlmm-pool-state"));
+        assert!(registry.contains("meteora-damm-v2-pool-state"));
+        assert!(registry.contains("meteora-damm-v2-pool-fees"));
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
@@ -1485,6 +1497,13 @@ templates: []
             "Should have 4 GoonFi templates (price, band, size impact, vault)"
         );
 
+        let meteora_templates = registry.by_protocol("Meteora");
+        assert_eq!(
+            meteora_templates.len(),
+            3,
+            "Should have 3 Meteora templates (1 DLMM + 2 DAMM v2)"
+        );
+
         let kamino_templates = registry.by_protocol("kamino");
         assert_eq!(
             kamino_templates.len(),
@@ -1661,7 +1680,7 @@ templates: []
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
-        assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
+        assert!(ids.contains(&"meteora-dlmm-pool-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
         assert!(ids.contains(&"kamino-obligation-health".to_string()));
@@ -2557,6 +2576,76 @@ templates: []
             assert_eq!(
                 import.address, expected,
                 "{template_id} keeps alive the oracle it writes or the one it is given"
+            );
+        }
+    }
+
+    #[test]
+    fn meteora_templates_expose_the_economic_levers() {
+        let registry = TemplateRegistry::new();
+
+        let template = registry
+            .get("meteora-dlmm-pool-state")
+            .expect("meteora-dlmm-pool-state should exist");
+        assert_eq!(template.account_type, "LbPair");
+        assert!(
+            !template.properties.iter().any(|p| p.path == "bin_step"),
+            "bin_step must not be exposed as a property"
+        );
+        // A price shock writes the same bin id into both, so they must share a type.
+        for path in ["active_id", "v_parameters.index_reference"] {
+            assert!(
+                template.properties.iter().any(|p| p.path == path),
+                "{path} must be exposed as a property"
+            );
+            let resolved =
+                surfpool_types::resolve_idl_type(template.idl(), &template.account_type, path)
+                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+            assert_eq!(*resolved, anchor_lang_idl::types::IdlType::I32);
+        }
+
+        let damm = registry
+            .get("meteora-damm-v2-pool-state")
+            .expect("meteora-damm-v2-pool-state should exist");
+        assert_eq!(damm.account_type, "Pool");
+
+        let damm_fees = registry
+            .get("meteora-damm-v2-pool-fees")
+            .expect("meteora-damm-v2-pool-fees should exist");
+        assert_eq!(damm_fees.account_type, "Pool");
+        let path = "pool_fees.base_fee.base_fee_info.data";
+        let resolved =
+            surfpool_types::resolve_idl_type(damm_fees.idl(), &damm_fees.account_type, path)
+                .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+        assert_eq!(
+            *resolved,
+            anchor_lang_idl::types::IdlType::Array(
+                Box::new(anchor_lang_idl::types::IdlType::U8),
+                anchor_lang_idl::types::IdlArrayLen::Value(32),
+            )
+        );
+
+        for property in template
+            .properties
+            .iter()
+            .chain(&damm.properties)
+            .chain(&damm_fees.properties)
+        {
+            assert!(
+                property
+                    .label
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} has no label",
+                property.path
+            );
+            assert!(
+                property
+                    .description
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{} has no description",
+                property.path
             );
         }
     }
