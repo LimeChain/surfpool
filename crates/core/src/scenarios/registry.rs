@@ -94,6 +94,10 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const PANCAKESWAP_V1_IDL_CONTENT: &str = include_str!("./protocols/pancakeswap/v1/idl.json");
+pub const PANCAKESWAP_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/pancakeswap/v1/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -160,6 +164,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_pancakeswap_overrides();
         if let Err(e) = default.check_keep_alive_imports() {
             panic!("unable to load the override templates: {e}");
         }
@@ -378,6 +383,14 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_pancakeswap_overrides(&mut self) {
+        self.load_protocol_overrides(
+            PANCAKESWAP_V1_IDL_CONTENT,
+            PANCAKESWAP_V1_OVERRIDES_CONTENT,
+            "pancakeswap",
         );
     }
 
@@ -891,11 +904,11 @@ templates:
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) + PancakeSwap CLMM (2) = 93
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            93,
+            "Registry should load 93 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -1016,6 +1029,9 @@ templates:
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("pancakeswap-clmm-pool-state"));
+        assert!(registry.contains("pancakeswap-clmm-amm-config"));
     }
 
     #[test]
@@ -1578,6 +1594,13 @@ templates: []
             phoenix_templates.len(),
             19,
             "Should have 19 Phoenix Eternal templates"
+        );
+
+        let pancakeswap_templates = registry.by_protocol("PancakeSwap");
+        assert_eq!(
+            pancakeswap_templates.len(),
+            2,
+            "Should have 2 PancakeSwap templates"
         );
     }
 

@@ -26,6 +26,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
  - **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, size-impact,
    swap-pressure and vault-inventory templates; its oracle is kept alive. See
    [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)
+- **PancakeSwap CLMM (Solana)** - Concentrated liquidity AMM, a fork of Raydium CLMM with identical account layouts. See [protocols/pancakeswap/README.md](./protocols/pancakeswap/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 
